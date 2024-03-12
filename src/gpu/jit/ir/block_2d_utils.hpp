@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,18 +19,22 @@
 
 #include <algorithm>
 
-#include "gpu/jit/ir/hw_config.hpp"
+#include "gpu/jit/ir/hw.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace gpu {
 namespace jit {
 
-inline int block_2d_base_alignment(const hw_config_t &hw_cfg) {
-    ir_assert(hw_cfg.hw() >= ngen::HW::XeHPC);
-    // XXX: A steppings require 128 byte alignment due to a HW bug.
-    if (hw_cfg.stepping_id() <= 6) return 128;
-    return 64;
+inline int block_2d_base_alignment(const hw_t &hw) {
+    switch (hw.to_ngen()) {
+        case ngen::HW::XeHPC:
+            // XXX: A steppings require 128 byte alignment due to a HW bug.
+            return (hw.stepping_id() <= 6) ? 128 : 64;
+        case ngen::HW::Xe2: return 64;
+        default: ir_error_not_expected();
+    }
+    return 0;
 }
 
 inline int block_2d_x_alignment(int type_size) {
@@ -50,15 +54,23 @@ inline bool block_2d_height_ok(int height) {
     return true;
 }
 
-inline bool block_2d_pitch_ok(const hw_config_t &hw_cfg, int pitch,
-        int type_size, bool use_xy = true) {
+inline int block_2d_pitch_alignment(const hw_t &hw) {
+    switch (hw.to_ngen()) {
+        case ngen::HW::XeHPC: return 8;
+        case ngen::HW::Xe2: return 16;
+        default: ir_error_not_expected();
+    }
+    return 0;
+}
+
+inline bool block_2d_pitch_ok(
+        const hw_t &hw, int pitch, int type_size, bool use_xy = true) {
     int pitch_bytes = pitch * type_size;
     if (pitch_bytes < 64) return false;
     if (pitch_bytes > (1 << 24)) return false;
-    if (pitch_bytes % 8 != 0) return false;
+    if (pitch_bytes % block_2d_pitch_alignment(hw) != 0) return false;
     // To be able to point the base to different rows.
-    if (use_xy && pitch_bytes % block_2d_base_alignment(hw_cfg) != 0)
-        return false;
+    if (use_xy && pitch_bytes % block_2d_base_alignment(hw) != 0) return false;
     return true;
 }
 

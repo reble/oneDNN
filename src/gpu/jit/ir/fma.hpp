@@ -30,12 +30,16 @@ namespace jit {
 
 // Possible backend instruction sets
 enum class fma_kind_t {
+    undef = 0,
     mad,
     dp4a,
     dpas,
     dpasw,
-    unknown,
+    _max,
 };
+
+std::string to_string(fma_kind_t kind);
+fma_kind_t str_to_fma_kind(const std::string &s);
 
 inline bool is_dp_fma(fma_kind_t kind) {
     switch (kind) {
@@ -46,18 +50,11 @@ inline bool is_dp_fma(fma_kind_t kind) {
     }
 }
 
-namespace fma_kind {
+fma_kind_t get_supported_fma_kind(
+        const hw_t &hw, const type_t &a, const type_t &b, const type_t &c);
 
-std::string to_string(fma_kind_t val);
-fma_kind_t from_string(std::string enum_string);
-
-fma_kind_t get_supported_kind(const hw_config_t &hw, const type_t &a,
+int get_simd_size(const hw_t &hw, fma_kind_t kind, const type_t &a,
         const type_t &b, const type_t &c);
-
-int get_simd_size(ngen::HW hw, fma_kind_t kind, const type_t &a,
-        const type_t &b, const type_t &c);
-
-} // namespace fma_kind
 
 class multiply_desc_t {
 public:
@@ -127,15 +124,16 @@ public:
         if (!obj.is<self_type>()) return false;
         auto &other = obj.as<self_type>();
 
-        return (is_dpasw == other.is_dpasw) && (sdepth == other.sdepth)
-                && (rcount == other.rcount) && (dst_type == other.dst_type)
+        return (is_dpasw == other.is_dpasw) && (exec_size == other.exec_size)
+                && (sdepth == other.sdepth) && (rcount == other.rcount)
+                && (dst_type == other.dst_type)
                 && (src1_type == other.src1_type)
                 && (src2_type == other.src2_type);
     }
 
     size_t get_hash() const override {
-        return ir_utils::get_hash(
-                is_dpasw, sdepth, rcount, dst_type, src1_type, src2_type);
+        return ir_utils::get_hash(is_dpasw, exec_size, sdepth, rcount, dst_type,
+                src1_type, src2_type);
     }
 
     std::string str() const override {
@@ -174,7 +172,7 @@ public:
     bool matches(const multiply_desc_t &desc) const;
 
     static bool matches_types(
-            ngen::HW hw, const type_t &a, const type_t &b, const type_t &c);
+            const hw_t &hw, const type_t &a, const type_t &b, const type_t &c);
     static bool is_src_type(type_t type);
 
     bool is_dpasw;
@@ -206,7 +204,7 @@ class mad_t : public func_impl_t {
 public:
     IR_DECL_DERIVED_TYPE_ID(mad_t, func_impl_t)
 
-    static func_t make(ngen::HW hw, const type_t &dst_type, int exec_size,
+    static func_t make(const hw_t &hw, const type_t &dst_type, int exec_size,
             const type_t &src1_type, int src1_stride, const type_t src2_type,
             int src2_stride) {
         return func_t(new mad_t(hw, dst_type, exec_size, src1_type, src1_stride,
@@ -257,17 +255,19 @@ public:
     }
 
     static bool matches_types(
-            ngen::HW hw, const type_t &a, const type_t &b, const type_t &c);
+            const hw_t &hw, const type_t &a, const type_t &b, const type_t &c);
 
     static const int max_exec_size = 32;
-    static const int get_max_exec_size_bytes(ngen::HW hw) {
+    static int get_max_exec_size_bytes(const hw_t &hw) {
         return hw >= ngen::HW::XeHPC ? 128 : 64;
     }
     static int get_simd_size(
-            ngen::HW hw, const type_t &a, const type_t &b, const type_t &c) {
+            const hw_t &hw, const type_t &a, const type_t &b, const type_t &c) {
         int max_size = max_exec_size;
         int max_exec_size_bytes = get_max_exec_size_bytes(hw);
-        int max_type_size = std::max(a.size(), std::max(b.size(), c.size()));
+        int max_type_size = utils::one_of(type_t::bf8(), a, b, c)
+                ? 2
+                : std::max(a.size(), std::max(b.size(), c.size()));
         return std::min(max_size, max_exec_size_bytes / max_type_size);
     }
     int get_exec_size() const { return exec_size; }
@@ -281,7 +281,7 @@ public:
     int src2_stride;
 
 private:
-    mad_t(ngen::HW hw, const type_t &dst_type, int exec_size,
+    mad_t(const hw_t &hw, const type_t &dst_type, int exec_size,
             const type_t &src1_type, int src1_stride, const type_t &src2_type,
             int src2_stride)
         : func_impl_t(_type_info())

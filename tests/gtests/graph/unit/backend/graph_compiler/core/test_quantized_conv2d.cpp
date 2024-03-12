@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@
 #include <compiler/ir/sc_data_type.hpp>
 #include <compiler/jit/jit.hpp>
 #include <ops/convolution.hpp>
+#include <ops/templates/conv_dw_fwd.hpp>
 #include <ops/templates/conv_fwd.hpp>
 #include <ops/templates/conv_rl.hpp>
 #include <ops/templates/nested_conv_fwd.hpp>
@@ -62,7 +63,9 @@ void check_qconv(conv_fwd_config_t cfg, int N, int G, int K, int C, int H,
         int W, int R, int S, const sc_dims &stride, const sc_dims &dilations,
         const sc_dims &pads_begin, const sc_dims &pads_end,
         bool fuse_bias = false, bool default_cfg = false,
-        bool force_blocking = false, bool force_channel_last = false) {
+        bool force_blocking = false, bool force_channel_last = false,
+        std::vector<int> data_zero_points = {0},
+        std::vector<int> weight_zero_points = {0}) {
     int stride_h = stride[0], stride_w = stride[0];
     if (stride.size() == 2) { stride_w = stride[1]; }
     int padding_h = pads_begin[0], padding_w = pads_begin[0];
@@ -74,20 +77,30 @@ void check_qconv(conv_fwd_config_t cfg, int N, int G, int K, int C, int H,
                     << C << "), K(" << K << "), G(" << G << ").");
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     sc_graph_t g;
+    bool is_dw = (G > 1) && (G == C);
 
     auto src_dtype = sc_data_traits_t<src_type>::type();
     auto wei_dtype = sc_data_traits_t<wei_type>::type();
-    sc_dims data_dims = {N, C, H, W};
-    sc_dims weight_dims = {K, C / G, R, S};
+    sc_dims data_dims
+            = G > 1 ? sc_dims {N, G, C / G, H, W} : sc_dims {N, C, H, W};
+    sc_dims weight_dims
+            = G > 1 ? sc_dims {G, K / G, C / G, R, S} : sc_dims {K, C, R, S};
     auto g_data = g.make_input({make_tensor(data_dims, src_dtype)});
     auto g_weight = g.make_input({make_tensor(weight_dims, wei_dtype)});
     auto g_conv_out = g.make("conv_fwd_core",
             {g_data->get_outputs()[0], g_weight->get_outputs()[0]}, {},
             {{"strides", stride}, {"pads_begin", pads_begin},
                     {"pads_end", pads_end}, {"use_nested", false},
-                    {"dilations", dilations}, {"groups", G}});
+                    {"dilations", dilations}, {"groups", G},
+                    {"data_zero_points", data_zero_points},
+                    {"weight_zero_points", weight_zero_points}});
+    dynamic_cast<ops::conv_fwd_core_op_t *>(g_conv_out.get())->is_quantized_
+            = true;
+    dynamic_cast<ops::conv_fwd_core_op_t *>(g_conv_out.get())
+            ->need_compensation_
+            = true;
+    g.attrs_[sc_graph_t::attr_key_t::quantize] = true;
     COMPILE_ASSERT(!force_blocking || !force_channel_last,
             "only one of force_blocking and force_channel_last allowed");
     if (force_blocking) {
@@ -95,23 +108,28 @@ void check_qconv(conv_fwd_config_t cfg, int N, int G, int K, int C, int H,
     } else if (force_channel_last) {
         g_conv_out->attrs_.set("temp.test_format", "NHWC");
     }
-    auto tunop = g_conv_out->template dyn_cast<tunable_op_t>();
 
+    auto tunop = g_conv_out->template dyn_cast<tunable_op_t>();
     auto gen = tunop->create_generator();
-    auto conv_gen = (ops::gen_conv_fwd_t *)gen.get();
     int D = 0, P = 0, Q = 0;
-    std::tie(D, P, Q) = conv_gen->get_output_shape();
-    if (!default_cfg) {
-        reflection::shared_general_object_t cfgptr
-                = reflection::general_object_t::make(cfg);
-        tunop->set_config(cfgptr);
-        auto pcfg = (conv_fwd_config_t *)cfgptr.get();
-        tunop->get_inputs()[0]->details_.set_format(
-                sc_data_format_t::NCHWc(pcfg->C_block));
-        tunop->get_inputs()[1]->details_.set_format(
-                sc_data_format_t::KCRSck4c(pcfg->C_block, pcfg->K_block));
-        tunop->get_outputs()[0]->details_.set_format(
-                sc_data_format_t::NCHWc(pcfg->K_block));
+    if (is_dw) {
+        auto conv_gen = (ops::gen_conv_dw_fwd_t *)gen.get();
+        std::tie(D, P, Q) = conv_gen->get_output_shape();
+    } else {
+        auto conv_gen = (ops::gen_conv_fwd_t *)gen.get();
+        std::tie(D, P, Q) = conv_gen->get_output_shape();
+        if (!default_cfg) {
+            reflection::shared_general_object_t cfgptr
+                    = reflection::general_object_t::make(cfg);
+            tunop->set_config(cfgptr);
+            auto pcfg = (conv_fwd_config_t *)cfgptr.get();
+            tunop->get_inputs()[0]->details_.set_format(
+                    sc_data_format_t::NCHWc(pcfg->C_block));
+            tunop->get_inputs()[1]->details_.set_format(
+                    sc_data_format_t::KCRSck4c(pcfg->C_block, pcfg->K_block));
+            tunop->get_outputs()[0]->details_.set_format(
+                    sc_data_format_t::NCHWc(pcfg->K_block));
+        }
     }
 
     std::vector<sc_op_ptr> args = {g_data, g_weight};
@@ -147,14 +165,14 @@ void check_qconv(conv_fwd_config_t cfg, int N, int G, int K, int C, int H,
     auto sc_output = std::move(output);
     auto plain_input = std::move(input);
     auto plain_weight = std::move(weight);
-
     test_buffer<float> plain_bias = std::move(bias);
     auto plain_output = alloc_array<dst_type>(N * K * P * Q, INIT_ZERO);
 
     compute_ref_direct_fwd(N, G, K, C, H, W, P, Q, R, S, stride_h, stride_w,
             padding_h, padding_w, &plain_input[0], &plain_weight[0],
             &plain_bias[0], &plain_output[0], fuse_bias ? dir_t::FWD_B : FWD_I,
-            nullptr, nullptr, false, 1, 1, 1, 0, 1, 1, dilation_h, dilation_w);
+            nullptr, nullptr, false, 1, 1, 1, 0, 1, 1, dilation_h, dilation_w,
+            true, data_zero_points, weight_zero_points);
 
     test_utils::compare_data(sc_output, plain_output, 1e-3f, 1e-3f);
 }
@@ -386,16 +404,19 @@ template <typename src_type, typename wei_type, typename dst_type>
 void check_rl_qconv(conv_fwd_rl_config_t cfg, int N, int G, int K, int C, int H,
         int W, int R, int S, const sc_dims &stride, const sc_dims &dilations,
         const sc_dims &pads_begin, const sc_dims &pads_end,
-        bool fuse_bias = false, bool default_cfg = false) {
+        bool fuse_bias = false, bool default_cfg = false,
+        std::vector<int> data_zero_points = {0},
+        std::vector<int> weight_zero_points = {0}) {
     COMPILE_ASSERT(default_cfg, "only default cfg is supported!");
     // use new fusion manager
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
 
     int stride_h = stride[0], stride_w = stride[0];
     if (stride.size() == 2) { stride_w = stride[1]; }
     int padding_h = pads_begin[0], padding_w = pads_begin[0];
     if (pads_begin.size() == 2) { padding_w = pads_begin[1]; }
+    int padding_h_end = pads_end[0], padding_w_end = pads_end[0];
+    if (pads_end.size() == 2) { padding_w_end = pads_end[1]; }
     int dilation_h = dilations[0], dilation_w = dilations[0];
     if (dilations.size() == 2) { dilation_w = dilations[1]; }
     COMPILE_ASSERT(C % G == 0 && K % G == 0,
@@ -403,8 +424,9 @@ void check_rl_qconv(conv_fwd_rl_config_t cfg, int N, int G, int K, int C, int H,
                     << C << "), K(" << K << "), G(" << G << ").");
 
     sc_graph_t g;
-    auto src_shape = sc_dims {N, C, H, W};
-    auto wei_shape = sc_dims {K, C / G, R, S};
+    auto src_shape = G > 1 ? sc_dims {N, G, C / G, H, W} : sc_dims {N, C, H, W};
+    auto wei_shape = G > 1 ? sc_dims {G, K / G, C / G, R, S}
+                           : sc_dims {K, C / G, R, S};
     auto src_dtype = sc_data_traits_t<src_type>::type();
     auto wei_dtype = sc_data_traits_t<wei_type>::type();
     auto g_data = g.make_input({make_tensor(src_shape, src_dtype)});
@@ -413,16 +435,21 @@ void check_rl_qconv(conv_fwd_rl_config_t cfg, int N, int G, int K, int C, int H,
             {g_data->get_outputs()[0], g_weight->get_outputs()[0]}, {},
             {{"strides", stride}, {"pads_begin", pads_begin},
                     {"pads_end", pads_end}, {"use_nested", false},
-                    {"dilations", dilations}, {"groups", G}});
-
-    auto out_shape = ops::conv_fwd_core_op_t::infer_out_dims(
-            g_conv_out->get_owner_graph(), src_shape, wei_shape, pads_begin,
-            pads_end, stride, dilations);
-    COMPILE_ASSERT(out_shape.size() == src_shape.size(),
-            "out_shape is expected to be same size vs src_shape, but got "
-                    << out_shape.size() << " vs " << src_shape.size());
-    int P = out_shape[2], Q = out_shape[3];
-
+                    {"dilations", dilations}, {"groups", G},
+                    {"data_zero_points", data_zero_points},
+                    {"weight_zero_points", weight_zero_points}});
+    dynamic_cast<ops::conv_fwd_core_op_t *>(g_conv_out.get())->is_quantized_
+            = true;
+    dynamic_cast<ops::conv_fwd_core_op_t *>(g_conv_out.get())
+            ->need_compensation_
+            = true;
+    g.attrs_[sc_graph_t::attr_key_t::quantize] = true;
+    int P = (H + padding_h + padding_h_end - dilation_h * (R - 1) - 1)
+                    / stride_h
+            + 1,
+        Q = (W + padding_w + padding_w_end - dilation_w * (S - 1) - 1)
+                    / stride_w
+            + 1;
     std::vector<sc_op_ptr> args = {g_data, g_weight};
     sc_op_ptr final_out = g_conv_out;
     auto bc_axis = std::vector<int> {1};
@@ -470,7 +497,7 @@ void check_rl_qconv(conv_fwd_rl_config_t cfg, int N, int G, int K, int C, int H,
             padding_h, padding_w, &plain_input[0], &plain_weight[0],
             &plain_bias[0], &plain_output[0], fuse_bias ? dir_t::FWD_B : FWD_I,
             nullptr, nullptr, false, 1, 1, 1, 0, 1, 1, dilation_h, dilation_w,
-            true);
+            true, data_zero_points, weight_zero_points);
 
     test_utils::compare_data(sc_output, plain_output, 1e-3f, 1e-3f);
 }
@@ -530,6 +557,30 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, single_os_block_2_NXC) {
     REQUIRE_AMX();
     check_qconv<uint8_t, int8_t, int32_t>(single_os_block_cfg2, 1, 16, 64, 7, 7,
             3, 3, {1, 1}, {1, 1}, {0, 0}, false, true, false, true);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, single_os_block_3_NCX) {
+    REQUIRE_AMX();
+    SET_THREADS_OR_SKIP(1);
+    check_qconv<uint8_t, int8_t, int32_t>(single_os_block_cfg2, 1, 64, 64, 16,
+            16, 3, 3, {2, 2}, {1, 1}, {0, 0}, false, true, true, false);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, single_os_block_3_NXC) {
+    REQUIRE_AMX();
+    SET_THREADS_OR_SKIP(1);
+    check_qconv<uint8_t, int8_t, int32_t>(single_os_block_cfg2, 1, 16, 64, 14,
+            14, 3, 3, {2, 2}, {1, 1}, {0, 0}, false, true, false, true);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, single_os_block_4_NCX) {
+    REQUIRE_AMX();
+    SET_THREADS_OR_SKIP(1);
+    check_qconv<uint8_t, int8_t, int32_t>(single_os_block_cfg2, 1, 64, 64, 16,
+            16, 3, 3, {2, 2}, {1, 1}, {0, 0}, false, true, true, false);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, single_os_block_4_NXC) {
+    REQUIRE_AMX();
+    SET_THREADS_OR_SKIP(1);
+    check_qconv<uint8_t, int8_t, int32_t>(single_os_block_cfg2, 1, 16, 64, 14,
+            14, 3, 3, {2, 2}, {2, 2}, {0, 0}, false, true, false, true);
 }
 TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, multi_os_block_NCX) {
     REQUIRE_AMX();
@@ -635,6 +686,80 @@ TEST(GCCore_CPU_qconv2d, Test_2DConv_3x3_with_asymmetric_dilation_int8) {
     }
     return;
 }
+TEST(GCCore_CPU_qconv2d_s8s8s32_1x1, no_padding_1_NCX) {
+    REQUIRE_VNNI();
+    check_qconv<int8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 1, 1,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, true, false);
+}
+TEST(GCCore_CPU_qconv2d_s8s8s32_1x1, no_padding_1_NXC) {
+    REQUIRE_VNNI();
+    check_qconv<int8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 1, 1,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, false, true);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_1x1, no_padding_with_zps1) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 1, 1,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, true, false,
+            std::vector<int> {129}, std::vector<int> {0});
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_1x1, no_padding_with_zps2) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 1, 1,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, true, false,
+            std::vector<int> {71}, std::vector<int> {56});
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_1x1, no_padding_with_zps3) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 1, 1,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, true, false,
+            std::vector<int> {125}, std::vector<int> {128});
+}
+TEST(GCCore_CPU_qconv2d_s8s8s32_3x3, no_padding_1_NCX) {
+    REQUIRE_VNNI();
+    check_qconv<int8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 3, 3,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, true, false);
+}
+TEST(GCCore_CPU_qconv2d_s8s8s32_3x3, no_padding_1_NXC) {
+    REQUIRE_VNNI();
+    check_qconv<int8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 3, 3,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, false, true);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, no_padding_with_zps1) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 3, 3,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, true, false,
+            std::vector<int> {129}, std::vector<int> {0});
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, no_padding_with_zps2) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 3, 3,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, true, false,
+            std::vector<int> {27}, std::vector<int> {56});
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, no_padding_with_zps3) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 3, 3,
+            {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, true, false,
+            std::vector<int> {125}, std::vector<int> {128});
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, padding_with_zps1) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 3, 3,
+            {1, 1}, {1, 1}, {1, 1}, {1, 1}, false, true, true, false,
+            std::vector<int> {129}, std::vector<int> {0});
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, padding_with_zps2) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 3, 3,
+            {1, 1}, {1, 1}, {1, 1}, {1, 1}, false, true, true, false,
+            std::vector<int> {43}, std::vector<int> {56});
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, padding_with_zps3) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 64, 64, 56, 56, 3, 3,
+            {1, 1}, {1, 1}, {1, 1}, {1, 1}, false, true, true, false,
+            std::vector<int> {125}, std::vector<int> {128});
+}
 TEST(GCCore_CPU_qconv2d_u8s8s32_1x1, no_padding_1_NCX) {
     REQUIRE_VNNI();
     check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 128, 64, 64, 56, 56, 1, 1,
@@ -664,6 +789,13 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_1x1, no_padding_3_NXC) {
     REQUIRE_VNNI();
     check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 32, 256, 128, 64, 64, 1, 1,
             {2, 3}, {1, 1}, {0, 0}, false, true, false, true);
+}
+
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, oob_efficientnet_conv_NXC) {
+    SET_THREADS_OR_SKIP(4);
+    REQUIRE_AMX();
+    check_qconv<int8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 144, 6, 1, 1,
+            1, 1, {1, 1}, {1, 1}, {0, 0}, false, true, false, true);
 }
 
 TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, no_padding_1_NCX) {
@@ -701,6 +833,13 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, with_padding_1_NCX) {
     REQUIRE_VNNI();
     check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 128, 64, 64, 56, 56, 3, 3,
             {1, 2}, {1, 1}, {1, 2}, false, true, true, false);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3, with_padding_2) {
+    REQUIRE_AMX();
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 1, 1, 1, 1, 3, 3,
+            {1, 1}, {1, 1}, {1, 1}, {1, 1}, false, true, false, true);
+    check_qconv<uint8_t, int8_t, int32_t>(cfg_fwd, 1, 1, 1, 1, 1, 1, 3, 3,
+            {1, 1}, {1, 1}, {1, 1}, {1, 1}, false, true, false, false);
 }
 
 #define conv_padding_support_NXC 0
@@ -810,6 +949,54 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_groups, no_padding_2_NXC) {
             28, 28, 3, 3, {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, false,
             true);
 }
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_groups, no_padding_3_NCX) {
+    REQUIRE_AMX();
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 16, 3712,
+            3712, 14, 14, 3, 3, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true,
+            false, false);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_groups, no_padding_3_NXC) {
+    REQUIRE_AMX();
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 16, 3712,
+            3712, 14, 14, 3, 3, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true,
+            false, true);
+}
+// dw conv
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_dw, no_padding_1) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 8, 8, 8, 12,
+            12, 3, 3, {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, false, true);
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 8, 8, 8, 12,
+            12, 3, 3, {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, false,
+            false);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_dw, no_padding_2) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 14, 48, 48, 48,
+            28, 28, 3, 3, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true, false,
+            true);
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 14, 48, 48, 48,
+            28, 28, 3, 3, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true, false,
+            false);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_dw, padding_1) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 8, 8, 8, 12,
+            12, 3, 3, {1, 1}, {1, 1}, {1, 1}, {1, 1}, false, true, false, true);
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 8, 8, 8, 12,
+            12, 3, 3, {1, 1}, {1, 1}, {1, 1}, {1, 1}, false, true, false,
+            false);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_dw, padding_2) {
+    REQUIRE_VNNI();
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 14, 48, 48, 48,
+            28, 28, 3, 3, {2, 2}, {1, 1}, {1, 1}, {1, 1}, false, true, false,
+            true);
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 14, 48, 48, 48,
+            28, 28, 3, 3, {2, 2}, {1, 1}, {1, 1}, {1, 1}, false, true, false,
+            false);
+}
+
 TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_groups, with_padding_1_NCX) {
     REQUIRE_AMX();
     check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 2, 8, 8, 12,
@@ -832,6 +1019,18 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_groups, with_padding_2_NXC) {
     check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 14, 2, 48, 48,
             114, 114, 3, 3, {2, 2}, {1, 1}, {1, 1}, {1, 1}, false, true, false,
             true);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_groups, with_padding_3_NCX) {
+    REQUIRE_AMX();
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 16, 3712,
+            3712, 14, 14, 3, 3, {2, 2}, {1, 1}, {1, 1}, {1, 1}, false, true,
+            false, false);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_groups, with_padding_3_NXC) {
+    REQUIRE_AMX();
+    check_qconv<uint8_t, int8_t, int32_t>(conv_fwd_config_t(), 1, 16, 3712,
+            3712, 14, 14, 3, 3, {2, 2}, {1, 1}, {1, 1}, {1, 1}, false, true,
+            false, true);
 }
 
 TEST(GCCore_CPU_qconv2d_nested_u8s8s32_3x3, rn50_stage1_NCX) {
@@ -882,17 +1081,17 @@ TEST(GCCore_CPU_qconv2d_nested_u8s8s32_3x3, rn50_stage4_NXC) {
             512, 512, 9, 9, 3, 3, {1, 1}, {0, 0}, false, true, false, true);
 }
 
-TEST(GCCore_CPU_qconv2d_nested_u8s8s32_1x1, rn50_stage4_NXC) {
-    REQUIRE_AMX();
-    check_nested_qconv<uint8_t, int8_t, int32_t>(nested_conv_fwd_config_t(), 12,
-            512, 512, 56, 56, 1, 1, {1, 1}, {0, 0}, false, true, false, true);
-}
-
 TEST(GCCore_CPU_qconv2d_nested_u8s8s32_3x3, oob_rn50_conv_NXC) {
     SET_THREADS_OR_SKIP(4);
     REQUIRE_AMX();
     check_nested_qconv<int8_t, int8_t, int32_t>(nested_conv_fwd_config_t(), 1,
             512, 512, 21, 21, 3, 3, {2, 2}, {0, 0}, false, true, false, true);
+}
+
+TEST(GCCore_CPU_qconv2d_nested_u8s8s32_1x1, rn50_stage4_NXC) {
+    REQUIRE_AMX();
+    check_nested_qconv<uint8_t, int8_t, int32_t>(nested_conv_fwd_config_t(), 12,
+            512, 512, 56, 56, 1, 1, {1, 1}, {0, 0}, false, true, false, true);
 }
 
 TEST(GCCore_CPU_dynamic_qconv2d_nested_u8s8s32_1x1, ut1) {
@@ -1048,38 +1247,45 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_rl, padding_1) {
     // single real_pr
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 64,
-            3, 224, 224, 7, 7, {2, 2}, {1, 1}, {3, 3}, {3, 3}, false, true);
+            3, 224, 224, 7, 7, {2, 2}, {1, 1}, {3, 3}, {3, 3}, false, true,
+            std::vector<int> {128}, std::vector<int> {57});
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 64,
-            3, 224, 224, 7, 7, {2, 2}, {1, 1}, {3, 3}, {2, 2}, false, true);
+            3, 224, 224, 7, 7, {2, 2}, {1, 1}, {3, 3}, {2, 2}, false, true,
+            std::vector<int> {67}, std::vector<int> {57});
 }
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, padding_2) {
     // double real_pr
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 16,
-            3, 12, 12, 5, 5, {2, 2}, {1, 1}, {4, 4}, {4, 4}, false, true);
+            3, 12, 12, 5, 5, {2, 2}, {1, 1}, {4, 4}, {4, 4}, false, true,
+            std::vector<int> {128}, std::vector<int> {57});
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 16,
-            3, 12, 12, 5, 5, {2, 2}, {1, 1}, {4, 4}, {3, 3}, false, true);
+            3, 12, 12, 5, 5, {2, 2}, {1, 1}, {4, 4}, {3, 3}, false, true,
+            std::vector<int> {67}, std::vector<int> {57});
 }
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, padding_3) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 16,
-            3, 16, 16, 7, 7, {2, 2}, {1, 1}, {4, 3}, {4, 3}, false, true);
+            3, 16, 16, 7, 7, {2, 2}, {1, 1}, {4, 3}, {4, 3}, false, true,
+            std::vector<int> {128}, std::vector<int> {57});
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 16,
             3, 16, 16, 7, 7, {2, 2}, {1, 1}, {4, 3},
             {
                     3,
                     4,
             },
-            false, true);
+            false, true, std::vector<int> {67}, std::vector<int> {57});
 }
 // top/middle/bottom padding region, left padding only, no padding, right
 // padding only
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, padding_4) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t {1, 1}, 1, 1,
-            1, 4, 6, 6, 3, 3, {1, 1}, {1, 1}, {2, 2}, {2, 2}, false, true);
+            1, 4, 6, 6, 3, 3, {1, 1}, {1, 1}, {2, 2}, {2, 2}, false, true,
+            std::vector<int> {67}, std::vector<int> {57});
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t {1, 1}, 1, 1,
-            1, 4, 6, 6, 3, 3, {1, 1}, {1, 1}, {2, 2}, {1, 1}, false, true);
+            1, 4, 6, 6, 3, 3, {1, 1}, {1, 1}, {2, 2}, {1, 1}, false, true,
+            std::vector<int> {67}, std::vector<int> {57});
 }
 // top/middle/bottom padding region, left and right padding
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, padding_5) {
@@ -1134,6 +1340,11 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_rl, padding_10) {
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 16,
             3, 5, 5, 5, 5, {2, 2}, {1, 1}, {3, 3}, {2, 2}, false, true);
 }
+TEST(GCCore_CPU_qconv2d_u8s8s32_rl, padding_11) {
+    REQUIRE_AMX();
+    check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 1, 1,
+            3, 3, 3, 3, {1, 1}, {1, 1}, {1, 0}, {1, 0}, false, true);
+}
 
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl_bias, padding_1) {
     REQUIRE_AMX();
@@ -1147,32 +1358,38 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_rl_bias, padding_1) {
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, no_padding_1) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 64,
-            3, 230, 230, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+            3, 230, 230, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true,
+            std::vector<int> {128}, std::vector<int> {57});
 
     // specify odd num_threads to cover different parallelism at width axis
     SET_THREADS_OR_SKIP(7);
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 64,
-            3, 230, 230, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+            3, 230, 230, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true,
+            std::vector<int> {67}, std::vector<int> {57});
 }
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, no_padding_2) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 64,
-            3, 17, 17, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+            3, 17, 17, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true,
+            std::vector<int> {128}, std::vector<int> {57});
 }
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, no_padding_3) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 8, 1, 64,
-            3, 16, 16, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+            3, 16, 16, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true,
+            std::vector<int> {67}, std::vector<int> {57});
 }
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, no_padding_4) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 64,
-            3, 12, 12, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+            3, 12, 12, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true,
+            std::vector<int> {67}, std::vector<int> {57});
 }
 TEST(GCCore_CPU_qconv2d_u8s8s32_rl, no_padding_5) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 1, 16,
-            3, 13, 13, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+            3, 13, 13, 7, 7, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true,
+            std::vector<int> {67}, std::vector<int> {57});
 }
 
 /*  rl conv with groups */
@@ -1205,6 +1422,16 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_rl_with_groups, with_padding_2) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 14, 4, 36,
             36, 114, 114, 5, 5, {2, 2}, {1, 1}, {1, 1}, {1, 1}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_dw, no_padding_3) {
+    REQUIRE_AMX();
+    check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 14, 48, 96,
+            48, 28, 28, 3, 3, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_u8s8s32_3x3_with_dw, padding_3) {
+    REQUIRE_AMX();
+    check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 14, 48, 96,
+            48, 28, 28, 3, 3, {2, 2}, {1, 1}, {1, 1}, {1, 1}, false, true);
 }
 
 /* kl lowering without padding */
@@ -1270,4 +1497,60 @@ TEST(GCCore_CPU_qconv2d_u8s8s32_kl_with_groups, padding_3) {
     REQUIRE_AMX();
     check_rl_qconv<uint8_t, int8_t, int32_t>(conv_fwd_rl_config_t(), 1, 3, 18,
             36, 13, 13, 5, 5, {1, 1}, {1, 1}, {4, 4}, {4, 4}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_kl_with_groups, no_padding_1) {
+    REQUIRE_AMX();
+    check_rl_qconv<bf16_t, bf16_t, float>(conv_fwd_rl_config_t(), 1, 2, 8, 32,
+            14, 14, 3, 3, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_kl_with_groups, no_padding_2) {
+    REQUIRE_AMX();
+    check_rl_qconv<bf16_t, bf16_t, float>(conv_fwd_rl_config_t(), 1, 3, 9, 36,
+            13, 13, 3, 3, {2, 2}, {1, 1}, {0, 0}, {0, 0}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_kl_with_groups, no_padding_3) {
+    REQUIRE_AMX();
+    check_rl_qconv<bf16_t, bf16_t, float>(conv_fwd_rl_config_t(), 1, 2, 8, 12,
+            13, 13, 5, 5, {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_kl_with_groups, padding_1) {
+    REQUIRE_AMX();
+    check_rl_qconv<bf16_t, bf16_t, float>(conv_fwd_rl_config_t(), 1, 2, 8, 32,
+            13, 13, 3, 3, {2, 2}, {1, 1}, {1, 1}, {1, 1}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_kl_with_groups, padding_2) {
+    REQUIRE_AMX();
+    check_rl_qconv<bf16_t, bf16_t, float>(conv_fwd_rl_config_t(), 1, 4, 8, 48,
+            13, 13, 3, 3, {2, 2}, {1, 1}, {2, 3}, {3, 2}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_kl_with_groups, padding_3) {
+    REQUIRE_AMX();
+    check_rl_qconv<bf16_t, bf16_t, float>(conv_fwd_rl_config_t(), 1, 3, 9, 18,
+            13, 13, 5, 5, {1, 1}, {1, 1}, {4, 4}, {4, 4}, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_kl_with_groups, padding_4) {
+    REQUIRE_AMX();
+    check_rl_qconv<bf16_t, bf16_t, float>(conv_fwd_rl_config_t(), 1, 2, 4, 4,
+            13, 13, 5, 5, {1, 1}, {1, 1}, {4, 4}, {4, 4}, false, true);
+}
+// dw
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_with_dw, no_padding_1) {
+    REQUIRE_AMX();
+    check_qconv<bf16_t, bf16_t, float>(conv_fwd_config_t(), 1, 8, 8, 8, 13, 13,
+            3, 3, {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_with_dw, no_padding_2) {
+    REQUIRE_AMX();
+    check_qconv<bf16_t, bf16_t, float>(conv_fwd_config_t(), 12, 32, 32, 32, 28,
+            28, 5, 5, {1, 1}, {1, 1}, {0, 0}, {0, 0}, false, true, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_with_dw, padding_1) {
+    REQUIRE_AMX();
+    check_qconv<bf16_t, bf16_t, float>(conv_fwd_config_t(), 1, 8, 8, 8, 13, 13,
+            3, 3, {1, 1}, {1, 1}, {1, 1}, {1, 1}, false, true, false, true);
+}
+TEST(GCCore_CPU_qconv2d_bf16bf16f32_with_dw, padding_2) {
+    REQUIRE_AMX();
+    check_qconv<bf16_t, bf16_t, float>(conv_fwd_config_t(), 12, 32, 32, 32, 28,
+            28, 5, 5, {1, 1}, {1, 1}, {2, 2}, {2, 2}, false, true, false, true);
 }

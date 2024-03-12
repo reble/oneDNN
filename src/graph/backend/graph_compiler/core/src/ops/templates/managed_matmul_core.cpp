@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,7 +26,8 @@
 #include <compiler/ir/builtin.hpp>
 #include <compiler/ir/easy_build.hpp>
 #include <compiler/ir/graph/dynamic_internal_info.hpp>
-#include <compiler/ir/graph/fusion_mgr.hpp>
+#include <compiler/ir/graph/fusion_anchor.hpp>
+#include <compiler/ir/graph/mixed_partition.hpp>
 #include <compiler/ir/graph/utils.hpp>
 #include <compiler/ir/pass/ir_copy.hpp>
 #include <compiler/ir/transform/dyn_tsr_transform.hpp>
@@ -231,7 +232,7 @@ config_ptr gen_managed_matmul_core_t::get_default_config(
   get_managed_matmul_config(ctx->machine_, cfg.M_split_num, cfg.N_split_num,
     cfg.M_sub_block, cfg.N_sub_block, cfg.K_sub_block, cfg.im_loop_order, M, N,
     K, iim_block, iin_block, iik_block, sizeofdtypeA, sizeofdtypeC, is_int8,
-    is_f32 || no_vnni_low_fp, owner_->is_dynamic());
+    is_f32 || no_vnni_low_fp, owner_->is_dynamic(), dispatch_avx_);
   return std::move(ret);
 }
 
@@ -318,6 +319,11 @@ config_ptr gen_managed_matmul_core_t::get_default_post_rd_config(
     cfg.K_sub_block = 1;
   }
   return std::move(ret);
+}
+
+static bool is_dyn_threadpool() {
+  return runtime_config_t::get().managed_thread_pool_
+    == thread_pool_mode_t::DYNAMIC;
 }
 
 config_ptr gen_managed_matmul_core_t::get_default_transposed_a_config(
@@ -513,6 +519,19 @@ static int suggest_aligned_block(const size_t plain_X,
   return utils::rnd_up(utils::divide_and_ceil(plain_X, num_X_block), align);
 }
 
+int gen_managed_matmul_core_t::suggest_aligned_iim_block(
+  const size_t plain_M, const size_t default_block, bool is_f32) {
+  auto iim = suggest_aligned_block(plain_M, default_block);
+  const int num_threads = runtime_config_t::get().get_num_threads();
+  if (!is_f32 && num_threads <= 16
+    && iim % 2 != 0 // Even numbers are good choices
+    && plain_M <= 256) {
+    split_iim_ = default_block;
+    iim = plain_M;
+  }
+  return iim;
+}
+
 static int64_t get_bf16_M_block_default(
   const int64_t plain_M, const int num_threads) {
   int64_t M_block_default = 64;
@@ -542,6 +561,7 @@ gen_managed_matmul_core_t::gen_managed_matmul_core_t(sc_op *owner,
     in_tensors_.size() == 2, "input logical tensor size should be two.");
   COMPILE_ASSERT(
     out_tensors_.size() == 1, "output logical tensor size should be one.");
+  if (owner->attrs_.get_or_else("dispatch_avx", false)) { dispatch_avx_ = 1; }
   const int64_t plain_M = get_mma_plain_dims()[0];
   const int64_t plain_K = get_mma_plain_dims()[1];
   const int64_t plain_N = get_mmb_plain_dims()[1];
@@ -563,11 +583,19 @@ gen_managed_matmul_core_t::gen_managed_matmul_core_t(sc_op *owner,
     || is_dynamic_dim(plain_K);
   if (is_f32 || no_vnni_low_fp) {
     if (is_spr_like) {
-      // prefer small blocks
-      if (plain_M <= 4096) {
+      // prefer small blocks: someone is small but none is too great
+      bool case_great_K = (std::min(plain_M, plain_N) > 512)
+        && (plain_K / std::min(plain_M, plain_N) > 16);
+      bool case_small_MNK = (plain_M < 1024 || plain_N < 1024 || plain_K < 512)
+        && !(plain_M >= 7168 || plain_N >= 7168);
+      if (case_great_K || case_small_MNK) {
         M_block_default = 16;
         N_block_default = 16;
         K_block_default = 16;
+      } else if (plain_M <= 4096 && plain_N <= 4096 && plain_K <= 8192) {
+        M_block_default = 32;
+        N_block_default = 32;
+        K_block_default = 32;
       }
     } else {
       if (plain_M <= 256) { M_block_default = 32; }
@@ -583,7 +611,7 @@ gen_managed_matmul_core_t::gen_managed_matmul_core_t(sc_op *owner,
       K_block_default = 32;
     }
   } else {
-    bool is_amx = get_default_context()->use_amx();
+    bool is_amx = get_default_context()->use_amx() && !dispatch_avx_;
     assert(utils::is_one_of(get_A_dtype(), datatypes::u8, datatypes::s8));
     if (plain_M <= 1024 || (plain_M / num_threads / 64 < 8 && is_amx)) {
       M_block_default = 32;
@@ -606,7 +634,7 @@ gen_managed_matmul_core_t::gen_managed_matmul_core_t(sc_op *owner,
         std::min(M_block_default,
           static_cast<int64_t>(utils::divide_and_ceil(plain_M, num_threads))));
     } else {
-      iim_block_ = suggest_aligned_block(plain_M, M_block_default);
+      iim_block_ = suggest_aligned_iim_block(plain_M, M_block_default, is_f32);
     }
   } else if (!is_dynamic_dim(plain_M)) {
     iim_block_ = get_matmul_dyn_cfg_single(plain_M, true);
@@ -626,7 +654,8 @@ gen_managed_matmul_core_t::gen_managed_matmul_core_t(sc_op *owner,
       }
     } else if (is_int8) {
       // vnni-int8 perfers padding iik_block_ to algin 16 when M <=2048
-      if (plain_M < 2048 && !get_default_context()->use_amx()) {
+      bool is_amx = get_default_context()->use_amx() && !dispatch_avx_;
+      if (plain_M < 2048 && !is_amx) {
         iik_block_ = 16;
       } else {
         iik_block_ = suggest_aligned_block(plain_K, K_block_default, 4, 16);
@@ -654,6 +683,10 @@ void gen_managed_matmul_core_t::generate_prefetcher_body_for_tensor(
   auto lookup = func_args[0];
   auto expected = func_args[1];
   auto tid = func_args[2];
+  auto doroll = [&tid](const expr &v, const expr &bound) {
+    if (is_dyn_threadpool()) { return v; }
+    return (v + tid) % bound;
+  };
   bool is_int8 = utils::is_one_of(get_A_dtype(), datatypes::u8, datatypes::s8);
   uint64_t sizeof_dtype = utils::get_sizeof_type(get_A_dtype());
   bool is_vnni_low_fp = ops::is_vnni_low_fp(ctx, get_A_dtype());
@@ -690,7 +723,7 @@ void gen_managed_matmul_core_t::generate_prefetcher_body_for_tensor(
           _for_(n_o, 0, n_o_end) {
             _var_init_(n_start_idx, datatypes::index,
               n_idx + n_b_idx * iin_block_
-                + ((n_o + tid) % n_o_end) * iin_block_);
+                + (doroll(n_o, n_o_end)) * iin_block_);
             _var_init_(bs, datatypes::index,
               builder::make_cast(datatypes::index,
                 get_balance211_length(K / iik_block_, config.K_sub_block, k_b,
@@ -706,7 +739,8 @@ void gen_managed_matmul_core_t::generate_prefetcher_body_for_tensor(
                   iik_block_ * iin_block_ * bs, 512 / sizeof_dtype),
                 64 / sizeof_dtype) {
                 std::vector<expr> B_indices;
-                if (get_A_dtype() == datatypes::f32) {
+                if (utils::is_one_of(
+                      get_A_dtype(), datatypes::f32, datatypes::f16)) {
                   B_indices = {n_start_idx / expr(iin_block_),
                     k_start_idx / expr(iik_block_), 0, i + j};
                 } else {
@@ -747,7 +781,7 @@ void gen_managed_matmul_core_t::generate_prefetcher_body_for_tensor(
             _for_(n_o, 0, n_o_end) {
               _var_init_(n_start_idx, datatypes::index,
                 n_idx + n_b_idx * iin_block_
-                  + ((n_o + tid) % n_o_end) * iin_block_);
+                  + (doroll(n_o, n_o_end)) * iin_block_);
               _var_init_(bs, datatypes::index,
                 builder::make_cast(datatypes::index,
                   get_balance211_length(K_single_thr_size / iik_block_,
@@ -765,7 +799,8 @@ void gen_managed_matmul_core_t::generate_prefetcher_body_for_tensor(
                     iik_block_ * iin_block_ * bs, 512 / sizeof_dtype),
                   64 / sizeof_dtype) {
                   std::vector<expr> B_indices;
-                  if (get_A_dtype() == datatypes::f32) {
+                  if (utils::is_one_of(
+                        get_A_dtype(), datatypes::f32, datatypes::f16)) {
                     B_indices = {n_start_idx / expr(iin_block_),
                       k_start_idx / expr(iik_block_), 0, i + j};
                   } else {
@@ -806,345 +841,6 @@ void gen_managed_matmul_core_t::schedule_loops(context_ptr ctx,
   const managed_matmul_core_config_t &config, stmt body,
   std::vector<for_loop> &fors) const {}
 
-void gen_managed_matmul_core_t::single_thread_reorder_matmul_call(
-  context_ptr ctx, const logical_tensor_t &ta, const logical_tensor_t &tb,
-  const logical_tensor_t &tc, const managed_matmul_core_config_t &config,
-  const expr &M, const expr &N, const expr &K, const expr &m_idx,
-  const expr &n_idx, const expr &k_idx, const expr &A, expr &B, const expr &C,
-  int dtype_block, fusion_manager *fusion, const expr &m_s, const expr &n_s,
-  std::vector<int> &M_anchor_info, std::vector<int> &N_anchor_info,
-  std::vector<int> &K_anchor_info, bool is_partial, const expr &k_s,
-  bool is_dynamic) const {
-  expr M_sub_block = config.M_sub_block, N_sub_block = config.N_sub_block,
-       K_sub_block = config.K_sub_block;
-  if (config.im_loop_order == 0) {
-    SC_MODULE_WARN << "Pre fusion vnni reorder in managed_matmul_core requires "
-                      "N loop to be OUTER loop to minimize the repeat time of "
-                      "reorder. Rectify im_loop_order==1 automatically here.";
-  }
-  for_loop im_k, im_m, im_n, o_im_m;
-  int ori_M = static_cast<int>(ta.get_plain_dims()[0]),
-      ori_K = static_cast<int>(ta.get_plain_dims()[1]),
-      ori_N = static_cast<int>(tb.get_plain_dims()[1]);
-  expr tid = builder::make_get_group_thread_id(-1);
-  expr B_vnni_tensor;
-  _tensor_(B_vnni, get_B_dtype(),
-    {utils::divide_and_ceil(ori_N, iin_block_),
-      utils::divide_and_ceil(ori_K, iik_block_), iik_block_ / dtype_block,
-      iin_block_, dtype_block});
-  B_vnni_tensor = B_vnni;
-
-  _for_(n_b, 0, N_sub_block) {
-    _named_for_(o_im_m, m_b, 0, M_sub_block) {
-      expr m_b_idx, n_b_idx, k_b_idx, m_b_bigger_num, n_b_bigger_num,
-        k_b_bigger_num;
-      _var_init_(m_o_end, datatypes::index,
-        get_balance211_length(
-          M / iim_block_, M_sub_block, m_b, m_b_idx, m_b_bigger_num));
-      _var_init_(n_o_end, datatypes::index,
-        get_balance211_length(
-          N / iin_block_, N_sub_block, n_b, n_b_idx, n_b_bigger_num));
-      _named_for_(im_k, k_b, 0, K_sub_block) {
-        // general matmul_core loops
-        _var_init_(bs, datatypes::index,
-          builder::make_cast(datatypes::index,
-            get_balance211_length(
-              K / iik_block_, K_sub_block, k_b, k_b_idx, k_b_bigger_num)));
-        _var_init_(k_start_idx, datatypes::index, k_idx + k_b_idx * iik_block_);
-        _named_for_(im_n, n_o, 0, n_o_end) {
-          // rolling N
-          _var_init_(n_start_idx, datatypes::index,
-            n_idx + n_b_idx * iin_block_
-              + ((n_o + tid) % n_o_end) * iin_block_);
-          // do reorder here
-          {
-            trace_guard_t tg(ctx, "vnni_reorder_B");
-            B_vnni_tensor->attr()[tensor_shrinker_attrs::should_shrink]
-              = tensor_shrinker_t::shrink_info_t {
-                {n_start_idx / iin_block_, k_start_idx / iik_block_, 0, 0, 0},
-                {1,
-                  utils::divide_and_ceil(
-                    is_partial ? K_anchor_info[1] : ori_K, iik_block_),
-                  iik_block_ / dtype_block, iin_block_, dtype_block},
-                stmts()};
-            auto commit_reorder_B
-              = [&](int length_N, int length_K, const expr &ko) {
-                  slice_range b_old_range
-                    = {{k_start_idx + ko * iik_block_, length_K},
-                      {n_start_idx, length_N}};
-                  if (in_tensors_[1].get_format() == sc_data_format_t::NK()) {
-                    std::swap(b_old_range[0], b_old_range[1]);
-                  }
-                  ops::commit_op(ctx, "reorder",
-                    {tensor_slice(B, std::move(b_old_range))},
-                    {tensor_slice(B_vnni_tensor,
-                      {{n_start_idx / iin_block_, 1},
-                        {(k_start_idx + ko * iik_block_) / iik_block_,
-                          utils::divide_and_ceil(length_K, iik_block_)},
-                        {0, iik_block_ / dtype_block}, {0, iin_block_},
-                        {0, dtype_block}})},
-                    {graph_tensor::make({ori_K, ori_N},
-                      in_tensors_[1].get_format(), datatypes::bf16)},
-                    {},
-                    {{"out_format",
-                      sc_data_format_t::NKkn2k(iik_block_, iin_block_)}});
-                };
-
-            int N_real_split = std::min(
-              static_cast<int>(utils::divide_and_ceil(ori_N, iin_block_)),
-              config.N_split_num);
-            int K_real_split = std::min(
-              static_cast<int>(utils::divide_and_ceil(ori_K, iik_block_)),
-              runtime_config_t::get().get_num_threads() / config.M_split_num
-                / config.N_split_num);
-            // discuss reorder type, which has different input slice
-            if (ori_K % iik_block_ == 0 && ori_N % iin_block_ == 0) {
-              // no padding
-              _for_(ko, 0, bs) { commit_reorder_B(iin_block_, iik_block_, ko); }
-            } else if (ori_K % iik_block_ == 0) {
-              // padding on N axis
-              _for_(ko, 0, bs) {
-                _if_(n_s == N_real_split - 1 && n_b == N_sub_block - 1
-                  && n_o == n_o_end - 1) {
-                  commit_reorder_B(ori_N % iin_block_, iik_block_, ko);
-                }
-                _else_ { commit_reorder_B(iin_block_, iik_block_, ko); }
-              }
-            } else if (ori_N % iin_block_ == 0) {
-              // padding on K axis
-              _for_(ko, 0, bs) {
-                _if_(k_s == K_real_split - 1 && k_b == K_sub_block - 1
-                  && ko == bs - 1) {
-                  commit_reorder_B(iin_block_, ori_K % iik_block_, ko);
-                }
-                _else_ { commit_reorder_B(iin_block_, iik_block_, ko); }
-              }
-            } else {
-              // padding on both K and N axes
-              _for_(ko, 0, bs) {
-                _if_(n_s == N_real_split - 1 && n_b == N_sub_block - 1
-                  && n_o == n_o_end - 1) {
-                  _if_(k_s == K_real_split - 1 && k_b == K_sub_block - 1
-                    && ko == bs - 1) {
-                    commit_reorder_B(
-                      ori_N % iin_block_, ori_K % iik_block_, ko);
-                  }
-                  _else_ {
-                    commit_reorder_B(ori_N % iin_block_, iik_block_, ko);
-                  }
-                }
-                _else_ {
-                  _if_(k_s == K_real_split - 1 && k_b == K_sub_block - 1
-                    && ko == bs - 1) {
-                    commit_reorder_B(iin_block_, ori_K % iik_block_, ko);
-                  }
-                  _else_ { commit_reorder_B(iin_block_, iik_block_, ko); }
-                }
-              }
-            }
-          }
-          _named_for_(im_m, m_o, 0, m_o_end) {
-            // rolling M
-            _var_init_(m_start_idx, datatypes::index,
-              m_idx + m_b_idx * iim_block_
-                + ((m_o + tid) % m_o_end) * iim_block_);
-            std::vector<expr> aidx = ta.get_format() == sc_data_format_t::MK()
-              ? std::vector<expr> {m_start_idx, k_start_idx}
-              : std::vector<expr> {
-                m_start_idx / iim_block_, k_start_idx / iik_block_, 0, 0};
-            std::vector<expr> bidx = std::vector<expr> {
-              n_start_idx / iin_block_, k_start_idx / iik_block_, 0, 0, 0};
-            std::vector<expr> cidx;
-            if (is_partial) {
-              cidx = !tc.get_format().is_blocking()
-                ? std::vector<expr> {m_b_idx * iim_block_
-                    + ((m_o + tid) % m_o_end) * iim_block_,
-                  n_b_idx * iin_block_ + ((n_o + tid) % n_o_end) * iin_block_}
-                : std::vector<expr> {m_b_idx + (m_o + tid) % m_o_end,
-                  n_b_idx + (n_o + tid) % n_o_end, 0, 0};
-              cidx.insert(cidx.begin(), k_s);
-            } else {
-              cidx = !tc.get_format().is_blocking()
-                ? std::vector<expr> {m_start_idx, n_start_idx}
-                : std::vector<expr> {
-                  m_start_idx / iim_block_, n_start_idx / iin_block_, 0, 0};
-            }
-            auto LDA
-              = ta.get_format() == sc_data_format_t::MK() ? ori_K : iik_block_;
-            auto LDB = iin_block_;
-            auto LDC = !tc.get_format().is_blocking()
-              ? (is_partial ? N_anchor_info[1] : ori_N)
-              : iin_block_;
-            auto stride_a = ta.get_format() == sc_data_format_t::MK()
-              ? iik_block_
-              : iim_block_ * iik_block_;
-            auto stride_b = iik_block_ * iin_block_;
-            _if_(k_b == 0) {
-              auto eval = builtin::brgemm_init_update(tensor_ptr(A, aidx),
-                tensor_ptr(B_vnni_tensor, bidx), tensor_ptr(C, cidx), bs,
-                iim_block_, iin_block_, iik_block_, LDA, LDB, LDC, stride_a,
-                stride_b, ta.dtype_, tb.dtype_);
-            }
-            _else_ {
-              builtin::brgemm_update(tensor_ptr(A, aidx),
-                tensor_ptr(B_vnni_tensor, bidx), tensor_ptr(C, cidx), bs,
-                iim_block_, iin_block_, iik_block_, LDA, LDB, LDC, stride_a,
-                stride_b, ta.dtype_, tb.dtype_);
-            }
-            if (fusion && !is_partial) {
-              _if_(k_b == K_sub_block - 1) {
-                fusion->create_output_fusion_anchor({tensor_slice(C,
-                  !tc.get_format().is_blocking()
-                    ? std::vector<std::pair<expr, expr>> {{m_start_idx,
-                                                            expr(iim_block_)},
-                      {n_start_idx, expr(iin_block_)}}
-                    : std::vector<std::pair<expr, expr>> {
-                      {m_start_idx / iim_block_, 1},
-                      {n_start_idx / iin_block_, 1}, {0, expr(iim_block_)},
-                      {0, expr(iin_block_)}})});
-              }
-            }
-          }
-        }
-      }
-      if (fusion && !is_partial) {
-        // 16 cases in total
-        if (M_anchor_info[1] == M_anchor_info[2]
-          && N_anchor_info[1] == N_anchor_info[2]
-          && M_anchor_info[1] / iim_block_ % config.M_sub_block == 0
-          && N_anchor_info[1] / iin_block_ % config.N_sub_block == 0) {
-          // case 1: no imbalance on single core, X_sub_block can be
-          // dividedevenly
-          fusion->create_output_fusion_anchor({tensor_slice(C,
-            !tc.get_format().is_blocking()
-              ? std::vector<std::pair<expr, expr>> {{m_idx
-                                                        + m_b_idx * iim_block_,
-                                                      M_anchor_info[1]
-                                                        / config.M_sub_block},
-                {n_idx + n_b_idx * iin_block_,
-                  N_anchor_info[1] / config.N_sub_block}}
-              : std::vector<std::pair<expr, expr>> {
-                {(m_idx + m_b_idx * iim_block_) / expr(iim_block_),
-                  M_anchor_info[1] / iim_block_ / config.M_sub_block},
-                {(n_idx + n_b_idx * iin_block_) / expr(iin_block_),
-                  N_anchor_info[1] / iin_block_ / config.N_sub_block},
-                {0, expr(iim_block_)}, {0, expr(iin_block_)}})});
-        } else {
-          slice_range_list mm_multi_slice;
-          // order:X_anchor_info[1] -> X_anchor_info[2]
-          for (int p = 0; p < 2; p++) {
-            for (int q = 0; q < 2; q++) {
-              for (int i = 0; i < 2; i++) {
-                for (int j = 0; j < 2; j++) {
-                  if (!tc.get_format().is_blocking()) {
-                    auto length_M = M_anchor_info[p + 1] / config.M_sub_block;
-                    if (M_anchor_info[p + 1] / iim_block_ % config.M_sub_block
-                      != 0) {
-                      length_M += (1 - i) * iim_block_;
-                    }
-                    auto length_N = N_anchor_info[q + 1] / config.N_sub_block;
-                    if (N_anchor_info[q + 1] / iin_block_ % config.N_sub_block
-                      != 0) {
-                      length_N += (1 - j) * iin_block_;
-                    }
-                    assert(length_M > 0 && length_N > 0);
-                    mm_multi_slice.emplace_back(
-                      slice_range {{m_idx + m_b_idx * iim_block_, length_M},
-                        {n_idx + n_b_idx * iin_block_, length_N}});
-                  } else {
-                    auto length_M
-                      = M_anchor_info[p + 1] / iim_block_ / config.M_sub_block;
-                    if (M_anchor_info[p + 1] / iim_block_ % config.M_sub_block
-                      != 0) {
-                      length_M += 1 - i;
-                    }
-                    auto length_N
-                      = N_anchor_info[q + 1] / iin_block_ / config.N_sub_block;
-                    if (N_anchor_info[q + 1] / iin_block_ % config.N_sub_block
-                      != 0) {
-                      length_N += 1 - j;
-                    }
-                    assert(length_M > 0 && length_N > 0);
-                    mm_multi_slice.emplace_back(slice_range {
-                      {(m_idx + m_b_idx * iim_block_) / expr(iim_block_),
-                        length_M},
-                      {(n_idx + n_b_idx * iin_block_) / expr(iin_block_),
-                        length_N},
-                      {0, expr(iim_block_)}, {0, expr(iin_block_)}});
-                  }
-                }
-              }
-            }
-          }
-          auto gen_iter_anchor = [&]() {
-            builder::ir_builder_t bd_helper;
-            bd_helper.push_scope();
-            _var_init_(anchor_iter, datatypes::index, UINT64_C(0));
-            // TODO(xxx): reduce the if-else node in IR
-            _if_(m_s < M_anchor_info[0]) {
-              // 0-8
-              _if_(n_s < N_anchor_info[0]) {
-                // 0-4
-                _if_(m_b < m_b_bigger_num) {
-                  _if_(n_b < n_b_bigger_num) { anchor_iter = UINT64_C(0); }
-                  _else_ { anchor_iter = UINT64_C(1); }
-                }
-                _else_ {
-                  _if_(n_b < n_b_bigger_num) { anchor_iter = UINT64_C(2); }
-                  _else_ { anchor_iter = UINT64_C(3); }
-                }
-              }
-              _else_ {
-                _if_(m_b < m_b_bigger_num) {
-                  _if_(n_b < n_b_bigger_num) { anchor_iter = UINT64_C(4); }
-                  _else_ { anchor_iter = UINT64_C(5); }
-                }
-                _else_ {
-                  _if_(n_b < n_b_bigger_num) { anchor_iter = UINT64_C(6); }
-                  _else_ { anchor_iter = UINT64_C(7); }
-                }
-              }
-            }
-            _else_ {
-              _if_(n_s < N_anchor_info[0]) {
-                _if_(m_b < m_b_bigger_num) {
-                  _if_(n_b < n_b_bigger_num) { anchor_iter = UINT64_C(8); }
-                  _else_ { anchor_iter = UINT64_C(9); }
-                }
-                _else_ {
-                  _if_(n_b < n_b_bigger_num) { anchor_iter = UINT64_C(10); }
-                  _else_ { anchor_iter = UINT64_C(11); }
-                }
-              }
-              _else_ {
-                _if_(m_b < m_b_bigger_num) {
-                  _if_(n_b < n_b_bigger_num) { anchor_iter = UINT64_C(12); }
-                  _else_ { anchor_iter = UINT64_C(13); }
-                }
-                _else_ {
-                  _if_(n_b < n_b_bigger_num) { anchor_iter = UINT64_C(14); }
-                  _else_ { anchor_iter = UINT64_C(15); }
-                }
-              }
-            }
-            auto scope_helper = bd_helper.pop_scope();
-            return std::make_pair(anchor_iter, scope_helper);
-          };
-          expr anchor_iter;
-          stmt scope_helper;
-          std::tie(anchor_iter, scope_helper) = gen_iter_anchor();
-          fusion->create_output_fusion_anchor(
-            anchor_iter, C, mm_multi_slice, scope_helper);
-        }
-      }
-    }
-  }
-  if (config.K_sub_block > 1) {
-    im_m->attr()[stmt_attr_key::reduce_root_loop]
-      = std::weak_ptr<stmt_base_t>(o_im_m.impl);
-  }
-}
-
 void gen_managed_matmul_core_t::dynamic_single_thread_matmul_call(
   const managed_matmul_core_config_t &config,
   const std::vector<expr> &buffer_args, const expr &m_s, const expr &n_s,
@@ -1166,24 +862,55 @@ void gen_managed_matmul_core_t::dynamic_single_thread_matmul_call(
   bld->push_evaluate(single_core_call);
 }
 
+static void get_index_with_offset(const logical_tensor_t &ta,
+  std::vector<expr> &new_aidx, const logical_tensor_t &tc,
+  std::vector<expr> &new_cidx, int iim_idx, int split_iim, bool is_partial) {
+  if (ta.get_format() == sc_data_format_t::MK()) {
+    new_aidx[0] = new_aidx[0] + iim_idx * split_iim;
+  } else { // A is MKmk blocking
+    new_aidx[2] = new_aidx[2] + iim_idx * split_iim;
+  }
+  if (is_partial) {
+    if (tc.get_format().is_blocking()) {
+      new_cidx[3] = new_cidx[3] + iim_idx * split_iim;
+    } else {
+      new_cidx[1] = new_cidx[1] + iim_idx * split_iim;
+    }
+  } else {
+    if (tc.get_format().is_blocking()) {
+      new_cidx[2] = new_cidx[2] + iim_idx * split_iim;
+    } else {
+      new_cidx[0] = new_cidx[0] + iim_idx * split_iim;
+    }
+  }
+}
+
 void gen_managed_matmul_core_t::single_thread_matmul_call(
   const context_ptr &ctx, sc_graph_t &graph, const logical_tensor_t &ta,
   const logical_tensor_t &tb, const logical_tensor_t &tc,
   const managed_matmul_core_config_t &config, const expr &M, const expr &N,
   const expr &K, const expr &m_idx, const expr &n_idx, const expr &k_idx,
   const expr &A, const expr &B, const expr &C, int dtype_block,
-  fusion_manager *fusion, const expr &m_s, const expr &n_s,
+  fusion_anchor_mgr_t *fusion, const expr &m_s, const expr &n_s,
   std::vector<int> &M_anchor_info, std::vector<int> &N_anchor_info,
   bool is_partial, const expr &k_s, bool is_dynamic,
   const expr &N_block_size_expr) const {
   expr M_sub_block = config.M_sub_block, N_sub_block = config.N_sub_block,
        K_sub_block = config.K_sub_block;
-  for_loop im_k, im_m, im_n, o_im_n;
+  for_loop im_k, im_m, im_n, o_im_m, o_im_n;
   int ori_M = static_cast<int>(ta.get_plain_dims()[0]),
       ori_K = static_cast<int>(ta.get_plain_dims()[1]),
       ori_N = static_cast<int>(tb.get_plain_dims()[1]);
   expr tid = builder::make_get_group_thread_id(-1);
-  _for_(m_b, 0, M_sub_block) {
+  sc_brgemm_attrs_t brg_attrs;
+  brg_attrs[brgemm::attr_key::dispatch_avx] = dispatch_avx_;
+  auto doroll = [&tid](const expr &v, const expr &bound) {
+    if (is_dyn_threadpool()) { return v; }
+    return (v + tid) % bound;
+  };
+  int num_main_iim_block = iim_block_ / split_iim_;
+  int tail_iim_block = iim_block_ % split_iim_;
+  _named_for_(o_im_m, m_b, 0, M_sub_block) {
     _named_for_(o_im_n, n_b, 0, N_sub_block) {
       expr m_b_idx, n_b_idx, k_b_idx, m_b_bigger_num, n_b_bigger_num,
         k_b_bigger_num;
@@ -1200,10 +927,10 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
             // rolling M and N
             _var_init_(m_start_idx, datatypes::index,
               m_idx + m_b_idx * iim_block_
-                + ((m_o + tid) % m_o_end) * iim_block_);
+                + (doroll(m_o, m_o_end)) * iim_block_);
             _var_init_(n_start_idx, datatypes::index,
               n_idx + n_b_idx * iin_block_
-                + ((n_o + tid) % n_o_end) * iin_block_);
+                + (doroll(n_o, n_o_end)) * iin_block_);
             _var_init_(bs, datatypes::index,
               builder::make_cast(datatypes::index,
                 get_balance211_length(
@@ -1219,8 +946,10 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
                 {k_start_idx / iik_block_, K / iik_block_ / K_sub_block},
                 {0, iik_block_ / dtype_block}, {0, iin_block_}};
               if (dtype_block > 1) { B_slice.push_back({0, dtype_block}); }
-              fusion->create_input_fusion_anchor(
-                {tensor_slice(B, std::move(B_slice))});
+              fusion->create_fusion_anchor(
+                slice_map {
+                  {owner_->get_inputs()[1].get(), slice_range_list {B_slice}}},
+                nullptr, true);
             }
             std::vector<expr> aidx = ta.get_format() == sc_data_format_t::MK()
               ? std::vector<expr> {m_start_idx, k_start_idx}
@@ -1237,10 +966,10 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
             if (is_partial) {
               cidx = !tc.get_format().is_blocking()
                 ? std::vector<expr> {m_b_idx * iim_block_
-                    + ((m_o + tid) % m_o_end) * iim_block_,
-                  n_b_idx * iin_block_ + ((n_o + tid) % n_o_end) * iin_block_}
-                : std::vector<expr> {m_b_idx + (m_o + tid) % m_o_end,
-                  n_b_idx + (n_o + tid) % n_o_end, 0, 0};
+                    + (doroll(m_o, m_o_end)) * iim_block_,
+                  n_b_idx * iin_block_ + (doroll(n_o, n_o_end)) * iin_block_}
+                : std::vector<expr> {m_b_idx + doroll(m_o, m_o_end),
+                  n_b_idx + doroll(n_o, n_o_end), 0, 0};
               cidx.insert(cidx.begin(), k_s);
             } else {
               cidx = !tc.get_format().is_blocking()
@@ -1266,19 +995,54 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
               tensor_ptr(B, bidx), bs, iin_block_, iik_block_);
 
             _if_(k_b == 0) {
-              auto eval = builtin::brgemm_init_update(tensor_ptr(A, aidx),
-                tensor_ptr(B, bidx), tensor_ptr(C, cidx), bs, iim_block_,
-                iin_block_, iik_block_, LDA, LDB, LDC, stride_a, stride_b,
-                ta.dtype_, tb.dtype_);
+              if (split_iim_ == -1) { // normal case, use iim_block_
+                auto eval = builtin::brgemm_init_update(tensor_ptr(A, aidx),
+                  tensor_ptr(B, bidx), tensor_ptr(C, cidx), bs, iim_block_,
+                  iin_block_, iik_block_, LDA, LDB, LDC, stride_a, stride_b,
+                  ta.dtype_, tb.dtype_, brg_attrs);
+              } else {
+                for (int iim_idx = 0; iim_idx < num_main_iim_block + 1;
+                     ++iim_idx) {
+                  auto new_aidx = aidx;
+                  auto new_cidx = cidx;
+                  get_index_with_offset(ta, new_aidx, tc, new_cidx, iim_idx,
+                    split_iim_, is_partial);
+                  auto real_iim = (iim_idx == num_main_iim_block)
+                    ? tail_iim_block
+                    : split_iim_;
+                  builtin::brgemm_init_update(tensor_ptr(A, new_aidx),
+                    tensor_ptr(B, bidx), tensor_ptr(C, new_cidx), bs, real_iim,
+                    iin_block_, iik_block_, LDA, LDB, LDC, stride_a, stride_b,
+                    ta.dtype_, tb.dtype_, brg_attrs);
+                }
+              }
             }
             _else_ {
-              builtin::brgemm_update(tensor_ptr(A, aidx), tensor_ptr(B, bidx),
-                tensor_ptr(C, cidx), bs, iim_block_, iin_block_, iik_block_,
-                LDA, LDB, LDC, stride_a, stride_b, ta.dtype_, tb.dtype_);
+              if (split_iim_ == -1) { // normal case, use iim_block_
+                builtin::brgemm_update(tensor_ptr(A, aidx), tensor_ptr(B, bidx),
+                  tensor_ptr(C, cidx), bs, iim_block_, iin_block_, iik_block_,
+                  LDA, LDB, LDC, stride_a, stride_b, ta.dtype_, tb.dtype_,
+                  brg_attrs);
+              } else {
+                for (int iim_idx = 0; iim_idx < num_main_iim_block + 1;
+                     ++iim_idx) {
+                  auto new_aidx = aidx;
+                  auto new_cidx = cidx;
+                  get_index_with_offset(ta, new_aidx, tc, new_cidx, iim_idx,
+                    split_iim_, is_partial);
+                  auto real_iim = (iim_idx == num_main_iim_block)
+                    ? tail_iim_block
+                    : split_iim_;
+                  auto eval = builtin::brgemm_update(tensor_ptr(A, new_aidx),
+                    tensor_ptr(B, bidx), tensor_ptr(C, new_cidx), bs, real_iim,
+                    iin_block_, iik_block_, LDA, LDB, LDC, stride_a, stride_b,
+                    ta.dtype_, tb.dtype_, brg_attrs);
+                }
+              }
             }
             if (fusion && !is_partial) {
               _if_(k_b == K_sub_block - 1) {
-                fusion->create_output_fusion_anchor({tensor_slice(C,
+                create_fusion_anchor(fusion, owner_->get_outputs()[0],
                   !tc.get_format().is_blocking()
                     ? std::vector<std::pair<expr, expr>> {{m_start_idx,
                                                             expr(iim_block_)},
@@ -1286,27 +1050,30 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
                     : std::vector<std::pair<expr, expr>> {
                       {m_start_idx / iim_block_, 1},
                       {n_start_idx / iin_block_, 1}, {0, expr(iim_block_)},
-                      {0, expr(iin_block_)}})});
+                      {0, expr(iin_block_)}});
               }
             }
           }
           if (fusion && !is_partial && config.N_split_num == 1
             && config.N_sub_block == 1 && config.im_loop_order == 0) {
             _if_(k_b == K_sub_block - 1) {
-              fusion->create_output_fusion_anchor({tensor_slice(C,
+              create_fusion_anchor(fusion, owner_->get_outputs()[0],
                 !tc.get_format().is_blocking()
-                  ? std::vector<std::pair<expr,
-                    expr>> {{m_idx + m_b_idx * iim_block_
-                                + ((m_o + tid) % m_o_end) * iim_block_,
-                              expr(iim_block_)},
+                  ? std::vector<std::pair<expr, expr>> {{m_idx
+                                                            + m_b_idx
+                                                              * iim_block_
+                                                            + doroll(
+                                                                m_o, m_o_end)
+                                                              * iim_block_,
+                                                          expr(iim_block_)},
                     {0, utils::rnd_up(ori_N, iin_block_)}}
                   : std::vector<std::pair<expr, expr>> {
                     {(m_idx + m_b_idx * iim_block_
-                       + ((m_o + tid) % m_o_end) * iim_block_)
+                       + (doroll(m_o, m_o_end)) * iim_block_)
                         / iim_block_,
                       1},
                     {0, utils::divide_and_ceil(ori_N, iin_block_)},
-                    {0, expr(iim_block_)}, {0, expr(iin_block_)}})});
+                    {0, expr(iim_block_)}, {0, expr(iin_block_)}});
             }
           }
         }
@@ -1319,7 +1086,7 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
           && N_anchor_info[1] / iin_block_ % config.N_sub_block == 0) {
           // case 1: no imbalance on single core, X_sub_block can be
           // dividedevenly
-          fusion->create_output_fusion_anchor({tensor_slice(C,
+          create_fusion_anchor(fusion, owner_->get_outputs()[0],
             !tc.get_format().is_blocking()
               ? std::vector<std::pair<expr, expr>> {{m_idx
                                                         + m_b_idx * iim_block_,
@@ -1332,7 +1099,7 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
                   M_anchor_info[1] / iim_block_ / config.M_sub_block},
                 {(n_idx + n_b_idx * iin_block_) / expr(iin_block_),
                   N_anchor_info[1] / iin_block_ / config.N_sub_block},
-                {0, expr(iim_block_)}, {0, expr(iin_block_)}})});
+                {0, expr(iim_block_)}, {0, expr(iin_block_)}});
         } else {
           slice_range_list mm_multi_slice;
           // order:X_anchor_info[1] -> X_anchor_info[2]
@@ -1437,8 +1204,10 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
           expr anchor_iter;
           stmt scope_helper;
           std::tie(anchor_iter, scope_helper) = gen_iter_anchor();
-          fusion->create_output_fusion_anchor(
-            anchor_iter, C, mm_multi_slice, scope_helper);
+          fusion->create_fusion_anchor(anchor_iter,
+            slice_map {{owner_->get_outputs()[0].get(),
+              slice_range_list {mm_multi_slice}}},
+            scope_helper);
         }
       }
     }
@@ -1452,6 +1221,9 @@ void gen_managed_matmul_core_t::single_thread_matmul_call(
     im_m->attr()[stmt_attr_key::reduce_root_loop]
       = std::weak_ptr<stmt_base_t>(o_im_n.impl);
   }
+  // bind outer loops with axis hint
+  bind_loop_axis(owner_->get_outputs()[0], o_im_m, 0);
+  bind_loop_axis(owner_->get_outputs()[0], o_im_n, 1);
 }
 
 std::vector<expr> gen_managed_matmul_core_t::get_extra_args_from_func(
@@ -1460,7 +1232,7 @@ std::vector<expr> gen_managed_matmul_core_t::get_extra_args_from_func(
 }
 
 func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
-  const managed_matmul_core_config_t &config, fusion_manager *fusion,
+  const managed_matmul_core_config_t &config, fusion_anchor_mgr_t *fusion,
   const std::vector<expr> &inputs, const std::vector<expr> &outputs,
   std::vector<for_loop> &loops) const {
   auto &graph = owner_->get_owner_graph();
@@ -1484,6 +1256,7 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
   static std::atomic<int> func_idx = {0};
   expr partial_C;
   sc_brgemm_attrs_t brg_attrs;
+  brg_attrs[brgemm::attr_key::dispatch_avx] = dispatch_avx_;
   _function_(datatypes::boolean, managed_matmul_single_core, {outputs[0]},
     {inputs[0]}, {inputs[1]}, _arg_("M_split_num", datatypes::index),
     _arg_("N_split_num", datatypes::index),
@@ -1510,6 +1283,10 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
     iin_block[0] = iin_block_;
     iik_block[0] = iik_block_;
     expr tid = builtin::get_thread_id_func()();
+    auto doroll = [&tid](const expr &v, const expr &bound) {
+      if (is_dyn_threadpool()) { return v; }
+      return (v + tid) % bound;
+    };
     k_idx_ = 0;
     K_single_thr_size_ = get_balance211_length(
       K / iik_block_, K_split_num, k_s, k_idx_, X_bigger_num);
@@ -1519,7 +1296,7 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
       = divide_and_ceil(M / iim_block_, M_split_num) * iim_block_;
     expr N_block_size_expr
       = divide_and_ceil(N / iin_block_, N_split_num) * iin_block_;
-    for_loop o_im_n, im_k, im_m, im_n;
+    for_loop o_im_m, o_im_n, im_k, im_m, im_n;
     auto K_real_split = builder::make_min(divide_and_ceil(K, iik_block_),
       runtime_config_t::get().get_num_threads() / M_split_num / N_split_num);
     auto N_real_split
@@ -1543,7 +1320,7 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
         !is_partial_
           ? do_cast_and_fold(divide_and_ceil(K, iik_block_) * iik_block_)
           : K_single_thr_size_);
-      _for_(m_b, 0, M_sub_block) {
+      _named_for_(o_im_m, m_b, 0, M_sub_block) {
         _named_for_(o_im_n, n_b, 0, N_sub_block) {
           expr m_b_idx, n_b_idx, k_b_idx, m_b_bigger_num, n_b_bigger_num,
             k_b_bigger_num;
@@ -1591,10 +1368,10 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
                 // rolling M and N
                 _var_init_(m_start_idx, datatypes::index,
                   m_idx + m_b_idx * iim_block_
-                    + ((m_o + tid) % m_o_end) * iim_block_);
+                    + (doroll(m_o, m_o_end)) * iim_block_);
                 _var_init_(n_start_idx, datatypes::index,
                   n_idx + n_b_idx * iin_block_
-                    + ((n_o + tid) % n_o_end) * iin_block_);
+                    + (doroll(n_o, n_o_end)) * iin_block_);
                 std::vector<expr> aidx = input_plain
                   ? std::vector<expr> {m_start_idx, k_start_idx}
                   : std::vector<expr> {
@@ -1609,10 +1386,10 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
                 std::vector<expr> partial_cidx, full_cidx;
                 partial_cidx = !tc.get_format().is_blocking()
                   ? std::vector<expr> {m_b_idx * iim_block_
-                      + ((m_o + tid) % m_o_end) * iim_block_,
-                    n_b_idx * iin_block_ + ((n_o + tid) % n_o_end) * iin_block_}
-                  : std::vector<expr> {m_b_idx + (m_o + tid) % m_o_end,
-                    n_b_idx + (n_o + tid) % n_o_end, 0, 0};
+                      + (doroll(m_o, m_o_end)) * iim_block_,
+                    n_b_idx * iin_block_ + (doroll(n_o, n_o_end)) * iin_block_}
+                  : std::vector<expr> {m_b_idx + doroll(m_o, m_o_end),
+                    n_b_idx + doroll(n_o, n_o_end), 0, 0};
                 partial_cidx.insert(partial_cidx.begin(), k_s);
                 full_cidx = !tc.get_format().is_blocking()
                   ? std::vector<expr> {m_start_idx, n_start_idx}
@@ -1723,7 +1500,7 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
 
                 if (fusion && !is_partial_) {
                   _if_(k_b == K_sub_block - 1) {
-                    fusion->create_output_fusion_anchor({tensor_slice(C,
+                    create_fusion_anchor(fusion, owner_->get_outputs()[0],
                       !tc.get_format().is_blocking()
                         ? std::vector<std::pair<expr, expr>> {{m_start_idx,
                                                                 expr(m_block)},
@@ -1731,7 +1508,7 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
                         : std::vector<std::pair<expr, expr>> {
                           {m_start_idx / iim_block_, 1},
                           {n_start_idx / iin_block_, 1}, {0, expr(iim_block_)},
-                          {0, expr(iin_block_)}})});
+                          {0, expr(iin_block_)}});
                   }
                 }
               }
@@ -1740,6 +1517,9 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
         }
       }
     }
+    // bind outer loops with axis hint
+    bind_loop_axis(owner_->get_outputs()[0], o_im_m, 0);
+    bind_loop_axis(owner_->get_outputs()[0], o_im_n, 1);
     // todo: K_sub_block partial or not may need combinated with format
     // dispatch(outer dispatch key) to dispatch.(inner impl in format dispatch
     // key not impl internal dispatch key.); Find the fusion strategy with
@@ -1765,14 +1545,10 @@ func_t gen_managed_matmul_core_t::get_single_core_func(context_ptr ctx,
  iix_block_.
  * */
 bool gen_managed_matmul_core_t::generate(context_ptr ctx,
-  const managed_matmul_core_config_t &config, fusion_manager *fusion,
+  const managed_matmul_core_config_t &config, fusion_anchor_mgr_t *fusion,
   const std::vector<expr> &inputs, const std::vector<expr> &outputs,
   std::vector<for_loop> &loops) const {
   sc_graph_t &graph = owner_->get_owner_graph();
-  if (!ctx->flags_.mixed_fusion_) {
-    SC_MODULE_WARN << "Managed matmul core has some conflicts with old fusion "
-                      "strategy, which may lead to wrong calculation.";
-  }
   // Init
   int M_split_num = config.M_split_num, N_split_num = config.N_split_num;
   int num_threads = runtime_config_t::get().get_num_threads();
@@ -1860,7 +1636,7 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
   std::vector<int> M_anchor_info = {M_blk_num, M_block_size, M_ib_block_size},
                    N_anchor_info = {N_blk_num, N_block_size, N_ib_block_size},
                    K_anchor_info = {K_blk_num, K_block_size, K_ib_block_size};
-  for_loop mloop;
+  for_loop mloop, nloop, kloop;
   expr M_real_split = is_dynamic
     ? M_split_num
     : do_cast_and_fold(
@@ -1879,7 +1655,8 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
     expr iim_block_tsr, iin_block_tsr, iik_block_tsr;
     _named_for_(
       mloop, m_s, 0, M_real_split, 1, for_type::PARALLEL, M_split_num) {
-      _for_(n_s, 0, N_real_split, 1, for_type::PARALLEL, N_split_num) {
+      _named_for_(
+        nloop, n_s, 0, N_real_split, 1, for_type::PARALLEL, N_split_num) {
         M_single_thr_size = get_balance211_length(
           M_expr / iim_block_, M_split_num, m_s, m_idx, X_bigger_num);
         M_single_thr_size = M_single_thr_size * iim_block_;
@@ -1889,7 +1666,7 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
           N_expr / iin_block_, N_split_num, n_s, n_idx, X_bigger_num);
         N_single_thr_size = N_single_thr_size * iin_block_;
         n_idx = n_idx * iin_block_;
-        _for_(k_s, 0, K_split_num, 1,
+        _named_for_(kloop, k_s, 0, K_split_num, 1,
           M_split_num * N_split_num == num_threads ? for_type::NORMAL
                                                    : for_type::PARALLEL,
           M_split_num * N_split_num == num_threads ? 0 : K_split_num) {
@@ -1898,68 +1675,60 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
             if (fusion && in_tensors_[0].get_format().is_blocking()
               && (M * K * sizeofdtypeA <= 1024 * 1024
                 || K * sizeofdtypeA <= 1024)) {
-              fusion->create_input_fusion_anchor({tensor_slice(A,
-                {{m_idx / iim_block_,
-                   utils::divide_and_ceil(M_block_size, iim_block_)},
-                  {0, K / iik_block_}, {0, iim_block_}, {0, iik_block_}})});
-            }
-            if (in_tensors_[0].get_format() == sc_data_format_t::NK()
-              && is_A_vnni_low_fp) {
-              trace_guard_t tg(ctx, "transpose_A");
-              expr A_trans_tensor;
-              _tensor_(A_trans, get_A_dtype(),
-                {M / iim_block_, K / iik_block_, iim_block_, iik_block_});
-              A_trans_tensor = A_trans;
-              A_trans_tensor->attr()[tensor_shrinker_attrs::should_shrink]
-                = tensor_shrinker_t::shrink_info_t {
-                  {m_idx / iim_block_, 0, 0, 0},
-                  {M_block_size / iim_block_, K / iik_block_, iim_block_,
-                    iik_block_},
-                  stmts()};
-              // do transpose A
-              auto commit_reorder_A = [&](int length_M) {
-                int length_K = in_tensors_[0].get_plain_dims()[1];
-                ops::commit_op(ctx, "reorder",
-                  {tensor_slice(A, {{0, length_K}, {m_idx, length_M}})},
-                  {tensor_slice(A_trans_tensor,
-                    {{m_idx / iim_block_,
-                       utils::divide_and_ceil(length_M, iim_block_)},
-                      {0, K / iik_block_}, {0, iim_block_}, {0, iik_block_}})},
-                  {graph_tensor::make(in_tensors_[0].get_plain_dims(),
-                    sc_data_format_t::NK(), A_dtype)},
-                  {},
-                  {{"out_format",
-                    sc_data_format_t::MKmk(iim_block_, iik_block_)}});
-              };
+              auto commit_reorder_A_anchor
+                = [&](int length_M, int grouped_id = -1) {
+                    slice_range A_slice
+                      = {{m_idx / iim_block_,
+                           utils::divide_and_ceil(length_M, iim_block_)},
+                        {0, K / iik_block_}, {0, iim_block_}, {0, iik_block_}};
+                    if (grouped_id > -1) {
+                      // create grouped anchor
+                      fusion->create_fusion_anchor(grouped_id,
+                        slice_map {{owner_->get_inputs()[0].get(),
+                          slice_range_list {A_slice}}},
+                        nullptr, true);
+                    } else {
+                      fusion->create_fusion_anchor(
+                        slice_map {{owner_->get_inputs()[0].get(),
+                          slice_range_list {A_slice}}},
+                        nullptr, true);
+                    }
+                  };
               if (in_tensors_[0].get_plain_dims()[0] % iim_block_ == 0) {
                 if (M_block_size == M_ib_block_size) {
-                  commit_reorder_A(M_block_size);
+                  commit_reorder_A_anchor(M_block_size);
                 } else {
-                  _if_(m_s < M_blk_num) { commit_reorder_A(M_block_size); }
-                  _else_ { commit_reorder_A(M_ib_block_size); }
+                  _if_(m_s < M_blk_num) {
+                    commit_reorder_A_anchor(M_block_size, 0);
+                  }
+                  _else_ { commit_reorder_A_anchor(M_ib_block_size, 0); }
                 }
               } else {
                 // has padding on M axis
                 if (M_block_size == M_ib_block_size) {
                   _if_(m_s == M_real_split - 1) {
-                    commit_reorder_A(M_block_size - iim_block_
-                      + in_tensors_[0].get_plain_dims()[0] % iim_block_);
+                    commit_reorder_A_anchor(M_block_size - iim_block_
+                        + in_tensors_[0].get_plain_dims()[0] % iim_block_,
+                      0);
                   }
-                  _else_ { commit_reorder_A(M_block_size); }
+                  _else_ { commit_reorder_A_anchor(M_block_size, 0); }
                 } else {
-                  _if_(m_s < M_blk_num) { commit_reorder_A(M_block_size); }
+                  _if_(m_s < M_blk_num) {
+                    commit_reorder_A_anchor(M_block_size, 0);
+                  }
                   _else_ {
                     _if_(m_s == M_real_split - 1) {
-                      commit_reorder_A(M_ib_block_size - iim_block_
-                        + in_tensors_[0].get_plain_dims()[0] % iim_block_);
+                      commit_reorder_A_anchor(M_ib_block_size - iim_block_
+                          + in_tensors_[0].get_plain_dims()[0] % iim_block_,
+                        0);
                     }
-                    _else_ { commit_reorder_A(M_ib_block_size); }
+                    _else_ { commit_reorder_A_anchor(M_ib_block_size, 0); }
                   }
                 }
               }
-              A = A_trans_tensor;
             }
           } else {
+            // dynamic
             _tensor_(iim_block_tmp, datatypes::s32, {1});
             _tensor_(iin_block_tmp, datatypes::s32, {1});
             _tensor_(iik_block_tmp, datatypes::s32, {1});
@@ -1967,16 +1736,7 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
             iin_block_tsr = iin_block_tmp;
             iik_block_tsr = iik_block_tmp;
           }
-          if (!is_dynamic
-            && utils::is_one_of(in_tensors_[1].get_format(),
-              sc_data_format_t::MK(), sc_data_format_t::NK())
-            && is_B_vnni_low_fp) {
-            single_thread_reorder_matmul_call(ctx, in_tensors_[0],
-              in_tensors_[1], out_tensors_[0], config, M_single_thr_size,
-              N_single_thr_size, (int)utils::rnd_up(K, iik_block_), m_idx,
-              n_idx, k_s, A, B, C, dtype_block, fusion, m_s, n_s, M_anchor_info,
-              N_anchor_info, K_anchor_info, false, k_s, is_dynamic);
-          } else if (!is_dynamic) {
+          if (!is_dynamic) {
             single_thread_matmul_call(ctx, graph, in_tensors_[0],
               in_tensors_[1], out_tensors_[0], config, M_single_thr_size,
               N_single_thr_size, (int)utils::rnd_up(K, iik_block_), m_idx,
@@ -2011,13 +1771,13 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
           if (M_block_size == M_ib_block_size
             && N_block_size == N_ib_block_size) {
             if (out_tensors_[0].get_format().is_blocking()) {
-              fusion->create_output_fusion_anchor({tensor_slice(C,
+              create_fusion_anchor(fusion, owner_->get_outputs()[0],
                 {{m_idx / expr(iim_block_), M_block_size / iim_block_},
                   {n_idx / expr(iin_block_), N_block_size / iin_block_},
-                  {0, iim_block_}, {0, iin_block_}})});
+                  {0, iim_block_}, {0, iin_block_}});
             } else {
-              fusion->create_output_fusion_anchor({tensor_slice(
-                C, {{m_idx, M_block_size}, {n_idx, N_block_size}})});
+              create_fusion_anchor(fusion, owner_->get_outputs()[0],
+                {{m_idx, M_block_size}, {n_idx, N_block_size}});
             }
           } else if (M_block_size == M_ib_block_size) {
             // differnt length on N
@@ -2036,8 +1796,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
             expr middle_anchor_iter;
             stmt scope_helper;
             std::tie(middle_anchor_iter, scope_helper) = gen_iter_anchor();
-            fusion->create_output_fusion_anchor(
-              middle_anchor_iter, C, mm_multi_slice, scope_helper);
+            fusion->create_fusion_anchor(middle_anchor_iter,
+              slice_map {{owner_->get_outputs()[0].get(),
+                slice_range_list {mm_multi_slice}}},
+              scope_helper);
           } else if (N_block_size == N_ib_block_size) {
             // different length on M
             mm_multi_slice.pop_back();
@@ -2055,8 +1817,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
             expr middle_anchor_iter;
             stmt scope_helper;
             std::tie(middle_anchor_iter, scope_helper) = gen_iter_anchor();
-            fusion->create_output_fusion_anchor(
-              middle_anchor_iter, C, mm_multi_slice, scope_helper);
+            fusion->create_fusion_anchor(middle_anchor_iter,
+              slice_map {{owner_->get_outputs()[0].get(),
+                slice_range_list {mm_multi_slice}}},
+              scope_helper);
           } else {
             // different length on both M and N
             auto gen_iter_anchor = [&]() {
@@ -2077,8 +1841,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
             expr middle_anchor_iter;
             stmt scope_helper;
             std::tie(middle_anchor_iter, scope_helper) = gen_iter_anchor();
-            fusion->create_output_fusion_anchor(
-              middle_anchor_iter, C, mm_multi_slice, scope_helper);
+            fusion->create_fusion_anchor(middle_anchor_iter,
+              slice_map {{owner_->get_outputs()[0].get(),
+                slice_range_list {mm_multi_slice}}},
+              scope_helper);
           }
         }
       }
@@ -2086,13 +1852,13 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
       if (fusion) {
         if (M_block_size == M_ib_block_size) {
           if (out_tensors_[0].get_format().is_blocking()) {
-            fusion->create_output_fusion_anchor({tensor_slice(C,
+            create_fusion_anchor(fusion, owner_->get_outputs()[0],
               {{m_idx / expr(iim_block_), M_block_size / iim_block_},
                 {0, utils::divide_and_ceil(N, iin_block_)},
-                {0, expr(iim_block_)}, {0, expr(iin_block_)}})});
+                {0, expr(iim_block_)}, {0, expr(iin_block_)}});
           } else {
-            fusion->create_output_fusion_anchor(
-              {tensor_slice(C, {{m_idx, M_block_size}, {0, N}})});
+            create_fusion_anchor(fusion, owner_->get_outputs()[0],
+              {{m_idx, M_block_size}, {0, N}});
           }
         } else {
           slice_range_list mm_multi_slice;
@@ -2120,8 +1886,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
           expr outer_anchor_iter;
           stmt scope_helper;
           std::tie(outer_anchor_iter, scope_helper) = gen_iter_anchor();
-          fusion->create_output_fusion_anchor(
-            outer_anchor_iter, C, mm_multi_slice, scope_helper);
+          fusion->create_fusion_anchor(outer_anchor_iter,
+            slice_map {{owner_->get_outputs()[0].get(),
+              slice_range_list {mm_multi_slice}}},
+            scope_helper);
         }
       }
     }
@@ -2147,7 +1915,8 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
     expr iim_block = iim_block_, iin_block = iin_block_, iik_block = iik_block_;
     _named_for_(
       mloop, m_s, 0, M_real_split, 1, for_type::PARALLEL, M_split_num) {
-      _for_(n_s, 0, N_real_split, 1, for_type::PARALLEL, N_split_num) {
+      _named_for_(
+        nloop, n_s, 0, N_real_split, 1, for_type::PARALLEL, N_split_num) {
         _tensor_(out_tmp_buf, out_dtype, out_tmp_buf_shape_expr);
         // fake plain dims to pass down.
         out_tmp_buf->attr().set(attr_keys::plain_dims,
@@ -2178,7 +1947,8 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
           iin_block->attr().set(attr_keys::no_index2var, true);
           iik_block->attr().set(attr_keys::no_index2var, true);
         }
-        _for_(k_s, 0, K_real_split, 1, for_type::PARALLEL, K_split_num) {
+        _named_for_(
+          kloop, k_s, 0, K_real_split, 1, for_type::PARALLEL, K_split_num) {
           expr K_single_thr_size;
           if (!is_dynamic && K_block_size == K_ib_block_size) {
             K_single_thr_size = K_block_size;
@@ -2190,163 +1960,147 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
             k_idx = k_idx * iik_block_;
           }
           // create input anchor for A if necessary
-          if (!is_dynamic) {
-            if (fusion && in_tensors_[0].get_format().is_blocking()
-              && (K_block_size == K_ib_block_size) && M * K <= 1024 * 1024) {
-              fusion->create_input_fusion_anchor({tensor_slice(A,
-                {{m_idx / iim_block_,
-                   utils::divide_and_ceil(M_block_size, iim_block_)},
-                  {k_idx / iik_block_, K_block_size / iik_block_},
-                  {0, iim_block_}, {0, iik_block_}})});
-            }
-            if (in_tensors_[0].get_format() == sc_data_format_t::NK()
-              && is_A_vnni_low_fp) {
-              trace_guard_t tg(ctx, "transpose_A");
-              expr A_trans_tensor;
-              _tensor_(A_trans, get_A_dtype(),
-                {M / iim_block_, K / iik_block_, iim_block_, iik_block_});
-              A_trans_tensor = A_trans;
-              A_trans_tensor->attr()[tensor_shrinker_attrs::should_shrink]
-                = tensor_shrinker_t::shrink_info_t {
-                  {m_idx / iim_block_, k_idx / iik_block_, 0, 0},
-                  {M_block_size / iim_block_, K_block_size / iik_block_,
-                    iim_block_, iik_block_},
-                  stmts()};
-              // do transpose A
-              auto commit_reorder_A = [&](int length_M, int length_K) {
-                ops::commit_op(ctx, "reorder",
-                  {tensor_slice(A, {{k_idx, length_K}, {m_idx, length_M}})},
-                  {tensor_slice(A_trans_tensor,
-                    {{m_idx / iim_block_,
-                       utils::divide_and_ceil(length_M, iim_block_)},
+          if (!is_dynamic && fusion && in_tensors_[0].get_format().is_blocking()
+            && (M * K <= 1024 * 1024)) {
+            auto commit_reorder_A_anchor
+              = [&](int length_M, int length_K, int grouped_id = -1) {
+                  slice_range A_slice
+                    = {{m_idx / iim_block_,
+                         utils::divide_and_ceil(length_M, iim_block_)},
                       {k_idx / iik_block_,
                         utils::divide_and_ceil(length_K, iik_block_)},
-                      {0, iim_block_}, {0, iik_block_}})},
-                  {graph_tensor::make(in_tensors_[0].get_plain_dims(),
-                    sc_data_format_t::NK(), A_dtype)},
-                  {},
-                  {{"out_format",
-                    sc_data_format_t::MKmk(iim_block_, iik_block_)}});
-              };
-              auto discuss_K = [&](int length_M) {
-                if (K_block_size == K_ib_block_size) {
-                  commit_reorder_A(length_M, K_block_size);
-                } else {
-                  _if_(k_s < K_blk_num) {
-                    commit_reorder_A(length_M, K_block_size);
+                      {0, iim_block_}, {0, iik_block_}};
+                  if (grouped_id > -1) {
+                    // create grouped anchor
+                    fusion->create_fusion_anchor(grouped_id,
+                      slice_map {{owner_->get_inputs()[0].get(),
+                        slice_range_list {A_slice}}},
+                      nullptr, true);
+                  } else {
+                    fusion->create_fusion_anchor(
+                      slice_map {{owner_->get_inputs()[0].get(),
+                        slice_range_list {A_slice}}},
+                      nullptr, true);
                   }
-                  _else_ { commit_reorder_A(length_M, K_ib_block_size); }
-                }
-              };
-              auto discuss_K2 = [&](int length_M) {
-                if (K_block_size == K_ib_block_size) {
-                  _if_(k_s == K_real_split - 1) {
-                    commit_reorder_A(length_M,
-                      K_block_size - iik_block_
-                        + in_tensors_[0].get_plain_dims()[1] % iik_block_);
-                  }
-                  _else_ { commit_reorder_A(length_M, K_block_size); }
-                } else {
-                  _if_(k_s < K_blk_num) {
-                    commit_reorder_A(length_M, K_block_size);
-                  }
-                  _else_ {
-                    _if_(k_s == K_real_split - 1) {
-                      commit_reorder_A(length_M,
-                        K_ib_block_size - iik_block_
-                          + in_tensors_[0].get_plain_dims()[1] % iik_block_);
-                    }
-                    _else_ { commit_reorder_A(length_M, K_ib_block_size); }
-                  }
-                }
-              };
-              auto discuss_M = [&](int length_K) {
-                if (M_block_size == M_ib_block_size) {
-                  commit_reorder_A(M_block_size, length_K);
-                } else {
-                  _if_(m_s < M_blk_num) {
-                    commit_reorder_A(M_block_size, length_K);
-                  }
-                  _else_ { commit_reorder_A(M_ib_block_size, length_K); }
-                }
-              };
-              if (in_tensors_[0].get_plain_dims()[0] % iim_block_ == 0
-                && in_tensors_[0].get_plain_dims()[1] % iik_block_ == 0) {
-                // no padding
-                if (M_block_size == M_ib_block_size) {
-                  discuss_K(M_block_size);
-                } else {
-                  _if_(m_s < M_blk_num) { discuss_K(M_block_size); }
-                  _else_ { discuss_K(M_ib_block_size); }
-                }
-              } else if (in_tensors_[0].get_plain_dims()[1] % iik_block_ == 0) {
-                // has padding on M axis only
-                if (M_block_size == M_ib_block_size) {
-                  _if_(m_s == M_real_split - 1) {
-                    discuss_K(M_block_size - iim_block_
-                      + in_tensors_[0].get_plain_dims()[0] % iim_block_);
-                  }
-                  _else_ { discuss_K(M_block_size); }
-                } else {
-                  _if_(m_s < M_blk_num) { discuss_K(M_block_size); }
-                  _else_ {
-                    _if_(m_s == M_real_split - 1) {
-                      discuss_K(M_ib_block_size - iim_block_
-                        + in_tensors_[0].get_plain_dims()[0] % iim_block_);
-                    }
-                    _else_ { discuss_K(M_ib_block_size); }
-                  }
-                }
-              } else if (in_tensors_[0].get_plain_dims()[0] % iim_block_ == 0) {
-                // has padding on K axis only
-                if (K_block_size == K_ib_block_size) {
-                  _if_(k_s == K_real_split - 1) {
-                    discuss_M(K_block_size - iik_block_
-                      + in_tensors_[0].get_plain_dims()[1] % iik_block_);
-                  }
-                  _else_ { discuss_M(K_block_size); }
-                } else {
-                  _if_(k_s < K_blk_num) { discuss_M(K_block_size); }
-                  _else_ {
-                    _if_(k_s == K_real_split - 1) {
-                      discuss_M(K_ib_block_size - iik_block_
-                        + in_tensors_[0].get_plain_dims()[1] % iik_block_);
-                    }
-                    _else_ { discuss_M(K_ib_block_size); }
-                  }
-                }
+                };
+            auto discuss_K = [&](int length_M) {
+              if (K_block_size == K_ib_block_size) {
+                commit_reorder_A_anchor(length_M, K_block_size, 0);
               } else {
-                // has padding on both M and K axes
-                if (M_block_size == M_ib_block_size) {
-                  _if_(m_s == M_real_split - 1) {
-                    discuss_K2(M_block_size - iim_block_
-                      + in_tensors_[0].get_plain_dims()[0] % iim_block_);
+                _if_(k_s < K_blk_num) {
+                  commit_reorder_A_anchor(length_M, K_block_size, 0);
+                }
+                _else_ {
+                  commit_reorder_A_anchor(length_M, K_ib_block_size, 0);
+                }
+              }
+            };
+            auto discuss_K2 = [&](int length_M) {
+              if (K_block_size == K_ib_block_size) {
+                _if_(k_s == K_real_split - 1) {
+                  commit_reorder_A_anchor(length_M,
+                    K_block_size - iik_block_
+                      + in_tensors_[0].get_plain_dims()[1] % iik_block_,
+                    0);
+                }
+                _else_ { commit_reorder_A_anchor(length_M, K_block_size, 0); }
+              } else {
+                _if_(k_s < K_blk_num) {
+                  commit_reorder_A_anchor(length_M, K_block_size, 0);
+                }
+                _else_ {
+                  _if_(k_s == K_real_split - 1) {
+                    commit_reorder_A_anchor(length_M,
+                      K_ib_block_size - iik_block_
+                        + in_tensors_[0].get_plain_dims()[1] % iik_block_,
+                      0);
                   }
-                  _else_ { discuss_K2(M_block_size); }
-                } else {
-                  _if_(m_s < M_blk_num) { discuss_K2(M_block_size); }
                   _else_ {
-                    _if_(m_s == M_real_split - 1) {
-                      discuss_K2(M_ib_block_size - iim_block_
-                        + in_tensors_[0].get_plain_dims()[0] % iim_block_);
-                    }
-                    _else_ { discuss_K2(M_ib_block_size); }
+                    commit_reorder_A_anchor(length_M, K_ib_block_size, 0);
                   }
                 }
               }
-              A = A_trans_tensor;
+            };
+            auto discuss_M = [&](int length_K) {
+              if (M_block_size == M_ib_block_size) {
+                commit_reorder_A_anchor(M_block_size, length_K, 0);
+              } else {
+                _if_(m_s < M_blk_num) {
+                  commit_reorder_A_anchor(M_block_size, length_K, 0);
+                }
+                _else_ {
+                  commit_reorder_A_anchor(M_ib_block_size, length_K, 0);
+                }
+              }
+            };
+            if (in_tensors_[0].get_plain_dims()[0] % iim_block_ == 0
+              && in_tensors_[0].get_plain_dims()[1] % iik_block_ == 0) {
+              // no padding
+              if (M_block_size == M_ib_block_size
+                && K_block_size == K_ib_block_size) {
+                discuss_K(M_block_size);
+              } else {
+                // need grouped anchor
+                _if_(m_s < M_blk_num) { discuss_K(M_block_size); }
+                _else_ { discuss_K(M_ib_block_size); }
+              }
+            } else if (in_tensors_[0].get_plain_dims()[1] % iik_block_ == 0) {
+              // has padding on M axis only
+              if (M_block_size == M_ib_block_size) {
+                _if_(m_s == M_real_split - 1) {
+                  discuss_K(M_block_size - iim_block_
+                    + in_tensors_[0].get_plain_dims()[0] % iim_block_);
+                }
+                _else_ { discuss_K(M_block_size); }
+              } else {
+                _if_(m_s < M_blk_num) { discuss_K(M_block_size); }
+                _else_ {
+                  _if_(m_s == M_real_split - 1) {
+                    discuss_K(M_ib_block_size - iim_block_
+                      + in_tensors_[0].get_plain_dims()[0] % iim_block_);
+                  }
+                  _else_ { discuss_K(M_ib_block_size); }
+                }
+              }
+            } else if (in_tensors_[0].get_plain_dims()[0] % iim_block_ == 0) {
+              // has padding on K axis only
+              if (K_block_size == K_ib_block_size) {
+                _if_(k_s == K_real_split - 1) {
+                  discuss_M(K_block_size - iik_block_
+                    + in_tensors_[0].get_plain_dims()[1] % iik_block_);
+                }
+                _else_ { discuss_M(K_block_size); }
+              } else {
+                _if_(k_s < K_blk_num) { discuss_M(K_block_size); }
+                _else_ {
+                  _if_(k_s == K_real_split - 1) {
+                    discuss_M(K_ib_block_size - iik_block_
+                      + in_tensors_[0].get_plain_dims()[1] % iik_block_);
+                  }
+                  _else_ { discuss_M(K_ib_block_size); }
+                }
+              }
+            } else {
+              // has padding on both M and K axes
+              if (M_block_size == M_ib_block_size) {
+                _if_(m_s == M_real_split - 1) {
+                  discuss_K2(M_block_size - iim_block_
+                    + in_tensors_[0].get_plain_dims()[0] % iim_block_);
+                }
+                _else_ { discuss_K2(M_block_size); }
+              } else {
+                _if_(m_s < M_blk_num) { discuss_K2(M_block_size); }
+                _else_ {
+                  _if_(m_s == M_real_split - 1) {
+                    discuss_K2(M_ib_block_size - iim_block_
+                      + in_tensors_[0].get_plain_dims()[0] % iim_block_);
+                  }
+                  _else_ { discuss_K2(M_ib_block_size); }
+                }
+              }
             }
           }
-          if (!is_dynamic
-            && utils::is_one_of(in_tensors_[1].get_format(),
-              sc_data_format_t::MK(), sc_data_format_t::NK())
-            && is_B_vnni_low_fp) {
-            single_thread_reorder_matmul_call(ctx, in_tensors_[0],
-              in_tensors_[1], out_tensors_[0], config, M_single_thr_size,
-              N_single_thr_size, K_single_thr_size, m_idx, n_idx, k_idx, A, B,
-              out_tmp_buf, dtype_block, fusion, m_s, n_s, M_anchor_info,
-              N_anchor_info, K_anchor_info, true, k_s);
-          } else if (!is_dynamic) {
+          if (!is_dynamic) {
             single_thread_matmul_call(ctx, graph, in_tensors_[0],
               in_tensors_[1], out_tensors_[0], config, M_single_thr_size,
               N_single_thr_size, K_single_thr_size, m_idx, n_idx, k_idx, A, B,
@@ -2454,10 +2208,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
               }
             }
             if (fusion && !is_dynamic) {
-              fusion->create_output_fusion_anchor({tensor_slice(C,
+              create_fusion_anchor(fusion, owner_->get_outputs()[0],
                 {{m_idx / expr(iim_block) + lm, 1},
                   {n_idx / expr(iin_block) + ln, 1}, {0, expr(iim_block)},
-                  {0, expr(iin_block)}})});
+                  {0, expr(iin_block)}});
             }
           }
           reduce_loop->attr()["dont_prefetch"] = true;
@@ -2507,13 +2261,13 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
             if (M_block_size == M_ib_block_size
               && N_block_size == N_ib_block_size) {
               if (out_tensors_[0].get_format().is_blocking()) {
-                fusion->create_output_fusion_anchor({tensor_slice(C,
+                create_fusion_anchor(fusion, owner_->get_outputs()[0],
                   {{m_idx / expr(iim_block_), M_block_size / iim_block_},
                     {n_idx / expr(iin_block_), N_block_size / iin_block_},
-                    {0, iim_block_}, {0, iin_block_}})});
+                    {0, iim_block_}, {0, iin_block_}});
               } else {
-                fusion->create_output_fusion_anchor({tensor_slice(
-                  C, {{m_idx, M_block_size}, {n_idx, N_block_size}})});
+                create_fusion_anchor(fusion, owner_->get_outputs()[0],
+                  {{m_idx, M_block_size}, {n_idx, N_block_size}});
               }
             } else if (M_block_size == M_ib_block_size) {
               // differnt length on N
@@ -2532,8 +2286,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
               expr inner_anchor_iter;
               stmt scope_helper;
               std::tie(inner_anchor_iter, scope_helper) = gen_iter_anchor();
-              fusion->create_output_fusion_anchor(
-                inner_anchor_iter, C, mm_multi_slice, scope_helper);
+              fusion->create_fusion_anchor(inner_anchor_iter,
+                slice_map {{owner_->get_outputs()[0].get(),
+                  slice_range_list {mm_multi_slice}}},
+                scope_helper);
             } else if (N_block_size == N_ib_block_size) {
               // different length on M
               mm_multi_slice.pop_back();
@@ -2551,8 +2307,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
               expr inner_anchor_iter;
               stmt scope_helper;
               std::tie(inner_anchor_iter, scope_helper) = gen_iter_anchor();
-              fusion->create_output_fusion_anchor(
-                inner_anchor_iter, C, mm_multi_slice, scope_helper);
+              fusion->create_fusion_anchor(inner_anchor_iter,
+                slice_map {{owner_->get_outputs()[0].get(),
+                  slice_range_list {mm_multi_slice}}},
+                scope_helper);
             } else {
               // different length on both M and N
               auto gen_iter_anchor = [&]() {
@@ -2573,8 +2331,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
               expr inner_anchor_iter;
               stmt scope_helper;
               std::tie(inner_anchor_iter, scope_helper) = gen_iter_anchor();
-              fusion->create_output_fusion_anchor(
-                inner_anchor_iter, C, mm_multi_slice, scope_helper);
+              fusion->create_fusion_anchor(inner_anchor_iter,
+                slice_map {{owner_->get_outputs()[0].get(),
+                  slice_range_list {mm_multi_slice}}},
+                scope_helper);
             }
           }
         }
@@ -2583,13 +2343,13 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
       if (fusion && !is_dynamic && N_split_num == 1) {
         if (M_block_size == M_ib_block_size) {
           if (out_tensors_[0].get_format().is_blocking()) {
-            fusion->create_output_fusion_anchor({tensor_slice(C,
+            create_fusion_anchor(fusion, owner_->get_outputs()[0],
               {{m_idx / expr(iim_block_), M_block_size / iim_block_},
                 {0, utils::divide_and_ceil(N, iin_block_)},
-                {0, expr(iim_block_)}, {0, expr(iin_block_)}})});
+                {0, expr(iim_block_)}, {0, expr(iin_block_)}});
           } else {
-            fusion->create_output_fusion_anchor(
-              {tensor_slice(C, {{m_idx, M_block_size}, {0, N}})});
+            create_fusion_anchor(fusion, owner_->get_outputs()[0],
+              {{m_idx, M_block_size}, {0, N}});
           }
         } else {
           slice_range_list mm_multi_slice;
@@ -2617,8 +2377,10 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
           expr outer_anchor_iter;
           stmt scope_helper;
           std::tie(outer_anchor_iter, scope_helper) = gen_iter_anchor();
-          fusion->create_output_fusion_anchor(
-            outer_anchor_iter, C, mm_multi_slice, scope_helper);
+          fusion->create_fusion_anchor(outer_anchor_iter,
+            slice_map {{owner_->get_outputs()[0].get(),
+              slice_range_list {mm_multi_slice}}},
+            scope_helper);
         }
       }
     }
@@ -2628,9 +2390,11 @@ bool gen_managed_matmul_core_t::generate(context_ptr ctx,
   mloop->attr()[stmt_attr_key::parallel_loop_balanced]
     = M_block_size == M_ib_block_size;
 
-  mloop->attr()[stmt_attr_key::loop_axis_hint]
-    = bound_axis {{0}, {1}, {}, {0}, {1}};
-  loops = {mloop};
+  // bind outer loops with axis hint
+  bind_loop_axis(owner_->get_outputs()[0], mloop, 0);
+  bind_loop_axis(owner_->get_outputs()[0], nloop, 1);
+  bind_loop_axis(owner_->get_outputs()[0], kloop, std::vector<int> {});
+
   return true;
 }
 } // namespace ops

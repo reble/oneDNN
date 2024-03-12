@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -35,60 +35,76 @@ template <prop_kind_t aprop>
 cell_execution_sig((_ref_rnn_common_t<aprop>::cell_execution_gru_lbr)) {
     const conf_t &rnn = this->pd()->rnn_conf;
     const ocl_conf_t &ocl_conf = this->pd()->ocl_conf;
-    data_type_t src_t = this->pd()->src_type;
+    const rnn_offsets_t &offsets = this->pd()->off;
 
-    dim_t cell_scratch_offset, cell_ws_iter_offset, cell_ws_lay_offset,
-            cell_wei_iter_offset;
+    auto cell_layer = !rnn.copy_src_layer && lay == 0
+            ? user_data.src_layer(dir, iter)
+            : workspace.states(lay - 1, dir, iter);
+    auto gemm_cell_layer_fwd = !rnn.copy_src_layer && lay == 0
+            ? gemm_layer_fwd_src
+            : gemm_layer_fwd;
+    auto gemm_diff_wei_cell_layer = !rnn.copy_src_layer && lay == 0
+            ? gemm_diff_wei_layer_src
+            : gemm_diff_wei_layer;
+    auto cell_iter = workspace.states(lay, dir, iter - 1);
 
-    set_offsets_fwd_gemm(rnn, iter, dir, lay, src_t, wei_iter_offsets,
-            ws_states_offset_, cell_ws_iter_offset, cell_ws_lay_offset,
-            cell_scratch_offset, cell_wei_iter_offset);
+    auto scratch_gates = scratch.gates(iter);
+    auto scratch_cell = scratch.cell();
+
+    auto wei_layer = user_data.wei_layer(lay, dir);
+    auto wei_iter = user_data.wei_iter(lay, dir);
 
     if (aprop == prop_kind::forward) {
         // call made when cell execution is enabled
         if (!rnn.merge_gemm_layer)
-            CHECK(gemm_primitive(engine, ctx, wei_layer, wei_layer_offset,
-                    workspace.ws(), cell_ws_lay_offset, scratch_gates,
-                    cell_scratch_offset, gemm_layer_fwd));
+            CHECK(gemm_primitive(engine, ctx, wei_layer, cell_layer,
+                    scratch_gates, gemm_cell_layer_fwd));
 
-        CHECK(gemm_primitive(engine, ctx, wei_iter, cell_wei_iter_offset,
-                workspace.ws(), cell_ws_iter_offset, scratch_cell, 0,
+        CHECK(gemm_primitive(engine, ctx, wei_iter, cell_iter, *scratch_cell,
                 gemm_iter_fwd));
 
         CHECK((this->*elemwise_gru_lbr)(ctx, dir, lay, iter, rnn.dhc, rnn.mb, 1,
-                workspace, scratch_gates, scratch_cell, scratch_diff_states,
-                bias, tm_scales, diff_bias));
+                user_data, workspace, scratch_gates, {}, *scratch_cell, {}, {},
+                {}, 0, tm_scales, diff_bias));
 
     } else {
-        dim_t cell_diff_wei_iter_off, cell_diff_wei_lay_off,
-                cell_scr_diff_iter_off, cell_scr_diff_lay_off;
+        auto diff_states_iter = scratch.diff_states(lay, dir, 0, iter + 1);
+        auto diff_states_layer
+                = !rnn.copy_diff_dst_layer && lay + 1 == rnn.n_layer
+                ? user_data.diff_dst_layer(dir, iter)
+                : scratch.diff_states(lay + 1, dir, rnn.n_states, iter);
+        auto diff_states_layer_ld
+                = !rnn.copy_diff_dst_layer && lay + 1 == rnn.n_layer
+                ? offsets.diff_dst_layer[1]
+                : rnn.scratch_diff_states_ld;
 
-        set_offsets_bwd_gemm(rnn, iter, dir, lay, cell_diff_wei_iter_off,
-                cell_diff_wei_lay_off, cell_scr_diff_lay_off,
-                cell_scr_diff_iter_off);
+        auto diff_states = scratch.diff_states(lay, dir, 0, iter);
+        auto diff_states1 = !rnn.copy_diff_src_layer && lay == 0
+                ? user_data.diff_src_layer(dir, iter)
+                : scratch.diff_states(lay, dir, rnn.n_states, iter);
+
+        auto diff_gates = scratch.diff_gates(iter);
 
         CHECK((this->*elemwise_gru_lbr)(ctx, dir, lay, iter, rnn.dhc, rnn.mb,
-                ocl_conf.elemwise_bwd_batch_block, workspace, scratch_gates,
-                scratch_cell, scratch_diff_states, bias, tm_scales, diff_bias));
+                ocl_conf.elemwise_bwd_batch_block, user_data, workspace,
+                scratch_gates, diff_gates, *scratch_cell, diff_states,
+                diff_states_iter, diff_states_layer, diff_states_layer_ld,
+                tm_scales, diff_bias));
 
         if (!rnn.merge_gemm_layer) {
-            CHECK(gemm_primitive(engine, ctx, scratch_gates,
-                    cell_scratch_offset, workspace.ws(), cell_ws_lay_offset,
-                    diff_weights_layer, cell_diff_wei_lay_off,
-                    gemm_diff_wei_layer));
+            CHECK(gemm_primitive(engine, ctx, diff_gates, cell_layer,
+                    user_data.diff_wei_layer(lay, dir),
+                    gemm_diff_wei_cell_layer));
 
-            CHECK(gemm_primitive(engine, ctx, wei_layer, wei_layer_offset,
-                    scratch_gates, cell_scratch_offset, scratch_diff_states,
-                    cell_scr_diff_lay_off, gemm_layer_bwd));
+            CHECK(gemm_primitive(engine, ctx, wei_layer, diff_gates,
+                    diff_states1, gemm_layer_bwd));
         }
 
-        CHECK(gemm_primitive(engine, ctx, wei_iter, cell_wei_iter_offset,
-                scratch_cell, 0, scratch_diff_states, cell_scr_diff_iter_off,
+        CHECK(gemm_primitive(engine, ctx, wei_iter, *scratch_cell, diff_states,
                 gemm_iter_bwd));
 
-        CHECK(gemm_primitive(engine, ctx, scratch_cell, 0, workspace.ws(),
-                cell_ws_iter_offset, diff_weights_iter, cell_diff_wei_iter_off,
-                gemm_diff_wei_iter));
+        CHECK(gemm_primitive(engine, ctx, *scratch_cell, cell_iter,
+                user_data.diff_wei_iter(lay, dir), gemm_diff_wei_iter));
     }
     return status::success;
 }

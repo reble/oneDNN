@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -75,11 +75,13 @@ status_t gemm_f32_matmul_t::pd_t::init(engine_t *engine) {
                         binary_injector_utils::extract_bcast_strategies(
                                 post_ops.entry_, dst_md()),
                         broadcasting_strategy_t::per_oc);
+        const bool has_prelu = post_ops.find(prelu) != -1;
         return cpu::inner_product_utils::post_ops_ok(
                        post_ops, dst_md(), enabled_bcast_strategy)
                 && IMPLICATION(is_binary_po_per_oc,
                         gemm_based::check_gemm_binary_per_oc_compatible_formats(
-                                *this));
+                                *this))
+                && IMPLICATION(N() == DNNL_RUNTIME_DIM_VAL, !has_prelu);
     };
 
     const bool problem_dt_correct = src_md()->data_type == src_type
@@ -88,7 +90,7 @@ status_t gemm_f32_matmul_t::pd_t::init(engine_t *engine) {
             && dst_md()->data_type == dst_type;
 
     VDISPATCH_MATMUL(is_dense_format_kind(), VERBOSE_UNSUPPORTED_SPARSE_CFG);
-    VDISPATCH_MATMUL(problem_dt_correct, VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_MATMUL(problem_dt_correct, VERBOSE_UNSUPPORTED_DT_CFG);
     VDISPATCH_MATMUL(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
     VDISPATCH_MATMUL(attr()->has_default_values(
                              primitive_attr_t::skip_mask_t::scales_runtime
@@ -98,17 +100,17 @@ status_t gemm_f32_matmul_t::pd_t::init(engine_t *engine) {
             VERBOSE_UNSUPPORTED_ATTR);
     VDISPATCH_MATMUL(attr()->post_ops_.check_sum_consistency(dst_type,
                              /* is_int8 */ false),
-            VERBOSE_UNSUPPORTED_DT);
+            VERBOSE_UNSUPPORTED_POSTOP);
     VDISPATCH_MATMUL(check_attr_scales(), VERBOSE_UNSUPPORTED_SCALES_CFG);
     VDISPATCH_MATMUL(check_bias(), VERBOSE_UNSUPPORTED_BIAS_CFG);
     VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
     // Should be followed by `set_default_formats`.
     VDISPATCH_MATMUL(check_attr_post_ops(), VERBOSE_UNSUPPORTED_POSTOP);
     VDISPATCH_MATMUL(gemm_based::check_gemm_compatible_formats(*this),
-            "Incompatible format");
+            VERBOSE_INCOMPATIBLE_GEMM_FMT);
 
     bool po_format_ok = attr_.set_default_formats(dst_md(0)) == status::success;
-    VDISPATCH_MATMUL(po_format_ok, VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_MATMUL(po_format_ok, VERBOSE_UNSUPPORTED_POSTOP);
 
     CHECK(configure_attributes());
 

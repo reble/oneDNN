@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -54,7 +54,7 @@ inline status_t init_tag(format_tag_t &tag, memory_desc_t &md,
         tag = mdw.matches_one_of_tag(tag_value);
     }
 
-    if (tag != tag_value) return status::unimplemented;
+    VDISPATCH_CONV_IC(tag == tag_value, VERBOSE_UNSUPPORTED_TAG);
 
     return status::success;
 }
@@ -442,7 +442,6 @@ struct brg_blocking_t : public jit_brgemm_conv_conf_t {
     float eff;
     static unsigned L1;
     static unsigned L2;
-    static unsigned L3;
     // These are rough estimates of the latency (relative) of access to various
     // cache levels. This is enough for an estimation of data access cost.
     // TODO: Improve memory access estimates
@@ -532,7 +531,6 @@ struct brg_blocking_t : public jit_brgemm_conv_conf_t {
 
 unsigned brg_blocking_t::L1;
 unsigned brg_blocking_t::L2;
-unsigned brg_blocking_t::L3;
 int brg_blocking_t::last_oc_block_size;
 
 float brg_blocking_t::io_k(dim_t src, dim_t wei, dim_t dst, float n, float pk,
@@ -660,7 +658,7 @@ status_t brg_blocking_t::get_brgemm_ur(
                             : 0;
                     brgattr.max_top_vpad = max_vpad;
                     brgattr.max_bottom_vpad = max_vpad;
-                    brgattr.fpmath_mode = attr->fpmath_mode_;
+                    brgattr.fpmath_mode = attr->fpmath_.mode_;
                     CHECK(brgemm_desc_set_attr(&brg, brgattr));
 
                     brg.with_sum = with_sum;
@@ -689,6 +687,7 @@ void brg_blocking_t::update_blocks() {
         iw_block = 28;
         ih_block = 14;
     }
+
     nb_id = div_up(id, id_block);
     nb_ih = div_up(ih, ih_block);
     nb_oc = div_up(oc, oc_block);
@@ -698,7 +697,7 @@ void brg_blocking_t::update_blocks() {
     nb_kw = div_up(kw, kw_block);
     nb_iw = div_up(iw, iw_block);
 
-    sp = iw;
+    sp = has_uneven_iw ? rnd_up(iw, stride_w) : iw;
     sp_block = iw_block;
     nb_sp = nb_iw;
 
@@ -1037,23 +1036,33 @@ void brg_blocking_t::iterate_ker_block(brg_blocking_t &best_brgb, int kd_block_,
             = div_up(ih, thr_ic_block * div_up(id, thr_id_block));
     id_block = nstl::min(id_block, thr_id_block);
     ih_block = nstl::min(ih_block, thr_ih_block);
-    while ((id_block % stride_d != 0 || id % id_block != 0) && id_block < id)
+    while ((id_block % stride_d != 0
+                   || (id % stride_d == 0
+                           && id % id_block
+                                   != 0) // TODO: remove this once perf is validated for all shapes
+                   )
+            && id_block < id)
         id_block++;
-    while ((ih_block % stride_h != 0 || ih % ih_block != 0) && ih_block < ih)
+    while ((ih_block % stride_h != 0
+                   || (ih % stride_h == 0
+                           && ih % ih_block
+                                   != 0) // TODO: remove this once perf is validated for all shapes
+                   )
+            && ih_block < ih)
         ih_block++;
 
     // --- Select iw_block ----
     const auto max_iw_block_L2 = iw;
     auto start_iw_block = nstl::min(max_iw_block_thr, max_iw_block_L2);
-
-    sp = iw;
-    const auto start_sp_block = start_iw_block;
+    sp = has_uneven_iw ? rnd_up(iw, stride_w) : iw;
+    const auto start_sp_block
+            = has_uneven_iw ? rnd_up(start_iw_block, stride_w) : start_iw_block;
     auto prev_spb = 0;
     for (auto ns = 1; ns <= sp; ns++) {
         const auto spb = div_up(sp, ns);
         if (spb == prev_spb || spb > start_sp_block) continue;
         if (spb % stride_w != 0) continue;
-        if (iw % spb != 0) continue;
+        if (!has_uneven_iw && iw % spb != 0) continue;
 
         prev_spb = spb;
         iw_block = spb;
@@ -1065,7 +1074,7 @@ void brg_blocking_t::iterate_ker_block(brg_blocking_t &best_brgb, int kd_block_,
 
         const status_t st = estimate_brgemm_ur();
         if (st != status::success) continue;
-        os_block = sp_block = iw_block;
+        is_block = sp_block = iw_block;
         update_blocks();
 
         eff = est_eff();
@@ -1074,7 +1083,7 @@ void brg_blocking_t::iterate_ker_block(brg_blocking_t &best_brgb, int kd_block_,
 }
 
 status_t brg_blocking_t::calc_blocks() {
-    sp = iw;
+    sp = has_uneven_iw ? rnd_up(iw, stride_w) : iw;
 
     nb_oc_blocking = 1;
     // --- Select kernel blocking ---
@@ -1082,20 +1091,21 @@ status_t brg_blocking_t::calc_blocks() {
     // results then we need the out buffer
     const auto maybe_use_buffer = (dst_dt != acc_dt || with_sum);
 
+    // kd/kh block should be either kd/kh or a multiple of stride_d/stride_h
     std::vector<int> kd_blocks(1), kh_blocks(1);
     kd_blocks[0] = kd;
     kh_blocks[0] = kh;
     if (kd != 1) {
         kd_blocks.resize(2);
-        kd_blocks[1] = 1;
+        kd_blocks[1] = stride_d;
     }
     if (kh != 1) {
         kh_blocks.resize(2);
-        kh_blocks[1] = 1;
+        kh_blocks[1] = stride_h;
     }
 
     const auto thr_eff_threshold = 0.9f;
-    const auto max_iw_block_thr = utils::saturate(1, iw,
+    const auto max_iw_block_thr = utils::saturate(1, sp,
             static_cast<int>(div_up(
                     mb * ngroups * nb_ic * is, thr_eff_threshold * nthr)));
 
@@ -1108,7 +1118,7 @@ status_t brg_blocking_t::calc_blocks() {
         }
     }
     *this = best_brgb;
-    if (sp_block <= 0) return status::unimplemented;
+    VDISPATCH_CONV_IC(sp_block > 0, VERBOSE_BLOCKING_FAIL);
 
     iw_block = is_block = sp_block;
     iw_tail = iw % iw_block;
@@ -1393,7 +1403,6 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
 
     brg_blocking_t::L1 = platform::get_per_core_cache_size(1);
     brg_blocking_t::L2 = platform::get_per_core_cache_size(2);
-    brg_blocking_t::L3 = platform::get_per_core_cache_size(2);
 
     const memory_desc_wrapper diff_dst_d(&diff_dst_md);
     const memory_desc_wrapper weights_d(&weights_md);
@@ -1429,19 +1438,21 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.stride_h = (ndims == 3) ? 1 : cd.strides[ndims - 4];
     jcp.stride_w = cd.strides[ndims - 3];
 
-    if (everyone_is(1, jcp.stride_d, jcp.stride_h, jcp.stride_w))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(!everyone_is(1, jcp.stride_d, jcp.stride_h, jcp.stride_w),
+            "skipping implementation as it does not support unit strides");
 
-    if (jcp.id % jcp.stride_d != 0 || jcp.ih % jcp.stride_h != 0
-            || jcp.iw % jcp.stride_w)
-        return status::unimplemented;
+    jcp.has_uneven_iw = jcp.iw % jcp.stride_w != 0;
+    const bool has_uneven_spatial = jcp.id % jcp.stride_d != 0
+            || jcp.ih % jcp.stride_h != 0 || jcp.has_uneven_iw;
+
+    if (is_deconv && has_uneven_spatial) return status::unimplemented;
 
     jcp.dilate_d = (ndims == 5) ? cd.dilates[0] : 0;
     jcp.dilate_h = (ndims == 3) ? 0 : cd.dilates[ndims - 4];
     jcp.dilate_w = cd.dilates[ndims - 3];
 
-    if (!everyone_is(0, jcp.dilate_d, jcp.dilate_h, jcp.dilate_w))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(everyone_is(0, jcp.dilate_d, jcp.dilate_h, jcp.dilate_w),
+            "skipping implementation since non-zero dilations are detected");
 
     jcp.is = jcp.id * jcp.ih * jcp.iw;
 
@@ -1478,9 +1489,10 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.simd_w = isa_max_vlen(isa) / jcp.src_dsz;
     jcp.acc_simd_w = isa_max_vlen(isa) / jcp.acc_dsz;
     jcp.is_bf32 = everyone_is(f32, jcp.src_dt, jcp.wei_dt)
-            && attr.fpmath_mode_ == fpmath_mode::bf16 && isa == avx512_core_amx;
+            && one_of(attr.fpmath_.mode_, fpmath_mode::bf16, fpmath_mode::any)
+            && isa == avx512_core_amx;
 
-    if (jcp.is_bf32) return status::unimplemented;
+    VDISPATCH_CONV_IC(!jcp.is_bf32, VERBOSE_UNSUPPORTED_DT);
 
     brg_blocking_t::last_oc_block_size
             = (jcp.wei_dt == f16 && isa == avx512_core_fp16)
@@ -1498,7 +1510,9 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
                             && !jcp.is_1x1)
             // Enable the shapes not supported in direct convs
             && IMPLICATION(with_groups, is_groups_ok(jcp));
-    if (is_grouped_small_oc) return status::unimplemented;
+    VDISPATCH_CONV_IC(!is_grouped_small_oc,
+            "skipping implementation as it does not support grouped "
+            "convolutions with small oc");
 
     // Dispatch the shapes to VNNI for better performance
     // TODO: optimize the perf of 3d shape with small oc and large spatial
@@ -1510,34 +1524,53 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     const auto is_3d_small_oc = is_amx(jcp.isa) && jcp.ndims == 5
             && jcp.oc * jcp.ic <= 32 && jcp.id >= 128 && jcp.ih >= 128
             && jcp.iw >= 128;
-    if (is_small_shape || is_3d_small_oc) return status::unimplemented;
+    VDISPATCH_CONV_IC(!(is_small_shape || is_3d_small_oc),
+            "skipping implementation as it does not support small 3d shapes "
+            "with small oc");
+
+    // TODO: optimize 2d/3d shapes with small iw for f32
+    const auto is_small_iw = jcp.iw < 64;
+    const auto is_2d_or_3d = jcp.ih > 1 || jcp.id > 1;
+    const bool is_f32
+            = utils::everyone_is(f32, jcp.src_dt, jcp.wei_dt, jcp.dst_dt);
+    VDISPATCH_CONV_IC(!(is_f32 && is_small_iw && is_2d_or_3d),
+            "skipping implementation due to performance reason for 2d/3d "
+            "shapes with small iw");
+
+    // Disable 2 shapes that cause performance regression
+    const auto is_regression_shape = jcp.id == 1 && jcp.od == 1
+            && ((jcp.ic == 128 && jcp.oc == 256 && jcp.ih == 101 && jcp.oh == 49
+                        && jcp.iw == 85 && jcp.ow == 41)
+                    || (jcp.ic == 3 && jcp.oc == 128 && jcp.ih == 207
+                            && jcp.oh == 101 && jcp.iw == 175 && jcp.ow == 85));
+    VDISPATCH_CONV_IC(!(is_f32 && is_regression_shape),
+            "implementation skipped due to low performance");
 
     const bool is_signed_input = jcp.src_dt == s8;
     jcp.s8s8_compensation_required = is_signed_input && !isa_has_s8s8(jcp.isa);
     jcp.has_int8_vnni = isa_has_int8_vnni(jcp.isa);
 
-    if (!IMPLICATION(jcp.wei_dt == s8,
-                is_superset(jcp.isa, avx512_core)
-                        || one_of(jcp.isa, avx2_vnni, avx2_vnni_2)))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(
+            IMPLICATION(jcp.wei_dt == s8,
+                    is_superset(jcp.isa, avx512_core)
+                            || one_of(jcp.isa, avx2_vnni, avx2_vnni_2)),
+            "unsupported isa for current datatype combination");
 
-    if (!IMPLICATION(jcp.wei_dt == bf16,
-                is_superset(jcp.isa, avx512_core_bf16)
-                        || is_superset(jcp.isa, avx2_vnni_2)))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(IMPLICATION(jcp.wei_dt == bf16,
+                              is_superset(jcp.isa, avx512_core_bf16)
+                                      || is_superset(jcp.isa, avx2_vnni_2)),
+            "unsupported isa for current datatype combination");
 
-    if (!IMPLICATION(jcp.wei_dt == f16,
-                is_superset(jcp.isa, avx512_core_fp16)
-                        || is_superset(jcp.isa, avx2_vnni_2)))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(IMPLICATION(jcp.wei_dt == f16,
+                              is_superset(jcp.isa, avx512_core_fp16)
+                                      || is_superset(jcp.isa, avx2_vnni_2)),
+            "unsupported isa for current datatype combination");
 
-    const bool is_f32
-            = utils::everyone_is(f32, jcp.src_dt, jcp.wei_dt, jcp.dst_dt);
-    if (!IMPLICATION(is_f32, one_of(isa, avx512_core, avx2)))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(IMPLICATION(is_f32, one_of(isa, avx512_core, avx2)),
+            "unsupported isa for current datatype combination");
 
-    if (!post_ops_ok(jcp, attr, diff_src_d, is_deconv))
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(post_ops_ok(jcp, attr, diff_src_d, is_deconv),
+            VERBOSE_UNSUPPORTED_POSTOP);
 
     jcp.amx_h = 16;
     jcp.amx_w = 64 / jcp.src_dsz;
@@ -1573,11 +1606,9 @@ status_t init_jcp(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
             && IMPLICATION(jcp.dst_zero_point,
                     attr.zero_points_.common(
                             is_deconv ? DNNL_ARG_DST : DNNL_ARG_DIFF_SRC));
-    if (!params_ok) return status::unimplemented;
+    VDISPATCH_CONV_IC(params_ok, VERBOSE_UNSUPPORTED_ZP_CFG);
 
     jcp.nthr = nthreads;
-    jcp.kh_sets = 1;
-    jcp.kw_sets = 1;
     jcp.copy_block_only = false;
     jcp.amx_tile_load_xx = false;
     jcp.use_M_mask = 0;
@@ -1770,7 +1801,7 @@ dim_t precalculate_comp_pad_kernels(const jit_brgemm_conv_conf_t &jcp,
         auto id_begin = idb * ID_BLOCK;
         auto id_end = nstl::min(ID, id_begin + ID_BLOCK);
         auto ih_begin = ihb * IH_BLOCK;
-        auto ih_end = jcp.is_os_blocking ? ih_begin + 1
+        auto ih_end = jcp.is_is_blocking ? ih_begin + 1
                                          : nstl::min(IH, ih_begin + IH_BLOCK);
         for_(int id = id_begin; id < id_end; id++)
         for_(int ih = ih_begin; ih < ih_end; ih++)
@@ -1828,6 +1859,7 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
 
     using namespace prop_kind;
 
+    // disabling verbose dispatch messages for unsupported isa for better readability
     if (!mayiuse(isa)) return status::unimplemented;
 
     CHECK(init_jcp(jcp, isa, cd, diff_dst_md, weights_md, diff_src_md, bias_md,
@@ -1857,7 +1889,7 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
 
     //-----------------------------------------------------------------------
 
-    jcp.exec_type = is_amx(isa) ? exec_trans : exec_base;
+    jcp.exec_type = (is_amx(isa) || jcp.has_uneven_iw) ? exec_trans : exec_base;
     jcp.brg_type = brgemm_addr; // TODO: Choose right type of BRGEMM
 
     // TODO: in future use (kd/kh/kw) and (kd/kh/kw)_pad blocks for more
@@ -1881,12 +1913,12 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     const auto oc_padded_block
             = jcp.acc_simd_w * brg_blocking_t::last_oc_block_size;
     jcp.is_oc_padded = one_of(jcp.wei_dt, bf16, f16, s8)
-            && jcp.oc * jcp.kw_sets > oc_padded_block && is_amx(isa);
+            && jcp.oc > oc_padded_block && is_amx(isa);
 
-    if (is_amx(isa) && (/* heuristic */ jcp.kw_sets == 1 && jcp.iw < 256)) {
+    if (is_amx(isa) && /* heuristic */ jcp.iw < 256) {
         jcp.use_M_mask = 0;
 
-        jcp.hint_prefetching = brgemm_kernel_prefetching_t::brgemm_prf1;
+        jcp.hint_prefetching = brgemm_kernel_prefetching_t::brgemm_prf0;
 
         // assuming 2x2 decomposition in amx brgemm kernel
         // and overlap of input by kw
@@ -1934,8 +1966,9 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     // ============ end blocking ===========================================
     jcp.max_vpad = 0;
 
-    if (jcp.iw_block == 0 || jcp.oc_block == 0 || jcp.ic_block == 0)
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(
+            !(jcp.iw_block == 0 || jcp.oc_block == 0 || jcp.ic_block == 0),
+            VERBOSE_BLOCKING_FAIL);
 
     jcp.gemm_batch_size = jcp.nb_oc_blocking
             * nstl::max(jcp.kd_block * jcp.kh_block * jcp.kw_block,
@@ -1959,6 +1992,8 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.inp_buffer_mask_size = rnd_up(static_cast<dim_t>(jcp.nb_id) * jcp.nb_ih
                     * jcp.nb_iw * jcp.ngroups * jcp.nb_oc,
             P4K);
+    jcp.out_buffer_size
+            = rnd_up(jcp.iw_block * jcp.stride_w * jcp.ic_without_padding, P4K);
 
     const bool scale_adjust_required
             = jcp.s8s8_compensation_required && !jcp.has_int8_vnni;
@@ -1982,10 +2017,11 @@ status_t init_conf(jit_brgemm_conv_conf_t &jcp, cpu_isa_t isa,
     jcp.req_cal_comp_pad = jcp.src_zero_point || jcp.s8s8_compensation_required;
 
     // Dispatch the shapes to VNNI for better performance
-    if (jcp.req_cal_comp_pad && jcp.src_zero_point && is_amx(jcp.isa)
-            && jcp.ngroups * jcp.ic * jcp.id * jcp.ih * jcp.iw < 4096
-            && jcp.ic <= 4 && jcp.oc <= 64 && jcp.mb <= 64)
-        return status::unimplemented;
+    VDISPATCH_CONV_IC(
+            !(jcp.req_cal_comp_pad && jcp.src_zero_point && is_amx(jcp.isa)
+                    && jcp.ngroups * jcp.ic * jcp.id * jcp.ih * jcp.iw < 4096
+                    && jcp.ic <= 4 && jcp.oc <= 64 && jcp.mb <= 64),
+            "heuristic to skip amx implementation for given data dimensions");
 
     if (jcp.req_cal_comp_pad) {
         const auto comp_buffer_iw = jcp.exec_type == exec_trans ? jcp.iw : 1;
@@ -2015,6 +2051,12 @@ void init_scratchpad(memory_tracking::registrar_t &scratchpad,
     scratchpad.book(key_conv_brgemm_inp_buffer_mask, inp_buffer_mask_size,
             sizeof(uint8_t), 0, P4K);
 
+    if (jcp.exec_type == exec_trans && jcp.has_uneven_iw) {
+        size_t out_buffer_size
+                = static_cast<size_t>(jcp.nthr) * jcp.out_buffer_size;
+        scratchpad.book(key_conv_brgemm_out_buffer, out_buffer_size,
+                jcp.dst_dsz, 0, P4K);
+    }
     if (jcp.use_buffer) {
         scratchpad.book(key_brgemm_primitive_buffer, jcp.nthr * jcp.buffer_size,
                 jcp.acc_dsz, 0, P4K);

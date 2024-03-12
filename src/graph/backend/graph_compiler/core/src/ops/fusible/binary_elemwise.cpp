@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,10 +22,12 @@
 #include <string>
 #include <utility>
 #include "binary_elemwise.hpp"
+#include "compiler/ir/attr_keys.hpp"
+#include "ops/fusible/unary_elemwise.hpp"
 #include <compiler/ir/builder.hpp>
+#include <compiler/ir/graph/brgemm_fusion.hpp>
 #include <compiler/ir/graph/fusible_op.hpp>
 #include <compiler/ir/graph/fusible_op_utils.hpp>
-#include <compiler/ir/graph/fusion_mgr.hpp>
 #include <compiler/ir/transform/auto_cast.hpp>
 #include <compiler/ir/transform/constant_fold.hpp>
 #include <runtime/dynamic_dispatch/ops/impl_type.hpp>
@@ -36,6 +38,11 @@ namespace dnnl {
 namespace impl {
 namespace graph {
 namespace gc {
+
+template <class T>
+static expr_c constant_maker(T data, const sc_data_type_t &dtype) {
+    return make_expr<constant_node>(data, dtype);
+};
 
 std::vector<std::pair<int, std::vector<tensor_inplace_info_t>>>
 binary_elementwise_op_impl_t::get_inplace_map() {
@@ -52,24 +59,24 @@ binary_elementwise_op_impl_t::get_inplace_map() {
     return {{0, std::move(ret)}};
 }
 
-void infer_binary_slice_ranges(
-        fusible_op_t *cur, fslice_map &fsmap, infer_status_map_t &stat_map) {
+infer_status_code infer_binary_slice_ranges(
+        fusible_op_t *cur, fslice_map &fsmap) {
     COMPILE_ASSERT(cur->get_inputs().size() == 2, "binary op is expected");
     // search known ranges from any input of cur fusbile op
-    slice_range_map known_ranges_map
-            = search_known_slice_ranges(cur, fsmap, stat_map);
-    if (known_ranges_map.empty()) return;
-    auto &outslice = fsmap.get(cur->get_outputs()[0]);
+    slice_range_map known_ranges_map = search_known_input_slice(cur, fsmap);
+    if (known_ranges_map.empty()) return infer_status_code::RETRY;
     // if unkown slice ranges exist.
     if (known_ranges_map.size() < cur->get_inputs().size()) {
         int unknown_idx
                 = known_ranges_map.find(0) != known_ranges_map.end() ? 1 : 0;
         known_ranges_map[unknown_idx] = known_ranges_map[1 - unknown_idx];
         // set the other unknown slice range by achieved known_ranges_list
-        set_unknown_slice_ranges(cur, known_ranges_map, fsmap, stat_map);
+        set_unknown_input_slice(cur, known_ranges_map, fsmap);
     }
     // set outputs slice range
+    auto &outslice = fsmap.get(cur->get_outputs()[0]);
     outslice = known_ranges_map[0];
+    return infer_status_code::OK;
 }
 
 static slice_range_list infer_broadcast_arg_slice(
@@ -103,7 +110,7 @@ static slice_range_list infer_broadcast_slice(
         COMPILE_ASSERT(known_range.size() == bc_dim.size()
                         || bc_axis == std::vector<int> {-1},
                 "Unexpected cases found")
-        for (size_t j = 0; j < known_range.size(); j++) {
+        for (size_t j = 0; j < bc_dim.size(); j++) {
             if (bc_axis.end() != std::find(bc_axis.begin(), bc_axis.end(), j)) {
                 bc_range_list[i].emplace_back(known_range.at(j));
             } else {
@@ -153,37 +160,35 @@ static sc_data_type_t infer_output_dtype(
     return a;
 }
 
-void binary_elementwise_op_impl_t::set_inplace_info() {
-    // legalize inplace
-    auto lhs_const = dynamic_cast<constant_op_t *>(
-            info_.inputs_.at(0)->producer_owner_);
-    auto rhs_const = dynamic_cast<constant_op_t *>(
-            info_.inputs_.at(1)->producer_owner_);
-    inplace_ = attrs_.get_or_else("inplace", 0);
-    auto non_bc_indices = get_non_broadcast_input_index(false);
-    // inplace 0-th input
-    if (inplace_ == 0
-            && (lhs_const
-                    || std::find(
-                               non_bc_indices.begin(), non_bc_indices.end(), 0)
-                            == non_bc_indices.end())) {
-        inplace_ = -1;
+void binary_elementwise_op_impl_t::set_plain_bc_axis() {
+    auto lhs_shape = info_.inputs_[0]->details_.get_plain_dims();
+    auto rhs_shape = info_.inputs_[1]->details_.get_plain_dims();
+    auto output_shape = info_.outputs_[0]->details_.get_plain_dims();
+    // get user specified bc_axis of the shorter input
+    auto input_bc_axis = attrs_.get_or_else("bc_axis", std::vector<int> {});
+    int ref_idx = get_ref_input_index(false);
+    if (ref_idx == may_broadcast_t::NOT_DETERMINED) {
+        ref_idx = lhs_shape.size() >= rhs_shape.size() ? 0 : 1;
     }
-    // inplace 1-th input
-    else if (inplace_ == 1
-            && (rhs_const
-                    || std::find(
-                               non_bc_indices.begin(), non_bc_indices.end(), 1)
-                            == non_bc_indices.end())) {
-        inplace_ = -1;
+    // user specified bc_axis of the shorter input
+    plain_bc_axis_.clear();
+    if (input_bc_axis.empty()) {
+        plain_bc_axis_.emplace_back(
+                op_traits::may_broadcast_t::get_auto_broadcast_bc_axis(
+                        lhs_shape, output_shape));
+        plain_bc_axis_.emplace_back(
+                op_traits::may_broadcast_t::get_auto_broadcast_bc_axis(
+                        rhs_shape, output_shape));
+    } else {
+        COMPILE_ASSERT(ref_idx == 0 || ref_idx == 1,
+                "bc_axis is only applicable to uni-directional broadcast.");
+        plain_bc_axis_.resize(2);
+        plain_bc_axis_[ref_idx]
+                = op_traits::may_broadcast_t::get_auto_broadcast_bc_axis(
+                        info_.inputs_[ref_idx]->details_.get_plain_dims(),
+                        output_shape);
+        plain_bc_axis_[1 - ref_idx] = input_bc_axis;
     }
-    COMPILE_ASSERT(inplace_ >= -1 && inplace_ <= 1,
-            "Binary elementwise op only have two inputs, but got "
-                    << inplace_ << "-th input to be inplaced.");
-
-    info_.tensor_share_info_ = (inplace_ == -1)
-            ? std::unordered_map<int, std::vector<int>> {}
-            : std::unordered_map<int, std::vector<int>> {{0, {inplace_}}};
 }
 
 binary_elementwise_op_impl_t::binary_elementwise_op_impl_t(
@@ -230,35 +235,17 @@ binary_elementwise_op_impl_t::binary_elementwise_op_impl_t(
         info_.outputs_ = outs;
     }
 
-    COMPILE_ASSERT(info_.outputs_[0]->details_.get_plain_dims() == output_shape,
+    COMPILE_ASSERT(
+            gc::graph::check_shape_equal(
+                    info_.outputs_[0]->details_.get_plain_dims(), output_shape),
             "Binary elementwise op's output shape is not set correctly.");
 
-    // user specified bc_axis of the shorter input
-    if (input_bc_axis.empty()) {
-        plain_bc_axis_.emplace_back(
-                op_traits::may_broadcast_t::get_auto_broadcast_bc_axis(
-                        lhs_shape, output_shape));
-        plain_bc_axis_.emplace_back(
-                op_traits::may_broadcast_t::get_auto_broadcast_bc_axis(
-                        rhs_shape, output_shape));
-    } else {
-        COMPILE_ASSERT(ref_idx == 0 || ref_idx == 1,
-                "bc_axis is only applicable to uni-directional broadcast.");
-        plain_bc_axis_.resize(2);
-        plain_bc_axis_[ref_idx]
-                = op_traits::may_broadcast_t::get_auto_broadcast_bc_axis(
-                        info_.inputs_[ref_idx]->details_.get_plain_dims(),
-                        output_shape);
-        plain_bc_axis_[1 - ref_idx] = input_bc_axis;
-    }
-
-    set_inplace_info();
+    set_plain_bc_axis();
 }
 
-binary_elementwise_op_impl_t::binary_elementwise_op_impl_t(graph_tensor_ptr lhs,
-        graph_tensor_ptr rhs, elt_operator elt_op, int inplace)
-    : binary_elementwise_op_impl_t(
-            {std::move(lhs), std::move(rhs)}, {}, {{"inplace", inplace}}) {
+binary_elementwise_op_impl_t::binary_elementwise_op_impl_t(
+        graph_tensor_ptr lhs, graph_tensor_ptr rhs, elt_operator elt_op)
+    : binary_elementwise_op_impl_t({std::move(lhs), std::move(rhs)}, {}, {}) {
     elt_op_ = elt_op;
     switch (elt_op) {
         case elt_operator::ADD: op_name_ = "add"; break;
@@ -367,25 +354,12 @@ void binary_elementwise_op_impl_t::query_format(context_ptr ctx,
             in_formats, out_formats, supported_ins, supported_outs);
 }
 
-void binary_elementwise_op_impl_t::prepare_fusion_data(fdata_map &fdmap) {
-    COMPILE_ASSERT(!op_name_.empty(), "op_name or elt_operator is not set.\n");
-    COMPILE_ASSERT(info_.outputs_.size() == 1, "Wrong op output size.\n");
-    auto &output = info_.outputs_[0];
-    auto &outdetail = fdmap.get(output);
-    auto &in_detail0 = fdmap.get(info_.inputs_[0]);
-    auto &in_detail1 = fdmap.get(info_.inputs_[1]);
-
-    in_detail0.use_count_++;
-    in_detail1.use_count_++;
-}
-
-void binary_elementwise_op_impl_t::infer_slice_ranges(
-        fslice_map &fsmap, infer_status_map_t &stat_map) {
+infer_status_code binary_elementwise_op_impl_t::infer_slice_ranges(
+        const context_ptr &ctx, fslice_map &fsmap) {
     COMPILE_ASSERT(get_inputs().size() == 2, "binary op is expected");
     // search known ranges from any input of cur fusbile op
-    slice_range_map known_ranges_map
-            = search_known_slice_ranges(this, fsmap, stat_map);
-    if (known_ranges_map.empty()) return;
+    slice_range_map known_ranges_map = search_known_input_slice(this, fsmap);
+    if (known_ranges_map.empty()) return infer_status_code::RETRY;
     // double-check all known case
     if (known_ranges_map.size() == get_inputs().size()) {
         // check whether slice size is matched
@@ -396,10 +370,9 @@ void binary_elementwise_op_impl_t::infer_slice_ranges(
                     ? 1
                     : 0;
             known_ranges_map.erase(erase_input_id);
-            fsmap.datamap_.erase(get_inputs()[erase_input_id].get());
+            fsmap.erase(get_inputs()[erase_input_id]);
         }
     }
-    auto &outslice = fsmap.get(get_outputs()[0]);
     // if unkown slice ranges exist.
     if (known_ranges_map.size() < get_inputs().size()) {
         int unknown_idx
@@ -426,30 +399,23 @@ void binary_elementwise_op_impl_t::infer_slice_ranges(
                         known_ranges_map[1 - unknown_idx], bc_axis, keep_dims);
                 known_ranges_map[unknown_idx] = std::move(bc_arg_range_list);
             }
-            // set the other unknown slice range by achieved known_ranges_list
-            set_unknown_slice_ranges(this, known_ranges_map, fsmap, stat_map);
-            // set outputs slice range
-            outslice = known_ranges_map[1 - bc_input_idx];
-            return;
         } else {
             known_ranges_map[unknown_idx] = known_ranges_map[1 - unknown_idx];
         }
         // set the other unknown slice range by achieved known_ranges_list
-        set_unknown_slice_ranges(this, known_ranges_map, fsmap, stat_map);
+        set_unknown_input_slice(this, known_ranges_map, fsmap);
     }
     // set outputs slice range
+    auto &outslice = fsmap.get(get_outputs()[0]);
     int bc_idx = get_broadcast_input();
-    outslice = known_ranges_map[bc_idx > -1 ? (1 - bc_idx)
-                                            : (inplace_ > -1 ? inplace_ : 0)];
+    outslice = known_ranges_map[bc_idx > -1 ? (1 - bc_idx) : 0];
+    return infer_status_code::OK;
 }
 
-void binary_elementwise_op_impl_t::pre_slice_ranges(
-        fslice_map &fsmap, infer_status_map_t &stat_map) {
+infer_status_code binary_elementwise_op_impl_t::pre_infer_slice_ranges(
+        const context_ptr &ctx, fslice_map &fsmap) {
     auto &outslice = fsmap.get(get_outputs()[0]);
-    if (outslice.empty()) {
-        stat_map.append_ops_by_status(this, infer_status_code::RETRY);
-        return;
-    }
+    if (outslice.empty()) { return infer_status_code::RETRY; }
     // check broadcast
     int bc_input_idx = get_broadcast_input();
     for (size_t i = 0; i < get_inputs().size(); i++) {
@@ -468,18 +434,15 @@ void binary_elementwise_op_impl_t::pre_slice_ranges(
             } else {
                 inpslice = outslice;
             }
-            if (stat_map.is_recursive_mode()) {
-                input->producer_owner_->dyn_cast<fusible_op_t>()
-                        ->pre_slice_ranges(fsmap, stat_map);
-            }
         }
     }
+    return infer_status_code::OK;
 }
 
 void binary_elementwise_op_impl_t::infer_binding_axis(
-        bound_axis_map &bdax_map) {
+        binding_axis_map &bdax_map) {
     // search known axis from any input of cur fusbile op
-    auto known_axis_map = search_known_bound_axis(this, bdax_map);
+    auto known_axis_map = search_known_input_axis(this, bdax_map);
     if (!bdax_map.get(get_outputs()[0]).empty()) return;
 
     if (known_axis_map.size() < get_inputs().size()) {
@@ -498,8 +461,8 @@ void binary_elementwise_op_impl_t::infer_binding_axis(
                 known_axis_map[unknown_idx] = known_axis_map[1 - unknown_idx];
             } else {
                 auto bc_axis = plain_bc_axis_[bc_input_idx];
-                bound_axis known_axis = known_axis_map[1 - unknown_idx],
-                           unknown_axis(known_axis.size());
+                binding_axis known_axis = known_axis_map[1 - unknown_idx],
+                             unknown_axis(known_axis.size());
                 if (unknown_idx != bc_input_idx) {
                     if (bc_axis == std::vector<int> {-1}) {
                         bc_axis[0] = get_inputs()[1 - bc_input_idx]
@@ -544,17 +507,17 @@ void binary_elementwise_op_impl_t::infer_binding_axis(
     // set outputs slice range
     int bc_idx = get_broadcast_input();
     bdax_map.get(get_outputs()[0])
-            = known_axis_map[bc_idx > -1 ? (1 - bc_idx)
-                                         : (inplace_ > -1 ? inplace_ : 0)];
+            = known_axis_map[bc_idx > -1 ? (1 - bc_idx) : 0];
 
     // set the other unknown slice range by achieved known_ranges_list
-    set_unknown_axis_binding(this, known_axis_map, bdax_map);
+    set_unknown_binding_axis(this, known_axis_map, bdax_map);
 }
 
-void binary_elementwise_op_impl_t::pre_binding_axis(bound_axis_map &bdax_map) {
+void binary_elementwise_op_impl_t::pre_infer_binding_axis(
+        binding_axis_map &bdax_map) {
     auto &outaxis = bdax_map.get(get_outputs()[0]);
     COMPILE_ASSERT(!outaxis.empty(),
-            "Unknown output axis found, could not pre bind axis")
+            "Unknown output axis found, could not pre infer binding axis")
 
     // check broadcast
     int bc_input_idx = get_broadcast_input();
@@ -590,7 +553,7 @@ void binary_elementwise_op_impl_t::pre_binding_axis(bound_axis_map &bdax_map) {
             }
             if (auto bd_op = input->producer_owner_->dyn_cast<
                              op_traits::mixed_partition_acceptable>()) {
-                bd_op->pre_binding_axis(bdax_map);
+                bd_op->pre_infer_binding_axis(bdax_map);
             }
         }
     }
@@ -648,81 +611,272 @@ shape_rl_vec binary_elementwise_op_impl_t::get_dynamic_shape_relations() const {
     return ret;
 }
 
-sc_dims binary_elementwise_op_impl_t::get_bwise_fuse_shrink_dims() {
-    auto &in0_detail = info_.inputs_[0]->details_;
-    auto &in1_detail = info_.inputs_[1]->details_;
-    auto output_dims = info_.outputs_[0]->details_.get_blocking_dims();
-    int offset = op_traits::batchwise_shrinkable_t::get_shrinkable_offset(
-            info_.outputs_[0]);
-    return {output_dims.begin(), output_dims.begin() + offset};
-}
-
-void binary_elementwise_op_impl_t::collect_shrinked_lt_map(
-        int bw_size, gt2gt_map &bw_lt_map) {
-    int bc_idx = get_broadcast_input();
-    if (bc_idx == -1)
-        op_traits::batchwise_shrinkable_t::collect_shrinked_lt_map(
-                bw_size, bw_lt_map);
-    std::vector<graph_tensor_ptr> new_ins;
-    op_traits::batchwise_shrinkable_t::record_shrinked_gt(
-            bw_lt_map, get_outputs()[0], bw_size);
-    auto old_ins = get_inputs();
-    bool keep_dims = get_inputs()[0]->details_.get_blocking_dims().size()
-            == get_inputs()[1]->details_.get_blocking_dims().size();
-    auto bc_axis = get_bc_axis();
-    int valid_size = 0;
-    for (auto &ax : bc_axis) {
-        if (ax < bw_size)
-            valid_size++;
-        else
-            break;
+static stmt select_algorithm(elt_operator elt_op, const expr &in0,
+        const expr &in1, const expr &out, const any_map_t &attrs,
+        const sc_op_info_t &info) {
+    std::vector<stmt_c> cur_list;
+    auto var_maker = [&cur_list, &in0](const std::string &name) {
+        auto var = builder::make_var(in0->dtype_, name);
+        cur_list.emplace_back(builder::make_var_tensor_def_unattached(var));
+        return var;
+    };
+    auto assign_maker = [&cur_list](const expr &def_var, const expr &def_val) {
+        cur_list.emplace_back(
+                builder::make_assign_unattached(def_var, def_val));
+    };
+    switch (elt_op) {
+        case elt_operator::ADD: {
+            return builder::make_assign_unattached(out, in0 + in1);
+        } break;
+        case elt_operator::SUB: {
+            return builder::make_assign_unattached(out, in0 - in1);
+        } break;
+        case elt_operator::MUL: {
+            return builder::make_assign_unattached(out, in0 * in1);
+        } break;
+        case elt_operator::DIV: {
+            return builder::make_assign_unattached(out, in0 / in1);
+        } break;
+        case elt_operator::MIN: {
+            return builder::make_assign_unattached(
+                    out, builder::make_min(in0, in1));
+        } break;
+        case elt_operator::MAX: {
+            return builder::make_assign_unattached(
+                    out, builder::make_max(in0, in1));
+        } break;
+        case elt_operator::SQD_DIFF: {
+            return builder::make_assign_unattached(
+                    out, (in0 - in1) * (in0 - in1));
+        } break;
+        case elt_operator::PRELU: {
+            return builder::make_assign_unattached(out,
+                    builder::make_select(in0 >= make_expr<constant_node>(
+                                                 (int64_t)0, in0->dtype_),
+                            in0, in0 * in1));
+        } break;
+        case elt_operator::ABS_BWD: {
+            return builder::make_assign_unattached(out,
+                    builder::make_select(
+                            in0 > make_expr<constant_node>(0.f, in0->dtype_),
+                            in1,
+                            builder::make_select(in0
+                                            != make_expr<constant_node>(
+                                                    0.f, in0->dtype_),
+                                    builder::make_sub(make_expr<constant_node>(
+                                                              0.f, in0->dtype_),
+                                            in1),
+                                    make_expr<constant_node>(
+                                            0.f, in0->dtype_))));
+        } break;
+        case elt_operator::CLAMP_BWD: {
+            return builder::make_assign_unattached(out,
+                    builder::make_select(in0 > make_expr<constant_node>(
+                                                 (float)attrs.get<float>("min"),
+                                                 in0->dtype_),
+                            builder::make_select(
+                                    in0 < make_expr<constant_node>(
+                                            (float)attrs.get<float>("max"),
+                                            in0->dtype_),
+                                    in1,
+                                    make_expr<constant_node>(0.f, in1->dtype_)),
+                            make_expr<constant_node>(0.f, in0->dtype_)));
+        } break;
+        case elt_operator::ELU_BWD: {
+            expr used_inp = builder::make_select(
+                    in0 > make_expr<constant_node>(0.f, in0->dtype_), in1,
+                    in1
+                            * make_expr<constant_node>(
+                                    (float)attrs.get<float>("alpha"),
+                                    in0->dtype_)
+                            * builder::make_exp(in0));
+            expr used_out = builder::make_select(
+                    in0 > make_expr<constant_node>(0.f, in0->dtype_), in1,
+                    in1
+                            * (in0
+                                    + make_expr<constant_node>(
+                                            (float)attrs.get<float>("alpha"),
+                                            in0->dtype_)));
+            expr res = attrs.get_or_else<bool>("use_dst", true) ? used_out
+                                                                : used_inp;
+            return builder::make_assign_unattached(out, res);
+        } break;
+        case elt_operator::HARDSWISH_BWD: {
+            auto alpha = attrs.get_or_else<float>("alpha", 1.f / 6.f);
+            auto beta = attrs.get_or_else<float>("beta", 0.5f);
+            expr test_expr = make_expr<constant_node>(alpha, in0->dtype_) * in0
+                    + make_expr<constant_node>(beta, in0->dtype_);
+            expr cal_expr = in1
+                    * (make_expr<constant_node>(2.f, in0->dtype_)
+                                    * make_expr<constant_node>(
+                                            alpha, in0->dtype_)
+                                    * in0
+                            + make_expr<constant_node>(beta, in0->dtype_));
+            expr res = builder::make_select(
+                    (test_expr) <= make_expr<constant_node>(0.f, in0->dtype_),
+                    make_expr<constant_node>(0.f, in0->dtype_),
+                    builder::make_select(
+                            (test_expr) >= make_expr<constant_node>(
+                                    1.f, in0->dtype_),
+                            in1, cal_expr));
+            return builder::make_assign_unattached(out, res);
+        } break;
+        case elt_operator::HARDSIGMOID_BWD: {
+            auto alpha = constant_maker<float>(
+                    attrs.get<float>("alpha"), in0->dtype_);
+            auto beta = constant_maker<float>(
+                    attrs.get<float>("beta"), in0->dtype_);
+            auto one_f = constant_maker<float>(1.f, in0->dtype_);
+            auto zero_f = constant_maker<float>(0.f, in0->dtype_);
+            expr test_expr = in0 * alpha + beta;
+            auto f_var0 = var_maker("f_var0");
+            assign_maker(f_var0, test_expr);
+            expr cal_expr = in1 * alpha;
+            auto f_var1 = var_maker("f_var1");
+            assign_maker(f_var1, cal_expr);
+            expr res = builder::make_select(f_var0 < one_f,
+                    builder::make_select(f_var0 > zero_f, f_var1, zero_f),
+                    zero_f);
+            assign_maker(out, res);
+            return builder::make_stmts_unattached(cur_list);
+        } break;
+        case elt_operator::SQRT_BWD: {
+            bool use_dst = attrs.get_or_else<bool>("use_dst", true);
+            auto half_f = constant_maker<float>(0.5f, in0->dtype_);
+            expr f_var = var_maker("f_var");
+            if (use_dst) {
+                auto dst_expr = (half_f / in0);
+                dst_expr->attr()[attr_keys::fast_math] = false;
+                assign_maker(f_var, dst_expr);
+            } else {
+                auto src_expr = half_f / builder::make_sqrt(in0);
+                src_expr->attr()[attr_keys::fast_math] = false;
+                assign_maker(f_var, src_expr);
+            }
+            auto ret = f_var * in1;
+            ret->attr()[attr_keys::fast_math] = false;
+            assign_maker(out, ret);
+            return builder::make_stmts_unattached(cur_list);
+        } break;
+        case elt_operator::MISH_BWD: {
+            auto min_inp = builder::make_min(
+                    in0, constant_maker<float>(22.180708f, in0->dtype_));
+            auto min_var = var_maker("inp_min_var_" + fusion_create_var_idx());
+            assign_maker(min_var, min_inp);
+            // e^x
+            auto exp_f = builder::make_exp(min_var);
+            auto var_exp_f = var_maker("exp_var_" + fusion_create_var_idx());
+            assign_maker(var_exp_f, exp_f);
+            // e^2x
+            auto exp_f2 = var_exp_f * var_exp_f;
+            auto exp_f2_var = var_maker("exp_f2_var" + fusion_create_var_idx());
+            assign_maker(exp_f2_var, exp_f2);
+            // 4 * e^2x
+            auto formular_0
+                    = exp_f2_var * constant_maker<float>(4.f, in0->dtype_);
+            auto f_var0 = var_maker("f_var0" + fusion_create_var_idx());
+            assign_maker(f_var0, formular_0);
+            // e^3x + 4 * e^2x
+            auto formular_1
+                    = builder::make_fmadd(var_exp_f, exp_f2_var, f_var0);
+            auto f_var1 = var_maker("f_var1" + fusion_create_var_idx());
+            assign_maker(f_var1, formular_1);
+            // x + 1.f
+            auto formular_2 = in0 + constant_maker<float>(1.f, in0->dtype_);
+            auto f_var2 = var_maker("f_var2" + fusion_create_var_idx());
+            assign_maker(f_var2, formular_2);
+            auto formular_3 = f_var2 + constant_maker(0.5f, in0->dtype_);
+            auto f_var3 = var_maker("f_var3" + fusion_create_var_idx());
+            assign_maker(f_var3, formular_3);
+            // 4 * (1 + 1.5f)
+            auto formular_4 = constant_maker(4.f, in0->dtype_) * f_var3;
+            auto f_var4 = var_maker("f_var4" + fusion_create_var_idx());
+            assign_maker(f_var4, formular_4);
+            // e^3x + 4*e^2x + 4*(x+1.5)*e^x
+            auto formular_5 = builder::make_fmadd(f_var4, var_exp_f, f_var1);
+            auto f_var5 = var_maker("f_var5" + fusion_create_var_idx());
+            assign_maker(f_var5, formular_5);
+            // omega = e^3x + 4*e^2x + 4*e^x*(x+1.5) + 4*(x+1)
+            auto formular_6 = builder::make_fmadd(
+                    constant_maker(4.f, in0->dtype_), f_var2, f_var5);
+            auto f_var6 = var_maker("f_var6" + fusion_create_var_idx());
+            assign_maker(f_var6, formular_6);
+            // delta = (e^x+1)^2 + 1
+            auto formular_7
+                    = var_exp_f + constant_maker<float>(1.f, in0->dtype_);
+            auto f_var7 = var_maker("f_var7" + fusion_create_var_idx());
+            assign_maker(f_var7, formular_7);
+            auto formular_8 = f_var7 * f_var7;
+            auto f_var8 = var_maker("f_var8" + fusion_create_var_idx());
+            assign_maker(f_var8, formular_8);
+            auto formular_9 = f_var8 + constant_maker<float>(1.f, in0->dtype_);
+            auto f_var9 = var_maker("f_var9" + fusion_create_var_idx());
+            assign_maker(f_var9, formular_9);
+            auto formular_10 = f_var9 * f_var9;
+            auto f_var10 = var_maker("f_var10");
+            assign_maker(f_var10, formular_10);
+            auto formular_11 = exp_f * f_var6;
+            auto f_var11 = var_maker("f_var11");
+            assign_maker(f_var11, formular_11);
+            auto formular_12 = f_var11 / f_var10;
+            formular_12->attr()[attr_keys::fast_math] = false;
+            auto f_var12 = var_maker("f_var12");
+            assign_maker(f_var12, formular_12);
+            auto res = f_var12 * in1;
+            res->attr()[attr_keys::fast_math] = false;
+            assign_maker(out, res);
+            return builder::make_stmts_unattached(cur_list);
+        } break;
+        case elt_operator::TANH_BWD: {
+            bool use_dst = attrs.get_or_else<bool>("use_dst", true);
+            tanh_op_t tanh_compute(info.inputs_[0]);
+            const auto &tanh_ret = tanh_compute.compute_element(in0);
+            expr src = builder::make_mul(in1,
+                    builder::make_sub(
+                            make_expr<constant_node>(1.f, in0->dtype_),
+                            builder::make_mul(tanh_ret, tanh_ret)));
+            expr dst = builder::make_mul(in1,
+                    builder::make_sub(
+                            make_expr<constant_node>(1.f, in0->dtype_),
+                            builder::make_mul(in0, in0)));
+            expr res = use_dst ? dst : src;
+            return builder::make_assign_unattached(out, res);
+        } break;
+        case elt_operator::SOFTPLUS_BWD: {
+            float beta = attrs.get_or_else<float>("beta", 1.f);
+            sigmoid_op_t sigmoid_compute(info.inputs_[0]);
+            bool is_f32 = in0->dtype_.type_code_ == sc_data_etype::F32;
+            auto make_cast_f32 = [](const expr &inp) {
+                return builder::make_cast(
+                        sc_data_type_t::f32(inp->dtype_.lanes_), inp);
+            };
+            auto sigmoid_inp = is_f32 ? in0 : make_cast_f32(in0);
+            const auto &sigmoid_ret
+                    = sigmoid_compute.compute_element(sigmoid_inp
+                            * constant_maker<float>(beta,
+                                    sc_data_type_t::f32(in0->dtype_.lanes_)));
+            auto inp2 = is_f32 ? in1 : make_cast_f32(in1);
+            auto f_val = builder::make_mul(sigmoid_ret, inp2);
+            auto res_val
+                    = is_f32 ? f_val : builder::make_cast(in0->dtype_, f_val);
+            auto res = builder::make_assign_unattached(out, res_val);
+            return res;
+        } break;
+        default: {
+            COMPILE_ASSERT(false,
+                    "Unsupport elementwise op "
+                    "found.\n");
+            return stmt();
+        } break;
     }
-    for (size_t i = 0; i < get_inputs().size(); i++) {
-        op_traits::batchwise_shrinkable_t::record_shrinked_gt(bw_lt_map,
-                get_inputs()[i],
-                static_cast<int>(i) == bc_idx && !keep_dims ? valid_size
-                                                            : bw_size);
-    }
-}
-
-void binary_elementwise_op_impl_t::collect_shrinked_axis_map(
-        int bw_size, gt2axis_map &bw_axis_map) {
-    int bc_idx = get_broadcast_input();
-    if (bc_idx == -1)
-        op_traits::batchwise_shrinkable_t::collect_shrinked_axis_map(
-                bw_size, bw_axis_map);
-    std::vector<graph_tensor_ptr> new_ins;
-    op_traits::batchwise_shrinkable_t::record_shrinked_axis(
-            bw_axis_map, get_outputs()[0], bw_size);
-    auto old_ins = get_inputs();
-    bool keep_dims = get_inputs()[0]->details_.get_blocking_dims().size()
-            == get_inputs()[1]->details_.get_blocking_dims().size();
-    auto bc_axis = get_bc_axis();
-    std::vector<int> bw_axis;
-    for (int i = 0; i < bw_size; i++) {
-        auto iter = std::find(bc_axis.begin(), bc_axis.end(), i);
-        if (iter != bc_axis.end()) {
-            bw_axis.emplace_back(iter - bc_axis.begin());
-        } else {
-            bw_axis.emplace_back(-1);
-        }
-    }
-    for (size_t i = 0; i < get_inputs().size(); i++) {
-        if (static_cast<int>(i) == bc_idx && !keep_dims) {
-            op_traits::batchwise_shrinkable_t::record_shrinked_axis(
-                    bw_axis_map, get_inputs()[i], bw_axis);
-        } else {
-            op_traits::batchwise_shrinkable_t::record_shrinked_axis(
-                    bw_axis_map, get_inputs()[i], bw_size);
-        }
-    }
+    return stmt();
 }
 
 void compute_block_broadcast(const context_ptr &ctx, sc_graph_t &graph,
         const std::vector<const tensor_slice *> &src, const tensor_slice &dst,
         sc_op_info_t &info, int bc_input_idx, const std::vector<int> &bc_axis,
         const vectorized_info_t &vx_info, const mask_compute_func_t &compute,
-        sc_data_type_t dtype = datatypes::f32, size_t wkld = 0UL,
+        const graph_tensor_ptr &expand_gt, size_t wkld = 0UL,
         bool use_mask = false) {
     //  enable vectorize code
     bool use_vectorized = false;
@@ -789,7 +943,6 @@ void compute_block_broadcast(const context_ptr &ctx, sc_graph_t &graph,
         tail_int = get_expr_as_int(tail);
         COMPILE_ASSERT((floor_int + tail_int), "Don't support shape len is 0.");
     }
-
     auto last_axis = expr(floor + tail);
     const int INVALID_AXIS_MASK = -64;
     int last_axis_mask = INVALID_AXIS_MASK;
@@ -894,6 +1047,7 @@ void compute_block_broadcast(const context_ptr &ctx, sc_graph_t &graph,
                     cur = make_stmt<for_loop_node_t>(iter_vars.at(i), expr(0),
                             floor, expr(int(vx_info.lanes)), cur, true,
                             for_type::NORMAL);
+                    bind_loop_axis(expand_gt, cur, i, true);
                 }
                 tcur.emplace_back(cur);
             }
@@ -933,6 +1087,7 @@ void compute_block_broadcast(const context_ptr &ctx, sc_graph_t &graph,
                         do_cast_and_fold(floor + tail),
                         use_scalar ? expr(1) : lanes, bld->pop_scope(), true,
                         for_type::NORMAL);
+                bind_loop_axis(expand_gt, cur, i, true);
                 tcur.emplace_back(cur);
             }
         } else if (iter_vars.at(i).isa<var>()) {
@@ -979,6 +1134,7 @@ void compute_block_broadcast(const context_ptr &ctx, sc_graph_t &graph,
                         dst.get_shape().at(i), expr(1), bld->pop_scope(), true,
                         for_type::NORMAL);
             }
+            bind_loop_axis(expand_gt, cur, i, true);
         }
     }
     if (!tcur.empty() && tcur[0].defined()) {
@@ -1018,94 +1174,92 @@ void binary_elementwise_op_impl_t::compute_block(context_ptr ctx,
     }
     // use broad-cast
     int bc_input_idx = get_broadcast_input();
-    if (bc_input_idx != -1) {
-        auto func = [&](const std::vector<expr> &ins,
-                            std::vector<expr::lvalue_proxy_t> &outs) -> stmt {
-            auto in_0 = ins[1 - bc_input_idx], in_1 = ins[bc_input_idx];
-            switch (elt_op_) {
-                case elt_operator::ADD:
-                    return builder::make_assign_unattached(
-                            outs[0], in_0 + in_1);
-                case elt_operator::SUB:
-                    return builder::make_assign_unattached(
-                            outs[0], in_0 - in_1);
-                case elt_operator::MUL:
-                    return builder::make_assign_unattached(
-                            outs[0], in_0 * in_1);
-                case elt_operator::DIV:
-                    return builder::make_assign_unattached(
-                            outs[0], in_0 / in_1);
-                case elt_operator::MIN:
-                    return builder::make_assign_unattached(
-                            outs[0], builder::make_min(in_0, in_1));
-                case elt_operator::MAX:
-                    return builder::make_assign_unattached(
-                            outs[0], builder::make_max(in_0, in_1));
-                case elt_operator::SQD_DIFF:
-                    return builder::make_assign_unattached(
-                            outs[0], (in_0 - in_1) * (in_0 - in_1));
-                case elt_operator::PRELU:
-                    return builder::make_assign_unattached(outs[0],
-                            builder::make_select(
-                                    in_0 >= make_expr<constant_node>(
-                                            (int64_t)0, in_0->dtype_),
-                                    in_0, in_0 * in_1));
-                default:
-                    COMPILE_ASSERT(false, "Unsupport elementwise op found.\n");
-                    return stmt();
-            }
-        };
-        // reuse broadcast op
-        compute_block_broadcast(ctx, get_owner_graph(), inputs, *dst[0], info_,
-                bc_input_idx, get_bc_axis(), vx_info_,
-                mask_compute_func_t(func), info_.outputs_[0]->details_.dtype_,
-                wkld, use_mask);
-    } else {
-        auto func = [&](const std::vector<expr> &in,
-                            std::vector<expr::lvalue_proxy_t> &out) -> stmt {
-            auto out_dtype = out[0]->dtype_;
-            expr in0 = in[0], in1 = in[1];
+    bool use_broadcast = bc_input_idx != -1;
+    auto func = [&](const std::vector<expr> &in,
+                        const std::vector<expr::lvalue_proxy_t> &out) -> stmt {
+        auto out_dtype = out[0]->dtype_;
+        expr in0, in1;
+        if (use_broadcast) {
+            in0 = in[1 - bc_input_idx], in1 = in[bc_input_idx];
+        } else {
+            in0 = in[0], in1 = in[1];
             if (in[0]->dtype_ != out_dtype) {
                 in0 = builder::make_cast(out_dtype, in[0]);
             }
             if (in[1]->dtype_ != out_dtype) {
                 in1 = builder::make_cast(out_dtype, in[1]);
             }
-            switch (elt_op_) {
-                case elt_operator::ADD:
-                    return builder::make_assign_unattached(out[0], in0 + in1);
-                case elt_operator::SUB:
-                    return builder::make_assign_unattached(out[0], in0 - in1);
-                case elt_operator::MUL:
-                    return builder::make_assign_unattached(out[0], in0 * in1);
-                case elt_operator::DIV:
-                    return builder::make_assign_unattached(out[0], in0 / in1);
-                case elt_operator::MIN:
-                    return builder::make_assign_unattached(
-                            out[0], builder::make_min(in0, in1));
-                case elt_operator::MAX:
-                    return builder::make_assign_unattached(
-                            out[0], builder::make_max(in0, in1));
-                case elt_operator::SQD_DIFF:
-                    return builder::make_assign_unattached(
-                            out[0], (in0 - in1) * (in0 - in1));
-                case elt_operator::PRELU:
-                    return builder::make_assign_unattached(out[0],
-                            builder::make_select(
-                                    in0 >= make_expr<constant_node>(
-                                            (int64_t)0, in0->dtype_),
-                                    in0, in0 * in1));
-                default:
-                    COMPILE_ASSERT(false,
-                            "Unsupport elementwise op "
-                            "found.\n");
-                    return stmt();
-            }
-        };
-
+        }
+        return select_algorithm(elt_op_, in0, in1, out[0], attrs_, info_);
+    };
+    if (use_broadcast) {
+        // reuse broadcast op
+        compute_block_broadcast(ctx, get_owner_graph(), inputs, *dst[0], info_,
+                bc_input_idx, get_bc_axis(), vx_info_,
+                mask_compute_func_t(func), get_outputs()[0], wkld, use_mask);
+    } else {
         compute_vectorized_op(ctx, get_owner_graph(), inputs, *dst[0], info_,
                 vx_info_, mask_compute_func_t(func), mask_compute_func_t(func),
-                attrs_, wkld, use_mask);
+                attrs_, get_outputs()[0], wkld, use_mask);
+    }
+}
+
+void unary_backward_base_t::compute_block(context_ptr ctx,
+        const std::vector<tensor_slice *> &dst,
+        const std::vector<const tensor_slice *> &inputs) {
+    size_t wkld = compute_fusible_workload(ctx, dst, inputs);
+    auto vx_info = get_vx_info();
+    auto elt_op = get_elt_operator();
+    // set default vectorized information
+    vx_info.axis = dst[0]->get_shape().size() - 1;
+
+    for (int64_t i = dst[0]->nslice_dims() - 1; i >= 0; --i) {
+        auto cur_dim = dst[0]->get_shape()[i];
+        if (!cur_dim.isa<constant>()
+                || get_const_as_int(cur_dim.checked_as<constant>())) {
+            vx_info.axis = i;
+            break;
+        }
+    }
+    vx_info.lanes
+            = vectorize_step(ctx, info_.inputs_[0]->details_.dtype_.type_code_);
+    bool use_mask = attrs_.get_or_else(op_attr_key::use_padded_mask, true);
+    if (get_owner_graph().is_dynamic()) {
+        use_mask &= info_.cur_impl_ != impl_kind_t::no_padding;
+    }
+    auto func = [&](const std::vector<expr> &in,
+                        const std::vector<expr::lvalue_proxy_t> &out) -> stmt {
+        auto out_dtype = out[0]->dtype_;
+        expr in0, in1;
+        in0 = in[0], in1 = in[1];
+        if (in[0]->dtype_ != out_dtype) {
+            in0 = builder::make_cast(out_dtype, in[0]);
+        }
+        if (in[1]->dtype_ != out_dtype) {
+            in1 = builder::make_cast(out_dtype, in[1]);
+        }
+        return select_algorithm(elt_op, in0, in1, out[0], attrs_, info_);
+    };
+    compute_vectorized_op(ctx, get_owner_graph(), inputs, *dst[0], info_,
+            vx_info, mask_compute_func_t(func), mask_compute_func_t(func),
+            attrs_, get_outputs()[0], wkld, use_mask);
+}
+
+unary_backward_base_t::unary_backward_base_t(
+        graph_tensor_ptr lhs, graph_tensor_ptr rhs, elt_operator elt_op)
+    : unary_backward_base_t({std::move(lhs), std::move(rhs)}, {}, {}) {
+    set_elt_operator(elt_op);
+    switch (elt_op) {
+        case elt_operator::ABS_BWD: op_name_ = "abs_bwd"; break;
+        case elt_operator::CLAMP_BWD: op_name_ = "clamp_bwd"; break;
+        case elt_operator::ELU_BWD: op_name_ = "elu_bwd"; break;
+        case elt_operator::HARDSWISH_BWD: op_name_ = "hardswish_bwd"; break;
+        case elt_operator::HARDSIGMOID_BWD: op_name_ = "hardsigmoid_bwd"; break;
+        case elt_operator::MISH_BWD: op_name_ = "mish_bwd"; break;
+        case elt_operator::SQRT_BWD: op_name_ = "sqrt_bwd"; break;
+        case elt_operator::TANH_BWD: op_name_ = "tanh_bwd"; break;
+        case elt_operator::SOFTPLUS_BWD: op_name_ = "soft_plus_bwd"; break;
+        default: break;
     }
 }
 
@@ -1117,7 +1271,15 @@ OP_REGISTER(min_op_t, min)
 OP_REGISTER(max_op_t, max)
 OP_REGISTER(squared_diff_op_t, squared_diff)
 OP_REGISTER(prelu_op_t, prelu)
-
+OP_REGISTER(abs_bwd_op_t, abs_bwd)
+OP_REGISTER(clamp_bwd_op_t, clamp_bwd)
+OP_REGISTER(elu_bwd_op_t, elu_bwd)
+OP_REGISTER(hardswish_bwd_op_t, hardswish_bwd)
+OP_REGISTER(hardsigmoid_bwd_op_t, hardsigmoid_bwd)
+OP_REGISTER(sqrt_bwd_op_t, sqrt_bwd)
+OP_REGISTER(mish_bwd_op_t, mish_bwd)
+OP_REGISTER(tanh_bwd_op_t, tanh_bwd)
+OP_REGISTER(softplus_bwd_op_t, soft_plus_bwd)
 } // namespace gc
 } // namespace graph
 } // namespace impl

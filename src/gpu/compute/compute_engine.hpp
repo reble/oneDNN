@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,16 +23,15 @@
 #include <initializer_list>
 
 #include "common/c_types_map.hpp"
-#include "common/engine.hpp"
 #include "common/primitive.hpp"
 #include "common/primitive_desc_iterator.hpp"
 #include "common/resource.hpp"
+#include "common/stream.hpp"
 #include "common/verbose.hpp"
 #include "gpu/compute/device_info.hpp"
 #include "gpu/compute/dispatch.hpp"
 #include "gpu/compute/kernel.hpp"
 #include "gpu/compute/kernel_ctx.hpp"
-#include "gpu/compute/kernel_generator.hpp"
 #include "gpu/jit/jit_generator_base.hpp"
 
 namespace dnnl {
@@ -51,13 +50,6 @@ public:
 
     const device_info_t *device_info() const { return device_info_.get(); }
 
-    virtual status_t create_compiled_bundle(compiled_bundle_t &generator,
-            const std::vector<const char *> &kernel_names,
-            const kernel_ctx_t &kernel_ctx) const = 0;
-
-    virtual status_t create_compiled_kernel(compiled_kernel_t &generator,
-            jit::jit_generator_base &jitter) const = 0;
-
     virtual status_t create_kernel(compute::kernel_t *kernel,
             jit::jit_generator_base *jitter,
             const cache_blob_t &cache_blob) const = 0;
@@ -67,6 +59,16 @@ public:
             const compute::kernel_ctx_t &kernel_ctx,
             const cache_blob_t &cache_blob) const = 0;
 
+    status_t create_kernel_bundle(kernel_bundle_t &bundle,
+            const std::vector<const char *> &kernel_names,
+            const compute::kernel_ctx_t &kernel_ctx,
+            const cache_blob_t &cache_blob = cache_blob_t()) const {
+        std::vector<kernel_t> kernels;
+        CHECK(create_kernels(&kernels, kernel_names, kernel_ctx, cache_blob));
+        bundle = kernel_bundle_t(std::move(kernels), kernel_names);
+        return status::success;
+    }
+
     virtual status_t create_kernels_from_ocl_source(
             std::vector<compute::kernel_t> *kernels,
             const std::vector<const char *> &kernel_names,
@@ -75,11 +77,6 @@ public:
         assert(!"unexpected");
         return status::success;
     };
-
-    virtual status_t create_kernels_from_bundle(
-            std::vector<compute::kernel_t> &kernels,
-            const std::vector<const char *> &kernel_names,
-            const compiled_bundle_t &generator) const = 0;
 
     virtual status_t create_kernel_from_binary(compute::kernel_t &kernel,
             const compute::binary_t &binary, const char *kernel_name) const = 0;
@@ -146,6 +143,10 @@ public:
     }
     bool mayiuse_non_uniform_work_groups() const {
         return device_info_->mayiuse_non_uniform_work_groups();
+    }
+    /// Returns true if the engine can directly access pointers from system allocators
+    bool mayiuse_system_memory_allocators() const {
+        return device_info_->mayiuse_system_memory_allocators();
     }
     bool mayiuse_sub_group(int size) const {
         return device_info_->mayiuse_sub_group(size);

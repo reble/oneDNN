@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@
 #include <sstream>
 
 #include "common/utils.hpp"
-#include "gpu/compute/compute.hpp"
+#include "gpu/compute/device_info.hpp"
 
 // Uncomment this when aborting on ir_assert is desired:
 // #define GPU_ABORT_ON_ERROR
@@ -29,6 +29,13 @@ namespace dnnl {
 namespace impl {
 namespace gpu {
 namespace gpu_utils {
+
+// Replacement implementation of std::enable_if_t from C++14, included here for
+// interoperability with C++11
+template <bool B, class T = void>
+using enable_if_t = typename std::enable_if<B, T>::type;
+template <typename T>
+using is_vector = std::is_same<T, typename std::vector<typename T::value_type>>;
 
 class error_stream_t {
 public:
@@ -90,6 +97,12 @@ private:
             && dnnl::impl::gpu::gpu_utils::error_stream_t( \
                     __FILE__, __LINE__, #cond)
 #endif
+
+#define gpu_error_not_expected() gpu_assert(false) << "Not expected. "
+#define gpu_except_not_implemented(msg) \
+    throw std::runtime_error(std::string(msg) + std::string(" at ") \
+            + std::string(__FILE_NAME__) + std::string(":") \
+            + std::to_string(__LINE__))
 
 template <typename out_type, typename in_type,
         typename std::enable_if<!std::is_fundamental<out_type>::value
@@ -177,6 +190,42 @@ inline compute::gpu_arch_t dev_getenv(const char *s, compute::gpu_arch_t arch,
     return arch;
 #endif
 }
+
+inline bool to_bool(const std::string &s) {
+    if (s == "0" || s == "false") return false;
+    return true;
+}
+
+inline std::vector<std::string> split(const std::string &s,
+        const std::string &delimiter = std::string(1, ' ')) {
+    size_t beg = 0;
+    size_t end = 0;
+    std::vector<std::string> ret;
+    do {
+        end = s.find(delimiter, beg);
+        size_t len
+                = (end == std::string::npos) ? std::string::npos : (end - beg);
+        ret.push_back(s.substr(beg, len));
+        beg = end + delimiter.size();
+    } while (end != std::string::npos);
+    return ret;
+}
+
+inline std::string join(
+        const std::string &delimiter, const std::vector<std::string> &parts) {
+    std::ostringstream oss;
+    bool is_first = true;
+    for (auto &p : parts) {
+        if (!is_first) oss << delimiter;
+        oss << p;
+        is_first = false;
+    }
+    return oss.str();
+}
+
+bool is_jit_dump_enabled();
+status_t dump_kernel_binary(
+        const std::vector<uint8_t> &binary, const std::string &name);
 
 } // namespace gpu_utils
 } // namespace gpu

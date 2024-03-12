@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 *******************************************************************************/
 
 #include "gpu/ocl/binary_types.h"
+#include "gpu/ocl/dispatch.h"
 
 #if IS_TENSOR_OP && IS_DENSE && IS_SAME_MD && !WITH_BINARY_POST_OP
 KERNEL_ATTR
@@ -34,7 +35,7 @@ __kernel void ref_binary(__global DATA_T *src0, __global DATA_T *src1,
     tmp_src1 = tmp_src1 * (*src1_scale);
 #endif
 
-    d = get_eltwise_op(tmp_src0, tmp_src1);
+    d = binary_op(BINARY_ALG, tmp_src0, tmp_src1);
 
     float dst_data;
 #if WITH_SUM
@@ -87,7 +88,7 @@ __kernel void ref_binary(__global SRC0_DATA_T *src0, __global SRC1_DATA_T *src1,
 
     if (dims0[0] >= DST_D0) {
         for (int ic = 0; ic < block_size; ++ic) {
-            dst[dst_off] = TO_DST(DATA_ZERO);
+            dst[dst_off] = TO_DST(0.0f);
             dst_off++;
         }
 
@@ -106,7 +107,7 @@ __kernel void ref_binary(__global SRC0_DATA_T *src0, __global SRC1_DATA_T *src1,
 #if WITH_SRC1_SCALE
             tmp_src1 = tmp_src1 * (*src1_scale);
 #endif
-            d = get_eltwise_op(tmp_src0, tmp_src1);
+            d = binary_op(BINARY_ALG, tmp_src0, tmp_src1);
 
             float dst_data;
 #if WITH_SUM
@@ -141,7 +142,7 @@ __kernel void ref_binary(__global SRC0_DATA_T *src0, __global SRC1_DATA_T *src1,
 #if WITH_SRC1_SCALE
             tmp_src1 = tmp_src1 * (*src1_scale);
 #endif
-            d = get_eltwise_op(tmp_src0, tmp_src1);
+            d = binary_op(BINARY_ALG, tmp_src0, tmp_src1);
 
             float dst_data;
 #if WITH_SUM
@@ -166,7 +167,7 @@ __kernel void ref_binary(__global SRC0_DATA_T *src0, __global SRC1_DATA_T *src1,
         }
 #if DST_D1 != DST_PD1
         for (int ic = 0; ic < min(DST_PD1 - DST_D1, block_size); ic++) {
-            dst[dst_off] = TO_DST(DATA_ZERO);
+            dst[dst_off] = TO_DST(0.0f);
             dst_off++;
         }
 #endif

@@ -16,6 +16,7 @@
 
 #include "../visitor.hpp"
 #include "transform.hpp"
+#include <compiler/ir/graph/fusible_op.hpp>
 #include <compiler/ir/graph/pass/pass.hpp>
 #include <ops/convolution.hpp>
 #include <ops/templates/conv_rl.hpp>
@@ -36,16 +37,16 @@ static inline int get_full_lowering_threshold(int tile_col) {
 
 static bool use_rl(const context_ptr &ctx, const sc_data_type_t &data_dtype,
         const sc_dims &data_dims, const sc_dims &weight_dims,
-        const sc_dims &pads_begin, const sc_dims &pads_end) {
+        const sc_dims &pads_begin, const sc_dims &pads_end, const int &groups) {
     auto ndims = data_dims.size();
-    assert(ndims == 4 && weight_dims.size() == ndims);
+    assert(ndims == 4UL + (groups > 1) && weight_dims.size() == ndims);
     if (!ops::is_amx_dtype(ctx, data_dtype)) { return false; }
     bool is_vnni_low_fp = ops::is_vnni_low_fp(ctx, data_dtype);
     int vnni_blk = is_vnni_low_fp ? 2 : 4;
     int tile_col = is_vnni_low_fp ? 32 : 64;
     int threshold = get_full_lowering_threshold(tile_col);
-    bool is_1x1 = std::all_of(weight_dims.begin() + 2, weight_dims.end(),
-            [](int x) { return x == 1; });
+    bool is_1x1 = std::all_of(weight_dims.begin() + 2 + (groups > 1),
+            weight_dims.end(), [](int x) { return x == 1; });
     bool is_small_padding = std::all_of(pads_begin.begin(), pads_begin.end(),
                                     [weight_dims, ndims](int x) {
                                         return x <= weight_dims[ndims - 1];
@@ -53,26 +54,33 @@ static bool use_rl(const context_ptr &ctx, const sc_data_type_t &data_dtype,
             && std::all_of(pads_end.begin(), pads_end.end(),
                     [weight_dims, ndims](
                             int x) { return x <= weight_dims[ndims - 1]; });
-    auto ic = weight_dims[1];
-    auto kw = weight_dims[ndims - 1];
-    return (!is_1x1 && ndims == 4 && is_small_padding && (ic <= (tile_col / 2))
-            && ((ic % vnni_blk != 0 && kw * ic <= threshold)
-                    || (ic % vnni_blk == 0)));
+    auto ic = weight_dims[1 + (groups > 1)];
+    auto kh = weight_dims[ndims - 2];
+    auto ih = data_dims[ndims - 2];
+
+    // Note: the current rl algorithm expects kw <= iw for init aux buffer
+    // handling
+    return (!is_1x1 && ndims == 4UL + (groups > 1) && is_small_padding
+            && (ic <= (tile_col / 2))
+            && ((ic % vnni_blk != 0 && kh * ic <= threshold)
+                    || (ic % vnni_blk == 0))
+            && kh <= ih);
 }
 
 static void query_accu_info_for_rl(const context_ptr &ctx,
         const sc_data_type_t &dtype, const int kh, const int kw, const int ic,
-        const int LDA, int &num_brgemm_k, int &brgemm_k, int &extra_padding,
-        int &kind) {
+        int &num_brgemm_k, int &brgemm_k, int &extra_padding, int &kind,
+        int groups) {
     assert(ops::is_amx_dtype(ctx, dtype));
     bool is_vnni_low_fp = ops::is_vnni_low_fp(ctx, dtype);
     int vnni_blk = is_vnni_low_fp ? 2 : 4;
     int tile_col = is_vnni_low_fp ? 32 : 64;
     int threshold = get_full_lowering_threshold(tile_col);
 
-    if (kw * ic <= threshold) {
+    // Notes: Here force group conv with small ic to conv_rl because group convs
+    // will prefer NHWGC while the kw_lowering only support NGHWC now
+    if (kw * ic <= threshold || ic % vnni_blk != 0 || groups > 1) {
         kind = ops::rl_kind::FULL_LOWERING;
-
         auto total_raw_accu = kw * kh * ic;
         num_brgemm_k = utils::divide_and_ceil(total_raw_accu, tile_col);
         auto total_padded_accu
@@ -82,49 +90,9 @@ static void query_accu_info_for_rl(const context_ptr &ctx,
     } else {
         kind = ops::rl_kind::KW_LOWERING;
 
-        int padding1 = 0, padding2 = 0;
-        int brgemm_k1 = 0, brgemm_k2 = 0;
-        int num_brgemm_k1 = 0, num_brgemm_k2 = 0;
-        auto get_num_brgemm_k_and_padding
-                = [&ic, &kh, &kw](int brg_k, int &num_brg_k, int &padding) {
-                      num_brg_k = utils::divide_and_ceil(ic * kw, brg_k) * kh;
-                      auto padded_accu_per_row = brg_k * num_brg_k / kh;
-                      padding = padded_accu_per_row - ic * kw;
-                  };
-        {
-            // 1) greedy
-            int k_len = 1;
-            for (; k_len <= kw; ++k_len) {
-                if (ic * k_len > tile_col) break;
-            }
-            assert(k_len > 1);
-            brgemm_k1 = ic * (k_len - 1);
-            get_num_brgemm_k_and_padding(brgemm_k1, num_brgemm_k1, padding1);
-        }
-
-        {
-            // 2) compact
-            int num_k = utils::divide_and_ceil(ic * kw, tile_col);
-            int num_kw = utils::divide_and_ceil(kw, num_k);
-            while (num_kw * ic > tile_col)
-                num_kw--;
-            brgemm_k2 = ic * num_kw;
-            get_num_brgemm_k_and_padding(brgemm_k2, num_brgemm_k2, padding2);
-        }
-
-        if (padding1 < padding2) {
-            brgemm_k = brgemm_k1;
-            num_brgemm_k = num_brgemm_k1;
-            extra_padding = padding1;
-        } else {
-            brgemm_k = brgemm_k2;
-            num_brgemm_k = num_brgemm_k2;
-            extra_padding = padding2;
-        }
-        COMPILE_ASSERT(extra_padding % ic == 0,
-                "Expect extra_padding is dividable by ic, but got "
-                "extra_padding="
-                        << extra_padding << ",ic=" << ic << ".");
+        brgemm_k = ic * kw;
+        num_brgemm_k = kh;
+        extra_padding = 0;
     }
 }
 
@@ -144,6 +112,11 @@ void rl_conv_weight_transform(sc_graph_t &graph, const context_ptr &ctx) {
             auto data_dtype = op->info_.inputs_[0]->details_.dtype_;
             auto ndims = data_plain_dims.size();
             sc_dim groups = op->attrs_.get_or_else("groups", 1);
+            if (ndims != 4UL + (groups > 1)) { return; }
+            // depthwise convolution
+            bool is_dw_brdgmm = groups > 1 && 1 == weight_plain_dims[1]
+                    && 1 == data_plain_dims[2];
+            if (is_dw_brdgmm) { return; }
             auto dilations = ops::get_dilations(op->attrs_);
             auto has_dilation = std::any_of(dilations.begin(), dilations.end(),
                     [](int x) { return x != 1; });
@@ -151,16 +124,16 @@ void rl_conv_weight_transform(sc_graph_t &graph, const context_ptr &ctx) {
             // kw, might be supported in future
             if (has_dilation) { return; };
 
-            if (ndims != 4) { return; }
             COMPILE_ASSERT(weight_plain_dims.size() == ndims,
                     "Weight dims size is expected equal to data dims, but got "
                             << weight_plain_dims.size() << " vs. " << ndims
                             << ".");
-            COMPILE_ASSERT(weight_plain_dims[1] == data_plain_dims[1] / groups,
+            COMPILE_ASSERT(weight_plain_dims[1 + (groups > 1)]
+                            == data_plain_dims[1 + (groups > 1)],
                     "Weight_plain_dims[1] is expected equal to "
-                    "data_plain_dims[1]/groups, but got "
-                            << weight_plain_dims[1] << " vs. "
-                            << data_plain_dims[1] / groups << ".");
+                    "data_plain_dims[1], but got "
+                            << weight_plain_dims[1 + (groups > 1)] << " vs. "
+                            << data_plain_dims[1 + (groups > 1)] << ".");
             sc_dims pads_begin, pads_end;
             if (op->attrs_.has_key("pads_begin")) {
                 pads_begin = op->attrs_.get<sc_dims>("pads_begin");
@@ -172,24 +145,23 @@ void rl_conv_weight_transform(sc_graph_t &graph, const context_ptr &ctx) {
 
             sc_dims strides = op->attrs_.get<sc_dims>("strides");
             if (!use_rl(ctx, data_dtype, data_plain_dims, weight_plain_dims,
-                        pads_begin, pads_end)) {
+                        pads_begin, pads_end, groups)) {
                 return;
             }
 
-            auto oc = weight_plain_dims[0];
+            auto oc = weight_plain_dims[(groups > 1)];
             auto kh = weight_plain_dims[ndims - 2];
             auto kw = weight_plain_dims[ndims - 1];
-            auto ic = data_plain_dims[1] / groups;
+            auto ic = data_plain_dims[1 + (groups > 1)];
             auto &stride = op->attrs_.get<sc_dims>("strides");
             auto sw = !stride.empty() ? stride[1] : stride[0];
             int num_brgemm_k = 1;
             int brgemm_k = 1;
             int extra_padding = 0;
             auto kind = ops::rl_kind::NO_LOWERING;
-            auto LDA = kw * ic * sw;
 
-            query_accu_info_for_rl(ctx, data_dtype, kh, kw, ic, LDA,
-                    num_brgemm_k, brgemm_k, extra_padding, kind);
+            query_accu_info_for_rl(ctx, data_dtype, kh, kw, ic, num_brgemm_k,
+                    brgemm_k, extra_padding, kind, groups);
             if (kind == ops::rl_kind::NO_LOWERING) { return; }
 #if 0
             //     fall-back for small amx utilization
@@ -204,7 +176,7 @@ void rl_conv_weight_transform(sc_graph_t &graph, const context_ptr &ctx) {
                           };
                 if (ops::is_amx_dtype(ctx, data_dtype)
                         && low_tmul_utilization(
-                                oc / groups, brgemm_k, data_dtype)) {
+                                oc, brgemm_k, data_dtype)) {
                     return;
                 }
 #endif
@@ -213,7 +185,9 @@ void rl_conv_weight_transform(sc_graph_t &graph, const context_ptr &ctx) {
             op->attrs_["num_brgemm_k"] = num_brgemm_k;
             op->attrs_["brgemm_k"] = brgemm_k;
             op->attrs_["extra_padding"] = extra_padding;
-            op->attrs_["origin_wei_plain_dims"] = sc_dims {oc, ic, kh, kw};
+            op->attrs_["origin_wei_plain_dims"] = groups > 1
+                    ? sc_dims {groups, oc, ic, kh, kw}
+                    : sc_dims {oc, ic, kh, kw};
 
             auto weight = op->get_inputs()[1];
             auto weight_op = weight->producer_owner_;
@@ -222,9 +196,12 @@ void rl_conv_weight_transform(sc_graph_t &graph, const context_ptr &ctx) {
                             "constant", const_kind::not_const));
             if (kind == ops::rl_kind::FULL_LOWERING) {
                 // B-OIHW->reorder->HWIO->view->KN->(padding on "K")
-                auto wei_shape_2d = sc_dims {ic * kh * kw, oc};
+                auto wei_shape_2d = sc_dims {ic * kh * kw, groups * oc};
                 auto trans_wei = graph.make("reorder", {weight}, {},
-                        {{"out_format", sc_data_format_t(format_kinds::CDBA)},
+                        {{"out_format",
+                                 sc_data_format_t(groups > 1
+                                                 ? format_kinds::EDCAB
+                                                 : format_kinds::DCBA)},
                                 {"internal", true}});
                 if (is_constant_weight) {
                     trans_wei->attrs_.set("constant", const_kind::local_const);
@@ -257,20 +234,7 @@ void rl_conv_weight_transform(sc_graph_t &graph, const context_ptr &ctx) {
                     op->replace_input(1, view_wei->get_outputs()[0], true);
                 }
             } else {
-                // B-OIHW->OIHW'(padding on rhs of "W")
-                if (extra_padding > 0) {
-                    auto padded_wei = graph.make("padding", {weight}, {},
-                            {{"pads_begin", sc_dims {0, 0}},
-                                    {"pads_end",
-                                            sc_dims {0, extra_padding / ic}}});
-
-                    if (is_constant_weight) {
-                        padded_wei->attrs_.set(
-                                "constant", const_kind::local_const);
-                    }
-                    op->replace_input(1, padded_wei->get_outputs()[0], true);
-                    vis->update_state_for_visited(padded_wei);
-                }
+                // noops as no need to re-layout weight/inputs
             }
         }
     });

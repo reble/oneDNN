@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #define GPU_JIT_UTILS_UTILS_HPP
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <fstream>
 #include <functional>
@@ -27,6 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "common/math_utils.hpp"
 #include "common/utils.hpp"
 #include "gpu/compute/device_info.hpp"
 #include "gpu/utils.hpp"
@@ -49,21 +51,21 @@ inline std::ostream &operator<<(std::ostream &out, const T &obj) {
 
 namespace ir_utils {
 
+const int LOG_DYNAMIC = -1;
 const int LOG_OFF = 0;
+const int LOG_FATAL = 50;
 const int LOG_WARNING = 100;
 const int LOG_SUGGESTION = 120;
 const int LOG_INFO = 150;
 const int LOG_PERF = 170;
 const int LOG_TRACE = 200;
-
-#ifdef DNNL_DEV_MODE
-const int LOG_LEVEL = LOG_WARNING;
-#else
-const int LOG_LEVEL = LOG_OFF;
-#endif
+const int LOG_CHECK_DEFAULT = LOG_TRACE;
 
 template <typename T>
 size_t get_hash(const T &t);
+
+template <typename T, size_t N>
+size_t get_hash(const std::array<T, N> &a);
 
 template <typename T>
 size_t get_hash(const std::vector<T> &v);
@@ -113,6 +115,14 @@ size_t get_hash(const T &t) {
     return get_hash_helper_t<T>::call(t);
 }
 
+template <typename T, size_t N>
+size_t get_hash(const std::array<T, N> &a) {
+    size_t h = 0;
+    for (auto &e : a)
+        h = hash_combine(h, get_hash(e));
+    return h;
+}
+
 template <typename T>
 size_t get_hash(const std::vector<T> &v) {
     size_t h = 0;
@@ -127,6 +137,11 @@ size_t get_hash(const ArgsT &...args) {
     get_hash_impl(h, args...);
     return h;
 }
+
+template <typename T>
+struct hasher_t {
+    size_t operator()(const T &t) const { return t.get_hash(); }
+};
 
 template <typename T, typename U, typename = void>
 struct is_equal_helper_t {
@@ -200,30 +215,59 @@ bool contains(const std::vector<T> &vec, const U &u) {
 #define ir_error_not_expected() ir_assert(false) << "Not expected. "
 #define ir_except_not_implemented(msg) throw std::runtime_error(msg)
 
-template <int level>
-class logger_t {
+template <int level, bool value = true, bool add_new_line = false>
+class base_logger_t {
 public:
-    logger_t(std::ostream &out = std::cout) : out_(out) {}
-
-    operator bool() const { return true; }
-
-    static bool is_enabled() {
+    template <int L = level>
+    base_logger_t(
+            typename std::enable_if<L == LOG_DYNAMIC, int>::type dynamic_level,
+            std::ostream &out = std::cout)
+        : dynamic_level_(dynamic_level), out_(out) {}
+    template <int L = level>
+    base_logger_t(
+            typename std::enable_if<L != LOG_DYNAMIC, std::ostream &>::type out
+            = std::cout)
+        : out_(out) {}
+    ~base_logger_t() {
+        if (add_new_line && !is_first_print_) out_ << std::endl;
 #if defined(DNNL_DEV_MODE)
-        return get_verbose(verbose_t::debuginfo) >= level;
+        if (get_level() <= LOG_FATAL) {
+            out_ << "Aborting after fatal error..." << std::endl;
+            abort();
+        }
+#endif
+    }
+
+    template <int L = level>
+    static typename std::enable_if<L != LOG_DYNAMIC, bool>::type is_enabled() {
+#if defined(DNNL_DEV_MODE)
+        return level <= LOG_FATAL || get_verbose(verbose_t::debuginfo) >= level;
 #else
         return false;
 #endif
     }
 
+    template <int L = level>
+    typename std::enable_if<L != LOG_DYNAMIC, int>::type get_level() const {
+        return level;
+    }
+
+    template <int L = level>
+    typename std::enable_if<L == LOG_DYNAMIC, int>::type get_level() const {
+        return dynamic_level_;
+    }
+
+    operator bool() const { return value; }
+
     template <typename T>
-    logger_t &operator<<(const T &obj) {
+    base_logger_t &operator<<(const T &obj) {
         using dnnl::impl::gpu::jit::operator<<;
         maybe_print_header();
         out_ << obj;
         return *this;
     }
 
-    logger_t &operator<<(std::ostream &(*os)(std::ostream &)) {
+    base_logger_t &operator<<(std::ostream &(*os)(std::ostream &)) {
         maybe_print_header();
         out_ << os;
         return *this;
@@ -233,7 +277,8 @@ private:
     void maybe_print_header() {
         if (!is_first_print_) return;
 
-        switch (level) {
+        switch (get_level()) {
+            case LOG_FATAL: out_ << "[FATAL] "; break;
             case LOG_WARNING: out_ << "[WARNING] "; break;
             case LOG_SUGGESTION: out_ << "[SUGGESTION] "; break;
             default: break;
@@ -241,9 +286,47 @@ private:
         is_first_print_ = false;
     }
 
+    int dynamic_level_ = level;
     std::ostream &out_;
     bool is_first_print_ = true;
 };
+
+template <int level>
+class logger_t : public base_logger_t<level> {
+public:
+    logger_t() : base_logger_t<level>() {}
+};
+
+class ir_check_log_level_t {
+public:
+    static int level() { return level_; }
+    static bool is_enabled() {
+#if defined(DNNL_DEV_MODE)
+        switch (level_) {
+            case LOG_FATAL: return logger_t<LOG_FATAL>::is_enabled();
+            case LOG_TRACE: return logger_t<LOG_TRACE>::is_enabled();
+            default: abort();
+        }
+#else
+        return false;
+#endif
+    }
+    ir_check_log_level_t(int new_level) {
+        old_level_ = level_;
+        level_ = new_level;
+    }
+    ~ir_check_log_level_t() { level_ = old_level_; }
+    ir_check_log_level_t(const ir_check_log_level_t &) = delete;
+
+private:
+    static thread_local int level_;
+    int old_level_ = LOG_CHECK_DEFAULT;
+};
+
+template <bool value = true, bool add_new_line = false>
+base_logger_t<LOG_DYNAMIC, value, add_new_line> make_logger(int level) {
+    return base_logger_t<LOG_DYNAMIC, value, add_new_line>(level);
+}
 
 #define ir_perf() \
     ir_utils::logger_t<ir_utils::LOG_PERF>::is_enabled() \
@@ -270,6 +353,29 @@ private:
 #define ir_trace() \
     ir_utils::logger_t<ir_utils::LOG_TRACE>::is_enabled() \
             && ir_utils::logger_t<ir_utils::LOG_TRACE>()
+
+#define ir_check(cond) \
+    if (!(cond)) \
+    return ir_utils::ir_check_log_level_t::is_enabled() \
+            && ir_utils::make_logger<false, true>( \
+                    ir_utils::ir_check_log_level_t::level())
+
+// This macro enables logging in all nested ir_check() calls. This is useful
+// when a check function can be used in scenarios when a failed check is
+// expected (regular check) or unexpected (e.g. debug assertion).
+// Example 1 (regular check):
+//     for (auto &cfg: generate_configs()) {
+//         // No logging here.
+//         if (!cfg.is_ok()) continue;
+//         ...
+//     }
+//
+// Example 2 (debug assertion):
+//     auto config = read_from_environment(...);
+//     // Detailed logging will show the cause of the failed assertion.
+//     ir_assert(ir_check_fatal(config.is_ok()));
+#define ir_check_fatal(call) \
+    (ir_utils::ir_check_log_level_t(ir_utils::LOG_FATAL), (call))
 
 // Pretty printers for STL objects.
 template <typename KeyT, typename HashT, typename EqualT>
@@ -327,6 +433,45 @@ inline std::ostream &operator<<(std::ostream &out, const std::vector<T> &v) {
     out << "]";
     return out;
 }
+
+template <typename T, typename = void>
+struct str_ostream_helper_t {
+    static std::string call(const T &t) {
+        ir_error_not_expected();
+        return {};
+    }
+};
+
+template <typename T>
+struct str_ostream_helper_t<T,
+        decltype(std::declval<std::ostream>() << std::declval<T>(), void())> {
+    static std::string call(const T &t) {
+        std::ostringstream oss;
+        oss << t;
+        return oss.str();
+    }
+};
+
+template <typename T, typename = void>
+struct str_helper_t {
+    static std::string call(const T &t) {
+        return str_ostream_helper_t<T>::call(t);
+    }
+};
+
+template <typename T>
+struct str_helper_t<T, decltype(std::declval<T>().str(), void())> {
+    static std::string call(const T &t) { return t.str(); }
+};
+
+template <typename T>
+struct str_helper_t<std::vector<T>, void> {
+    static std::string call(const std::vector<T> &v) {
+        std::ostringstream oss;
+        oss << v;
+        return oss.str();
+    }
+};
 
 // Helper class to pretty-print tables.
 // Each operator<<() call corresponds to one cell/header. std::endl or '/n'
@@ -419,26 +564,6 @@ inline std::string to_string(bool b) {
     return b ? "True" : "False";
 }
 
-inline bool to_bool(const std::string &s) {
-    if (s == "0" || s == "false") return false;
-    return true;
-}
-
-inline std::vector<std::string> split(const std::string &s,
-        const std::string &delimiter = std::string(1, ' ')) {
-    size_t beg = 0;
-    size_t end = 0;
-    std::vector<std::string> ret;
-    while (end != std::string::npos) {
-        beg = (end == 0) ? 0 : end + delimiter.size();
-        end = s.find(delimiter, beg);
-        size_t len
-                = (end == std::string::npos) ? std::string::npos : (end - beg);
-        ret.push_back(s.substr(beg, len));
-    }
-    return ret;
-}
-
 inline std::string to_lower(const std::string &s) {
     auto ret = s;
     std::transform(ret.begin(), ret.end(), ret.begin(),
@@ -446,12 +571,31 @@ inline std::string to_lower(const std::string &s) {
     return ret;
 }
 
-inline std::string add_indent(const std::string &s, const std::string &indent) {
-    auto lines = split(s, "\n");
+inline std::string add_indent(const std::string &s, const std::string &indent,
+        bool skip_first = false) {
+    auto lines = gpu_utils::split(s, "\n");
     std::ostringstream oss;
     for (int i = 0; i < (int)lines.size(); i++) {
         if (i > 0) oss << std::endl;
-        oss << indent << lines[i];
+        if (i == 0 && skip_first) {
+            oss << " ";
+        } else {
+            oss << indent;
+        }
+        oss << lines[i];
+    }
+    return oss.str();
+}
+
+inline std::string add_tag(
+        const std::string &tag, const std::string &s, bool eol = true) {
+    std::ostringstream oss;
+    oss << tag << ":";
+    if (s.empty()) {
+        oss << " (empty)";
+    } else {
+        if (eol) oss << std::endl;
+        oss << add_indent(s, "  ", /*skip_first=*/!eol);
     }
     return oss.str();
 }
@@ -476,6 +620,11 @@ template <typename T, typename U>
 inline T safe_divide(T a, U b) {
     ir_assert(b != 0 && a % b == 0) << "Can't divide: " << a << " / " << b;
     return a / b;
+}
+
+template <typename T, typename U>
+inline T safe_div(T a, U b) {
+    return safe_divide(a, b);
 }
 
 template <typename ContainerT, typename T>
@@ -555,6 +704,12 @@ float dequantize(T t, float v_min = 0, float v_max = 1) {
     return v_min + f * (v_max - v_min);
 }
 
+template <class T>
+struct is_array_helper_t : std::false_type {};
+
+template <class T, size_t N>
+struct is_array_helper_t<std::array<T, N>> : std::true_type {};
+
 template <typename T>
 void serialize(const T &t, std::ostream &out);
 
@@ -565,7 +720,8 @@ struct serialize_helper_t {
 
 template <typename T>
 struct serialize_helper_t<T,
-        typename std::enable_if<std::is_trivial<T>::value>::type> {
+        typename std::enable_if<std::is_trivial<T>::value
+                && !is_array_helper_t<T>::value>::type> {
     static void call(const T &t, std::ostream &out) {
         out.write((const char *)&t, sizeof(t));
     }
@@ -587,6 +743,18 @@ struct serialize_helper_t<std::vector<T>, void> {
     }
 };
 
+template <typename KeyT, typename ValueT, typename HashT>
+struct serialize_helper_t<std::unordered_map<KeyT, ValueT, HashT>, void> {
+    static void call(const std::unordered_map<KeyT, ValueT, HashT> &m,
+            std::ostream &out) {
+        serialize((int)m.size(), out);
+        for (auto &kv : m) {
+            serialize(kv.first, out);
+            serialize(kv.second, out);
+        }
+    }
+};
+
 template <>
 struct serialize_helper_t<std::string, void> {
     static void call(const std::string &s, std::ostream &out) {
@@ -598,6 +766,12 @@ struct serialize_helper_t<std::string, void> {
 template <typename T>
 void serialize(const T &t, std::ostream &out) {
     serialize_helper_t<T>::call(t, out);
+}
+
+template <typename T>
+void serialize(const T &t, const std::string &path) {
+    std::ofstream out(path, std::ios::binary);
+    serialize(t, out);
 }
 
 template <typename T>
@@ -614,7 +788,8 @@ struct deserialize_helper_t {
 
 template <typename T>
 struct deserialize_helper_t<T,
-        typename std::enable_if<std::is_trivial<T>::value>::type> {
+        typename std::enable_if<std::is_trivial<T>::value
+                && !is_array_helper_t<T>::value>::type> {
     static T call(std::istream &in) {
         T ret;
         in.read((char *)&ret, sizeof(ret));
@@ -642,6 +817,20 @@ struct deserialize_helper_t<std::vector<T>, void> {
     }
 };
 
+template <typename KeyT, typename ValueT, typename HashT>
+struct deserialize_helper_t<std::unordered_map<KeyT, ValueT, HashT>, void> {
+    static std::unordered_map<KeyT, ValueT, HashT> call(std::istream &in) {
+        int size = deserialize<int>(in);
+        std::unordered_map<KeyT, ValueT, HashT> ret;
+        for (int i = 0; i < size; i++) {
+            auto k = deserialize<KeyT>(in);
+            auto v = deserialize<ValueT>(in);
+            ret.emplace(k, v);
+        }
+        return ret;
+    }
+};
+
 template <>
 struct deserialize_helper_t<std::string, void> {
     static std::string call(std::istream &in) {
@@ -658,34 +847,92 @@ T deserialize(std::istream &in) {
 }
 
 template <typename T>
-void serialize_to_file(
-        const T &t, const std::string &file_name, const std::string &var_name) {
+void deserialize(T &t, std::istream &in) {
+    t = deserialize<T>(in);
+}
+
+template <typename T>
+void deserialize(T &t, const std::string &path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) {
+        t = T();
+        return;
+    }
+    t = deserialize<T>(in);
+}
+
+template <typename T>
+void serialize_to_file(const T &t, const std::string &file_name,
+        const std::string &var_name,
+        const std::vector<std::string> &namespaces = {}) {
     std::ostringstream t_oss;
     serialize(t, t_oss);
     auto str = t_oss.str();
     auto data = std::vector<uint8_t>(str.begin(), str.end());
     std::ostringstream oss;
-    oss << "std::vector<uint64_t> " << var_name << " = {" << std::endl;
+    oss << "#include <cstdint>\n";
+    oss << "#include <vector>\n\n";
+    for (auto &ns : namespaces)
+        oss << "namespace " << ns << " {\n";
+    oss << "\n// clang-format off\n";
+    oss << "const std::vector<uint64_t> &get_" << var_name << "() {\n";
+    oss << "    static std::vector<uint64_t> data = {\n";
+    oss << "        ";
     size_t bytes = data.size();
     size_t u64_bytes = sizeof(uint64_t);
     for (size_t i = 0; i < bytes; i += u64_bytes) {
         uint64_t v = 0;
-        for (size_t j = 0; j < std::min(bytes - i, u64_bytes); j++) {
-            v |= ((uint64_t)data[i + j]) << (j * 8);
-        }
+        size_t len = std::min(bytes - i, u64_bytes);
+        std::memcpy(&v, &data[i], len);
         oss << "0x" << std::setfill('0') << std::setw(16) << std::hex << v;
         if (i + u64_bytes < bytes) {
+            bool eol = ((i / u64_bytes + 1) % 8 == 0);
             oss << ",";
-            if ((i / u64_bytes + 1) % 8 == 0) {
-                oss << std::endl;
-            } else {
-                oss << " ";
-            }
+            oss << (eol ? "\n        " : " ");
         }
     }
-    oss << "};";
+    oss << "\n    };";
+    oss << "\n    return data;";
+    oss << "\n};";
+    oss << "\n// clang-format on\n\n";
+    for (auto it = namespaces.rbegin(); it != namespaces.rend(); it++)
+        oss << "} // namespace " << *it << "\n";
     std::ofstream out(file_name);
-    out << oss.str() << std::endl;
+    out << oss.str();
+}
+
+inline bool str_to_bool(const std::string &s) {
+    if (utils::one_of(s, "1", "true", "True")) return true;
+    return false;
+}
+
+inline int str_to_int(const std::string &s) {
+    return std::stoi(s);
+}
+
+inline std::string to_string(prop_kind_t prop) {
+    switch (prop) {
+#define CASE(value, name) \
+    case prop_kind::value: return #name
+        CASE(undef, undef);
+        CASE(forward, fwd);
+        CASE(backward_data, bwd_d);
+        CASE(backward_weights, bwd_w);
+#undef CASE
+        default: ir_error_not_expected();
+    }
+    return {};
+}
+
+inline prop_kind_t str_to_prop_kind(const std::string &s) {
+#define CASE(value) \
+    if (to_string(prop_kind::value) == s) return prop_kind::value
+    CASE(forward);
+    CASE(backward_data);
+    CASE(backward_weights);
+#undef CASE
+    ir_error_not_expected();
+    return prop_kind::undef;
 }
 
 inline bool is_big_endian() {
@@ -739,6 +986,146 @@ public:
 private:
     int32_t seed_;
 };
+
+template <typename T>
+class cli_iface_t {
+public:
+    using get_func_t = std::string (&)(const T *);
+    using set_func_t = void (&)(T *, const std::string &);
+
+    void add_arg(const std::string &key, const std::string &help,
+            get_func_t getter, set_func_t setter) {
+        args_.emplace_back((int)args_.size(), key, help, getter, setter);
+    }
+
+    void parse(const std::string &s, T *obj) {
+        bool is_help = (s.find("--help") != std::string::npos);
+        if (is_help) {
+            for (auto &a : args_) {
+                std::cout << "  ";
+                std::cout << std::left << std::setw(22) << a.key;
+                std::cout << a.help << std::endl;
+            }
+            exit(0);
+            return;
+        }
+        std::vector<bool> seen(args_.size());
+        auto parse_part = [&](const std::string &key,
+                                  const std::string &value) {
+            for (auto &a : args_) {
+                if (a.key == key) {
+                    if (seen[a.idx]) {
+                        std::cout << "Error: argument set twice: " << key
+                                  << std::endl;
+                        ir_error_not_expected();
+                    }
+                    a.setter(obj, value);
+                    seen[a.idx] = true;
+                    return;
+                }
+            }
+            std::cout << "Error: unknown argument: " << key << std::endl;
+            ir_error_not_expected();
+        };
+        std::vector<std::string> parts;
+        for (auto &p : gpu_utils::split(s, " ")) {
+            if (p.empty()) continue;
+            parts.push_back(p);
+        }
+        int nparts = (int)parts.size();
+        for (int i = 0; i < nparts; i += 2) {
+            if (i + 1 >= nparts) {
+                std::cout << "Error: value is missing for argument: "
+                          << parts[i] << std::endl;
+                ir_error_not_expected();
+            }
+            parse_part(parts[i], parts[i + 1]);
+        }
+    }
+
+    std::string cmd_str(const T *obj) const {
+        std::vector<std::string> parts;
+        auto add = [&](const std::string &key, const std::string &value) {
+            if (value.empty()) return;
+            parts.push_back(key);
+            parts.push_back(value);
+        };
+        for (auto &a : args_) {
+            add(a.key, a.getter(obj));
+        }
+        std::ostringstream oss;
+        bool is_first = true;
+        for (auto &p : parts) {
+            if (!is_first) oss << " ";
+            oss << p;
+            is_first = false;
+        }
+        return oss.str();
+    }
+
+private:
+    struct arg_t {
+        arg_t(int idx, const std::string &key, const std::string &help,
+                get_func_t getter, set_func_t setter)
+            : idx(idx), key(key), help(help), getter(getter), setter(setter) {}
+
+        int idx = -1;
+        std::string key;
+        std::string help;
+        get_func_t getter;
+        set_func_t setter;
+        bool is_parsed = false;
+    };
+
+    std::vector<arg_t> args_;
+};
+
+inline std::unordered_map<std::string, int> to_string_int_map(
+        const std::string &s) {
+    std::unordered_map<std::string, int> ret;
+    int name_beg = -1;
+    int value_beg = -1;
+    for (int pos = 0; pos < (int)s.size() + 1; pos++) {
+        bool prev_digit = pos > 0 && std::isdigit(s[pos - 1]);
+        bool cur_digit = pos < (int)s.size() && std::isdigit(s[pos]);
+        if ((pos == 0 || prev_digit) && !cur_digit) {
+            if (name_beg != -1 && value_beg != -1) {
+                auto key = s.substr(name_beg, value_beg - name_beg);
+                auto value = std::stoi(s.substr(value_beg, pos - value_beg));
+                ret[key] = value;
+            }
+            name_beg = pos;
+            value_beg = -1;
+        }
+        if (!prev_digit && cur_digit) value_beg = pos;
+    }
+    return ret;
+}
+
+// Adapted version of magicgu function from Hacker's Delight 10-15.
+inline void idiv_magicgu(uint32_t d, uint32_t &m, uint32_t &p) {
+    uint32_t s32_max = std::numeric_limits<int32_t>::max();
+    ir_assert(d != 0 && d <= s32_max);
+    uint64_t nc = (s32_max / d) * d - 1;
+    for (p = 32; p < 64; p++) {
+        uint64_t _2p = 1LL << p;
+        if (_2p > nc * (d - 1 - (_2p - 1) % d)) {
+            m = (_2p + d - 1 - (_2p - 1) % d) / d;
+            return;
+        }
+    }
+    ir_error_not_expected();
+}
+
+inline uint64_t idiv_magicgu_packed(uint32_t d) {
+    uint32_t m = 0, p = 0;
+    if (math::is_pow2(d)) {
+        p = math::ilog2q(d);
+    } else {
+        ir_utils::idiv_magicgu(d, m, p);
+    }
+    return m + (static_cast<uint64_t>(p) << 32);
+}
 
 } // namespace ir_utils
 } // namespace jit

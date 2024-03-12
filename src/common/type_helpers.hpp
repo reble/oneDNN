@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -83,6 +83,8 @@ namespace types {
 inline size_t data_type_size(data_type_t data_type) {
     using namespace data_type;
     switch ((int)data_type) {
+        case f8_e5m2: return sizeof(prec_traits<f8_e5m2>::type);
+        case f8_e4m3: return sizeof(prec_traits<f8_e4m3>::type);
         case f16: return sizeof(prec_traits<f16>::type);
         case bf16: return sizeof(prec_traits<bf16>::type);
         case tf32: // the tf32 type is an f32
@@ -91,6 +93,8 @@ inline size_t data_type_size(data_type_t data_type) {
         case s32: return sizeof(prec_traits<s32>::type);
         case s8: return sizeof(prec_traits<s8>::type);
         case u8: return sizeof(prec_traits<u8>::type);
+        case s4: return sizeof(prec_traits<s4>::type);
+        case u4: return sizeof(prec_traits<u4>::type);
         case boolean: return sizeof(prec_traits<boolean>::type);
         case data_type::undef:
         default: assert(!"unknown data_type");
@@ -105,6 +109,8 @@ inline T max_value(data_type_t data_type) {
     case x: \
         return static_cast<T>(nstl::numeric_limits<prec_traits<x>::type>::max())
     switch (data_type) {
+        CASE(f8_e5m2);
+        CASE(f8_e4m3);
         CASE(f16);
         CASE(bf16);
         CASE(s32);
@@ -126,6 +132,8 @@ inline float max_value(data_type_t data_type) {
         return static_cast<float>( \
                 nstl::numeric_limits<prec_traits<x>::type>::max())
     switch (data_type) {
+        CASE(f8_e5m2);
+        CASE(f8_e4m3);
         CASE(f16);
         CASE(bf16);
         CASE(s8);
@@ -191,11 +199,28 @@ inline bool blocking_desc_is_equal(const memory_desc_t &lhs_md,
         const memory_desc_t &rhs_md, bool ignore_strides = false) {
     using dnnl::impl::utils::array_cmp;
 
-    assert(lhs_md.format_kind == format_kind::blocked);
-    assert(rhs_md.format_kind == format_kind::blocked);
+    auto is_sparse_packed_desc = [](const memory_desc_t &md) {
+        return md.format_kind == format_kind::sparse
+                && md.format_desc.sparse_desc.encoding
+                == sparse_encoding::packed;
+    };
 
-    const auto &lhs = lhs_md.format_desc.blocking;
-    const auto &rhs = rhs_md.format_desc.blocking;
+    const bool lhs_is_sparse_packed_desc = is_sparse_packed_desc(lhs_md);
+    const bool rhs_is_sparse_packed_desc = is_sparse_packed_desc(rhs_md);
+
+    if (lhs_md.format_kind != format_kind::blocked
+            && !lhs_is_sparse_packed_desc)
+        return false;
+    if (rhs_md.format_kind != format_kind::blocked
+            && !rhs_is_sparse_packed_desc)
+        return false;
+
+    const auto &lhs = lhs_md.format_kind == format_kind::sparse
+            ? lhs_md.format_desc.sparse_desc.packed_desc
+            : lhs_md.format_desc.blocking;
+    const auto &rhs = rhs_md.format_kind == format_kind::sparse
+            ? rhs_md.format_desc.sparse_desc.packed_desc
+            : rhs_md.format_desc.blocking;
     bool equal = lhs.inner_nblks == rhs.inner_nblks
             && array_cmp(lhs.inner_blks, rhs.inner_blks, lhs.inner_nblks)
             && array_cmp(lhs.inner_idxs, rhs.inner_idxs, lhs.inner_nblks);
@@ -262,15 +287,19 @@ inline data_type_t default_accum_data_type(
     // we allow to use f32 accumulation type only when the
     // accumulation chain is small. Otherwise, strict should be set to
     // true
-    if (one_of(src_dt, s8, u8) && (dst_dt != f32 || strict)) return s32;
+    if (one_of(src_dt, s8, u8, u4, s4) && (dst_dt != f32 || strict)) return s32;
 
+    if (one_of(f8_e5m2, src_dt, dst_dt)) return f32;
+    if (one_of(f8_e4m3, src_dt, dst_dt)) return f32;
     if (one_of(f16, src_dt, dst_dt)) return f32;
     if (one_of(bf16, src_dt, dst_dt)) return f32;
     if (one_of(f32, src_dt, dst_dt)) return f32;
     if (one_of(f64, src_dt, dst_dt)) return f64;
     if (one_of(s32, src_dt, dst_dt)) return s32;
 
-    if (one_of(s8, src_dt, dst_dt) || one_of(u8, src_dt, dst_dt)) return s32;
+    if (one_of(s8, src_dt, dst_dt) || one_of(u8, src_dt, dst_dt)
+            || one_of(s4, src_dt, dst_dt) || one_of(u4, src_dt, dst_dt))
+        return s32;
 
     return data_type::undef;
 }
@@ -288,6 +317,9 @@ inline data_type_t default_accum_data_type(data_type_t src_dt,
     if (one_of(prop_kind, forward_training, forward_inference)) {
         if ((src_dt == u8 || src_dt == s8) && wei_dt == s8) return s32;
         if (one_of(f16, src_dt, wei_dt)) return f32;
+        // weights decompression
+        if (one_of(src_dt, bf16, f32) && one_of(wei_dt, u8, s8, s4, u4))
+            return f32;
     } else if (prop_kind == backward_data) {
         if (one_of(src_dt, f32, s32, s8, u8) && wei_dt == s8
                 && one_of(dst_dt, s8, u8, s32))
@@ -297,6 +329,8 @@ inline data_type_t default_accum_data_type(data_type_t src_dt,
             return f32;
     }
 
+    if (one_of(f8_e5m2, src_dt, wei_dt, dst_dt)) return f32;
+    if (one_of(f8_e4m3, src_dt, wei_dt, dst_dt)) return f32;
     if (one_of(bf16, src_dt, wei_dt, dst_dt)) return f32;
     if (one_of(f16, src_dt, wei_dt, dst_dt)) return f32;
 
@@ -305,7 +339,7 @@ inline data_type_t default_accum_data_type(data_type_t src_dt,
 
 inline bool is_integral_dt(data_type_t dt) {
     using namespace data_type;
-    return utils::one_of(dt, s32, s8, u8);
+    return utils::one_of(dt, s32, s8, u8, u4, s4);
 }
 
 template <typename data_t>
@@ -943,17 +977,13 @@ inline status_t memory_desc_init_by_md_and_dt(memory_desc_t &md,
     return status::success;
 }
 
-/** returns true if memory desc @p md corresponds to the given format tag and
- * strides.
- * If strides are not passed (or passed as nullptr) the dense structure is
- * assumed (i.e. the one that memory_desc_init_by_tag() returns).
- * Strides might contain `0` value, indicating the stride must match the one
- * that memory_desc_init_by_tag() returns.
- * Strides might contain `-1` values, that would be ignored during the
- * comparison. For instance, this can be used if a stride along minibatch
- * doesn't matter. */
-inline bool memory_desc_matches_tag(const memory_desc_t &md, format_tag_t tag,
-        const dims_t strides = nullptr) {
+/** returns true if memory desc @p md corresponds to the given format tag.
+ * Assumes a dense structure such as that returned by memory_desc_init_by_tag().
+ * Strides must match those returned by memory_desc_init_by_tag(), with one
+ * exception: the strides of unit dimensions are ignored in order to align with
+ * memory descriptor equality comparisons and hashing.
+ */
+inline bool memory_desc_matches_tag(const memory_desc_t &md, format_tag_t tag) {
     if (md.format_kind != format_kind::sparse) {
         if (md.format_kind != types::format_tag_to_kind(tag)) return false;
     }
@@ -963,36 +993,7 @@ inline bool memory_desc_matches_tag(const memory_desc_t &md, format_tag_t tag,
             md_gold, md.ndims, md.dims, md.data_type, tag);
     if (status != status::success) return false;
 
-    const bool is_sparse_packed_desc = md.format_kind == format_kind::sparse
-            && md.format_desc.sparse_desc.encoding == sparse_encoding::packed;
-
-    if (md.format_kind != format_kind::blocked && !is_sparse_packed_desc)
-        return false; // unimplemented yet
-
-    const auto &blk = md.format_kind == format_kind::blocked
-            ? md.format_desc.blocking
-            : md.format_desc.sparse_desc.packed_desc;
-
-    const auto &blk_gold = md_gold.format_desc.blocking;
-
-    using utils::array_cmp;
-    bool same_blocks = true && blk.inner_nblks == blk_gold.inner_nblks
-            && array_cmp(blk.inner_blks, blk_gold.inner_blks, blk.inner_nblks)
-            && array_cmp(blk.inner_idxs, blk_gold.inner_idxs, blk.inner_nblks);
-
-    if (!same_blocks) return false;
-
-    if (strides == nullptr)
-        return array_cmp(blk.strides, blk_gold.strides, md.ndims);
-
-    for (int d = 0; d < md.ndims; ++d) {
-        dim_t stride = strides[d];
-        if (stride == -1) continue;
-        if (stride == 0) stride = blk_gold.strides[d];
-        if (blk.strides[d] != stride) return false;
-    }
-
-    return true;
+    return types::blocking_desc_is_equal(md, md_gold);
 }
 
 /** returns matching tag (or undef if match is not found)
@@ -1028,7 +1029,8 @@ inline bool memory_desc_sanity_check(int ndims, const dims_t dims,
     if (ndims == 0) return true;
 
     bool ok = dims != nullptr && 0 < ndims && ndims <= DNNL_MAX_NDIMS
-            && utils::one_of(data_type, f16, bf16, f32, f64, s32, s8, u8);
+            && utils::one_of(data_type, f8_e5m2, f8_e4m3, f16, bf16, f32, f64,
+                    s32, s8, u8, s4, u4);
     if (!ok) return false;
 
     bool has_runtime_dims = false;

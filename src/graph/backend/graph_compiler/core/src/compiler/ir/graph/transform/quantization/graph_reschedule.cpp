@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,10 +36,18 @@ namespace gc {
 namespace quantize {
 bool reschedule_forbid_op(const sc_op_ptr &node) {
     // transpose could be processed as it only changes the order of dim.
-    return (node->isa<ops::dynamic_reshape_op>()
-                   || node->isa<tensor_view_op_t>() || node->isa<reshape_op_t>()
-                   || node->isa<concat_op_t>() || node->isa<split_op_t>())
-            && node->attrs_.get_or_else(attr_keys::per_channel, false);
+    // tensor_view without changing the non-broadcast(non-one) axis could also
+    // be processed.
+    return ((node->isa<ops::dynamic_reshape_op>()
+                    || (node->isa<tensor_view_op_t>()
+                            && !dynamic_cast<tensor_view_op_t *>(node.get())
+                                        ->is_only_expand_or_penetrate())
+                    || node->isa<reshape_op_t>() || node->isa<concat_op_t>()
+                    || node->isa<split_op_t>())
+                   && node->attrs_.get_or_else(attr_keys::per_channel, false)
+                   && !node->attrs_.get_or_else(
+                           "allow_quantize_reschedule", false))
+            || node->isa<concat_op_t>();
 }
 void dequantize_elimination(sc_graph_t &mgr, const context_ptr &ctx) {
     op_visitor_t vis = op_visitor_t::bfs();
@@ -227,11 +235,17 @@ void insert_back_dequantize(sc_graph_t &mgr, const context_ptr &ctx) {
                                             wei_details.dtype_)},
                                     {});
                         }
+                        bool is_per_channel
+                                = out_scales->get_outputs()[0]
+                                          ->details_.get_plain_dims()[0]
+                                > 1;
                         dequantize_node = mgr.make("dynamic_dequantize",
                                 {cur_parent->get_outputs()[0],
                                         out_scales->get_outputs()[0]},
                                 {},
                                 {{attr_keys::quan_dtype, datatypes::f32},
+                                        {attr_keys::per_channel,
+                                                is_per_channel},
                                         {attr_keys::channel_axis,
                                                 output_channel_axis}});
                     } else {

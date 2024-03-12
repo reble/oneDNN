@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,21 +17,15 @@
 #ifndef GPU_OCL_RNN_REF_RNN_HPP
 #define GPU_OCL_RNN_REF_RNN_HPP
 
-#include <assert.h>
 #include <stdio.h>
 
 #include "common/c_types_map.hpp"
 #include "common/primitive.hpp"
 #include "common/primitive_desc_iterator.hpp"
-#include "common/type_helpers.hpp"
 #include "common/utils.hpp"
-#include "gpu/compute/compute.hpp"
-#include "gpu/gemm/gpu_gemm.hpp"
 #include "gpu/gpu_primitive.hpp"
 #include "gpu/gpu_resource.hpp"
 #include "gpu/gpu_rnn_pd.hpp"
-#include "gpu/ocl/ocl_memory_storage.hpp"
-#include "gpu/ocl/ocl_stream.hpp"
 #include "gpu/ocl/ocl_utils.hpp"
 #include "gpu/ocl/rnn/rnn_utils.hpp"
 #include "gpu/primitive_conf.hpp"
@@ -48,106 +42,14 @@ enum gemm_kind_t {
     gemm_iter_fwd,
     gemm_iter_fwd_2,
     gemm_layer_fwd,
+    gemm_layer_fwd_src,
     gemm_iter_bwd,
     gemm_iter_bwd_2,
     gemm_layer_bwd,
     gemm_diff_wei_iter,
     gemm_diff_wei_iter_2,
-    gemm_diff_wei_layer
-};
-
-struct workspace_t {
-    using mst = memory_storage_t;
-    workspace_t(const mst &ws, const rnn_utils::ocl_conf_t &ocl_conf,
-            const rnn_utils::conf_t &conf, const rnn_offsets_t &off)
-        : ws_(ws)
-        , ocl_conf_(ocl_conf)
-        , conf_(conf)
-        , gates_(conf.ws_gates_size > 0 ? ws.get_sub_storage(
-                         conf.ws_gates_offset, conf.ws_gates_size)
-                                        : nullptr)
-        , states_(conf.ws_states_size > 0 ? ws.get_sub_storage(
-                          conf.ws_states_offset, conf.ws_states_size)
-                                          : nullptr)
-        , c_states_(conf.ws_c_states_size > 0 ? ws.get_sub_storage(
-                            conf.ws_c_state_offset, conf.ws_c_states_size)
-                                              : nullptr)
-        , bias_(conf.ws_bias_size > 0 ? ws.get_sub_storage(
-                        conf.ws_bias_offset, conf.ws_bias_size)
-                                      : nullptr)
-        , grid_comp_(conf.ws_grid_comp_size > 0 ? ws.get_sub_storage(
-                             conf.ws_grid_comp_offset, conf.ws_grid_comp_size)
-                                                : nullptr) {}
-
-    dim_t calc_off_ws_state(
-            dim_t i0, dim_t i1, dim_t i2, dim_t i3, dim_t i4) const {
-        return OFF5(i0, conf_.n_layer + 1, i1, conf_.n_dir, i2,
-                conf_.n_iter + 1, i3, conf_.mb, i4, conf_.states_ws_ld);
-    }
-
-    dim_t calc_off_ws_gates(
-            dim_t i0, dim_t i1, dim_t i2, dim_t i3, dim_t i4, dim_t i5) const {
-        return i0 * conf_.n_dir * conf_.n_iter * conf_.mb * conf_.gates_ws_ld
-                + i1 * conf_.n_iter * conf_.mb * conf_.gates_ws_ld
-                + i2 * conf_.mb * conf_.gates_ws_ld + i3 * conf_.gates_ws_ld
-                + i4 * conf_.dhc + i5;
-    }
-
-    dim_t calc_off_ws_grid_offset(
-            dim_t i0, dim_t i1, dim_t i2, dim_t i3, dim_t i4) const {
-        return OFF5(i0, conf_.n_layer + 1, i1, conf_.n_dir, i2,
-                conf_.n_iter + 1, i3, conf_.mb, i4, conf_.dhc);
-    }
-
-    const mst &ws() const { return ws_; }
-    const mst &gates() const { return rnn_utils::get_storage(gates_); }
-    const mst &states() const { return rnn_utils::get_storage(states_); }
-
-    std::unique_ptr<mst> states(dim_t layer, dim_t dir, dim_t time) const {
-        if (!states_) return nullptr;
-        auto off_ = calc_off_ws_state(layer, dir, time, 0, 0)
-                * types::data_type_size(ocl_conf_.src_dt);
-        return states_->get_sub_storage(off_, conf_.ws_states_cell_size);
-    }
-
-    std::unique_ptr<mst> c_states(dim_t layer, dim_t dir, dim_t time) const {
-        if (!c_states_) return nullptr;
-        // conf_.aux_data_type is float for all datatypes except f16
-        // so can be used for lstm_elemwise_u8s8 case as well
-        auto off_ = calc_off_ws_state(layer, dir, time, 0, 0)
-                * types::data_type_size(conf_.aux_data_type);
-        return c_states_->get_sub_storage(off_, conf_.ws_c_states_cell_size);
-    }
-
-    std::unique_ptr<mst> gates(dim_t layer, dim_t dir, dim_t time) const {
-        if (!gates_) return nullptr;
-
-        auto off_ = calc_off_ws_gates(layer, dir, time, 0, 0, 0)
-                * types::data_type_size(conf_.aux_data_type);
-        return gates_->get_sub_storage(off_, conf_.ws_gates_cell_size);
-    }
-
-    std::unique_ptr<mst> grid_comp(dim_t layer, dim_t dir, dim_t time) const {
-        if (!grid_comp_) return nullptr;
-
-        auto off_ = calc_off_ws_grid_offset(layer, dir, time, 0, 0)
-                * types::data_type_size(conf_.aux_data_type);
-        return grid_comp_->get_sub_storage(off_, conf_.ws_per_cell);
-    }
-
-    const mst &c_states() const { return rnn_utils::get_storage(c_states_); }
-    const mst &bias() const { return rnn_utils::get_storage(bias_); }
-    const mst &grid_comp() const { return rnn_utils::get_storage(grid_comp_); }
-
-private:
-    const mst &ws_;
-    const rnn_utils::ocl_conf_t &ocl_conf_;
-    const rnn_utils::conf_t &conf_;
-    std::unique_ptr<mst> gates_;
-    std::unique_ptr<mst> states_;
-    std::unique_ptr<mst> c_states_;
-    std::unique_ptr<mst> bias_;
-    std::unique_ptr<mst> grid_comp_;
+    gemm_diff_wei_layer,
+    gemm_diff_wei_layer_src
 };
 
 template <prop_kind_t aprop>
@@ -162,22 +64,10 @@ struct _ref_rnn_common_t : public gpu_primitive_t {
     typedef cell_execution_sig((class_name::*cell_execution_f));
     typedef grid_execution_sig((class_name::*grid_execution_f));
     typedef gemm_sig((class_name::*gemm_t));
-    typedef weights_assign_sig((class_name::*weights_assign_t));
 
     using base_pd_t =
             typename utils::conditional<false || aprop == prop_kind::forward,
                     gpu_rnn_fwd_pd_t, gpu_rnn_bwd_pd_t>::type;
-    enum {
-        key_gemm_iter_fwd = memory_tracking::names::key_nested_multiple,
-        key_gemm_iter_fwd_2,
-        key_gemm_layer_fwd,
-        key_gemm_iter_bwd,
-        key_gemm_iter_bwd_2,
-        key_gemm_layer_bwd,
-        key_gemm_diff_wei_layer,
-        key_gemm_diff_wei_iter,
-        key_gemm_diff_wei_iter_2,
-    };
 
     struct pd_t : public base_pd_t {
 
@@ -203,10 +93,12 @@ struct _ref_rnn_common_t : public gpu_primitive_t {
         std::shared_ptr<primitive_desc_t> gemm_iter_fwd_pd_;
         std::shared_ptr<primitive_desc_t> gemm_iter_fwd_2_pd_;
         std::shared_ptr<primitive_desc_t> gemm_layer_fwd_pd_;
+        std::shared_ptr<primitive_desc_t> gemm_layer_fwd_src_pd_;
         std::shared_ptr<primitive_desc_t> gemm_iter_bwd_pd_;
         std::shared_ptr<primitive_desc_t> gemm_iter_bwd_2_pd_;
         std::shared_ptr<primitive_desc_t> gemm_layer_bwd_pd_;
         std::shared_ptr<primitive_desc_t> gemm_diff_wei_layer_pd_;
+        std::shared_ptr<primitive_desc_t> gemm_diff_wei_layer_src_pd_;
         std::shared_ptr<primitive_desc_t> gemm_diff_wei_iter_pd_;
         std::shared_ptr<primitive_desc_t> gemm_diff_wei_iter_2_pd_;
 
@@ -216,45 +108,20 @@ struct _ref_rnn_common_t : public gpu_primitive_t {
             auto scratchpad = this->scratchpad_registry().registrar();
             scratchpad.book(key_rnn_space, workspace_size, 1,
                     OCL_BUFFER_ALIGNMENT, 4096);
-            scratchpad.book(key_rnn_gates, rnn_conf.scratch_gates_size, 1,
-                    OCL_BUFFER_ALIGNMENT, 4096);
-            scratchpad.book(key_rnn_cell, rnn_conf.scratch_cell_size, 1,
-                    OCL_BUFFER_ALIGNMENT, 4096);
-            scratchpad.book(key_rnn_diff_states,
-                    rnn_conf.scratch_diff_states_size, 1, OCL_BUFFER_ALIGNMENT,
-                    4096);
-            scratchpad.book(key_rnn_diff_ht, rnn_conf.scratch_dhG1_size, 1,
-                    OCL_BUFFER_ALIGNMENT, 4096);
-            // book scratchpad for nested primitives
-            switch (aprop) {
-                case prop_kind::forward:
-                    scratchpad.book(key_gemm_iter_fwd,
-                            gemm_iter_fwd_pd_->scratchpad_registry());
-                    scratchpad.book(key_gemm_layer_fwd,
-                            gemm_layer_fwd_pd_->scratchpad_registry());
-                    if (rnn_conf.is_vanilla_gru)
-                        scratchpad.book(key_gemm_iter_fwd_2,
-                                gemm_iter_fwd_2_pd_->scratchpad_registry());
-                    break;
-                case prop_kind::backward:
-                    scratchpad.book(key_gemm_iter_bwd,
-                            gemm_iter_bwd_pd_->scratchpad_registry());
-                    scratchpad.book(key_gemm_layer_bwd,
-                            gemm_layer_bwd_pd_->scratchpad_registry());
-                    scratchpad.book(key_gemm_diff_wei_layer,
-                            gemm_diff_wei_layer_pd_->scratchpad_registry());
-                    scratchpad.book(key_gemm_diff_wei_iter,
-                            gemm_diff_wei_iter_pd_->scratchpad_registry());
-                    if (rnn_conf.is_vanilla_gru) {
-                        scratchpad.book(key_gemm_iter_bwd_2,
-                                gemm_iter_bwd_2_pd_->scratchpad_registry());
-                        scratchpad.book(key_gemm_diff_wei_iter_2,
-                                gemm_diff_wei_iter_2_pd_
-                                        ->scratchpad_registry());
-                    }
-                    break;
-                default: assert(!"unknown prop_kind");
-            }
+            rnn_utils::scratch_t::book(scratchpad, rnn_conf,
+                    {
+                            gemm_iter_fwd_pd_.get(),
+                            gemm_iter_fwd_2_pd_.get(),
+                            gemm_layer_fwd_pd_.get(),
+                            gemm_layer_fwd_src_pd_.get(),
+                            gemm_iter_bwd_pd_.get(),
+                            gemm_iter_bwd_2_pd_.get(),
+                            gemm_layer_bwd_pd_.get(),
+                            gemm_diff_wei_layer_pd_.get(),
+                            gemm_diff_wei_layer_src_pd_.get(),
+                            gemm_diff_wei_iter_pd_.get(),
+                            gemm_diff_wei_iter_2_pd_.get(),
+                    });
         }
     }; // struct pd_t : public base_pd_t
 
@@ -287,7 +154,7 @@ private:
             lws_max = lws_max / l_dim;
         }
 
-        return compute::nd_range_t(gws, lws);
+        return compute::nd_range_t(gws, {lws});
     }
 
     // set the class names
@@ -305,8 +172,6 @@ private:
 
     gemm_sig(gemm_primitive);
 
-    weights_assign_sig(assign_weight_offsets);
-
     float (*activation_func)(float dd, float s, float alpha, float cliping)
             = nullptr;
     status_t bias_prepare(const exec_ctx_t &ctx,
@@ -320,14 +185,15 @@ private:
             dim_t n_iter, dim_t batch, dim_t slc, dim_t dhc, dim_t n_layer,
             dim_t n_dir, dim_t n_states, dim_t states_ws_ld,
             dim_t scratch_diff_states_ld, const memory_storage_t &ws_states,
-            const memory_storage_t &scratch_diff_states,
+            const memory_storage_t *scratch_diff_states,
             const memory_storage_t &input,
             const memory_storage_t &diff_dst_layer) const;
     status_t copy_init_iter(const exec_ctx_t &ctx,
             compute::compute_stream_t *compute_stream, dim_t n_layer,
             dim_t n_dir, dim_t batch, dim_t sic, dim_t dhc, dim_t n_iter,
             dim_t n_states, dim_t states_ws_ld, dim_t scratch_diff_states_ld,
-            const workspace_t &ws, const memory_storage_t &scratch_diff_states,
+            const rnn_utils::workspace_t &ws,
+            const memory_storage_t *scratch_diff_states,
             const memory_storage_t &firstit_states,
             const memory_storage_t &firstit_c_states,
             const memory_storage_t &diff_dst_iter,
@@ -338,7 +204,7 @@ private:
             dim_t n_iter, dim_t batch, dim_t slc, dim_t dhc, dim_t n_layer,
             dim_t n_dir, dim_t n_states, dim_t states_ws_ld,
             dim_t scratch_diff_states_ld,
-            const memory_storage_t &scratch_diff_states,
+            const memory_storage_t *scratch_diff_states,
             const memory_storage_t &dst_last_layer,
             const memory_storage_t &diff_src_layer,
             const memory_storage_t &ws_states, const float shift,
@@ -347,39 +213,26 @@ private:
             compute::compute_stream_t *compute_stream, dim_t n_layer,
             dim_t n_dir, dim_t batch, dim_t sic, dim_t dhc, dim_t n_iter,
             dim_t n_states, dim_t states_ws_ld, dim_t scratch_diff_states_ld,
-            const memory_storage_t &scratch_diff_states,
+            const memory_storage_t *scratch_diff_states,
             const memory_storage_t &dst_last_iter,
             const memory_storage_t &dst_last_iter_c,
             const memory_storage_t &diff_src_iter,
-            const memory_storage_t &diff_src_iter_c, const workspace_t &ws,
-            const float shift, const float scale, const bool dequantize) const;
-    status_t ws_set(const exec_ctx_t &ctx,
-            compute::compute_stream_t *compute_stream,
-            const memory_storage_t &workspace, const dim_t ws_offset,
-            const int ws_part, const float val, const dim_t size) const;
-    status_t ws_print(const exec_ctx_t &ctx, compute::compute_stream_t *s,
-            const workspace_t &workspace) const;
+            const memory_storage_t &diff_src_iter_c,
+            const rnn_utils::workspace_t &ws, const float shift,
+            const float scale, const bool dequantize) const;
 
-    compute::kernel_t ws_print_kernel_;
-
-    compute::kernel_t bias_prepare_kernel_;
-    compute::kernel_t copy_init_layer_kernel_;
-    compute::kernel_t copy_init_iter_kernel_;
-    compute::kernel_t copy_res_layer_kernel_;
-    compute::kernel_t copy_res_iter_kernel_;
-
-    compute::kernel_t ws_set_kernel_;
-    compute::kernel_t elemwise_fwd_kernel_;
-    compute::kernel_t elemwise_bwd_kernel_;
+    std::vector<compute::kernel_t> kernels_;
 
     // ptrs to GEMM primitives
     std::shared_ptr<primitive_t> gemm_layer_fwd_;
+    std::shared_ptr<primitive_t> gemm_layer_fwd_src_;
     std::shared_ptr<primitive_t> gemm_iter_fwd_;
     std::shared_ptr<primitive_t> gemm_iter_fwd_2_;
     std::shared_ptr<primitive_t> gemm_layer_bwd_;
     std::shared_ptr<primitive_t> gemm_iter_bwd_;
     std::shared_ptr<primitive_t> gemm_iter_bwd_2_;
     std::shared_ptr<primitive_t> gemm_diff_wei_layer_;
+    std::shared_ptr<primitive_t> gemm_diff_wei_layer_src_;
     std::shared_ptr<primitive_t> gemm_diff_wei_iter_;
     std::shared_ptr<primitive_t> gemm_diff_wei_iter_2_;
 

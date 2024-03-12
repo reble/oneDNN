@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include "gpu/ocl/kernel_utils.hpp"
 #include "gpu/ocl/ocl_gpu_device_info.hpp"
 #include "gpu/ocl/ocl_gpu_engine.hpp"
+#include "gpu/ocl/ocl_gpu_kernel.hpp"
 #include "gpu/ocl/ocl_memory_storage.hpp"
 #include "gpu/ocl/ocl_stream.hpp"
 #include "gpu/ocl/ocl_utils.hpp"
@@ -34,6 +35,22 @@ namespace dnnl {
 namespace impl {
 namespace gpu {
 namespace ocl {
+
+void maybe_print_build_info(const std::vector<const char *> &kernel_names,
+        const compute::kernel_ctx_t &kernel_ctx) {
+#ifndef DISABLE_VERBOSE
+    // Print out kernel options if the correct verbosity is set
+    if (get_verbose(verbose_t::debuginfo) >= 5) {
+        std::ostringstream oss;
+        for (const char *name : kernel_names)
+            oss << name << " ";
+
+        VFORMAT(get_msec(), primitive, exec, VERBOSE_debug,
+                "kernel options,%s,%s", oss.str().c_str(),
+                kernel_ctx.options().c_str());
+    }
+#endif
+}
 
 status_t ocl_gpu_engine_t::init() {
     return init({});
@@ -158,19 +175,18 @@ status_t create_ocl_kernel_from_cache_blob(const ocl_gpu_engine_t *ocl_engine,
         std::shared_ptr<compute::kernel_impl_t> kernel_impl
                 = std::make_shared<ocl_gpu_kernel_t>(ocl_kernel, arg_types);
         (*kernels)[i] = std::move(kernel_impl);
-        dump_kernel_binary(ocl_engine, (*kernels)[i]);
     }
 
     return status::success;
 }
 
 cl_int maybe_print_debug_info(
-        cl_int err, cl_program program, cl_device_id dev) {
+        cl_int err_, cl_program program, cl_device_id dev) {
     // Return error code if verbose is not enabled.
-    if (err == CL_SUCCESS || !get_verbose(verbose_t::error)) return err;
+    if (err_ == CL_SUCCESS || !get_verbose(verbose_t::error)) return err_;
 
     size_t log_length = 0;
-    err = clGetProgramBuildInfo(
+    auto err = clGetProgramBuildInfo(
             program, dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_length);
     assert(err == CL_SUCCESS);
 
@@ -181,7 +197,8 @@ cl_int maybe_print_debug_info(
     VERROR(common, ocl,
             "Error during the build of OpenCL program. Build log:\n%s",
             log_buf.data());
-    return err;
+    MAYBE_UNUSED(err);
+    return err_;
 };
 
 inline status_t preprocess_headers(
@@ -254,69 +271,6 @@ status_t ocl_gpu_engine_t::create_binary_from_ocl_source(
     return status::success;
 }
 
-status_t ocl_gpu_engine_t::create_compiled_bundle(
-        compute::compiled_bundle_t &generator,
-        const std::vector<const char *> &kernel_names,
-        const compute::kernel_ctx_t &kernel_ctx) const {
-
-    const char *source = ocl::get_kernel_source(kernel_names[0]);
-    for (const auto &kernel_name : kernel_names) {
-        assert(ocl::get_kernel_source(kernel_name) == source);
-        MAYBE_UNUSED(kernel_name);
-    }
-
-    compute::binary_t kernel_binary {};
-    CHECK(create_binary_from_ocl_source(kernel_binary, source, kernel_ctx));
-    generator = compute::compiled_bundle_t(kernel_binary);
-    return status::success;
-};
-
-status_t ocl_gpu_engine_t::create_compiled_kernel(
-        compute::compiled_kernel_t &generator,
-        jit::jit_generator_base &jitter) const {
-    auto &ocl_engine = *utils::downcast<const ocl_gpu_engine_t *>(this);
-    generator = compute::compiled_kernel_t(
-            jitter.get_binary(ocl_engine.context(), ocl_engine.device()),
-            jitter.kernel_name());
-    return status::success;
-}
-
-status_t ocl_gpu_engine_t::create_kernels_from_bundle(
-        std::vector<compute::kernel_t> &kernels,
-        const std::vector<const char *> &kernel_names,
-        const compute::compiled_bundle_t &generator) const {
-
-    auto dev = this->device();
-    auto ctx = this->context();
-    cl_int err = CL_SUCCESS;
-
-    auto &binary = generator.binary();
-    const uint8_t *binary_data = binary.data();
-    size_t binary_size = binary.size();
-    auto program = make_ocl_wrapper(clCreateProgramWithBinary(
-            ctx, 1, &dev, &binary_size, &binary_data, nullptr, &err));
-    OCL_CHECK(err);
-
-    err = clBuildProgram(program, 1, &dev, nullptr, nullptr, nullptr);
-    OCL_CHECK(err);
-
-    kernels = std::vector<compute::kernel_t>(kernel_names.size());
-    for (size_t i = 0; i < kernel_names.size(); ++i) {
-        ocl_wrapper_t<cl_kernel> ocl_kernel
-                = clCreateKernel(program, kernel_names[i], &err);
-        OCL_CHECK(err);
-        std::vector<gpu::compute::scalar_type_t> arg_types;
-        CHECK(get_kernel_arg_types(ocl_kernel, &arg_types));
-
-        std::shared_ptr<compute::kernel_impl_t> kernel_impl
-                = std::make_shared<ocl_gpu_kernel_t>(ocl_kernel, arg_types);
-        kernels[i] = std::move(kernel_impl);
-        dump_kernel_binary(this, kernels[i]);
-    }
-
-    return status::success;
-}
-
 status_t ocl_gpu_engine_t::create_kernel_from_binary(compute::kernel_t &kernel,
         const compute::binary_t &binary, const char *kernel_name) const {
     ocl_wrapper_t<cl_program> program;
@@ -334,7 +288,6 @@ status_t ocl_gpu_engine_t::create_kernel_from_binary(compute::kernel_t &kernel,
     std::shared_ptr<compute::kernel_impl_t> kernel_impl
             = std::make_shared<ocl_gpu_kernel_t>(ocl_kernel, arg_types);
     kernel = std::move(kernel_impl);
-    dump_kernel_binary(this, kernel);
 
     return status::success;
 }
@@ -362,6 +315,7 @@ status_t ocl_gpu_engine_t::create_kernel(compute::kernel_t *kernel,
     }
 
     compute::binary_t binary = jitter->get_binary(context(), device());
+    if (binary.empty()) return status::runtime_error;
     return create_kernel_from_binary(*kernel, binary, kernel_name);
 }
 
@@ -370,6 +324,7 @@ status_t ocl_gpu_engine_t::create_kernels(
         const std::vector<const char *> &kernel_names,
         const compute::kernel_ctx_t &kernel_ctx,
         const cache_blob_t &cache_blob) const {
+    maybe_print_build_info(kernel_names, kernel_ctx);
 
     *kernels = std::vector<compute::kernel_t>(kernel_names.size());
 
@@ -395,6 +350,7 @@ status_t ocl_gpu_engine_t::create_kernels_from_ocl_source(
 
     *kernels = std::vector<compute::kernel_t>(kernel_names.size());
     for (size_t i = 0; i < kernel_names.size(); ++i) {
+        if (!kernel_names[i]) continue;
         cl_int err;
         ocl_wrapper_t<cl_kernel> ocl_kernel
                 = clCreateKernel(program, kernel_names[i], &err);
@@ -405,7 +361,6 @@ status_t ocl_gpu_engine_t::create_kernels_from_ocl_source(
         std::shared_ptr<compute::kernel_impl_t> kernel_impl
                 = std::make_shared<ocl_gpu_kernel_t>(ocl_kernel, arg_types);
         (*kernels)[i] = std::move(kernel_impl);
-        dump_kernel_binary(this, (*kernels)[i]);
     }
 
     return status::success;

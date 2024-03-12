@@ -14,6 +14,7 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include "gpu/ocl/dispatch.h"
 #include "gpu/ocl/ocl_types.h"
 
 #include "gpu/ocl/concat_common.h"
@@ -85,9 +86,9 @@ __kernel void gen9_concat(__global DST_DATA_T *dst, long dst_offset0,
             const int dst_off = OFF_MD(DST, dst_dims[0], dst_dims[1],
                     dst_dims[2], dst_dims[3], dst_dims[4], dst_dims[5]);
 #if SUB_GROUP_SIZE > 1
-            BLOCK_WRITE_DST(&dst[dst_off], TO_DST(DATA_ZERO));
+            BLOCK_WRITE_DST(&dst[dst_off], TO_DST(0.0f));
 #else // SUB_GROUP_SIZE > 1
-            dst[dst_off] = TO_DST(DATA_ZERO);
+            dst[dst_off] = TO_DST(0.0f);
 #endif // SUB_GROUP_SIZE > 1
         }
         return;
@@ -96,7 +97,7 @@ __kernel void gen9_concat(__global DST_DATA_T *dst, long dst_offset0,
             dst_dims[ITER_DIM_IDX]++, src_dims[ITER_DIM_IDX]++) {
         int part;
         int src_off;
-        __global SRC_DATA_T *src;
+        const __global SRC_DATA_T *src;
         INIT_FLOAT_SCALE;
 
         if (IS_IN_PART(0)) SET_DIMS(0, 0)
@@ -190,9 +191,9 @@ __kernel void gen9_concat(__global DST_DATA_T *dst, long dst_offset0,
         const int dst_off = OFF_MD(DST, dst_dims[0], dst_dims[1], dst_dims[2],
                 dst_dims[3], dst_dims[4], dst_dims[5]);
 #if SUB_GROUP_SIZE > 1
-        BLOCK_WRITE_DST(&dst[dst_off], TO_DST(DATA_ZERO));
+        BLOCK_WRITE_DST(&dst[dst_off], TO_DST(0.0f));
 #else // SUB_GROUP_SIZE > 1
-        dst[dst_off] = TO_DST(DATA_ZERO);
+        dst[dst_off] = TO_DST(0.0f);
 #endif // SUB_GROUP_SIZE > 1
     }
 }

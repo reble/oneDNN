@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022 Intel Corporation
+* Copyright 2022-2023 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -80,7 +80,7 @@ stmt_t merge_slm_buffers(const stmt_t &_stmt, ir_context_t &ir_ctx) {
 class slm_reorder_injector_t : public ir_mutator_t {
 public:
     slm_reorder_injector_t(
-            const stmt_t &root, ngen::HW hw, const grid_info_t &tg_grid)
+            const stmt_t &root, const hw_t &hw, const grid_info_t &tg_grid)
         : hw_(hw), tg_grid_(tg_grid) {
         alloc_manager_t alloc_mgr(root);
         auto slm_buffers = alloc_mgr.find_buffers(alloc_kind_t::slm);
@@ -165,9 +165,9 @@ private:
         slm_size_ = std::max(slm_size_, slm_thr_size * tg_grid_.elems());
 
         auto store_send = send_t::make(hw_, send_op_t::store,
-                send_address_t::slm, type_t::dword(vect_size), simd);
+                send_address_t::slm, type_t::dword(vect_size), simd, true);
         auto load_send = send_t::make(hw_, send_op_t::load, send_address_t::slm,
-                type_t::hword(hwords), 1);
+                type_t::hword(hwords), 1, true);
 
         std::vector<expr_t> vec(simd);
         for (int i = 0; i < simd; i++)
@@ -214,7 +214,7 @@ private:
         return true;
     }
 
-    ngen::HW hw_;
+    hw_t hw_;
     grid_info_t tg_grid_;
 
     expr_t slm_base_;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -61,14 +61,14 @@ dnnl::impl::graph::pass::pass_base_ptr get_pass(const std::string &pass_name) {
 }
 } // namespace
 
-TEST(Subgraph, Kind2Str) {
+TEST(test_subgraph_pass_subgraph, Kind2Str) {
     ASSERT_EQ(graph::dnnl_impl::kind2str(graph::op_kind::Abs), "Abs");
     ASSERT_EQ(
             graph::dnnl_impl::kind2str(graph::dnnl_impl::op_kind::dnnl_add_zps),
             "Dnnl_add_zps");
 }
 
-TEST(SubgraphPass, LowerDownToInt8Conv) {
+TEST(test_subgraph_pass_subgraph_pass, LowerDownToInt8Conv) {
     /*
         | (u8/s8)  | (s8)
      dequant    dequant
@@ -190,11 +190,6 @@ TEST(SubgraphPass, LowerDownToInt8Conv) {
     // 2. fuse src, wei scales
     dnnl_impl::convert_to_runtime_src_scales(subgraph);
     dnnl_impl::fuse_src_scales(subgraph);
-    auto qconv_op = std::find_if(subgraph->get_ops().begin(),
-            subgraph->get_ops().end(), [](const std::shared_ptr<op_t> &op) {
-                return op->get_kind() == dnnl_impl::op_kind::dnnl_convolution;
-            });
-
     dnnl_impl::infer_shape(subgraph);
     dnnl_impl::binary_canonicalization(subgraph);
     dnnl_impl::infer_shape(subgraph);
@@ -202,10 +197,11 @@ TEST(SubgraphPass, LowerDownToInt8Conv) {
     // 3. fuse post ops to int8 conv
     ASSERT_EQ(dnnl_impl::fuse_post_ops(subgraph), status::success);
 
-    qconv_op = std::find_if(subgraph->get_ops().begin(),
+    auto qconv_op = std::find_if(subgraph->get_ops().begin(),
             subgraph->get_ops().end(), [](const std::shared_ptr<op_t> &op) {
                 return op->get_kind() == dnnl_impl::op_kind::dnnl_convolution;
             });
+    ASSERT_NE(qconv_op, subgraph->get_ops().end());
     ASSERT_TRUE((*qconv_op)->has_attr(dnnl_impl::op_attr::fusion_info_key));
     int64_t key = (*qconv_op)->get_attr<int64_t>(
             dnnl_impl::op_attr::fusion_info_key);
@@ -214,7 +210,7 @@ TEST(SubgraphPass, LowerDownToInt8Conv) {
     ASSERT_EQ(post_ops.size(), 2U);
 }
 
-TEST(SubgraphPass, LowerDownToInt8Matmul) {
+TEST(test_subgraph_pass_subgraph_pass, LowerDownToInt8Matmul) {
     /*
         | (u8/s8)  | (s8)
      dequant    dequant
@@ -296,6 +292,7 @@ TEST(SubgraphPass, LowerDownToInt8Matmul) {
             subgraph->get_ops().end(), [](const std::shared_ptr<op_t> &op) {
                 return op->get_kind() == dnnl_impl::op_kind::dnnl_matmul;
             });
+    ASSERT_NE(matmul_op, subgraph->get_ops().end());
     auto &producer0 = (*matmul_op)->get_input_value(0)->get_producer();
     ASSERT_EQ(producer0.get_kind(), dnnl_impl::op_kind::dnnl_mul_scales);
     ASSERT_EQ(producer0.get_attr<std::vector<float>>(op_attr::scales)[0],
@@ -320,6 +317,7 @@ TEST(SubgraphPass, LowerDownToInt8Matmul) {
             subgraph->get_ops().end(), [](const std::shared_ptr<op_t> &op) {
                 return op->get_kind() == dnnl_impl::op_kind::dnnl_matmul;
             });
+    ASSERT_NE(qmatmul_op, subgraph->get_ops().end());
     ASSERT_TRUE((*qmatmul_op)->has_attr(dnnl_impl::op_attr::fusion_info_key));
     int64_t key
             = (*qmatmul_op)
@@ -329,7 +327,7 @@ TEST(SubgraphPass, LowerDownToInt8Matmul) {
     ASSERT_EQ(post_ops.size(), 1U);
 }
 
-TEST(SubgraphPass, Conv2dNxcPlainDst) {
+TEST(test_subgraph_pass_subgraph_pass, Conv2dNxcPlainDst) {
     using dims = graph::dnnl_impl::dims;
     graph::engine_t *engine = get_engine();
     dnnl::engine p_eng
@@ -451,7 +449,7 @@ TEST(SubgraphPass, Conv2dNxcPlainDst) {
     }
 }
 
-TEST(SubgraphPass, Int8ConvSumRelu) {
+TEST(test_subgraph_pass_subgraph_pass, Int8ConvSumRelu) {
     /*
                    | (f32, constant)
                  quant
@@ -919,7 +917,8 @@ TEST_P(int8_matmul_with_diff_inputs_t, Int8MatmulPasses) {
     ASSERT_EQ(subgraph->get_ops().size(), params.final_subgraph_size);
 }
 
-INSTANTIATE_TEST_SUITE_P(SubgraphPass, int8_matmul_with_diff_inputs_t,
+INSTANTIATE_TEST_SUITE_P(test_subgraph_pass_subgraph_pass,
+        int8_matmul_with_diff_inputs_t,
         testing::Values(matmul_params_t {{1, 1024}, {1000, 1024}, {1000},
                                 {1, 1000}, false, true, false, 7, 8},
                 matmul_params_t {{1, 1024}, {1000, 1024}, {1000}, {1, 1000},
@@ -1033,7 +1032,8 @@ TEST_P(matmul_with_diff_inputs_t, MatmulPasses) {
     ASSERT_EQ(subgraph->get_ops().size(), final_subgraph_size);
 }
 
-INSTANTIATE_TEST_SUITE_P(SubgraphPass, matmul_with_diff_inputs_t,
+INSTANTIATE_TEST_SUITE_P(test_subgraph_pass_subgraph_pass,
+        matmul_with_diff_inputs_t,
         testing::Values(matmul_params_t {{1, 1024}, {1000, 1024}, {1000},
                                 {1, 1000}, false, true, false, 4, 5},
                 matmul_params_t {{4, 3, 64}, {3, 64}, {3}, {4, 3, 3}, false,
@@ -1041,7 +1041,7 @@ INSTANTIATE_TEST_SUITE_P(SubgraphPass, matmul_with_diff_inputs_t,
                 matmul_params_t {{4, 64, 3}, {3, 64}, {3}, {4, 3, 3}, true,
                         true, false, 6, 8}));
 
-TEST(SubgraphPass, ExecutionArgsSet) {
+TEST(test_subgraph_pass_subgraph_pass, ExecutionArgsSet) {
     ///////////////////////////
     // val1    val2
     //   \     /
@@ -1118,16 +1118,16 @@ TEST(SubgraphPass, ExecutionArgsSet) {
 
     // because of deep copy, the desc should be same but the address should be
     // different
-    ASSERT_TRUE(cloned_mem1.get_desc() == mem1.get_desc()
-            && cloned_mem1.get() != mem1.get());
-    ASSERT_TRUE(cloned_mem2.get_desc() == mem2.get_desc()
-            && cloned_mem2.get() != mem2.get());
-    ASSERT_TRUE(cloned_mem3.get_desc() == mem3.get_desc()
-            && cloned_mem3.get() != mem3.get());
-    ASSERT_TRUE(cloned_mem4.get_desc() == mem4.get_desc()
-            && cloned_mem4.get() != mem4.get());
-    ASSERT_TRUE(cloned_mem5.get_desc() == mem5.get_desc()
-            && cloned_mem5.get() != mem5.get());
+    ASSERT_TRUE(
+            cloned_mem1.get_desc() == mem1.get_desc() && cloned_mem1 != mem1);
+    ASSERT_TRUE(
+            cloned_mem2.get_desc() == mem2.get_desc() && cloned_mem2 != mem2);
+    ASSERT_TRUE(
+            cloned_mem3.get_desc() == mem3.get_desc() && cloned_mem3 != mem3);
+    ASSERT_TRUE(
+            cloned_mem4.get_desc() == mem4.get_desc() && cloned_mem4 != mem4);
+    ASSERT_TRUE(
+            cloned_mem5.get_desc() == mem5.get_desc() && cloned_mem5 != mem5);
 
     // the external mems and internal mems are just alias to the mem object in
     // val-mem map, so both of their desc and address should be same
@@ -1135,25 +1135,25 @@ TEST(SubgraphPass, ExecutionArgsSet) {
             = cloned_exec_args_set.get_mems_use_external_inputs();
     ASSERT_TRUE(cloned_mem1.get_desc()
                     == mems_use_external_inputs[0].first.get_desc()
-            && cloned_mem1.get() == mems_use_external_inputs[0].first.get());
+            && cloned_mem1 == mems_use_external_inputs[0].first);
     ASSERT_TRUE(cloned_mem2.get_desc()
                     == mems_use_external_inputs[1].first.get_desc()
-            && cloned_mem2.get() == mems_use_external_inputs[1].first.get());
+            && cloned_mem2 == mems_use_external_inputs[1].first);
     ASSERT_TRUE(cloned_mem4.get_desc()
                     == mems_use_external_inputs[2].first.get_desc()
-            && cloned_mem4.get() == mems_use_external_inputs[2].first.get());
+            && cloned_mem4 == mems_use_external_inputs[2].first);
 
     auto mems_use_external_outputs
             = cloned_exec_args_set.get_mems_use_external_outputs();
     ASSERT_TRUE(cloned_mem5.get_desc()
                     == mems_use_external_outputs[0].first.get_desc()
-            && cloned_mem5.get() == mems_use_external_outputs[0].first.get());
+            && cloned_mem5 == mems_use_external_outputs[0].first);
 
     auto mems_use_internal_variables
             = cloned_exec_args_set.get_mems_use_internal_temporary();
     ASSERT_TRUE(cloned_mem3.get_desc()
                     == mems_use_internal_variables[0].first.get_desc()
-            && cloned_mem3.get() == mems_use_internal_variables[0].first.get());
+            && cloned_mem3 == mems_use_internal_variables[0].first);
 
     auto args = cloned_exec_args_set.get_exec_args();
 
@@ -1161,27 +1161,27 @@ TEST(SubgraphPass, ExecutionArgsSet) {
     auto cloned_op1_args = args[0];
     ASSERT_TRUE(
             cloned_mem1.get_desc() == cloned_op1_args[DNNL_ARG_SRC_0].get_desc()
-            && cloned_mem1.get() == cloned_op1_args[DNNL_ARG_SRC_0].get());
+            && cloned_mem1 == cloned_op1_args[DNNL_ARG_SRC_0]);
     ASSERT_TRUE(
             cloned_mem2.get_desc() == cloned_op1_args[DNNL_ARG_SRC_1].get_desc()
-            && cloned_mem2.get() == cloned_op1_args[DNNL_ARG_SRC_1].get());
+            && cloned_mem2 == cloned_op1_args[DNNL_ARG_SRC_1]);
     ASSERT_TRUE(
             cloned_mem3.get_desc() == cloned_op1_args[DNNL_ARG_DST].get_desc()
-            && cloned_mem3.get() == cloned_op1_args[DNNL_ARG_DST].get());
+            && cloned_mem3 == cloned_op1_args[DNNL_ARG_DST]);
 
     auto cloned_op2_args = args[1];
     ASSERT_TRUE(
             cloned_mem3.get_desc() == cloned_op2_args[DNNL_ARG_SRC_0].get_desc()
-            && cloned_mem3.get() == cloned_op2_args[DNNL_ARG_SRC_0].get());
+            && cloned_mem3 == cloned_op2_args[DNNL_ARG_SRC_0]);
     ASSERT_TRUE(
             cloned_mem4.get_desc() == cloned_op2_args[DNNL_ARG_SRC_1].get_desc()
-            && cloned_mem4.get() == cloned_op2_args[DNNL_ARG_SRC_1].get());
+            && cloned_mem4 == cloned_op2_args[DNNL_ARG_SRC_1]);
     ASSERT_TRUE(
             cloned_mem5.get_desc() == cloned_op2_args[DNNL_ARG_DST].get_desc()
-            && cloned_mem5.get() == cloned_op2_args[DNNL_ARG_DST].get());
+            && cloned_mem5 == cloned_op2_args[DNNL_ARG_DST]);
 }
 
-TEST(SubgraphPass, MemoryPlanning) {
+TEST(test_subgraph_pass_subgraph_pass, MemoryPlanning) {
     /*
                 / -> dnnl_reorder -> dnnl_reorder
                /
@@ -1280,7 +1280,7 @@ TEST(SubgraphPass, MemoryPlanning) {
     ASSERT_TRUE(mem_offkeys.empty());
 }
 
-TEST(SubgraphPass, FusePostOpsForConvDepthwise) {
+TEST(test_subgraph_pass_subgraph_pass, FusePostOpsForConvDepthwise) {
     /*   conv
           |
          conv (depthwise)
@@ -1330,7 +1330,8 @@ TEST(SubgraphPass, FusePostOpsForConvDepthwise) {
     g.add_op(&depthwise);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("fp_conv_depthwise_cpu");
+    graph::pass::pass_base_ptr apass
+            = get_pass("fp_conv_postops_depthwise_postops_cpu");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1348,7 +1349,63 @@ TEST(SubgraphPass, FusePostOpsForConvDepthwise) {
     ASSERT_EQ(subgraph->num_ops(), 2U);
 }
 
-TEST(SubgraphPass, FuseSigmoidMultiplyToSwish) {
+TEST(test_subgraph_pass_subgraph_pass, FailToFusePostOpsForConvDepthwise) {
+    /*   conv
+          |
+         conv (depthwise)
+    */
+    graph::engine_t *g_eng = get_engine();
+    dnnl::engine p_eng = dnnl::impl::graph::dnnl_impl::make_dnnl_engine(*g_eng);
+
+    // N, IC, IH, IW
+    std::vector<int64_t> conv_src_shape {4, 4, 4, 4};
+    // OC, IC/G, KH, KW
+    std::vector<int64_t> conv_wei_shape {4, 4, 1, 1};
+    // N, OC, OH, OW
+    std::vector<int64_t> conv_dst_shape {4, 4, 4, 4};
+    // OC, IC/G, KH, KW
+    std::vector<int64_t> dw_wei_shape {4, 1, 3, 3};
+    // N, OC, OH, OW
+    std::vector<int64_t> dw_dst_shape {4, 4, 2, 2};
+
+    graph::op_t conv {0, graph::op_kind::Convolution, "conv"};
+    set_conv_dw_base_op_attr(conv);
+
+    graph::op_t depthwise {1, graph::op_kind::Convolution, "depthwise"};
+    set_conv_dw_post_op_attr(depthwise, "k3s2p1");
+
+    graph::logical_tensor_t conv_src
+            = logical_tensor_init(0, graph::data_type::f32);
+    graph::logical_tensor_t conv_wei
+            = logical_tensor_init(1, graph::data_type::f32);
+    graph::logical_tensor_t conv_dst
+            = logical_tensor_init(2, graph::data_type::f32);
+
+    graph::logical_tensor_t dw_wei
+            = logical_tensor_init(3, graph::data_type::f32);
+    graph::logical_tensor_t dw_dst
+            = logical_tensor_init(4, graph::data_type::f32);
+
+    conv.add_input(conv_src);
+    conv.add_input(conv_wei);
+    conv.add_output(conv_dst);
+
+    depthwise.add_input(conv_dst);
+    depthwise.add_input(dw_wei);
+    depthwise.add_output(dw_dst);
+
+    graph::graph_t g;
+    g.add_op(&conv);
+    g.add_op(&depthwise);
+    g.finalize();
+
+    graph::pass::pass_base_ptr apass
+            = get_pass("fp_conv_postops_depthwise_postops_cpu");
+    apass->run(g);
+    ASSERT_EQ(g.get_num_partitions(), 0U);
+}
+
+TEST(test_subgraph_pass_subgraph_pass, FuseSigmoidMultiplyToSwish) {
     /*   
               /\
         sigmoid \
@@ -1403,7 +1460,8 @@ TEST(SubgraphPass, FuseSigmoidMultiplyToSwish) {
             dnnl::algorithm::eltwise_swish);
 }
 
-TEST(TestInt8MatmulPassesWithDiffInputs, X8X8BF16MatmulScaleAddPasses) {
+TEST(test_subgraph_pass_int8_matmul_passes_with_diff_inputs,
+        X8X8BF16MatmulScaleAddPasses) {
     /*
         | (u8/s8)  | (u8/s8)
      dequant    dequant
@@ -1550,7 +1608,7 @@ TEST(TestInt8MatmulPassesWithDiffInputs, X8X8BF16MatmulScaleAddPasses) {
     }
 }
 
-TEST(SubgraphPass, FuseTypecastToQuantize) {
+TEST(test_subgraph_pass_subgraph_pass, FuseTypecastToQuantize) {
     graph::engine_t *g_eng = get_engine();
     dnnl::engine p_eng = dnnl::impl::graph::dnnl_impl::make_dnnl_engine(*g_eng);
     graph_t agraph;
@@ -1597,7 +1655,7 @@ TEST(SubgraphPass, FuseTypecastToQuantize) {
     ASSERT_EQ(subgraph->get_ops().size(), 3U);
 }
 
-TEST(LayoutPropagation, ReshapeWithSpecifiedOutputLayout) {
+TEST(test_subgraph_pass_layout_propagation, ReshapeWithSpecifiedOutputLayout) {
     graph::engine_t *g_eng = get_engine();
     dnnl::engine p_eng = dnnl::impl::graph::dnnl_impl::make_dnnl_engine(*g_eng);
 
@@ -1636,7 +1694,8 @@ TEST(LayoutPropagation, ReshapeWithSpecifiedOutputLayout) {
     ASSERT_EQ(sorted_ops[0]->get_kind(), dnnl_impl::op_kind::dnnl_reorder);
 }
 
-TEST(LayoutPropagation, ReshapeWithUnreshapableInputLayout) {
+TEST(test_subgraph_pass_layout_propagation,
+        ReshapeWithUnreshapableInputLayout) {
     graph::engine_t *g_eng = get_engine();
     dnnl::engine p_eng = dnnl::impl::graph::dnnl_impl::make_dnnl_engine(*g_eng);
 
@@ -1677,7 +1736,7 @@ TEST(LayoutPropagation, ReshapeWithUnreshapableInputLayout) {
     ASSERT_EQ(sorted_ops[0]->get_kind(), dnnl_impl::op_kind::dnnl_reorder);
 }
 
-TEST(LayoutPropagation, ReshapeWithReshapableInputLayout) {
+TEST(test_subgraph_pass_layout_propagation, ReshapeWithReshapableInputLayout) {
     graph::engine_t *g_eng = get_engine();
     dnnl::engine p_eng = dnnl::impl::graph::dnnl_impl::make_dnnl_engine(*g_eng);
 
@@ -1709,7 +1768,7 @@ TEST(LayoutPropagation, ReshapeWithReshapableInputLayout) {
     ASSERT_EQ(subgraph->get_ops().size(), 1U);
 }
 
-TEST(LayoutPropagation, Transpose) {
+TEST(test_subgraph_pass_layout_propagation, Transpose) {
     graph::engine_t *g_eng = get_engine();
     dnnl::engine p_eng = dnnl::impl::graph::dnnl_impl::make_dnnl_engine(*g_eng);
 
@@ -1751,7 +1810,7 @@ TEST(LayoutPropagation, Transpose) {
     ASSERT_EQ(md_stride, out_stride);
 }
 
-TEST(SubgraphPass, FuseTypecastBeforeFusePostops) {
+TEST(test_subgraph_pass_subgraph_pass, FuseTypecastBeforeFusePostops) {
     graph::engine_t *engine = get_engine();
 
     // prepare fp32 data
@@ -1885,7 +1944,7 @@ TEST(SubgraphPass, FuseTypecastBeforeFusePostops) {
     ASSERT_EQ(subgraph->num_ops(), 9U);
 }
 
-TEST(SubgraphPass, CheckUndefinedOpAttribute) {
+TEST(test_subgraph_pass_subgraph_pass, CheckUndefinedOpAttribute) {
     /*
     (f32) \     / (f32)
             conv
@@ -1941,7 +2000,7 @@ TEST(SubgraphPass, CheckUndefinedOpAttribute) {
     ASSERT_EQ(validator.run(subgraph), status::invalid_graph_op);
 }
 
-TEST(SubgraphPass, CommonReorderElimination) {
+TEST(test_subgraph_pass_subgraph_pass, CommonReorderElimination) {
     graph::engine_t &g_eng = *get_engine();
     dnnl::engine p_eng = graph::dnnl_impl::make_dnnl_engine(g_eng);
     size_t id = 0;
@@ -1982,7 +2041,7 @@ TEST(SubgraphPass, CommonReorderElimination) {
     ASSERT_EQ(subgraph->get_ops().size(), 3U);
 }
 
-TEST(SubgraphPass, CombineBinaryPostOpScales) {
+TEST(test_subgraph_pass_subgraph_pass, CombineBinaryPostOpScales) {
     namespace utils = dnnl::graph::tests::unit::utils;
     dnnl_impl::dnnl_backend::get_singleton();
     using dims = graph::dnnl_impl::dims;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -31,19 +31,6 @@ namespace dnnl {
 namespace impl {
 namespace gpu {
 namespace jit {
-
-bool need_src_or_dst_check(
-        bool is_fwd, int o, int i, int k, int p, int s, int d) {
-    if (is_fwd) {
-        int i_min = -p;
-        int i_max = (o - 1) * s - p + (k - 1) * (1 + d);
-        return (i_min < 0) || (i_max >= i);
-    }
-    // Backward.
-    int os_min = p - (k - 1) * (1 + d);
-    int os_max = (i - 1) + p;
-    return (os_min < 0) || (os_max >= o * s);
-}
 
 // Represents hierarchy of tile levels and corresponding loop/grid indices.
 //
@@ -81,7 +68,7 @@ static dim_tile_t create_tile(gemm_schedule_t &gemm_schedule,
         const conv_config_t &cfg, const expr_t &dim) {
     dim_tile_t tile;
     auto &name = dim.as<var_t>().name;
-    auto conv_dim = conv_dim_t::from_name(name);
+    auto conv_dim = prb_dim_t::from_name(name);
     int loop_dim = cfg.loop_dim(conv_dim);
     int tg_dim = cfg.thread_group_dim(conv_dim);
     int iter_dim = cfg.iter_dim(conv_dim);
@@ -99,12 +86,11 @@ static dim_tile_t create_tile(gemm_schedule_t &gemm_schedule,
         bool is_tg = (dim_idx == 2);
         bool is_iter = (dim_idx == 3);
         if (is_thr || is_iter) return true;
-        for (int i = 0; i < 3; i++) {
-            auto *tile = is_tg ? get_thread_group_grid_conv_dims(cfg.prb(), i)
-                               : get_kernel_grid_conv_dims(cfg.prb(), i);
-            for (auto d : *tile)
+        auto &grid = is_tg ? get_thread_group_grid_conv_dims(cfg.prb())
+                           : get_kernel_grid_conv_dims(cfg.prb());
+        for (auto &tile : grid)
+            for (auto &d : tile)
                 if (dim_name == d.name()) return true;
-        }
         return false;
     };
 
@@ -154,22 +140,22 @@ void init_fwd(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
     od = var_t::make(type_t::s32(), "od");
     oh = var_t::make(type_t::s32(), "oh");
     ow = var_t::make(type_t::s32(), "ow");
-    check_ow = (prb_.ow < cfg_.padded_dim(conv_dims::ow));
+    check_ow = (prb_.ow < cfg_.padded_dim(prb_dims::ow));
 
     // Initialize masks.
     expr_t id_mask, ih_mask, iw_mask;
     expr_t od_mask, oh_mask, ow_mask;
 
-    bool check_kw = (prb_.kw < cfg_.padded_dim(conv_dims::kw));
+    bool check_kw = (prb_.kw < cfg_.padded_dim(prb_dims::kw));
     bool check_iw = check_kw || check_ow
-            || need_src_or_dst_check(prb_.is_fwd, prb_.ow, prb_.iw, prb_.kw,
-                    prb_.pw, prb_.sw, prb_.dw);
+            || utils::need_src_or_dst_check(prb_.is_fwd, prb_.ow, prb_.iw,
+                    prb_.kw, prb_.pw, prb_.sw, prb_.dw);
     bool check_ih = check_oh
-            || need_src_or_dst_check(prb_.is_fwd, prb_.oh, prb_.ih, prb_.kh,
-                    prb_.ph, prb_.sh, prb_.dh);
+            || utils::need_src_or_dst_check(prb_.is_fwd, prb_.oh, prb_.ih,
+                    prb_.kh, prb_.ph, prb_.sh, prb_.dh);
     bool check_id = check_od
-            || need_src_or_dst_check(prb_.is_fwd, prb_.od, prb_.id, prb_.kd,
-                    prb_.pd, prb_.sd, prb_.dd);
+            || utils::need_src_or_dst_check(prb_.is_fwd, prb_.od, prb_.id,
+                    prb_.kd, prb_.pd, prb_.sd, prb_.dd);
 
     auto &x = view_t::placeholder_var();
     if (check_id) id_mask = (x >= 0) & (x < prb_.id);
@@ -250,8 +236,7 @@ void init_fwd(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
     gemm_schedule.set_k_vars({ic, kd, kh, kw});
 
     gemm_schedule.for_each_var([&](const expr_t &var) {
-        int bound
-                = cfg_.padded_dim(conv_dim_t::from_name(var.as<var_t>().name));
+        int bound = cfg_.padded_dim(prb_dim_t::from_name(var.as<var_t>().name));
         gemm_schedule.set_var_bound(var, bound);
     });
 
@@ -315,13 +300,13 @@ void init_bwd_d(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
     // Initialize masks.
     expr_t od_mask(true), oh_mask(true), ow_mask(true);
 
-    bool check_iw = (prb_.iw < cfg_.padded_dim(conv_dims::iw));
+    bool check_iw = (prb_.iw < cfg_.padded_dim(prb_dims::iw));
     bool check_ow = check_iw
-            || need_src_or_dst_check(prb_.is_fwd, prb_.ow, prb_.iw, prb_.kw,
-                    prb_.pw, prb_.sw, prb_.dw);
-    bool check_oh = need_src_or_dst_check(
+            || utils::need_src_or_dst_check(prb_.is_fwd, prb_.ow, prb_.iw,
+                    prb_.kw, prb_.pw, prb_.sw, prb_.dw);
+    bool check_oh = utils::need_src_or_dst_check(
             prb_.is_fwd, prb_.oh, prb_.ih, prb_.kh, prb_.ph, prb_.sh, prb_.dh);
-    bool check_od = need_src_or_dst_check(
+    bool check_od = utils::need_src_or_dst_check(
             prb_.is_fwd, prb_.od, prb_.id, prb_.kd, prb_.pd, prb_.sd, prb_.dd);
 
     auto &x = view_t::placeholder_var();
@@ -334,8 +319,8 @@ void init_bwd_d(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
         // Apply mapping to iw to ensure each thread group has the same
         // stride condition when evaluating skip conditions.
         iw_mapping = [&](const expr_t &e) {
-            int iw_tg_blk = cfg_.thread_group_dim(conv_dims::iw)
-                    * cfg_.iter_dim(conv_dims::iw);
+            int iw_tg_blk = cfg_.thread_group_dim(prb_dims::iw)
+                    * cfg_.iter_dim(prb_dims::iw);
             int iw_bound = utils::rnd_up(prb_.iw, iw_tg_blk);
             int iw_same_mod_blk = ir_utils::safe_divide(iw_bound, prb_.sw);
             return (e % iw_same_mod_blk) * prb_.sw + (e / iw_same_mod_blk);
@@ -439,8 +424,7 @@ void init_bwd_d(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
     gemm_schedule.set_k_vars({oc, kd, kh, kw});
 
     gemm_schedule.for_each_var([&](const expr_t &var) {
-        int bound
-                = cfg_.padded_dim(conv_dim_t::from_name(var.as<var_t>().name));
+        int bound = cfg_.padded_dim(prb_dim_t::from_name(var.as<var_t>().name));
         gemm_schedule.set_var_bound(var, bound);
     });
 
@@ -526,17 +510,17 @@ void init_bwd_w(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
     // Initialize masks.
     expr_t id_mask(true), ih_mask(true), iw_mask(true);
 
-    bool check_ow = (prb_.ow < cfg_.padded_dim(conv_dims::ow));
-    bool check_oh = (prb_.oh < cfg_.padded_dim(conv_dims::oh));
-    bool check_od = (prb_.od < cfg_.padded_dim(conv_dims::od));
-    bool check_kw = (prb_.kw < cfg_.padded_dim(conv_dims::kw));
+    bool check_ow = (prb_.ow < cfg_.padded_dim(prb_dims::ow));
+    bool check_oh = (prb_.oh < cfg_.padded_dim(prb_dims::oh));
+    bool check_od = (prb_.od < cfg_.padded_dim(prb_dims::od));
+    bool check_kw = (prb_.kw < cfg_.padded_dim(prb_dims::kw));
     bool check_iw = check_kw
-            || need_src_or_dst_check(/*is_fwd=*/true, prb_.ow, prb_.iw, prb_.kw,
-                    prb_.pw, prb_.sw, prb_.dw);
-    bool check_ih = need_src_or_dst_check(/*is_fwd=*/true, prb_.oh, prb_.ih,
-            prb_.kh, prb_.ph, prb_.sh, prb_.dh);
-    bool check_id = need_src_or_dst_check(/*is_fwd=*/true, prb_.od, prb_.id,
-            prb_.kd, prb_.pd, prb_.sd, prb_.dd);
+            || utils::need_src_or_dst_check(/*is_fwd=*/true, prb_.ow, prb_.iw,
+                    prb_.kw, prb_.pw, prb_.sw, prb_.dw);
+    bool check_ih = utils::need_src_or_dst_check(/*is_fwd=*/true, prb_.oh,
+            prb_.ih, prb_.kh, prb_.ph, prb_.sh, prb_.dh);
+    bool check_id = utils::need_src_or_dst_check(/*is_fwd=*/true, prb_.od,
+            prb_.id, prb_.kd, prb_.pd, prb_.sd, prb_.dd);
     bool check_iw_min = check_iw;
     bool check_ih_min = check_ih;
     bool check_id_min = check_id;
@@ -635,8 +619,7 @@ void init_bwd_w(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
     gemm_schedule.set_k_vars({mb, od, oh, ow});
 
     gemm_schedule.for_each_var([&](const expr_t &var) {
-        int bound
-                = cfg_.padded_dim(conv_dim_t::from_name(var.as<var_t>().name));
+        int bound = cfg_.padded_dim(prb_dim_t::from_name(var.as<var_t>().name));
         gemm_schedule.set_var_bound(var, bound);
     });
 
@@ -673,8 +656,8 @@ void init_bwd_w(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
     gemm_schedule.reorder({od_tile.loop_idx(), oh_tile.loop_idx(),
             ow_tile.loop_idx(), mb_tile.loop_idx()});
 
-    gemm_schedule.unroll(mb_tile.loop_idx(), cfg_.unroll(conv_dims::mb));
-    gemm_schedule.unroll(ow_tile.loop_idx(), cfg_.unroll(conv_dims::ow));
+    gemm_schedule.unroll(mb_tile.loop_idx(), cfg_.unroll(prb_dims::mb));
+    gemm_schedule.unroll(ow_tile.loop_idx(), cfg_.unroll(prb_dims::ow));
 
     gemm_schedule.tensorize(g_tile.iter_idx());
     gemm_schedule.tensorize(oc_tile.iter_idx());
@@ -685,7 +668,7 @@ void init_bwd_w(const conv_config_t &cfg_, gemm_schedule_t &gemm_schedule,
 }
 
 reorder_plan_t create_reorder_plan(
-        ngen::HW hw, const layout_t &src, const layout_t &dst) {
+        const hw_t &hw, const layout_t &src, const layout_t &dst) {
     if (src == dst) return reorder_plan_t();
     if (src.type().is_bitwise_compatible(dst.type())
             && src.retype(dst.type()) == dst)
@@ -733,8 +716,8 @@ int reorder_plan_t::estimate_regs() const {
     return utils::div_up(ret, grf_size());
 }
 
-reduce_plan_t create_reduce_plan(
-        ngen::HW hw, const layout_t &src, const layout_t &dst, uint32_t mask) {
+reduce_plan_t create_reduce_plan(const hw_t &hw, const layout_t &src,
+        const layout_t &dst, uint32_t mask) {
     reduce_plan_t ret(hw);
     ret.src = src;
     ret.dst = dst;
@@ -1152,6 +1135,7 @@ struct fma_context_t {
         fma = cfg.fma_kind();
         a_type = type_t(cfg.prb().a_data_type);
         b_type = type_t(cfg.prb().b_data_type);
+        c_type = type_t(cfg.prb().c_data_type);
         is_src1_broadcast = !cfg.prb().is_dw;
         ab_swap_transpose_ = cfg.prb().ab_swap_transpose;
     }
@@ -1171,8 +1155,17 @@ struct fma_context_t {
         if (layout.type().is_x8())
             return layout.retype(type_t::s16()).make_strided(2);
 
+        if (a_type.is_f16() && b_type.is_f16() && c_type.is_f32()) {
+            return layout.retype(type_t::f32()).make_dense();
+        }
+        if (layout.type().is_bf8())
+            return layout.make_dense().retype(type_t::f16());
+
         // mad with f16 requires aligned regioning for src1/src2.
         if (a_type.is_f16()) return layout.make_dense();
+
+        if (layout.type().is_bf16() && !hw.systolic_support())
+            return layout.retype(type_t::f32()).make_dense();
 
         if (a_type.is_bf16()) {
             // bf16 mixed mode requires src1 to be converted to f32 when it's
@@ -1194,8 +1187,7 @@ struct fma_context_t {
         bool is_a = (abc == abc_kind_t::a);
         bool is_b = (abc == abc_kind_t::b);
         auto type = (is_a ? a_type : b_type);
-        int type_size = type.size();
-
+        int type_size = (layout.type().is_bf8() ? 2 : type.size());
         if (is_dpas) {
             int sdepth = 8;
             int dword_size = 4;
@@ -1220,6 +1212,7 @@ struct fma_context_t {
                     layout_t(type, 0, (int)bmnks.size(), blocks));
             auto abc_layout
                     = mapper.map_from_bmnk(abc, bmnks, fma_layout, layout);
+            if (layout.type().is_bf8()) return abc_layout.retype(type_t::f16());
             return abc_layout;
         }
 
@@ -1230,9 +1223,10 @@ struct fma_context_t {
                     std::vector<block_t> blocks;
                     int new_inner_stride = 1;
                     int nblocks = (int)layout.blocks().size();
+                    auto inner_most_block = layout.blocks()[0];
                     for (int i = nblocks - 1; i >= 0; --i) {
                         auto &b = layout.blocks()[i];
-                        if (i == nblocks - 1) {
+                        if (b.dim_idx != inner_most_block.dim_idx) {
                             new_inner_stride = b.block;
                             blocks.insert(blocks.begin(),
                                     block_t(b.dim_idx, b.block, stride_t(1)));
@@ -1241,8 +1235,10 @@ struct fma_context_t {
                                     stride_t(new_inner_stride)));
                         }
                     }
-                    return layout_t(layout.type(), layout.ndims(),
-                            layout.offset(), blocks);
+                    return maybe_retype_layout_for_mad(is_a,
+                            layout_t(layout.type(), layout.ndims(),
+                                    layout.offset(), blocks)
+                                    .make_dense());
                 }
             }
             // XXX: type and layout.type() may be different here when using mad
@@ -1256,7 +1252,7 @@ struct fma_context_t {
             auto bmnks = get_bmnk_kinds(abc, /*with_batch=*/true);
             auto bmnk_layout = mapper.map_to_bmnk(abc, bmnks, ret);
             auto fma_layout = bmnk_layout.make_with_block(
-                    layout_t(type, 0, (int)bmnks.size(), blocks));
+                    layout_t(ret.type(), 0, (int)bmnks.size(), blocks));
             auto abc_layout = mapper.map_from_bmnk(abc, bmnks, fma_layout, ret);
             return abc_layout;
         }
@@ -1331,12 +1327,13 @@ struct fma_context_t {
         }
     }
 
-    ngen::HW hw;
+    hw_t hw;
     int simd;
     int vec_size;
     fma_kind_t fma;
     type_t a_type;
     type_t b_type;
+    type_t c_type;
     bool is_src1_broadcast;
     bool ab_swap_transpose_;
     fma_layout_hint_t a_layout_hint;
@@ -1344,12 +1341,12 @@ struct fma_context_t {
 };
 
 dim_t find_min_stride_without_conflicts(
-        ngen::HW hw, dim_t inner_bytes, dim_t dense_stride_bytes) {
+        const hw_t &hw, dim_t inner_bytes, dim_t dense_stride_bytes) {
     int write_step = 64;
     int stride_step = 16;
     dim_t stride_beg = dense_stride_bytes;
     dim_t stride_end = 2 * dense_stride_bytes;
-    auto arch = convert_ngen_arch_to_dnnl(hw);
+    auto arch = convert_ngen_arch_to_dnnl(hw.to_ngen());
     const int slm_banks = compute::device_info_t::slm_memory_bank_count(arch);
     const int bank_granularity
             = compute::device_info_t::slm_memory_bank_granularity(arch);
@@ -1384,7 +1381,7 @@ dim_t find_min_stride_without_conflicts(
 }
 
 layout_t pad_slm_layout(
-        ngen::HW hw, const layout_t &layout, const grid_info_t &grid) {
+        const hw_t &hw, const layout_t &layout, const grid_info_t &grid) {
     // EUs are fused only in XeHP and XeHPG; otherwise no need to pad SLM.
     if (hw >= ngen::HW::XeHPC || hw <= ngen::HW::XeLP) return layout;
     auto tg_dim0 = grid.dim(0);
@@ -1829,7 +1826,10 @@ private:
         int tmp_regs = 5;
         int bound = cfg_.regs() - tmp_regs;
         if (plan.grf_usage().total() < bound) return plan_status_t::success;
-
+        // Do not downsize grf mode at the cost of disabling below optimizations.
+        if (cfg_.exec_cfg().hw().large_grf_support() && cfg_.regs() <= 128
+                && default_regs(cfg_) != 128)
+            return plan_status_t::out_of_registers;
         plan_status_t status;
 
         status = try_apply_ab_split(plan, bound);
@@ -1910,7 +1910,7 @@ private:
                 && cfg_.is_dp_fma())
             return false;
         bmnk_dim_helper_t h(cfg_);
-        int k_tg = h.thread_group_dim(gemm_dims::k);
+        int k_tg = h.thread_group_dim(prb_dims::k);
         if (k_tg != 1) return false;
         return true;
     }
@@ -1918,6 +1918,7 @@ private:
     bool use_slm(abc_kind_t abc) const {
         auto &prb = cfg_.prb();
         bool is_a = (abc == abc_kind_t::a);
+        if (cfg_.bufs_hint() == 0) return false;
         if (cfg_.slm().is_overridden()) {
             return is_a ? cfg_.slm().a() : cfg_.slm().b();
         }
@@ -1964,7 +1965,7 @@ private:
         auto &src = g2s_load.reg_layout();
         auto &dst = g2s_store.reg_layout();
         reorder = create_reorder_plan(cfg_.hw(), src, dst);
-        if (reduce_mask) {
+        if (reduce_mask && !cfg_.prb().deterministic) {
             *reduce_tile = to_reduce_tensor(abs_thr_tile, reduce_mask.mask);
             auto reduce_layout = to_reduce_layout(src, reduce_mask.mask);
             *reduce = create_reduce_plan(
@@ -2003,7 +2004,7 @@ private:
         auto &tg = cfg_.thread_group_grid();
         auto thr_view = tg_view.split(tg, &grid);
         auto params = get_send_params(cfg_.exec_cfg(), send_op_t::prefetch,
-                send_address_t::a64, fma_kind_t::unknown, abc, thr_view,
+                send_address_t::a64, fma_kind_t::undef, abc, thr_view,
                 gemm_schedule_);
         prefetch = create_send_plan(cfg_.exec_cfg(), thr_view, params);
         return plan_status_t::success;
@@ -2019,13 +2020,23 @@ private:
 
     plan_status_t init_x_s2r_plan(abc_kind_t abc, bool has_x_slm,
             const layout_t &slm_layout, const tensor_t &thr_tile,
-            send_plan_t &load, layout_t &layout) const {
+            const tensor_t &abs_thr_tile, send_plan_t &load, layout_t &layout,
+            reduce_mask_t reduce_mask = reduce_mask_t(),
+            reduce_plan_t *reduce = nullptr,
+            tensor_t *reduce_tile = nullptr) const {
         if (!has_x_slm) return plan_status_t::success;
         auto thr_view = view_t(slm_layout).create_sub_view(thr_tile);
         auto params = get_send_params(cfg_.exec_cfg(), send_op_t::load,
                 send_address_t::slm, abc, thr_view);
         load = create_send_plan(cfg_.exec_cfg(), thr_view, params);
         layout = load.reg_layout();
+        if (reduce_mask && cfg_.prb().deterministic) {
+            *reduce_tile = to_reduce_tensor(abs_thr_tile, reduce_mask.mask);
+            auto reduce_layout = to_reduce_layout(layout, reduce_mask.mask);
+            *reduce = create_reduce_plan(
+                    cfg_.hw(), layout, reduce_layout, reduce_mask.mask);
+        }
+
         if (load.is_scattered()) {
             // Do not use SLM with scattered SLM load.
             return plan_status_t::invalid_slm_send;
@@ -2086,10 +2097,9 @@ private:
         return plan_status_t::success;
     }
 
-    // Verifies that SLM loads after k-slicing are at GRF granularity.
     plan_status_t verify_slm_k_slicing() const {
         bmnk_dim_helper_t h(cfg_);
-        int k_tg = h.thread_group_dim(gemm_dims::k);
+        int k_tg = h.thread_group_dim(prb_dims::k);
         if (k_tg == 1) return plan_status_t::success;
 
         auto l = plan_.fma.c_prb_layout;
@@ -2112,16 +2122,20 @@ private:
             }
         }
         if (outer != k_tg) return plan_status_t::invalid_slm_k_slicing;
-        auto l_sub = l.map(tensor_t(rem_dims));
-        int bytes = l_sub.type().size();
-        stride_t stride = 1;
-        for (auto &b : l_sub.blocks()) {
-            if (b.stride != stride) break;
-            bytes *= (int)b.block;
-            stride *= b.block;
+
+        if (plan_.hw < ngen::HW::XeHPG) {
+            // Verifies that SLM loads after k-slicing are at GRF granularity.
+            auto l_sub = l.map(tensor_t(rem_dims));
+            int bytes = l_sub.type().size();
+            stride_t stride = 1;
+            for (auto &b : l_sub.blocks()) {
+                if (b.stride != stride) break;
+                bytes *= (int)b.block;
+                stride *= b.block;
+            }
+            if (bytes % plan_.grf_size() != 0)
+                return plan_status_t::invalid_slm_k_slicing;
         }
-        if (bytes % plan_.grf_size() != 0)
-            return plan_status_t::invalid_slm_k_slicing;
         return plan_status_t::success;
     }
 
@@ -2183,9 +2197,15 @@ private:
 
     plan_status_t init_x2r_plan(const slm_plan_t &slm, x2r_plan_t &plan) const {
         PLAN_CHECK(init_x_s2r_plan(abc_kind_t::a, slm.has_a(), slm.a_layout,
-                gemm_schedule_.a_thr_tile(), plan.a_load, plan.a_layout));
+                gemm_schedule_.a_thr_tile(),
+                gemm_schedule_.a_thr_tile(/*is_relative=*/false), plan.a_load,
+                plan.a_layout, reduce_mask(cfg_, abc_kind_t::a), &plan.x_reduce,
+                &plan.x_reduce_tile));
         PLAN_CHECK(init_x_s2r_plan(abc_kind_t::b, slm.has_b(), slm.b_layout,
-                gemm_schedule_.b_thr_tile(), plan.b_load, plan.b_layout));
+                gemm_schedule_.b_thr_tile(),
+                gemm_schedule_.b_thr_tile(/*is_relative=*/false), plan.b_load,
+                plan.b_layout, reduce_mask(cfg_, abc_kind_t::b), &plan.x_reduce,
+                &plan.x_reduce_tile));
         PLAN_CHECK(init_x_g2r_plan(abc_kind_t::a, slm.has_a(),
                 gemm_schedule_.a_tg_view(), gemm_schedule_.a_thr_tile(),
                 gemm_schedule_.a_thr_tile(/*is_relative=*/false), plan.a_load,

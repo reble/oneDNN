@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,7 +28,6 @@
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
 
-#include "binary/binary.hpp"
 #include "conv/conv_dw_fusion.hpp"
 
 namespace conv_dw_fusion {
@@ -79,10 +78,16 @@ std::unique_ptr<prb_t> get_fused_conv_prb(const prb_t *prb) {
     if (!prb->attr.scales.get(DNNL_ARG_DST).is_def())
         fusion_attr.scales.set(
                 DNNL_ARG_SRC, prb->attr.scales.get(DNNL_ARG_DST));
-    if (!fused_conv_po.wei_scale.is_def())
-        fusion_attr.scales.set(DNNL_ARG_WEIGHTS, fused_conv_po.wei_scale);
-    if (!fused_conv_po.dst_scale.is_def())
-        fusion_attr.scales.set(DNNL_ARG_DST, fused_conv_po.dst_scale);
+
+    const auto &dw_wei_scale
+            = prb->attr.scales.get(DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
+    if (!dw_wei_scale.is_def())
+        fusion_attr.scales.set(DNNL_ARG_WEIGHTS, dw_wei_scale);
+
+    const auto &dw_dst_scale
+            = prb->attr.scales.get(DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_DST);
+    if (!dw_dst_scale.is_def())
+        fusion_attr.scales.set(DNNL_ARG_DST, dw_dst_scale);
 
     for (int i = fusion_index + 1; i < po.len(); ++i) {
         fusion_attr.post_ops.entry.push_back(prb->attr.post_ops.entry[i]);
@@ -162,7 +167,7 @@ int init_ref_memory_args(dnn_mem_map_t &mem_map0, dnn_mem_map_t &mem_map1,
                 break;
             case DNNL_ARG_BIAS:
                 SAFE(fill_data(BIA, prb0, cfg, mem, ref_mem, res), WARN);
-                if (ref_mem.ndims() > 0 && has_bench_mode_bit(mode_bit_t::corr))
+                if (has_bench_mode_bit(mode_bit_t::corr))
                     SAFE(mem_map0.at(exec_arg).reorder(ref_mem), WARN);
                 break;
             case (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS):
@@ -172,7 +177,7 @@ int init_ref_memory_args(dnn_mem_map_t &mem_map0, dnn_mem_map_t &mem_map1,
                 break;
             case (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS):
                 SAFE(fill_data(BIA, prb1, cfg, mem, ref_mem, res), WARN);
-                if (ref_mem.ndims() > 0 && has_bench_mode_bit(mode_bit_t::corr))
+                if (has_bench_mode_bit(mode_bit_t::corr))
                     SAFE(mem_map1.at(DNNL_ARG_BIAS).reorder(ref_mem), WARN);
                 break;
             default: { // Process all attributes here
@@ -190,8 +195,14 @@ int init_ref_memory_args(dnn_mem_map_t &mem_map0, dnn_mem_map_t &mem_map1,
                         && (exec_arg & DNNL_ARG_ATTR_POST_OP_DW);
 
                 if (is_pre_dw_post_ops_arg && !is_post_dw_post_ops_arg) {
+                    // Binary post-op filling config.
+                    fill_cfg_t binary_fill_cfg(mem.dt(), -16.f, 16.f,
+                            /* int = */ true, attr_t::post_ops_t::kind_t::ADD,
+                            "binary post-op");
                     if (exec_arg & DNNL_ARG_SRC_1) {
-                        SAFE(binary::fill_mem(exec_arg, mem, ref_mem), WARN);
+                        SAFE(fill_random_real(
+                                     mem, ref_mem, res, binary_fill_cfg),
+                                WARN);
                         SAFE(mem_map0.at(exec_arg).reorder(ref_mem), WARN);
                     }
                 } else if (is_pre_dw_scales_arg && !is_post_dw_scales_arg) {
@@ -216,9 +227,13 @@ int init_ref_memory_args(dnn_mem_map_t &mem_map0, dnn_mem_map_t &mem_map1,
             int orig_idx = DNNL_ARG_ATTR_MULTIPLE_POST_OP(
                                    second_conv_idx + dw_idx + 1)
                     | DNNL_ARG_SRC_1;
-            SAFE(binary::fill_mem(
-                         orig_idx, mem_map.at(orig_idx), mem_map1.at(arg)),
-                    WARN);
+            auto &mem = mem_map.at(orig_idx);
+            auto &ref_mem = mem_map1.at(arg);
+
+            // Binary post-op filling config.
+            fill_cfg_t binary_fill_cfg(mem.dt(), -16.f, 16.f, /* int = */ true,
+                    attr_t::post_ops_t::kind_t::ADD, "binary post-op");
+            SAFE(fill_random_real(mem, ref_mem, res, binary_fill_cfg), WARN);
         }
     }
 

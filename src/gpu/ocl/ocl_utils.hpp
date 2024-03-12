@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,23 +17,15 @@
 #ifndef GPU_OCL_OCL_UTILS_HPP
 #define GPU_OCL_OCL_UTILS_HPP
 
-#include <cinttypes>
-#include <memory>
-#include <sstream>
 #include <string.h>
 #include <string>
 #include <utility>
 #include <vector>
 #include <CL/cl.h>
-#include <initializer_list>
-#include <type_traits>
 #include <unordered_map>
-#include <unordered_set>
 
 #include "common/c_types_map.hpp"
 #include "common/cpp_compat.hpp"
-#include "common/internal_defs.hpp"
-#include "common/utils.hpp"
 #include "common/verbose.hpp"
 #include "gpu/compute/kernel_arg_list.hpp"
 #include "gpu/compute/utils.hpp"
@@ -41,12 +33,9 @@
 namespace dnnl {
 namespace impl {
 namespace gpu {
-
-namespace compute {
-class kernel_t;
-}
-
 namespace ocl {
+
+std::string get_kernel_name(cl_kernel kernel);
 
 inline status_t convert_to_dnnl(cl_int cl_status) {
     switch (cl_status) {
@@ -69,7 +58,9 @@ inline status_t convert_to_dnnl(cl_int cl_status) {
         case CL_LINKER_NOT_AVAILABLE:
         case CL_LINK_PROGRAM_FAILURE:
         case CL_DEVICE_PARTITION_FAILED:
-        case CL_KERNEL_ARG_INFO_NOT_AVAILABLE: return status::runtime_error;
+        case CL_KERNEL_ARG_INFO_NOT_AVAILABLE:
+        case CL_INVALID_PLATFORM:
+        case CL_INVALID_DEVICE: return status::runtime_error;
         case CL_INVALID_VALUE:
         case CL_INVALID_DEVICE_TYPE:
         case CL_INVALID_CONTEXT:
@@ -85,77 +76,88 @@ inline status_t convert_to_dnnl(cl_int cl_status) {
         case CL_INVALID_PROGRAM:
         case CL_INVALID_PROGRAM_EXECUTABLE:
         case CL_INVALID_KERNEL_NAME:
-        case CL_INVALID_KERNEL_DEFINITION: // FI
+        case CL_INVALID_KERNEL_DEFINITION:
         case CL_INVALID_KERNEL:
         case CL_INVALID_ARG_INDEX:
-        case CL_INVALID_ARG_VALUE: return status::invalid_arguments;
+        case CL_INVALID_ARG_VALUE:
+        case CL_INVALID_ARG_SIZE:
+        case CL_INVALID_KERNEL_ARGS:
+        case CL_INVALID_WORK_DIMENSION:
+        case CL_INVALID_WORK_GROUP_SIZE:
+        case CL_INVALID_WORK_ITEM_SIZE:
+        case CL_INVALID_GLOBAL_OFFSET:
+        case CL_INVALID_EVENT_WAIT_LIST:
+        case CL_INVALID_EVENT:
+        case CL_INVALID_OPERATION:
+        case CL_INVALID_GL_OBJECT:
+        case CL_INVALID_BUFFER_SIZE:
+        case CL_INVALID_MIP_LEVEL:
+        case CL_INVALID_GLOBAL_WORK_SIZE: return status::invalid_arguments;
 
         default: return status::runtime_error;
     }
 }
 
+// Ordered by value as defined by opencl
 inline const char *convert_cl_int_to_str(cl_int cl_status) {
+#define CL_STATUS_CASE(status) \
+    case status: return #status
     switch (cl_status) {
-        case CL_SUCCESS: return "CL_SUCCESS";
-        case CL_MEM_OBJECT_ALLOCATION_FAILURE:
-            return "CL_MEM_OBJECT_ALLOCATION_FAILURE";
-        case CL_OUT_OF_RESOURCES: return "CL_OUT_OF_RESOURCES";
-        case CL_OUT_OF_HOST_MEMORY: return "CL_OUT_OF_HOST_MEMORY";
-        case CL_DEVICE_NOT_FOUND: return "CL_DEVICE_NOT_FOUND";
-        case CL_DEVICE_NOT_AVAILABLE: return "CL_DEVICE_NOT_AVAILABLE";
-        case CL_COMPILER_NOT_AVAILABLE: return "CL_COMPILER_NOT_AVAILABLE";
-        case CL_PROFILING_INFO_NOT_AVAILABLE:
-            return "CL_PROFILING_INFO_NOT_AVAILABLE";
-        case CL_MEM_COPY_OVERLAP: return "CL_MEM_COPY_OVERLAP";
-        case CL_IMAGE_FORMAT_MISMATCH: return "CL_IMAGE_FORMAT_MISMATCH";
-        case CL_IMAGE_FORMAT_NOT_SUPPORTED:
-            return "CL_IMAGE_FORMAT_NOT_SUPPORTED";
-        case CL_BUILD_PROGRAM_FAILURE: return "CL_BUILD_PROGRAM_FAILURE";
-        case CL_MAP_FAILURE: return "CL_MAP_FAILURE";
-        case CL_MISALIGNED_SUB_BUFFER_OFFSET:
-            return "CL_MISALIGNED_SUB_BUFFER_OFFSET";
-        case CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST:
-            return "CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST";
-        case CL_COMPILE_PROGRAM_FAILURE: return "CL_COMPILE_PROGRAM_FAILURE";
-        case CL_LINKER_NOT_AVAILABLE: return "CL_LINKER_NOT_AVAILABLE";
-        case CL_LINK_PROGRAM_FAILURE: return "CL_LINK_PROGRAM_FAILURE";
-        case CL_DEVICE_PARTITION_FAILED: return "CL_DEVICE_PARTITION_FAILED";
-        case CL_KERNEL_ARG_INFO_NOT_AVAILABLE:
-            return "CL_KERNEL_ARG_INFO_NOT_AVAILABLE";
-        case CL_INVALID_VALUE: return "CL_INVALID_VALUE";
-        case CL_INVALID_DEVICE_TYPE: return "CL_INVALID_DEVICE_TYPE";
-        case CL_INVALID_CONTEXT: return "CL_INVALID_CONTEXT";
-        case CL_INVALID_QUEUE_PROPERTIES: return "CL_INVALID_QUEUE_PROPERTIES";
-        case CL_INVALID_COMMAND_QUEUE: return "CL_INVALID_COMMAND_QUEUE";
-        case CL_INVALID_HOST_PTR: return "CL_INVALID_HOST_PTR";
-        case CL_INVALID_MEM_OBJECT: return "CL_INVALID_MEM_OBJECT";
-        case CL_INVALID_IMAGE_FORMAT_DESCRIPTOR:
-            return "CL_INVALID_IMAGE_FORMAT_DESCRIPTOR";
-        case CL_INVALID_IMAGE_SIZE: return "CL_INVALID_IMAGE_SIZE";
-        case CL_INVALID_SAMPLER: return "CL_INVALID_SAMPLER";
-        case CL_INVALID_BINARY: return "CL_INVALID_BINARY";
-        case CL_INVALID_BUILD_OPTIONS: return "CL_INVALID_BUILD_OPTIONS";
-        case CL_INVALID_PROGRAM: return "CL_INVALID_PROGRAM";
-        case CL_INVALID_PROGRAM_EXECUTABLE:
-            return "CL_INVALID_PROGRAM_EXECUTABLE";
-        case CL_INVALID_KERNEL_NAME: return "CL_INVALID_KERNEL_NAME";
-        case CL_INVALID_KERNEL_DEFINITION:
-            return "CL_INVALID_KERNEL_DEFINITION";
-        case CL_INVALID_KERNEL: return "CL_INVALID_KERNEL";
-        case CL_INVALID_ARG_INDEX: return "CL_INVALID_ARG_INDEX";
-        case CL_INVALID_ARG_VALUE: return "CL_INVALID_ARG_VALUE";
-        case CL_INVALID_WORK_DIMENSION: return "CL_INVALID_WORK_DIMENSION";
-        case CL_INVALID_WORK_GROUP_SIZE: return "CL_INVALID_WORK_GROUP_SIZE";
-        case CL_INVALID_WORK_ITEM_SIZE: return "CL_INVALID_WORK_ITEM_SIZE";
-        case CL_INVALID_GLOBAL_OFFSET: return "CL_INVALID_GLOBAL_OFFSET";
-        case CL_INVALID_EVENT_WAIT_LIST: return "CL_INVALID_EVENT_WAIT_LIST";
-        case CL_INVALID_EVENT: return "CL_INVALID_EVENT";
-        case CL_INVALID_OPERATION: return "CL_INVALID_OPERATION";
-        case CL_INVALID_GL_OBJECT: return "CL_INVALID_GL_OBJECT";
-        case CL_INVALID_BUFFER_SIZE: return "CL_INVALID_BUFFER_SIZE";
-        case CL_INVALID_MIP_LEVEL: return "CL_INVALID_MIP_LEVEL";
-        case CL_INVALID_GLOBAL_WORK_SIZE: return "CL_INVALID_GLOBAL_WORK_SIZE";
-
+        CL_STATUS_CASE(CL_SUCCESS);
+        CL_STATUS_CASE(CL_DEVICE_NOT_FOUND);
+        CL_STATUS_CASE(CL_DEVICE_NOT_AVAILABLE);
+        CL_STATUS_CASE(CL_COMPILER_NOT_AVAILABLE);
+        CL_STATUS_CASE(CL_MEM_OBJECT_ALLOCATION_FAILURE);
+        CL_STATUS_CASE(CL_OUT_OF_RESOURCES);
+        CL_STATUS_CASE(CL_OUT_OF_HOST_MEMORY);
+        CL_STATUS_CASE(CL_PROFILING_INFO_NOT_AVAILABLE);
+        CL_STATUS_CASE(CL_MEM_COPY_OVERLAP);
+        CL_STATUS_CASE(CL_IMAGE_FORMAT_MISMATCH);
+        CL_STATUS_CASE(CL_IMAGE_FORMAT_NOT_SUPPORTED);
+        CL_STATUS_CASE(CL_BUILD_PROGRAM_FAILURE);
+        CL_STATUS_CASE(CL_MAP_FAILURE);
+        CL_STATUS_CASE(CL_MISALIGNED_SUB_BUFFER_OFFSET);
+        CL_STATUS_CASE(CL_EXEC_STATUS_ERROR_FOR_EVENTS_IN_WAIT_LIST);
+        CL_STATUS_CASE(CL_COMPILE_PROGRAM_FAILURE);
+        CL_STATUS_CASE(CL_LINKER_NOT_AVAILABLE);
+        CL_STATUS_CASE(CL_LINK_PROGRAM_FAILURE);
+        CL_STATUS_CASE(CL_DEVICE_PARTITION_FAILED);
+        CL_STATUS_CASE(CL_KERNEL_ARG_INFO_NOT_AVAILABLE);
+        CL_STATUS_CASE(CL_INVALID_VALUE);
+        CL_STATUS_CASE(CL_INVALID_DEVICE_TYPE);
+        CL_STATUS_CASE(CL_INVALID_PLATFORM);
+        CL_STATUS_CASE(CL_INVALID_DEVICE);
+        CL_STATUS_CASE(CL_INVALID_CONTEXT);
+        CL_STATUS_CASE(CL_INVALID_QUEUE_PROPERTIES);
+        CL_STATUS_CASE(CL_INVALID_COMMAND_QUEUE);
+        CL_STATUS_CASE(CL_INVALID_HOST_PTR);
+        CL_STATUS_CASE(CL_INVALID_MEM_OBJECT);
+        CL_STATUS_CASE(CL_INVALID_IMAGE_FORMAT_DESCRIPTOR);
+        CL_STATUS_CASE(CL_INVALID_IMAGE_SIZE);
+        CL_STATUS_CASE(CL_INVALID_SAMPLER);
+        CL_STATUS_CASE(CL_INVALID_BINARY);
+        CL_STATUS_CASE(CL_INVALID_BUILD_OPTIONS);
+        CL_STATUS_CASE(CL_INVALID_PROGRAM);
+        CL_STATUS_CASE(CL_INVALID_PROGRAM_EXECUTABLE);
+        CL_STATUS_CASE(CL_INVALID_KERNEL_NAME);
+        CL_STATUS_CASE(CL_INVALID_KERNEL_DEFINITION);
+        CL_STATUS_CASE(CL_INVALID_KERNEL);
+        CL_STATUS_CASE(CL_INVALID_ARG_INDEX);
+        CL_STATUS_CASE(CL_INVALID_ARG_VALUE);
+        CL_STATUS_CASE(CL_INVALID_ARG_SIZE);
+        CL_STATUS_CASE(CL_INVALID_KERNEL_ARGS);
+        CL_STATUS_CASE(CL_INVALID_WORK_DIMENSION);
+        CL_STATUS_CASE(CL_INVALID_WORK_GROUP_SIZE);
+        CL_STATUS_CASE(CL_INVALID_WORK_ITEM_SIZE);
+        CL_STATUS_CASE(CL_INVALID_GLOBAL_OFFSET);
+        CL_STATUS_CASE(CL_INVALID_EVENT_WAIT_LIST);
+        CL_STATUS_CASE(CL_INVALID_EVENT);
+        CL_STATUS_CASE(CL_INVALID_OPERATION);
+        CL_STATUS_CASE(CL_INVALID_GL_OBJECT);
+        CL_STATUS_CASE(CL_INVALID_BUFFER_SIZE);
+        CL_STATUS_CASE(CL_INVALID_MIP_LEVEL);
+        CL_STATUS_CASE(CL_INVALID_GLOBAL_WORK_SIZE);
+#undef CL_STATUS_CASE
         default: return "unknown macro name";
     }
 }
@@ -193,6 +195,7 @@ enum { OCL_BUFFER_ALIGNMENT = 128 };
 #define UNUSED_OCL_RESULT(x) \
     do { \
         cl_int s = x; \
+        if (s != CL_SUCCESS) { MAYBE_REPORT_OCL_ERROR(s); } \
         assert(s == CL_SUCCESS); \
         MAYBE_UNUSED(s); \
     } while (false)
@@ -334,8 +337,8 @@ private:
 
 // Constructs an OpenCL wrapper object (providing RAII support)
 template <typename T>
-ocl_wrapper_t<T> make_ocl_wrapper(T t) {
-    return ocl_wrapper_t<T>(t);
+ocl_wrapper_t<T> make_ocl_wrapper(T t, bool retain = false) {
+    return ocl_wrapper_t<T>(t, retain);
 }
 
 template <typename F>
@@ -422,14 +425,10 @@ status_t get_ocl_program_binary(
 status_t get_ocl_program_binary(
         cl_kernel kernel, cl_device_id device, compute::binary_t &binary);
 
+status_t get_ocl_kernel_binary(cl_kernel ocl_kernel, compute::binary_t &binary);
+
 status_t get_ocl_program_binary_size(
         cl_kernel kernel, cl_device_id device, size_t *size);
-
-void dump_kernel_binary(
-        const compute::binary_t &binary, const std::string &name);
-void dump_kernel_binary(cl_kernel ocl_kernel);
-void dump_kernel_binary(
-        const engine_t *engine, const compute::kernel_t &binary_kernel);
 
 void debugdump_processed_source(const std::string &source,
         const std::string &options, const std::string &ocl_options);
@@ -439,10 +438,20 @@ status_t get_kernel_arg_types(cl_kernel ocl_kernel,
 
 status_t get_ocl_device_eu_count(cl_device_id device, int32_t *eu_count);
 
+status_t get_ocl_device_enabled_systolic_intel(
+        cl_device_id device, bool &systolic_enabled);
+
 status_t clone_kernel(cl_kernel kernel, cl_kernel *cloned_kernel);
 
 status_t create_ocl_program(gpu::ocl::ocl_wrapper_t<cl_program> &ocl_program,
         cl_device_id dev, cl_context ctx, const gpu::compute::binary_t &binary);
+
+status_t get_device_uuid(
+        gpu::compute::device_uuid_t &uuid, cl_device_id ocl_dev);
+
+status_t get_ocl_devices(std::vector<cl_device_id> *devices,
+        std::vector<ocl_wrapper_t<cl_device_id>> *sub_devices,
+        cl_device_type device_type);
 
 } // namespace ocl
 } // namespace gpu

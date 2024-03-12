@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@
 
 #include "common/utils.hpp"
 #include "gpu/jit/ir/block_2d_utils.hpp"
-#include "gpu/jit/ir/hw_config.hpp"
+#include "gpu/jit/ir/hw.hpp"
 #include "gpu/jit/ir/message.hpp"
 #include "gpu/jit/pass/simplify.hpp"
 
@@ -647,11 +647,11 @@ struct send_2d_params_t {
         return true;
     }
 
-    bool is_supported(const hw_config_t &hw_cfg) const {
+    bool is_supported(const hw_t &hw) const {
         if (!block_2d_width_ok(W, type.size()))
             return fail_2d("Width is not supported.");
         if (!block_2d_height_ok(H)) return fail_2d("Height is not supported.");
-        if (!block_2d_pitch_ok(hw_cfg, P, type.size(), false))
+        if (!block_2d_pitch_ok(hw, P, type.size(), false))
             return fail_2d("Pitch is not supported.");
         return true;
     }
@@ -838,13 +838,13 @@ int rounded_slots(int slots, int max_slots) {
     return ret;
 }
 
-int get_max_slots(ngen::HW hw, const send_params_t &send_params) {
+int get_max_slots(const hw_t &hw, const send_params_t &send_params) {
     if (hw >= ngen::HW::XeHPC) return 32;
     if (send_params.send_op == send_op_t::atomic_fadd) return 8;
     return 16;
 }
 
-int get_max_block_size(ngen::HW hw, const send_params_t &params) {
+int get_max_block_size(const hw_t &hw, const send_params_t &params) {
     if (hw >= ngen::HW::XeHPC) return 512;
     return params.send_address == send_address_t::slm && hw <= ngen::HW::XeLP
             ? 128
@@ -902,7 +902,7 @@ struct send_group_t {
 
     int rounded_slots() const { return jit::rounded_slots(slots, max_slots); }
     int payload_size() const {
-        int grf_size = ngen::GRF::bytes(hw);
+        int grf_size = hw.grf_size();
         if (is_block()) return utils::rnd_up(type_size, grf_size);
         if (is_scattered()) {
             return utils::rnd_up(slots * slot_stride, grf_size);
@@ -999,7 +999,7 @@ struct send_group_t {
                 type = fixup_type(type, send_params);
                 auto f = send_t::make(hw, send_params.send_op,
                         send_params.send_address, type, 1,
-                        send_t::default_slot_mask, is_lsc,
+                        send_t::default_slot_mask, is_lsc, zero_out,
                         send_params.cache_hint);
                 ret.push_back(f);
             }
@@ -1016,7 +1016,7 @@ struct send_group_t {
                 type = fixup_type(type, send_params);
                 auto f = send_t::make(hw, send_params.send_op,
                         send_params.send_address, type, cur_slots, slot_mask,
-                        is_lsc, send_params.cache_hint);
+                        is_lsc, zero_out, send_params.cache_hint);
                 ret.push_back(f);
             }
         } else if (is_2d()) {
@@ -1026,7 +1026,7 @@ struct send_group_t {
                 auto type = fixup_type(p.type, send_params);
                 auto f = send_t::make_2d(hw, to_2d(send_params.send_op), type,
                         p.W, p.H, p.P, p.w, p.h, p.c, p.vnni, p.transpose,
-                        send_params.cache_hint);
+                        zero_out, send_params.cache_hint);
                 ret.push_back(f);
             }
         } else {
@@ -1047,6 +1047,7 @@ struct send_group_t {
         } else {
             ir_error_not_expected();
         }
+        if (!zero_out) oss << ".nzo";
         oss << "(" << addr_inc << ")";
         if (mask_bits != 0)
             oss << std::endl << indent << "  mask_base: " << mask_inc;
@@ -1085,7 +1086,7 @@ struct send_group_t {
         if (is_g1b1) {
             if (type_size % factor != 0) return send_group_t();
             int new_type_size = type_size / factor;
-            int grf_size = ngen::GRF::bytes(hw);
+            int grf_size = hw.grf_size();
             if (new_type_size % grf_size != 0) return send_group_t();
             auto ret = *this;
             ret.addr_inc[0] = addr_inc[0] + new_type_size * subtile_idx;
@@ -1108,13 +1109,14 @@ struct send_group_t {
         return ret;
     }
 
-    ngen::HW hw = ngen::HW::Unknown;
+    hw_t hw;
     int max_slots = 1;
     int type_size = 0;
     int slots = 0;
     int slot_stride = 0;
     int mask_bits = 0;
     int pad_bytes = 0;
+    bool zero_out = true;
     send_2d_params_t send_2d_params;
 
     vec_off_t addr_inc; // slots
@@ -1170,13 +1172,6 @@ private:
     std::vector<tdim_info_t> tdims_;
 };
 
-enum class send_kind_t {
-    undef,
-    _2d,
-    block,
-    scattered,
-};
-
 send_kind_t get_send_kind(const send_t &send) {
     if (send.is_block()) return send_kind_t::block;
     if (send.is_scattered()) return send_kind_t::scattered;
@@ -1220,9 +1215,9 @@ struct layout_2d_wrapper_t {
 
 class view_info_t {
 public:
-    view_info_t(const hw_config_t &hw_cfg, const view_t &view,
+    view_info_t(const hw_t &hw, const view_t &view,
             const send_params_t &send_params)
-        : hw_cfg_(hw_cfg), view_(view), send_params_(send_params) {
+        : hw_(hw), view_(view), send_params_(send_params) {
         vlayout_ = view.create_pseudo_vlayout(/*init_offset=*/true);
 
         init_tdims();
@@ -1232,7 +1227,7 @@ public:
         init_base();
     }
 
-    const hw_config_t &hw_cfg() const { return hw_cfg_; }
+    const hw_t &hw() const { return hw_; }
     const view_t &view() const { return view_; }
     const send_params_t &send_params() const { return send_params_; }
     const layout_t &vlayout() const { return vlayout_; }
@@ -1247,8 +1242,7 @@ public:
     const expr_t &y_base() const { return y_base_; }
     const std::vector<mask_desc_t> &mask_descs() const { return mask_descs_; }
     const mod_info_t &mod_info() const { return mod_info_; }
-    ngen::HW hw() const { return hw_cfg_.hw(); }
-    int grf_size() const { return hw_cfg_.grf_size(); }
+    int grf_size() const { return hw_.grf_size(); }
 
     int mask_bits() const {
         int ret = 0;
@@ -1296,9 +1290,10 @@ public:
         const int type_size = send_params.mem_type.size();
         if (type_size < slot_size && slot_size < 4) slot_size = type_size;
 
-        // GPUs <= XeLP dislike scattered store offsets not aligned by slot; it
-        // is crucial to make slot_size small enough to become a layout divisor
-        if (is_hw_xelp_or_below && is_store) {
+        // GPUs <= XeLP requires qword alignment for qword scattered messages,
+        // downgrade to byte scattered (x1, x2 or x4) when alignment is
+        // sub-qword.
+        if (is_hw_xelp_or_below && slot_size == 8) {
             const int align = get_block_alignment_bytes(inner_idx());
             slot_size = std::min(
                     slot_size, ir_utils::max_divisor(align, {1, 2, 4, 8}));
@@ -1368,16 +1363,16 @@ private:
             const send_params_t &send_params) const {
         if (send_params.send_op == send_op_t::atomic_fadd) return false;
 
-        const auto align = (hw_cfg_.hw() < ngen::HW::XeHPC)
+        const auto align = (hw_ < ngen::HW::XeHPC)
                 ? std::min(32, ir_utils::max_pow2_divisor(inner_bytes))
                 : 8;
         if (get_block_alignment_bytes(inner_idx) % align != 0) return false;
 
-        if (inner_bytes % hw_cfg_.grf_size() == 0) return true;
+        if (inner_bytes % hw_.grf_size() == 0) return true;
 
         int oword_size = 16;
         if (inner_bytes % oword_size == 0 && inner_bytes == total_bytes) {
-            int grf_size = hw_cfg_.grf_size();
+            int grf_size = hw_.grf_size();
             uint32_t owords = inner_bytes / oword_size;
             uint32_t owords_per_grf = grf_size / oword_size;
             uint32_t sub_grf_mask = (owords_per_grf - 1);
@@ -1477,7 +1472,7 @@ private:
                 = init_scattered_params(send_params_, inner_bytes, total_bytes);
         reg_bytes_per_elem = std::max(1, 4 / slot_size) * type_size;
 
-        int max_slots = get_max_slots(hw_cfg_.hw(), send_params_);
+        int max_slots = get_max_slots(hw_, send_params_);
         int inner_slots = ir_utils::safe_divide(inner_bytes, slot_size);
         int slots = inner_slots;
         int best_idx = layout.nblocks() - 1;
@@ -1581,7 +1576,7 @@ private:
         return e;
     }
 
-    hw_config_t hw_cfg_;
+    hw_t hw_;
     view_t view_;
     send_params_t send_params_;
     std::vector<tdim_info_t> tdims_;
@@ -1694,7 +1689,7 @@ public:
         params_.h_vstride = h_vstride;
 
         if (!params_.apply_vnni_factor(hint.vnni_permute_factor)) return false;
-        if (!params_.is_supported(info_.hw_cfg())) return false;
+        if (!params_.is_supported(info_.hw())) return false;
         if (!base_alignment_ok(vlayout, mod_info, h_tdim, h_vstride))
             return false;
         if (!x_alignment_ok(w_tdim, mod_info)) return false;
@@ -1714,7 +1709,7 @@ private:
         vmods[params_.w_vidx] = modulus_t(0);
         vmods[params_.h_vidx] = modulus_t(0);
         auto base_mod = mod_info.get_modulus(info_.view().tlayout(), vmods);
-        int base_align = block_2d_base_alignment(info_.hw_cfg());
+        int base_align = block_2d_base_alignment(info_.hw());
         if (!base_mod.is_divisible(base_align) != 0)
             return fail_2d("Unsupported base alignment: ", base_align);
 
@@ -2096,7 +2091,7 @@ public:
         int ret = 0;
         if (with_headers) ret += header_size;
         if (with_buffer) ret += reg_buf_size();
-        int grf_size = ngen::GRF::bytes(send_params_.hw);
+        int grf_size = send_params_.hw.grf_size();
         return utils::div_up(ret, grf_size);
     }
 
@@ -2207,7 +2202,7 @@ private:
             type = type.with_elems(
                     type.elems() * (new_size / s0.payload_size()));
             auto func = send_t::make(s0.hw, s0.op, s0.address, type, s0.slots,
-                    /*is_lsc=*/false, s0.cache_hint);
+                    /*is_lsc=*/false, s0.zero_out, s0.cache_hint);
             auto new_args = c0.args;
             auto &mask = send_t::arg_mask(new_args);
             std::vector<expr_t> vec_mask;
@@ -2323,7 +2318,7 @@ public:
         int ret = 0;
         if (with_headers) ret += header_size;
         if (with_buffer) ret += reg_buf_size();
-        int grf_size = ngen::GRF::bytes(send_params_.hw);
+        int grf_size = send_params_.hw.grf_size();
         return utils::div_up(ret, grf_size);
     }
 
@@ -2437,14 +2432,15 @@ std::string send_plan_t::str(const std::string &tag) const {
     return impl_->str(tag);
 }
 
-send_group_t init_2d(
-        const view_info_t &info, view_iterator_t &it, layout_t &reg_layout) {
+send_group_t init_2d(const view_info_t &info, view_iterator_t &it,
+        layout_t &reg_layout, bool zero_out) {
     auto &params = info.send_2d_params();
     auto &vlayout = info.vlayout();
     send_group_t ret;
     ret.hw = info.hw();
     ret.type_size = params.type.size();
     ret.slots = 1;
+    ret.zero_out = zero_out;
     ret.mask_bits = info.mask_bits();
     ret.send_2d_params = params;
     ret.addr_inc = vec_off_t(0);
@@ -2455,16 +2451,17 @@ send_group_t init_2d(
     return ret;
 }
 
-send_group_t init_block(
-        const view_info_t &info, view_iterator_t &it, layout_t &reg_layout) {
+send_group_t init_block(const view_info_t &info, view_iterator_t &it,
+        layout_t &reg_layout, bool zero_out) {
     send_group_t ret;
     ret.hw = info.hw();
     ret.type_size = it.inner_bytes();
     ret.slots = 1;
+    ret.zero_out = zero_out;
     ret.mask_bits = info.mask_bits();
     ret.addr_inc = vec_off_t(0);
     ret.mask_inc = it.get_mask(ret.mask_bits);
-    ret.pad_bytes = info.hw_cfg().grf_size();
+    ret.pad_bytes = info.hw().grf_size();
     auto &vlayout = info.vlayout();
     auto &blocks = vlayout.blocks();
     reg_layout = layout_t(vlayout.type(), vlayout.ndims(), 0,
@@ -2475,7 +2472,7 @@ send_group_t init_block(
 
 send_group_t init_scattered(const view_info_t &info,
         const send_params_t &send_params, view_iterator_t &it,
-        layout_t &reg_layout) {
+        layout_t &reg_layout, bool zero_out) {
     auto &vlayout = info.vlayout();
     auto &blocks = vlayout.blocks();
     int type_size = vlayout.type().size();
@@ -2488,10 +2485,11 @@ send_group_t init_scattered(const view_info_t &info,
 
     send_group_t ret;
     ret.hw = info.hw();
-    ret.max_slots = get_max_slots(ret.hw, send_params);
+    ret.max_slots = get_max_slots(info.hw(), send_params);
     ret.type_size = slot_size;
     ret.slot_stride = slot_stride;
     ret.slots = inner_slots * it.middle_blocks();
+    ret.zero_out = zero_out;
     ret.mask_bits = info.mask_bits();
     auto mask_base = it.get_mask(ret.mask_bits, inner_slots);
     auto addr_base = it.get_addr(inner_slots, slot_size);
@@ -2629,24 +2627,25 @@ send_plan_t create_ir_send_plan(const exec_config_t &exec_cfg,
 }
 
 send_plan_t create_send_plan(const exec_config_t &exec_cfg, const view_t &view,
-        const send_params_t &send_params) {
+        const send_params_t &send_params, bool zero_out) {
     if (!send_params.use_send_plan)
         return create_ir_send_plan(exec_cfg, view, send_params);
-    auto &hw_cfg = exec_cfg.hw_cfg();
-    view_info_t info(hw_cfg, view, send_params);
+    auto &hw = exec_cfg.hw();
+    view_info_t info(hw, view, send_params);
     view_iterator_t it(info);
 
     send_group_t base_group;
     layout_t reg_layout;
     switch (info.send_kind()) {
         case send_kind_t::_2d:
-            base_group = init_2d(info, it, reg_layout);
+            base_group = init_2d(info, it, reg_layout, zero_out);
             break;
         case send_kind_t::block:
-            base_group = init_block(info, it, reg_layout);
+            base_group = init_block(info, it, reg_layout, zero_out);
             break;
         case send_kind_t::scattered:
-            base_group = init_scattered(info, send_params, it, reg_layout);
+            base_group = init_scattered(
+                    info, send_params, it, reg_layout, zero_out);
             break;
         default: ir_error_not_expected();
     }

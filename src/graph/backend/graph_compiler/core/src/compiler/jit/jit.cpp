@@ -30,6 +30,7 @@
 #include <compiler/ir/graph/dynamic_utils.hpp>
 #include <compiler/ir/pass/ir_copy.hpp>
 #include <runtime/config.hpp>
+#include <runtime/dynamic_threadpool_c.hpp>
 #include <runtime/managed_thread_pool.hpp>
 #include <runtime/microkernel/cpu/brgemm_range_handle.hpp>
 #include <util/math_utils.hpp>
@@ -50,7 +51,9 @@ std::shared_ptr<jit_function_t> jit_engine_t::get_entry_func(
     auto jm = make_jit_module(ir_mod, generic);
     COMPILE_ASSERT(ir_mod->get_entry_func(),
             "Expecting an ir_module with entry function");
-    return jm->get_function(ir_mod->get_entry_func()->name_);
+    auto jit_func = jm->get_function(ir_mod->get_entry_func()->name_);
+    if (jm->code_) { jit_func->inplace_pairs_ = jm->code_->inplace_pairs_; }
+    return jit_func;
 }
 
 std::unique_ptr<jit_engine_t> jit_engine_t::make(const context_ptr &ctx) {
@@ -114,7 +117,7 @@ void jit_engine_t::set_target_machine(
 
 static std::atomic<size_t> module_id {0};
 
-jit_module_code::jit_module_code(bool managed_thread_pool)
+jit_module_code::jit_module_code(thread_pool_mode_t managed_thread_pool)
     : module_id_(module_id++), managed_thread_pool_(managed_thread_pool) {}
 
 void jit_module_code::postprocess(
@@ -122,6 +125,12 @@ void jit_module_code::postprocess(
     update_runtime_data(ir_mod, globals);
     if (ir_mod->get_entry_func()) {
         entry_func_name_ = ir_mod->get_entry_func()->name_;
+
+        // pairs of {out arg, in arg} that out arg can inplace in arg
+        inplace_pairs_ = any_map_t::fetch_or_else(
+                ir_mod->get_entry_func()->attr_.get(),
+                function_attrs::inplace_hint,
+                std::vector<std::pair<size_t, size_t>>());
     }
 }
 void jit_module_code::update_op_dispatch_table(
@@ -271,7 +280,7 @@ struct jit_timer_t<true> {
 
 using functype = runtime::thread_manager::main_func_t;
 
-template <bool thread_pool_init>
+template <thread_pool_mode_t thread_pool_init>
 struct thread_pool_caller_t {
     static void call(functype f, runtime::stream_t *stream, void *module_data,
             generic_val *args) {
@@ -280,11 +289,19 @@ struct thread_pool_caller_t {
 };
 
 template <>
-struct thread_pool_caller_t<true> {
+struct thread_pool_caller_t<thread_pool_mode_t::MANAGED> {
     static void call(functype f, runtime::stream_t *stream, void *module_data,
             generic_val *args) {
         runtime::thread_manager::cur_mgr.run_main_function(
                 f, stream, module_data, args);
+    }
+};
+
+template <>
+struct thread_pool_caller_t<thread_pool_mode_t::DYNAMIC> {
+    static void call(functype f, runtime::stream_t *stream, void *module_data,
+            generic_val *args) {
+        runtime::dynamic_threadpool::thread_main(f, stream, module_data, args);
     }
 };
 
@@ -303,7 +320,7 @@ struct thread_pool_caller_t<true> {
 #define after_kernel_run()
 #endif
 
-template <bool thread_pool_init, bool execution_verbose>
+template <thread_pool_mode_t thread_pool_init, bool execution_verbose>
 class injected_general_jit_function_t : public general_jit_function_t {
     void call_generic(
             runtime::stream_t *stream, generic_val *args) const override {
@@ -347,28 +364,47 @@ void general_jit_function_t::call_generic(
 
 std::shared_ptr<jit_function_t> general_jit_function_t::make(
         const std::shared_ptr<jit_module> &module, void *funcptr, void *wrapper,
-        const std::string &name, bool managed_thread_pool) {
+        const std::string &name, thread_pool_mode_t managed_thread_pool) {
     auto &runtime_cfg = runtime_config_t::get();
-    if (managed_thread_pool) {
-        if (runtime_cfg.execution_verbose_) {
-            return std::shared_ptr<general_jit_function_t>(
-                    new injected_general_jit_function_t<true, true>(
-                            module, funcptr, wrapper, name));
-        } else {
-            return std::shared_ptr<general_jit_function_t>(
-                    new injected_general_jit_function_t<true, false>(
-                            module, funcptr, wrapper, name));
-        }
-    } else {
-        if (runtime_cfg.execution_verbose_) {
-            return std::shared_ptr<general_jit_function_t>(
-                    new injected_general_jit_function_t<false, true>(
-                            module, funcptr, wrapper, name));
-        } else {
-            return std::shared_ptr<general_jit_function_t>(
-                    new general_jit_function_t(module, funcptr, wrapper, name));
-        }
+    switch (managed_thread_pool) {
+        case thread_pool_mode_t::MANAGED:
+            if (runtime_cfg.execution_verbose_) {
+                return std::shared_ptr<general_jit_function_t>(
+                        new injected_general_jit_function_t<
+                                thread_pool_mode_t::MANAGED, true>(
+                                module, funcptr, wrapper, name));
+            } else {
+                return std::shared_ptr<general_jit_function_t>(
+                        new injected_general_jit_function_t<
+                                thread_pool_mode_t::MANAGED, false>(
+                                module, funcptr, wrapper, name));
+            }
+            break;
+        case thread_pool_mode_t::DIRECT:
+            if (runtime_cfg.execution_verbose_) {
+                return std::shared_ptr<general_jit_function_t>(
+                        new injected_general_jit_function_t<
+                                thread_pool_mode_t::MANAGED, true>(
+                                module, funcptr, wrapper, name));
+            } else {
+                return std::shared_ptr<general_jit_function_t>(
+                        new general_jit_function_t(
+                                module, funcptr, wrapper, name));
+            }
+        case thread_pool_mode_t::DYNAMIC:
+            if (runtime_cfg.execution_verbose_) {
+                return std::shared_ptr<general_jit_function_t>(
+                        new injected_general_jit_function_t<
+                                thread_pool_mode_t::DYNAMIC, true>(
+                                module, funcptr, wrapper, name));
+            } else {
+                return std::shared_ptr<general_jit_function_t>(
+                        new injected_general_jit_function_t<
+                                thread_pool_mode_t::DYNAMIC, false>(
+                                module, funcptr, wrapper, name));
+            }
     }
+    return nullptr;
 }
 
 } // namespace gc

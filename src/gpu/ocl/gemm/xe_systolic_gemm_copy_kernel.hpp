@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,8 +18,9 @@
 #define GPU_OCL_GEMM_XE_SYSTOLIC_GEMM_COPY_KERNEL_HPP
 
 #include "common/c_types_map.hpp"
-#include "gpu/compute/compute.hpp"
-#include "gpu/primitive_conf.hpp"
+#include "gpu/compute/compute_engine.hpp"
+#include "gpu/compute/device_info.hpp"
+#include "gpu/compute/kernel.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -40,12 +41,11 @@ struct xe_systolic_gemm_copy_kernel_t {
         return status::success;
     };
 
-    status_t create_generator(
-            engine_t *engine, compute::compiled_bundle_t &generator) const {
+    status_t create_generator(const compute::compute_engine_t &engine,
+            compute::kernel_bundle_t &bundle) const {
         compute::kernel_ctx_t ctx;
         CHECK(init_kernel_ctx(ctx));
-        return compute::compiled_bundle_t::create(
-                generator, engine, {name()}, ctx);
+        return engine.create_kernel_bundle(bundle, {name()}, ctx);
     };
 
     status_t init_kernel_ctx(compute::kernel_ctx_t &kernel_ctx) const {
@@ -56,6 +56,8 @@ struct xe_systolic_gemm_copy_kernel_t {
     static status_t init_kernel_ctx(compute::kernel_ctx_t &kernel_ctx,
             compute::gpu_arch_t arch, data_type_t dt, int unroll_n, bool copyb,
             bool trans, bool sum = false, bool clear_sum = false) {
+
+        using arch_t = compute::gpu_arch_t;
 
         auto dt_size = types::data_type_size(dt);
 
@@ -71,11 +73,9 @@ struct xe_systolic_gemm_copy_kernel_t {
         kernel_ctx.add_option("-cl-strict-aliasing");
         kernel_ctx.add_option(
                 "-cl-intel-256-GRF-per-thread"); // avoid GRF mode switch
-        if (arch == compute::gpu_arch_t::xe_hp)
+        if (utils::one_of(arch, arch_t::xe_hp, arch_t::xe_hpg))
             kernel_ctx.add_option("-DCOPY_XE_HP");
-        if (arch == compute::gpu_arch_t::xe_hpg)
-            kernel_ctx.add_option("-DCOPY_XE_HP");
-        if (arch == compute::gpu_arch_t::xe_hpc)
+        if (utils::one_of(arch, arch_t::xe_hpc, arch_t::xe2))
             kernel_ctx.add_option("-DCOPY_XE_HPC");
 
         return status::success;
@@ -83,11 +83,12 @@ struct xe_systolic_gemm_copy_kernel_t {
 
     const char *name() const { return name(arch_); }
     static const char *name(compute::gpu_arch_t arch) {
+        using arch_t = compute::gpu_arch_t;
         switch (arch) {
-            case compute::gpu_arch_t::xe_hp: return "xe_hp_systolic_gemm_copy";
-            case compute::gpu_arch_t::xe_hpg: return "xe_hp_systolic_gemm_copy";
-            case compute::gpu_arch_t::xe_hpc:
-                return "xe_hpc_systolic_gemm_copy";
+            case arch_t::xe_hp:
+            case arch_t::xe_hpg: return "xe_hp_systolic_gemm_copy";
+            case arch_t::xe_hpc:
+            case arch_t::xe2: return "xe_hpc_systolic_gemm_copy";
             default: assert(!"Unsupported architecture"); return "";
         }
     }
@@ -98,7 +99,7 @@ struct xe_systolic_gemm_copy_kernel_t {
 
     static constexpr int unroll_r(
             compute::gpu_arch_t arch, size_t element_size, bool copyb) {
-        return !copyb ? ((arch == compute::gpu_arch_t::xe_hpc) ? 64 : 32)
+        return !copyb ? ((arch >= compute::gpu_arch_t::xe_hpc) ? 64 : 32)
                       : unroll_k(element_size);
     }
 
@@ -108,22 +109,18 @@ struct xe_systolic_gemm_copy_kernel_t {
     }
 
     static constexpr int subgroup_size(compute::gpu_arch_t arch) {
-        return (arch == compute::gpu_arch_t::xe_hpc) ? 16 : 8;
+        return (arch >= compute::gpu_arch_t::xe_hpc) ? 16 : 8;
     }
 
     static constexpr int subgroup_size_clear_sum(compute::gpu_arch_t arch) {
-        return (arch == compute::gpu_arch_t::xe_hpc) ? 16 : 8;
+        return (arch >= compute::gpu_arch_t::xe_hpc) ? 16 : 8;
     }
 
 #if __cplusplus >= 202002L
     bool operator==(const xe_systolic_gemm_copy_kernel_t &) const = default;
 #endif
 
-    serialized_t serialize() const {
-        serialized_t s;
-        s.append(*this);
-        return s;
-    }
+    serialized_t serialize() const { return serialized_t(*this); }
 
     static xe_systolic_gemm_copy_kernel_t deserialize(const serialized_t &s) {
         xe_systolic_gemm_copy_kernel_t t {};

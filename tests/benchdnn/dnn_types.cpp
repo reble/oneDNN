@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,9 +37,9 @@
 #include "dnnl_debug.hpp"
 #include "dnnl_memory.hpp"
 #include "utils/cold_cache.hpp"
+#include "utils/dims.hpp"
 #include "utils/parser.hpp"
-
-#define BENCHDNN_DNNL_ARG_UNDEF 0
+#include "utils/stream_kind.hpp"
 
 namespace tag {
 const char *x {"x"};
@@ -74,21 +74,6 @@ std::ostream &operator<<(std::ostream &s, dnnl_engine_kind_t ek) {
     return s;
 }
 
-dir_t str2dir(const char *str) {
-#define CASE(x) \
-    if (!strcasecmp(STRINGIFY(x), str)) return x
-    CASE(FWD_D);
-    CASE(FWD_I);
-    CASE(FWD_B);
-    CASE(BWD_D);
-    CASE(BWD_W);
-    CASE(BWD_WB);
-    CASE(BWD_DW);
-#undef CASE
-    assert(!"unknown dir");
-    return DIR_UNDEF;
-}
-
 dnnl_prop_kind_t prop2prop_kind(const dir_t dir) {
     if (dir == FWD_D) return dnnl_forward_training;
     if (dir == FWD_I) return dnnl_forward_inference;
@@ -103,32 +88,6 @@ const char *prop2str(dnnl_prop_kind_t prop) {
     if (prop == dnnl_backward) return "BWD_DW";
     assert(!"unknown prop_kind");
     return "unknown prop_kind";
-}
-
-const char *data_kind2str(data_kind_t kind) {
-    switch (kind) {
-        case SRC: return "SRC";
-        case SRC_1: return "SRC_ADD";
-        case WEI: return "WEI";
-        case BIA: return "BIA";
-        case DST: return "DST";
-        case DIFF_DST: return "DIFF_DST";
-        case ACC: return "ACC";
-        case MEAN: return "MEAN";
-        case VAR: return "VAR";
-        case SC: return "SC";
-        case SH: return "SH";
-        case DST_ITER: return "DST_ITER";
-        case DST_ITER_C: return "DST_ITER_C";
-        case AUGRU_ATTENTION: return "AUGRU_ATTENTION";
-        case SRC_ITER: return "SRC_ITER";
-        case SRC_ITER_C: return "SRC_ITER_C";
-        case WEI_ITER: return "WEI_ITER";
-        case WEI_PEEPHOLE: return "WEI_PEEPHOLE";
-        case WEI_PROJECTION: return "WEI_PROJECTION";
-        default: assert(!"incorrect data kind");
-    }
-    return "incorrect data kind";
 }
 
 static const std::map<int, std::vector<const char *>> supported_args {
@@ -179,6 +138,7 @@ policy_t attr_t::str2policy(const std::string &str) {
     if (s.compare(STRINGIFY(_plc)) == 0) return _plc
     CASE(COMMON);
     CASE(PER_OC);
+    CASE(PER_OCIC);
     CASE(PER_DIM_0);
     CASE(PER_DIM_1);
     CASE(PER_DIM_01);
@@ -193,6 +153,7 @@ policy_t attr_t::str2policy(const std::string &str) {
 const char *attr_t::policy2str(policy_t policy) {
     if (policy == COMMON) return "common";
     if (policy == PER_OC) return "per_oc";
+    if (policy == PER_OCIC) return "per_ocic";
     if (policy == PER_DIM_0) return "per_dim_0";
     if (policy == PER_DIM_1) return "per_dim_1";
     if (policy == PER_DIM_01) return "per_dim_01";
@@ -208,6 +169,7 @@ int attr_t::get_default_mask(policy_t policy) {
         case PER_DIM_0: return (1 << 0);
         case PER_OC:
         case PER_DIM_1: return (1 << 1);
+        case PER_OCIC:
         case PER_DIM_01: return (1 << 0) + (1 << 1);
         case PER_DIM_2: return (1 << 2);
         case PER_DIM_3: return (1 << 3);
@@ -217,31 +179,9 @@ int attr_t::get_default_mask(policy_t policy) {
     }
 }
 
-// This function takes input string, extracts float value and asteriks, if
-// present, from the string. Updates @value with extracted values.
-// TODO: remove asteriks from all inputs and update doc.
-int parse_value_and_runtime(float &value, const std::string &s) {
-    // process value
-    size_t scale_pos = 0;
-    try {
-        value = std::stof(s, &scale_pos);
-    } catch (const std::invalid_argument &) {
-        BENCHDNN_PRINT(0, "%s\n%s \'%s\'; %s\n",
-                "Error: scale or zero point input value is invalid.",
-                "Given input:", s.c_str(),
-                "Expected input: \'VAL[*]\'. See help for proper syntax.");
-        SAFE_V(FAIL);
-    }
-    if (scale_pos + 1 < s.size()) return FAIL;
-    if (scale_pos == s.size()) return OK;
-    if (s.back() != '*') return FAIL;
-    return OK;
-}
-
-int attr_t::arg_scales_t::entry_t::policy2mask(
-        int arg, dnnl_primitive_kind_t prim_kind, bool has_groups) const {
-    const auto policy = this->policy;
-
+int attr_t::policy2mask(int arg, policy_t policy,
+        dnnl_primitive_kind_t prim_kind, const_dnnl_memory_desc_t wei_md,
+        bool has_groups) {
     if (arg != DNNL_ARG_WEIGHTS || policy == policy_t::COMMON)
         return attr_t::get_default_mask(policy);
 
@@ -257,10 +197,13 @@ int attr_t::arg_scales_t::entry_t::policy2mask(
             default: SAFE(FAIL, CRIT); return -1;
         }
     } else if (prim_kind == dnnl_matmul) {
+        if (query_md_ndims(wei_md) <= 0) SAFE_V(FAIL);
         switch (policy) {
-            // TODO: add batch dimension?
-            case PER_OC: return attr_t::get_default_mask(PER_DIM_1);
-            default: SAFE(FAIL, CRIT); return -1;
+            case PER_OC: return (1 << (query_md_ndims(wei_md) - 1));
+            case PER_OCIC:
+                return (1 << (query_md_ndims(wei_md) - 1))
+                        + (1 << (query_md_ndims(wei_md) - 2));
+            default: SAFE_V(FAIL); return -1;
         }
     } else {
         assert(prim_kind == dnnl_undefined_primitive);
@@ -271,6 +214,37 @@ int attr_t::arg_scales_t::entry_t::policy2mask(
         return -1;
     }
 }
+
+// This function takes input string, extracts float value and asteriks, if
+// present, from the string. Updates @value with extracted values.
+int parse_value_and_runtime(float &value, const std::string &s) {
+    // process value
+    size_t scale_pos = 0;
+    try {
+        value = std::stof(s, &scale_pos);
+    } catch (const std::invalid_argument &) {
+        BENCHDNN_PRINT(0, "%s \'%s\'.\n",
+                "Error: scale or zero point input value is expected to be a "
+                "real number. Given input:",
+                s.c_str());
+        SAFE_V(FAIL);
+    }
+    if (scale_pos != s.size()) {
+        BENCHDNN_PRINT(0, "%s \'%s\'. %s \'%g\'.\n",
+                "Error: not every input symbol was processed. Given input:",
+                s.c_str(), "Parsed value:", value);
+        SAFE_V(FAIL);
+    }
+    return OK;
+}
+
+#define HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING() \
+    if (start_pos == std::string::npos) return OK; \
+    if (start_pos >= s.size()) { \
+        BENCHDNN_PRINT(0, "%s \'%s\'\n", \
+                "Error: dangling symbol at the end of input", s.c_str()); \
+        SAFE_V(FAIL); \
+    }
 
 int attr_t::arg_scales_t::entry_t::from_str(const std::string &s) {
     *this = arg_scales_t::entry_t();
@@ -285,19 +259,124 @@ int attr_t::arg_scales_t::entry_t::from_str(const std::string &s) {
                 policy_str.c_str(), "is not recognized.");
         SAFE_V(FAIL);
     }
-    if (start_pos == std::string::npos) return OK;
-    if (start_pos >= s.size()) {
-        BENCHDNN_PRINT(0, "%s \'%s\'\n",
-                "Error: dangling symbol at the end of input", s.c_str());
+    HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING();
+
+    // process scale value for COMMON policy
+    if (this->policy == COMMON) {
+        SAFE(parse_value_and_runtime(
+                     this->scale, parser::get_substr(s, start_pos, ':')),
+                WARN);
+        if (this->scale < 0) {
+            BENCHDNN_PRINT(0, "%s \'%g\'\n",
+                    "Error: the scale can't be negative:", this->scale);
+            SAFE_V(FAIL);
+        }
+    }
+    HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING();
+
+    // process data type
+    const auto dt_str = parser::get_substr(s, start_pos, ':');
+    this->dt = str2dt(dt_str.c_str());
+    if (this->dt == dnnl_data_type_undef) {
+        BENCHDNN_PRINT(0, "Error: data type \'%s\' was not recognized.\n",
+                dt_str.c_str());
         SAFE_V(FAIL);
     }
+    HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING();
 
-    SAFE(parse_value_and_runtime(
-                 this->scale, parser::get_substr(s, start_pos, ':')),
-            WARN);
-    if (this->scale < 0) return FAIL;
+    // process groups
+    const auto g_str = parser::get_substr(s, start_pos, ':');
+    parser::parse_vector_str(this->groups, dims_t(),
+            parser::parser_utils::stoll_safe, g_str, 'x');
+
+    if (!groups.empty()) {
+        switch (this->policy) {
+            case PER_OCIC:
+                if (this->groups.size() != 2) {
+                    BENCHDNN_PRINT(0, "%s\n",
+                            "Error: number of groups should be equal to number "
+                            "of dimension bits set in the mask.");
+                    SAFE_V(FAIL);
+                }
+                break;
+            default:
+                BENCHDNN_PRINT(0, "%s\n",
+                        "Error: groups are supported only for policy PER_OCIC");
+                SAFE_V(FAIL);
+        }
+    }
+    HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING();
+
     return OK;
 }
+
+int attr_t::zero_points_t::entry_t::from_str(const std::string &s) {
+    *this = zero_points_t::entry_t();
+    if (s.empty()) return OK;
+
+    size_t start_pos = 0;
+
+    // process policy
+    const auto policy_str = parser::get_substr(s, start_pos, ':');
+    this->policy = str2policy(policy_str);
+    if (this->policy == POLICY_TOTAL) {
+        BENCHDNN_PRINT(0, "Error: policy \'%s\' was not recognized.\n",
+                policy_str.c_str());
+        SAFE_V(FAIL);
+    }
+    HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING();
+
+    if (this->policy == COMMON) {
+        float value = 0.0f;
+        SAFE(parse_value_and_runtime(
+                     value, parser::get_substr(s, start_pos, ':')),
+                WARN);
+        int zp_val = static_cast<int>(value);
+        if (static_cast<float>(zp_val) != value) {
+            BENCHDNN_PRINT(0, "%s \'%d\'\n",
+                    "Error: the zero point is not exact:", zp_val);
+            SAFE_V(FAIL);
+        }
+        this->value = zp_val;
+    }
+    HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING();
+
+    // process data type
+    const auto dt_str = parser::get_substr(s, start_pos, ':');
+    this->dt = str2dt(dt_str.c_str());
+    if (this->dt == dnnl_data_type_undef) {
+        BENCHDNN_PRINT(0, "Error: data type \'%s\' was not recognized.\n",
+                dt_str.c_str());
+        SAFE_V(FAIL);
+    }
+    HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING();
+
+    // process groups
+    const auto g_str = parser::get_substr(s, start_pos, ':');
+    parser::parse_vector_str(this->groups, dims_t(),
+            parser::parser_utils::stoll_safe, g_str, 'x');
+    if (!groups.empty()) {
+        switch (this->policy) {
+            case PER_OCIC:
+                if (this->groups.size() != 2) {
+                    BENCHDNN_PRINT(0, "%s\n",
+                            "Error: number of groups should be equal to number "
+                            "of dimension bits set in the mask.");
+                    SAFE_V(FAIL);
+                }
+                break;
+            default:
+                BENCHDNN_PRINT(0, "%s\n",
+                        "Error: groups are supported only for policy PER_OCIC");
+                SAFE_V(FAIL);
+        }
+    }
+    HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING();
+
+    return OK;
+}
+
+#undef HANDLE_DANGLING_SYMBOL_AND_END_OF_STRING
 
 int attr_t::zero_points_t::from_str(const std::string &s) {
     *this = zero_points_t();
@@ -314,19 +393,13 @@ int attr_t::zero_points_t::from_str(const std::string &s) {
             BENCHDNN_PRINT(0,
                     "Error: argument name \'%s\' was not recognized.\n",
                     subs.c_str());
-            return FAIL;
+            SAFE_V(FAIL);
         }
 
-        auto policy = str2policy(parser::get_substr(subs, subs_pos, ':'));
-        if (policy == POLICY_TOTAL || subs_pos == std::string::npos
-                || subs_pos >= subs.size())
-            return FAIL;
-
-        float zp = 0;
-        SAFE(parse_value_and_runtime(
-                     zp, parser::get_substr(subs, subs_pos, '\0')),
+        zero_points_t::entry_t zero_point;
+        SAFE(zero_point.from_str(parser::get_substr(subs, subs_pos, '\0')),
                 WARN);
-        set(arg, policy, static_cast<int>(zp));
+        set(arg, zero_point);
     }
     return OK;
 }
@@ -351,7 +424,7 @@ int attr_t::arg_scales_t::from_str(const std::string &s) {
             BENCHDNN_PRINT(0,
                     "Error: argument name \'%s\' was not recognized.\n",
                     subs.c_str());
-            return FAIL;
+            SAFE_V(FAIL);
         }
 
         arg_scales_t::entry_t arg_scale;
@@ -374,9 +447,7 @@ static po_table_entry_t kind_table[] = {
         // sum
         {pk_t::SUM, {"sum"}, dnnl_alg_kind_undef},
         // depthwise convolution
-        {pk_t::DW, {"dw"}, dnnl_convolution_auto},
-        {pk_t::DW_K3S1P1, {"dw_k3s1p1"}, dnnl_convolution_auto},
-        {pk_t::DW_K3S2P1, {"dw_k3s2p1"}, dnnl_convolution_auto},
+        {pk_t::DW, {"dw"}, dnnl_convolution_direct},
         // eltwise
         {pk_t::ELTWISE_START, {"eltwise_undef"}, dnnl_alg_kind_undef},
         {pk_t::ABS, {"abs", "eltwise_abs"}, dnnl_eltwise_abs},
@@ -505,8 +576,8 @@ std::vector<std::pair<int, int>> attr_t::post_ops_t::get_po_masks() const {
 bool attr_t::is_def(bool skip_fpmath) const {
     return scales.is_def() && zero_points.is_def() && post_ops.is_def()
             && scratchpad_mode == get_default_scratchpad_mode()
-            && IMPLICATION(
-                    !skip_fpmath, fpmath_mode == dnnl_fpmath_mode_strict);
+            && IMPLICATION(!skip_fpmath, fpmath_mode.is_def())
+            && deterministic.is_def();
 }
 
 int attr_t::post_ops_t::find(pk_t kind, int start, int stop) const {
@@ -521,7 +592,7 @@ bool attr_t::post_ops_t::entry_t::is_sum_kind() const {
     return kind == SUM;
 }
 bool attr_t::post_ops_t::entry_t::is_convolution_kind() const {
-    return kind == DW || kind == DW_K3S1P1 || kind == DW_K3S2P1;
+    return kind == DW;
 }
 bool attr_t::post_ops_t::entry_t::is_eltwise_kind() const {
     return kind > ELTWISE_START && kind < ELTWISE_END;
@@ -568,19 +639,28 @@ std::ostream &operator<<(std::ostream &s, const policy_t &policy) {
 
 std::ostream &operator<<(
         std::ostream &s, const attr_t::arg_scales_t::entry_t &scale) {
-    // TODO: remove '*'
-    s << scale.policy << ":" << scale.scale << '*';
+    using ::operator<<;
+
+    s << scale.policy;
+    if (scale.policy == policy_t::COMMON) s << ":" << scale.scale;
+    if (scale.dt != dnnl_f32) s << ':' << scale.dt;
+    if (!scale.groups.empty()) s << ":" << dims2str(scale.groups);
     return s;
 }
 
 std::ostream &operator<<(
         std::ostream &s, const attr_t::zero_points_t &zero_points) {
+    using ::operator<<;
+
     const char *delim = "";
-    // TODO: remove '*'
     for (const auto &point : zero_points.points) {
         s << delim;
-        s << arg2str(point.first) << ":" << point.second.policy << ":"
-          << point.second.value << '*';
+        s << arg2str(point.first) << ":" << point.second.policy;
+        if (point.second.policy == policy_t::COMMON)
+            s << ":" << point.second.value;
+        if (point.second.dt != dnnl_s32) s << ':' << point.second.dt;
+        if (!point.second.groups.empty())
+            s << ":" << dims2str(point.second.groups);
         delim = "+";
     }
 
@@ -619,17 +699,10 @@ std::ostream &operator<<(std::ostream &s, const attr_t::post_ops_t &post_ops) {
                 s << ":" << e.sum.zero_point;
             if (e.sum.dt != dnnl_data_type_undef) s << ":" << e.sum.dt;
         } else if (e.is_convolution_kind()) {
-            if (e.kind == pk_t::DW) {
-                s << ":k" << e.convolution.kernel << "s" << e.convolution.stride
-                  << "p" << e.convolution.padding;
-            }
-            const auto &c_ws = e.convolution.wei_scale;
-            const auto &c_ds = e.convolution.dst_scale;
-            if (e.convolution.dst_dt != dnnl_f32 || !c_ws.is_def()
-                    || !c_ds.is_def())
+            s << ":k" << e.convolution.kernel << "s" << e.convolution.stride
+              << "p" << e.convolution.padding;
+            if (e.convolution.dst_dt != dnnl_f32)
                 s << ":" << e.convolution.dst_dt;
-            if (!c_ws.is_def() || !c_ds.is_def()) s << ":" << c_ws;
-            if (!c_ds.is_def()) s << ":" << c_ds;
         } else if (e.is_eltwise_kind()) {
             if (e.eltwise.beta != 0.f)
                 s << ":" << e.eltwise.alpha << ":" << e.eltwise.beta;
@@ -667,8 +740,19 @@ std::ostream &operator<<(std::ostream &s, dnnl_scratchpad_mode_t sm) {
     return s;
 }
 
-std::ostream &operator<<(std::ostream &s, dnnl_fpmath_mode_t fm) {
-    s << fpmath_mode2str(fm);
+std::ostream &operator<<(std::ostream &s, const attr_t::fpmath_mode_t &fm) {
+    s << fpmath_mode2str(fm.mode);
+    if (fm.apply_to_int) s << ":" << bool2str(fm.apply_to_int);
+    return s;
+}
+
+std::ostream &operator<<(std::ostream &s, dnnl_accumulation_mode_t am) {
+    s << accumulation_mode2str(am);
+    return s;
+}
+
+std::ostream &operator<<(std::ostream &s, const attr_t::deterministic_t &d) {
+    s << bool2str(d.enabled);
     return s;
 }
 
@@ -681,8 +765,12 @@ std::ostream &operator<<(std::ostream &s, const attr_t &attr) {
             s << "--attr-post-ops=" << attr.post_ops << " ";
         if (attr.scratchpad_mode != attr_t::get_default_scratchpad_mode())
             s << "--attr-scratchpad=" << attr.scratchpad_mode << " ";
-        if (attr.fpmath_mode != dnnl_fpmath_mode_strict)
+        if (!attr.fpmath_mode.is_def())
             s << "--attr-fpmath=" << attr.fpmath_mode << " ";
+        if (attr.acc_mode != dnnl_accumulation_mode_strict)
+            s << "--attr-acc-mode=" << attr.acc_mode << " ";
+        if (!attr.deterministic.is_def())
+            s << "--attr-deterministic=" << attr.deterministic << " ";
     }
     return s;
 }
@@ -753,8 +841,8 @@ std::ostream &dump_global_params(std::ostream &s) {
         if (engine_index != 0) s << ":" << engine_index;
         s << " ";
     }
-    if (canonical || fast_ref_gpu != true)
-        s << "--fast-ref-gpu=" << bool2str(fast_ref_gpu) << " ";
+    if (canonical || fast_ref != default_fast_ref)
+        s << "--fast-ref=" << bool2str(fast_ref) << " ";
     if (!skip_impl.empty()) s << "--skip-impl=" << skip_impl << " ";
     if (canonical || mem_check != true)
         s << "--mem-check=" << bool2str(mem_check) << " ";
@@ -767,6 +855,8 @@ std::ostream &dump_global_params(std::ostream &s) {
 #if defined(DNNL_WITH_SYCL) || DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
     if (canonical || memory_kind != default_memory_kind)
         s << "--memory-kind=" << memory_kind << " ";
+    if (canonical || stream_kind != default_stream_kind)
+        s << "--stream-kind=" << stream_kind << " ";
 #endif
     if (canonical || cold_cache_mode != default_cold_cache_mode)
         s << "--cold-cache=" << cold_cache_mode << " ";
@@ -819,6 +909,28 @@ dnnl_fpmath_mode_t str2fpmath_mode(const char *str) {
 
     assert(!"not expected");
     return dnnl_fpmath_mode_strict;
+
+#undef CASE
+}
+
+dnnl_accumulation_mode_t str2accumulation_mode(const char *str) {
+
+#define CASE(am) \
+    param = #am; \
+    if (!strncasecmp(param, str, strlen(param))) \
+        return dnnl_accumulation_mode_##am;
+
+    const char *param;
+
+    CASE(strict);
+    CASE(relaxed);
+    CASE(any);
+    CASE(f32);
+    CASE(s32);
+    CASE(f16);
+
+    assert(!"not expected");
+    return dnnl_accumulation_mode_strict;
 
 #undef CASE
 }
@@ -921,10 +1033,10 @@ dnnl_primitive_attr_t create_dnnl_attr(
                             == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
             int mask = (is_wei_arg && e.policy != policy_t::COMMON)
                     ? attr_args.get_mask(arg_name)
-                    : e.policy2mask(arg_name);
+                    : attr_t::policy2mask(arg_name, e.policy);
 
-            DNN_SAFE_V(dnnl_primitive_attr_set_scales_mask(
-                    dnnl_attr, arg_name, mask));
+            DNN_SAFE_V(dnnl_primitive_attr_set_scales(dnnl_attr, arg_name, mask,
+                    static_cast<int>(e.groups.size()), e.groups.data(), e.dt));
         }
     }
 
@@ -935,10 +1047,21 @@ dnnl_primitive_attr_t create_dnnl_attr(
             if (zp.is_def(arg_name)) continue;
 
             const auto &e = arg.second;
-            int mask = attr_t::get_default_mask(e.policy);
+            // Weights mask differs from primitive to primitive, that's why it
+            // is stashed in `attr_args` at primitive creation time.
+            const bool is_wei_arg = arg_name == DNNL_ARG_WEIGHTS
+                    || arg_name
+                            == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
+            int mask = (is_wei_arg && e.policy != policy_t::COMMON)
+                    ? attr_args.get_mask(DNNL_ARG_ATTR_ZERO_POINTS | arg_name)
+                    : attr_t::policy2mask(arg_name, e.policy);
 
-            DNN_SAFE_V(dnnl_primitive_attr_set_zero_points_mask(
-                    dnnl_attr, arg_name, mask));
+            int ndims = static_cast<int>(e.groups.size());
+            const auto &groups = e.groups.data();
+            const auto dt = e.dt;
+
+            DNN_SAFE_V(dnnl_primitive_attr_set_zero_points(
+                    dnnl_attr, arg_name, mask, ndims, groups, dt));
         }
     }
 
@@ -959,23 +1082,6 @@ dnnl_primitive_attr_t create_dnnl_attr(
                 DNN_SAFE_V(dnnl_post_ops_append_dw(ops, wei_dt, bia_dt,
                         e.convolution.dst_dt, e.convolution.kernel,
                         e.convolution.stride, e.convolution.padding));
-
-                // TODO: remove in favor of attr-scales option and update input
-                // files relying on scales in dw post-op string.
-                const auto &wei_scale = e.convolution.wei_scale;
-                int wei_mask = wei_scale.policy2mask(DNNL_ARG_WEIGHTS,
-                        dnnl_convolution, /* has_groups = */ true);
-                if (!wei_scale.is_def())
-                    DNN_SAFE_V(dnnl_primitive_attr_set_scales_mask(dnnl_attr,
-                            DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS,
-                            wei_mask));
-
-                const auto &dst_scale = e.convolution.dst_scale;
-                int dst_mask = dst_scale.policy2mask(DNNL_ARG_DST);
-                if (!dst_scale.is_def())
-                    DNN_SAFE_V(dnnl_primitive_attr_set_scales_mask(dnnl_attr,
-                            DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_DST, dst_mask));
-
             } else if (e.is_eltwise_kind()) {
                 DNN_SAFE_V(dnnl_post_ops_append_eltwise(
                         ops, e.eltwise.alg, e.eltwise.alpha, e.eltwise.beta));
@@ -1003,8 +1109,14 @@ dnnl_primitive_attr_t create_dnnl_attr(
     DNN_SAFE_V(dnnl_primitive_attr_set_scratchpad_mode(
             dnnl_attr, attr.scratchpad_mode));
 
-    DNN_SAFE_V(
-            dnnl_primitive_attr_set_fpmath_mode(dnnl_attr, attr.fpmath_mode));
+    DNN_SAFE_V(dnnl_primitive_attr_set_fpmath_mode_v2(
+            dnnl_attr, attr.fpmath_mode.mode, attr.fpmath_mode.apply_to_int));
+
+    DNN_SAFE_V(dnnl_primitive_attr_set_accumulation_mode(
+            dnnl_attr, attr.acc_mode));
+
+    DNN_SAFE_V(dnnl_primitive_attr_set_deterministic(
+            dnnl_attr, attr.deterministic.enabled));
 
     return dnnl_attr;
 }

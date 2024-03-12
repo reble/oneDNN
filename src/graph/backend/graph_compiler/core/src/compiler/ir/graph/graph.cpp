@@ -67,13 +67,12 @@ bool gt_map_t<valT>::haskey(const graph_tensor_ptr &v) const {
     return haskey(v.get());
 }
 
-template struct gt_map_t<fusion_data_t>;
 template struct gt_map_t<slice_range_list>;
 template struct gt_map_t<graph_tensor_ptr>;
 template struct gt_map_t<std::vector<int>>;
 template struct gt_map_t<expr>;
-template struct gt_map_t<fuse_anchor_map_t *>;
-template struct gt_map_t<bound_axis>;
+template struct gt_map_t<fusion_anchor_t *>;
+template struct gt_map_t<binding_axis>;
 
 sc_op_ptr op_traits::auto_copyable_t::copy(
         const std::vector<graph_tensor_ptr> &ins,
@@ -960,6 +959,26 @@ sc_graph_t make_single_op_graph(const std::string &opname,
     auto op = ret.make(opname, inputs, outputs, attr);
     ret.make_output(op->get_outputs());
     return ret;
+}
+
+bool check_shape_equal(const sc_dims &lhs_shape, const sc_dims &rhs_shape) {
+    if (lhs_shape.size() != rhs_shape.size()) { return false; }
+    if (!std::equal(lhs_shape.begin(), lhs_shape.end(), rhs_shape.begin(),
+                [](const int x, const int y) {
+                    return is_dynamic_dim(x) || is_dynamic_dim(y) || x == y;
+                })) {
+        return false;
+    }
+    return true;
+}
+
+void check_logical_tensor_shape_dtype_identical(
+        const logical_tensor_t &lhs, const logical_tensor_t &rhs) {
+    COMPILE_ASSERT(
+            check_shape_equal(lhs.get_plain_dims(), rhs.get_plain_dims()),
+            "The given logical tensors shall have the same shape.")
+    COMPILE_ASSERT(lhs.dtype_.type_code_ == rhs.dtype_.type_code_,
+            "The given logical tensors shall have the same dtype.")
 }
 
 } // namespace graph

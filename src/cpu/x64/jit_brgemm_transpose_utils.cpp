@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -119,7 +119,8 @@ void jit_brgemm_trans_m_k_f32_t::transpose_16x16(int nrows, int ncolumns) {
             kmovw(kTail, (1 << ncolumns) - 1);
             src_load = src_zmm(i) | kTail | T_z;
         }
-        vmovups(src_load, EVEX_compress_addr(reg_src, i * src_stride));
+        vmovups(src_load,
+                EVEX_compress_addr_safe(reg_src, i * src_stride, reg_tmp));
     };
 
     auto store = [&](Zmm r, int i) {
@@ -327,8 +328,8 @@ void jit_brgemm_trans_m_k_f32_t::transpose(int nrows, int ncolumns) {
     Label K_loop, K_tail_or_done, K_done;
     const int num_nrows_loop = nrows / transpose_size;
     const int nrows_tail = nrows % transpose_size;
-    const dim_t src_shift
-            = static_cast<dim_t>(transpose_size) * conf_->ic * typesize;
+    const dim_t src_shift = static_cast<dim_t>(transpose_size) * conf_->ic
+            * conf_->ks() * typesize;
     const dim_t tr_src_shift = static_cast<dim_t>(transpose_size) * typesize;
 
     if (num_nrows_loop > 1) mov(reg_row_loop, num_nrows_loop);
@@ -361,7 +362,7 @@ void jit_brgemm_trans_m_k_f32_t::init_masks(int tail_length) {
         kmovw(k0F0F, 0x0f0f); // 0000111100001111
         kmovw(kF0F0, 0xf0f0); // 1111000011110000
     } else if (tail_length) {
-        mov(reg_tmp, mask_label_);
+        lea(reg_tmp, ptr[rip + mask_label_]);
         vmovups(ymm_tail_mask, ptr[reg_tmp]);
         vmovups(xmm_upper_tail_mask, ptr[reg_tmp + vreg_traits<Xmm>::vlen]);
     }
@@ -376,8 +377,8 @@ void jit_brgemm_trans_m_k_f32_t::generate() {
     const int os_block = conf_->os_block;
     const int last_os_block_tail = conf_->K_tail % os_block;
     const int ic_tail = conf_->M_tail % transpose_size;
-    src_stride = conf_->ic * typesize;
-    tr_src_stride = conf_->LDA * typesize;
+    src_stride = static_cast<dim_t>(conf_->ic) * conf_->ks() * typesize;
+    tr_src_stride = static_cast<dim_t>(conf_->LDA) * typesize;
     const dim_t m_src_shift = static_cast<dim_t>(transpose_size) * typesize;
     const dim_t m_tr_src_shift = tr_src_stride * transpose_size;
 
@@ -703,7 +704,7 @@ void jit_brgemm_trans_m_k_bf16_t::generate() {
     const int os_block = conf_->os_block;
     const int last_os_block_tail = eff_K_tail % transpose_size;
     const int ic_tail = conf_->M_tail % transpose_size;
-    src_stride = conf_->ic * typesize;
+    src_stride = static_cast<dim_t>(conf_->ic) * conf_->ks() * typesize;
     tr_src_stride = conf_->LDA * typesize;
 
     const dim_t batch_src_shift = static_cast<dim_t>(src_stride) * os_block;
@@ -714,8 +715,8 @@ void jit_brgemm_trans_m_k_bf16_t::generate() {
     const dim_t M_tr_src_shift
             = static_cast<dim_t>(transpose_size) * conf_->LDA * typesize;
 
-    const dim_t K_src_shift
-            = static_cast<dim_t>(transpose_size) * conf_->ic * typesize;
+    const dim_t K_src_shift = static_cast<dim_t>(transpose_size) * conf_->ic
+            * conf_->ks() * typesize;
     const dim_t K_tr_src_shift = static_cast<dim_t>(transpose_size) * typesize;
 
     auto kmovw = [this](Opmask k, unsigned w) {
@@ -870,6 +871,7 @@ private:
     reg64_t reg_loop_batch = r12;
     reg64_t reg_tr_src_tmp = r13;
     reg32_t regw_tmp = r14d;
+    reg64_t reg_tmp = r14;
 
     void transpose_16x16(int nrows, int ncolumns = transpose_size);
     void generate() override;
@@ -1024,8 +1026,8 @@ void jit_brgemm_trans_m_k_f16_t::generate() {
     const int os_block = conf_->os_block;
     const int last_os_block_tail = conf_->K_tail % transpose_size;
     const int ic_tail = conf_->M_tail % transpose_size;
-    src_stride = conf_->ic * typesize_in;
-    tr_src_stride = conf_->LDA * typesize_out;
+    src_stride = static_cast<dim_t>(conf_->ic) * conf_->ks() * typesize_in;
+    tr_src_stride = static_cast<dim_t>(conf_->LDA) * typesize_out;
     const dim_t m_src_shift = transpose_size * typesize_in;
     const dim_t m_tr_src_shift = tr_src_stride * transpose_size;
 
@@ -1632,9 +1634,8 @@ struct jit_copy_f32_t : public jit_brgemm_trans_to_vnni_t,
         : jit_brgemm_trans_to_vnni_t(conf, matrix_to_transform)
         , jit_generator(jit_name())
         , column_step(isa_max_vlen(conf->isa) / typesize_data)
-        , num_regs(isa_num_vregs(conf->isa)) {
-        col_shift = static_cast<dim_t>(column_step) * typesize_data;
-    }
+        , num_regs(isa_num_vregs(conf->isa))
+        , col_shift(static_cast<dim_t>(column_step) * typesize_data) {}
 
     void operator()(ctx_t *ctx) override { jit_generator::operator()(ctx); }
     status_t create_kernel() override { return jit_generator::create_kernel(); }
@@ -1727,12 +1728,10 @@ void jit_copy_f32_t::init_masks(int tail_length) {
         jit_generator::kmovd(k, regw_tmp);
     };
 
-    if (isa_has_masks(conf_->isa)) {
+    if (isa_has_masks(conf_->isa))
         kmovd(mask_tail, (1 << tail_length) - 1);
-    } else {
-        mov(reg_tmp, mask_label_);
-        vmovups(ymm_tail_mask, ptr[reg_tmp]);
-    }
+    else
+        vmovups(ymm_tail_mask, ptr[rip + mask_label_]);
 }
 
 void jit_copy_f32_t::generate() {
@@ -2000,9 +1999,11 @@ void jit_copy_f16_t::generate() {
 void jit_brgemm_relo_copy_to_wbuffer_t::generate() {
 
     const bool is_xf16 = one_of(wjcp.wei_dt, data_type::bf16, data_type::f16);
+    const bool is_f32 = wjcp.wei_dt == data_type::f32;
 
     // required for use of VPERMB instruction
-    assert(IMPLICATION(!is_xf16, cpu().has(Xbyak::util::Cpu::tAVX512_VBMI)));
+    assert(IMPLICATION(
+            !(is_xf16 || is_f32), cpu().has(Xbyak::util::Cpu::tAVX512_VBMI)));
     assert(wjcp.inp_oc_block == 16);
 
     preamble();
@@ -2024,6 +2025,9 @@ void jit_brgemm_relo_copy_to_wbuffer_t::generate() {
             vmovdqu16(zmm_src_tmp, ptr[aux_reg_src]);
             vpermw(zmm_dst, zmm_idx, zmm_src);
             vmovdqu16(ptr[aux_reg_dst], zmm_dst);
+        } else if (is_f32) {
+            vmovdqu32(zmm_src_tmp, ptr[aux_reg_src]);
+            vmovdqu32(ptr[aux_reg_dst], zmm_src_tmp);
         } else {
             vmovdqu8(zmm_src_tmp, ptr[aux_reg_src]);
             vpermb(zmm_dst, zmm_idx, zmm_src);
@@ -2066,11 +2070,12 @@ void jit_brgemm_relo_copy_to_wbuffer_t::generate() {
 
     // load permute indices from data section
     Label full_ocb_label, finish_label, permute_index_table;
-    mov(reg_tmp, permute_index_table);
-    if (is_xf16)
-        vmovdqu16(zmm_idx, ptr[reg_tmp]);
-    else
-        vmovdqu8(zmm_idx, ptr[reg_tmp]);
+    if (!is_f32) {
+        if (is_xf16)
+            vmovdqu16(zmm_idx, ptr[rip + permute_index_table]);
+        else
+            vmovdqu8(zmm_idx, ptr[rip + permute_index_table]);
+    }
 
     mov(reg_src, ptr[param1 + GET_OFF(src)]);
     mov(reg_dst, ptr[param1 + GET_OFF(dst)]);
@@ -2090,14 +2095,16 @@ void jit_brgemm_relo_copy_to_wbuffer_t::generate() {
 
     align(64);
     L(permute_index_table);
-    const uint8_t no = 16; // 16o
-    for (uint8_t o = 0; o < no; ++o) {
-        for (uint8_t r = 0; r < vnni_width; r++) {
-            const uint8_t index = o + r * no;
-            if (is_xf16)
-                dw(index);
-            else
-                db(index);
+    if (!is_f32) {
+        const uint8_t no = 16; // 16o
+        for (uint8_t o = 0; o < no; ++o) {
+            for (uint8_t r = 0; r < vnni_width; r++) {
+                const uint8_t index = o + r * no;
+                if (is_xf16)
+                    dw(index);
+                else
+                    db(index);
+            }
         }
     }
 }
@@ -2149,7 +2156,6 @@ private:
     void transpose_16x16(int nrows, int ncolumns);
     void transpose_8x8();
     void transpose(int nrows, int ncolumns);
-    int get_oc_block();
     void init_masks();
     void generate() override;
 };
@@ -2353,32 +2359,6 @@ void jit_brgemm_trans_wei_f32_t::transpose(int nrows, int ncolumns) {
     }
 }
 
-int jit_brgemm_trans_wei_f32_t::get_oc_block() {
-    switch (conf_->wei_tag) {
-        case OI16i64o:
-        case OIw16i64o:
-        case OIhw16i64o:
-        case OIdhw16i64o: return 64;
-        case OI16i48o:
-        case OIw16i48o:
-        case OIhw16i48o:
-        case OIdhw16i48o: return 48;
-        case OI16i32o:
-        case OIw16i32o:
-        case OIhw16i32o:
-        case OIdhw16i32o: return 32;
-        case OI8i24o:
-        case OIw8i24o:
-        case OIhw8i24o:
-        case OIdhw8i24o: return 24;
-        case OI8i16o:
-        case OIw8i16o:
-        case OIhw8i16o:
-        case OIdhw8i16o: return 16;
-        default: return conf_->simd_w;
-    };
-}
-
 void jit_brgemm_trans_wei_f32_t::generate() {
     preamble();
 
@@ -2388,16 +2368,15 @@ void jit_brgemm_trans_wei_f32_t::generate() {
     // column axis = input oc axis
 
     assert(conf_->oc_block % transpose_size == 0);
-    const int fwd_ic_block = conf_->simd_w;
-    const int fwd_oc_block = get_oc_block();
+    const dim_t fwd_ic_block = conf_->simd_w;
+    const dim_t fwd_oc_block = conf_->get_weights_oc_block();
 
     int oc_tail = conf_->K_tail % transpose_size;
     int ic_block = conf_->ic_block;
     int ic_tail = conf_->N_tail % transpose_size;
     src_stride = fwd_oc_block * typesize; // src_row_stride
     tr_src_stride = ic_block * typesize; // tr_src_row_stride
-    dim_t N_src_shift = static_cast<dim_t>(conf_->kd) * conf_->kh * conf_->kw
-            * fwd_ic_block * fwd_oc_block * typesize;
+    dim_t N_src_shift = fwd_ic_block * fwd_oc_block * typesize;
     dim_t N_tr_src_shift = conf_->simd_w * typesize;
     dim_t K_src_shift = conf_->simd_w * typesize;
     dim_t K_tr_src_shift = conf_->ic_block * conf_->simd_w * typesize;
@@ -2591,35 +2570,7 @@ void jit_brgemm_trans_wei_bf16_t::transpose_16x16_vnni(
 
 void jit_brgemm_trans_wei_bf16_t::generate() {
     preamble();
-    int fwd_oc_block = 0;
-    switch (conf_->wei_tag) {
-        case OI16i64o:
-        case OIw16i64o:
-        case OIhw16i64o:
-        case OIdhw16i64o:
-        case OI8i64o2i:
-        case OIw8i64o2i:
-        case OIhw8i64o2i:
-        case OIdhw8i64o2i:
-        case OI16i64o2i:
-        case OIw16i64o2i:
-        case OIhw16i64o2i:
-        case OIdhw16i64o2i: fwd_oc_block = 4 * conf_->simd_w; break;
-        case OI16i32o:
-        case OIw16i32o:
-        case OIhw16i32o:
-        case OIdhw16i32o:
-        case OI8i32o2i:
-        case OIw8i32o2i:
-        case OIhw8i32o2i:
-        case OIdhw8i32o2i:
-        case OI16i32o2i:
-        case OIw16i32o2i:
-        case OIhw16i32o2i:
-        case OIdhw16i32o2i: fwd_oc_block = 2 * conf_->simd_w; break;
-        default: fwd_oc_block = conf_->simd_w;
-    };
-
+    int fwd_oc_block = conf_->get_weights_oc_block();
     int oc_tail = conf_->K_tail % transpose_size;
     int ic_block = conf_->ic_block;
     int ic_tail = conf_->N_tail % transpose_size;
@@ -2896,43 +2847,14 @@ void jit_brgemm_trans_wei_f16_t::transpose_16x16(int nrows, int ncolumns) {
 void jit_brgemm_trans_wei_f16_t::generate() {
     preamble();
     assert(conf_->oc_block % transpose_size == 0);
-    int fwd_ic_block = conf_->simd_w;
-    int fwd_oc_block = 0;
-    switch (conf_->wei_tag) {
-        case OI16i64o:
-        case OIw16i64o:
-        case OIhw16i64o:
-        case OIdhw16i64o:
-        case OI8i64o2i:
-        case OIw8i64o2i:
-        case OIhw8i64o2i:
-        case OIdhw8i64o2i:
-        case OI16i64o2i:
-        case OIw16i64o2i:
-        case OIhw16i64o2i:
-        case OIdhw16i64o2i: fwd_oc_block = 4 * conf_->simd_w; break;
-        case OI16i32o:
-        case OIw16i32o:
-        case OIhw16i32o:
-        case OIdhw16i32o:
-        case OI8i32o2i:
-        case OIw8i32o2i:
-        case OIhw8i32o2i:
-        case OIdhw8i32o2i:
-        case OI16i32o2i:
-        case OIw16i32o2i:
-        case OIhw16i32o2i:
-        case OIdhw16i32o2i: fwd_oc_block = 2 * conf_->simd_w; break;
-        default: fwd_oc_block = conf_->simd_w;
-    };
-
+    dim_t fwd_ic_block = conf_->simd_w;
+    dim_t fwd_oc_block = conf_->get_weights_oc_block();
     int oc_tail = conf_->K_tail % transpose_size;
     int ic_block = conf_->ic_block;
     int ic_tail = conf_->N_tail % transpose_size;
     src_stride = fwd_oc_block * typesize_in;
     tr_src_stride = ic_block * typesize_out;
-    dim_t N_src_shift = static_cast<dim_t>(conf_->kd) * conf_->kh * conf_->kw
-            * fwd_ic_block * fwd_oc_block * typesize_in;
+    dim_t N_src_shift = fwd_ic_block * fwd_oc_block * typesize_in;
     dim_t N_tr_src_shift = conf_->simd_w * typesize_out;
     dim_t K_src_shift = conf_->simd_w * typesize_in;
     dim_t K_tr_src_shift = static_cast<dim_t>(conf_->ic_block) * conf_->simd_w
@@ -3038,7 +2960,6 @@ void jit_amx_ip_trans_diff_wei_to_vnni_t::generate() {
 
     const reg64_t &reg_output = r15;
     const reg64_t &reg_input = r14;
-    const reg64_t &reg_prm_table = r13;
     const reg64_t &reg_last_ic_block = r12;
     const reg64_t &reg_last_oc_block = r11;
     const reg32_t &regw_tmp = r10d;
@@ -3077,8 +2998,9 @@ void jit_amx_ip_trans_diff_wei_to_vnni_t::generate() {
         for (int oc = 0; oc < jbgp_->oc_block; oc += simd_w) {
             int ext_oc = oc % ext_oc_block_;
             int ext_ocb = oc / ext_oc_block_;
+            const dim_t n_sp_slices = jbgp_->ks();
             dim_t ext_ocb_offset = static_cast<dim_t>(typesize_out)
-                    * (ext_ocb * div_up(jbgp_->ic, ext_ic_block_)
+                    * (ext_ocb * n_sp_slices * div_up(jbgp_->ic, ext_ic_block_)
                             * div_up(ext_ic_block_, 2) * ext_oc_block_ * 2);
             if (is_oc_tail && oc_padded != oc_padded_ext
                     && oc + simd_w > ext_oc_block_)
@@ -3212,8 +3134,7 @@ void jit_amx_ip_trans_diff_wei_to_vnni_t::generate() {
     mov(reg_last_ic_block, ptr[abi_param1 + GET_OFF(last_ic_block)]);
     mov(reg_last_oc_block, ptr[abi_param1 + GET_OFF(last_oc_block)]);
 
-    mov(reg_prm_table, prm_table);
-    vmovups(zmm_idx, ptr[reg_prm_table]);
+    vmovups(zmm_idx, ptr[rip + prm_table]);
 
     cmp(reg_last_oc_block, 0);
     je(skip_oc_tail, T_NEAR);

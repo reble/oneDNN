@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,10 +23,14 @@
 
 namespace dnnl {
 namespace impl {
+
+struct primitive_t;
+
 namespace gpu {
 namespace jit {
 
 class conv_config_t;
+class prim_config_t;
 class conv_tuner_t;
 class conv_tiler_impl_t;
 
@@ -40,8 +44,10 @@ public:
     void set_params(conv_config_t &cfg);
     void notify_out_of_registers(const conv_config_t &cfg);
     bool is_grf_limit_ok(const conv_config_t &cfg) const;
-    static void after_create_hook(const conv_config_t &cfg);
-    static void before_exec_hook(const conv_config_t &cfg, stream_t *stream);
+    static void after_create_hook(
+            const conv_config_t &cfg, const primitive_t *primitive);
+    static void before_exec_hook(
+            const primitive_t *primitive, stream_t *stream);
 
 private:
     std::shared_ptr<conv_tiler_impl_t> impl_;

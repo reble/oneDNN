@@ -143,8 +143,32 @@ bool static_fusion_cost_model_t::make_decision_for_parti(
     }
 }
 
+// Some kinds of op may perform more parallism when fusion break, like tunable
+// op and broadcast op, which needs double check
+static bool need_double_check_standalone_parallel(
+        const sc_op *op, const mixed_parti_t *mxp) {
+    if (op->isa<tunable_op_t>()) return true;
+    if (auto broadcast_op = op->dyn_cast<const op_traits::may_broadcast_t>()) {
+        auto non_bc_index = broadcast_op->get_non_broadcast_input_index(true);
+        // If no broadcast semantic found
+        if (non_bc_index.size() == op->get_inputs().size()) return false;
+        // If any non-broadcast input of op is included in mxp with tunable op,
+        // rely on previous decision made by cost model
+        if (mxp->contain_tunable_op()
+                && std::any_of(non_bc_index.begin(), non_bc_index.end(),
+                        [&op, &mxp](const int &idx) {
+                            return mxp->contains(
+                                    op->get_inputs()[idx]->producer_owner_);
+                        }))
+            return false;
+        if (mxp->can_optimize_outer_loop(true)) return false;
+        return true;
+    }
+    return false;
+}
+
 bool static_fusion_cost_model_t::make_decision_for_op(
-        const sc_op *op, const fuse_anchor_map_ptr &fanchor) {
+        const sc_op *op, const fusion_anchor_ptr &fanchor) {
     // query if turn on
     if (!enable_) return true;
     /** Auto Skip List:
@@ -153,8 +177,7 @@ bool static_fusion_cost_model_t::make_decision_for_op(
      * 3. singel op lowering
      * */
     if (binded_mxp_->empty() || binded_mxp_->contain_nested_parallel_for()
-            || op->get_owner_graph().attrs_.get_or_else(
-                    mixed_partition_hint::single_op_graph, false))
+            || is_single_op_graph(op->get_owner_graph()))
         return true;
 
     auto orig_loop_parallelism
@@ -165,15 +188,12 @@ bool static_fusion_cost_model_t::make_decision_for_op(
     bool ret = (!binded_mxp_->contain_tunable_op() && !op->isa<tunable_op_t>())
             || (fanchor_loop_parallelism >= orig_loop_parallelism);
 
-    bool double_check_standalone_parallel = (op->isa<tunable_op_t>()
-            || (is_broadcast_op(op) && !binded_mxp_->contain_tunable_op()
-                    && !binded_mxp_->can_optimize_outer_loop(true)));
-
     // double check parallelism of standalone op
-    if (double_check_standalone_parallel) {
+    if (need_double_check_standalone_parallel(op, binded_mxp_)) {
+        SC_MODULE_INFO << "double check standalone parallellism for "
+                       << op->op_name_ << op->logical_op_id_;
         mixed_parti_t op_parti(binded_mxp_->ctx_,
-                std::const_pointer_cast<sc_op>(op->shared_from_this()),
-                nullptr);
+                std::const_pointer_cast<sc_op>(op->shared_from_this()));
         float standalone_parallel
                 = evaluate_loop_parallel_balance(op_parti.get_outer_loops());
         // if original result of partition can not meet requirement
@@ -264,7 +284,7 @@ bool dynamic_fusion_cost_model_t::make_decision_for_parti(
 }
 
 bool dynamic_fusion_cost_model_t::make_decision_for_op(
-        const sc_op *op, const fuse_anchor_map_ptr &fanchor) {
+        const sc_op *op, const fusion_anchor_ptr &fanchor) {
     // query if turn on
     if (!enable_ || policy_ == dynamic_fusion_policy_t::max_fusion) return true;
     // auto skip
@@ -283,9 +303,10 @@ bool dynamic_fusion_cost_model_t::make_decision_for_op(
             && evaluate_loop_parallel_balance(
                        binded_mxp_->get_outer_loops(), thr_cond, true)
                     == 0.f) {
+        SC_MODULE_INFO << "double check standalone parallellism for "
+                       << op->op_name_ << op->logical_op_id_;
         mixed_parti_t tunable_parti(binded_mxp_->ctx_,
-                std::const_pointer_cast<sc_op>(op->shared_from_this()),
-                nullptr);
+                std::const_pointer_cast<sc_op>(op->shared_from_this()));
         if (evaluate_loop_parallel_balance(
                     tunable_parti.get_outer_loops(), dummy_cond)
                 > other_parallelism) {

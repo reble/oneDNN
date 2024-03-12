@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,13 +19,11 @@
 
 #include <algorithm>
 #include <map>
-#include <mutex>
-#include <thread>
 #include <vector>
 
 #include "common/optional.hpp"
 #include "gpu/jit/ir/core.hpp"
-#include "gpu/jit/ir/hw_config.hpp"
+#include "gpu/jit/ir/hw.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -41,11 +39,9 @@ public:
 
     const exec_config_t &exec_cfg() const { return exec_cfg_; }
 
-    const hw_config_t &hw_cfg() const { return exec_cfg().hw_cfg(); }
+    const hw_t &hw() const { return exec_cfg().hw(); }
 
-    ngen::HW hw() const { return hw_cfg().hw(); }
-
-    int grf_size() const { return hw_cfg().grf_size(); }
+    int grf_size() const { return hw().grf_size(); }
 
     const constraint_set_t &cset() { return cset_; }
 
@@ -53,10 +49,14 @@ public:
 
     expr_t create_tmp_var(
             const type_t &type, const std::string &prefix = "tmp") {
+        return var_t::make(type, create_tmp_name(prefix));
+    }
+
+    std::string create_tmp_name(const std::string &prefix = "tmp") {
         int &id = prefix_ids_[prefix];
         auto name = prefix + "_" + std::to_string(id);
         id++;
-        return var_t::make(type, name);
+        return name;
     }
 
 private:
@@ -100,17 +100,23 @@ public:
     std::map<std::string, entry_t> &entries() { return entries_; }
 
     expr_t get(const std::string &name, int size = 0) {
-        size = utils::rnd_up(size, ir_ctx_->grf_size());
+        entry_t *entry_ptr = nullptr;
         auto it = entries_.find(name);
         if (it != entries_.end()) {
             auto &e = it->second;
             if (e.size < size) e.size = size;
-            return e.buf;
+            entry_ptr = &e;
+        } else {
+            if (size == 0) return expr_t();
+            auto buf = make_buffer(name);
+            entries_[name] = entry_t(buf, size);
+            entry_ptr = &entries_[name];
         }
-        if (size == 0) return expr_t();
-        auto buf = make_buffer(name);
-        entries_[name] = entry_t(buf, size);
-        return buf;
+        // Ensure large GRF buffers are aligned to a register boundary.
+        if (!entry_ptr->is_slm() && entry_ptr->size > ir_ctx_->grf_size()) {
+            ir_assert(entry_ptr->size % ir_ctx_->grf_size() == 0);
+        }
+        return entry_ptr->buf;
     }
 
     entry_t find(const std::string &name, bool allow_empty = false) const {
@@ -124,6 +130,16 @@ public:
         return find(buf.as<var_t>().name, allow_empty);
     }
 
+    const entry_t &find_ref(const std::string &name) const {
+        auto it = entries_.find(name);
+        ir_assert(it != entries_.end());
+        return it->second;
+    }
+
+    const entry_t &find_ref(const expr_t &buf) const {
+        return find_ref(buf.as<var_t>().name);
+    }
+
     entry_t &find_ref(const std::string &name) {
         auto it = entries_.find(name);
         ir_assert(it != entries_.end());
@@ -132,6 +148,10 @@ public:
 
     entry_t &find_ref(const expr_t &buf) {
         return find_ref(buf.as<var_t>().name);
+    }
+
+    const expr_t &find_buf(const std::string &name) const {
+        return find_ref(name).buf;
     }
 
     int size(const expr_t &buf) const {

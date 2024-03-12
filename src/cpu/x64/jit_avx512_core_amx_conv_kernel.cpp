@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -704,7 +704,9 @@ void jit_avx512_core_amx_copy_to_pbuffer_t::copy_row_reduced_lowering() {
         kmovq(kmask, reg_tmp);
     };
 
-    const bool is_bf16 = jcp.src_dt == data_type::bf16;
+    const bool is_f32 = jcp.src_dt == data_type::f32;
+    const bool is_xf16 = one_of(jcp.src_dt, data_type::bf16, data_type::f16);
+
     const int inp_w_step
             = jcp.ngroups * jcp.ic_without_padding * jcp.typesize_in;
     const int inp_h_step = jcp.iw * inp_w_step;
@@ -713,12 +715,14 @@ void jit_avx512_core_amx_copy_to_pbuffer_t::copy_row_reduced_lowering() {
     const int tail_size = jcp.ic_without_padding % jcp.ic_block_int;
     if (tail_size > 0) load_mask(tail_size, ktail_mask);
 
-    auto zero_it = [this, is_bf16](reg64_t tmp_out_ptr) {
+    auto zero_it = [this, is_f32, is_xf16](reg64_t tmp_out_ptr) {
         for (int ic = 0; ic < jcp.ic_without_padding; ic += jcp.ic_block_int) {
             const int offset = ic * jcp.typesize_in;
             const bool masked = ic + jcp.ic_block_int > jcp.ic_without_padding;
             Zmm zmm = masked ? zmm_zero | ktail_mask : zmm_zero;
-            if (is_bf16)
+            if (is_f32)
+                vmovdqu32(ptr[tmp_out_ptr + offset], zmm);
+            else if (is_xf16)
                 vmovdqu16(ptr[tmp_out_ptr + offset], zmm);
             else
                 vmovdqu8(ptr[tmp_out_ptr + offset], zmm);
@@ -826,7 +830,10 @@ void jit_avx512_core_amx_copy_to_pbuffer_t::copy_row_reduced_lowering() {
                 // zero masking is needed to avoid dependency on destination
                 Zmm zmm_load = masked ? zmm_tmp | ktail_mask | T_z : zmm_tmp;
                 Zmm zmm_store = masked ? zmm_tmp | ktail_mask : zmm_tmp;
-                if (is_bf16) {
+                if (is_f32) {
+                    vmovdqu32(zmm_load, ptr[reg_aux_inp_ptr + offset]);
+                    vmovdqu32(ptr[reg_aux_out_ptr + offset], zmm_store);
+                } else if (is_xf16) {
                     vmovdqu16(zmm_load, ptr[reg_aux_inp_ptr + offset]);
                     vmovdqu16(ptr[reg_aux_out_ptr + offset], zmm_store);
                 } else {
@@ -896,15 +903,18 @@ void jit_avx512_core_amx_copy_to_pbuffer_t::copy_row_reduced_lowering() {
         L(label_rov_skip);
     }
 
-    // For bf16, zero-pad an extra cacheline to avoid NaNs
+    // For floating point, zero-pad an extra cacheline to avoid NaNs
     // For int8, it is sufficient to zero-pad the weights only
-    if (is_bf16) {
+    if (is_f32 || is_xf16) {
         // shift forward to align h index to end of needed buffer
         imul(reg_tmp, reg_kht, out_h_step);
         add(reg_out_ptr, reg_tmp);
         // shift backward to align w index to end of needed buffer
         sub(reg_out_ptr, out_w_step);
-        vmovdqu16(ptr[reg_out_ptr], zmm_zero);
+        if (is_f32)
+            vmovdqu32(ptr[reg_out_ptr], zmm_zero);
+        else
+            vmovdqu16(ptr[reg_out_ptr], zmm_zero);
     }
 }
 
@@ -1523,8 +1533,7 @@ void jit_avx512_core_amx_fwd_kernel_t::store_output_vector_int8(
     if (one_of(jcp.dst_dt, u8, s8, s32)) {
         init_saturate_f32(
                 zmm_zero, zmm_saturation, reg_aux_saturation, f32, jcp.dst_dt);
-        saturate_f32(zmm_out, zmm_zero, zmm_saturation, jcp.dst_dt);
-        vcvtps2dq(zmm_out, zmm_out);
+        saturate_cvt_f32(zmm_out, zmm_zero, zmm_saturation, jcp.dst_dt);
     }
 
     const Zmm zmm_out_store = zmm_mask(zmm_out, mask_flag, true);
@@ -3300,8 +3309,7 @@ void jit_avx512_core_amx_bwd_data_kernel_t::store_output_vector_int8(
     if (one_of(jcp.dsrc_dt, u8, s8, s32)) {
         init_saturate_f32(
                 zmm_zero, zmm_saturation, reg_aux_saturation, f32, jcp.dsrc_dt);
-        saturate_f32(zmm_out, zmm_zero, zmm_saturation, jcp.dsrc_dt);
-        vcvtps2dq(zmm_out, zmm_out);
+        saturate_cvt_f32(zmm_out, zmm_zero, zmm_saturation, jcp.dsrc_dt);
     }
 
     const Zmm zmm_out_store = zmm_mask(zmm_out, mask_flag, true);
@@ -5478,7 +5486,7 @@ void jit_avx512_core_amx_bwd_weights_kernel_t::balance(const jit_conv_conf_t &j,
     nthr_g_ = j.ngroups;
     const int nthr = max_threads / nthr_g_;
 
-    auto calc_mem_cost = [j, nthr_g_](
+    auto calc_mem_cost = [&j, nthr_g_](
                                  int nthr_mb, int nthr_oc_b, int nthr_ic_b) {
         /* calculate per thread memory cost (read/write). high level optimizer
          * tries to minimize memory consumption. few notes:

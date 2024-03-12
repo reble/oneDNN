@@ -47,6 +47,7 @@ enum class key_hw_kind_t {
     xehp,
     xehpg,
     xehpc,
+    xe2,
 };
 
 std::string to_string(key_hw_kind_t kind) {
@@ -59,6 +60,7 @@ std::string to_string(key_hw_kind_t kind) {
         CASE(xehp);
         CASE(xehpg);
         CASE(xehpc);
+        CASE(xe2);
         default: ir_error_not_expected();
     }
 #undef CASE
@@ -72,6 +74,7 @@ key_hw_kind_t to_hw_kind(ngen::HW hw) {
         case ngen::HW::XeHP: return key_hw_kind_t::xehp;
         case ngen::HW::XeHPG: return key_hw_kind_t::xehpg;
         case ngen::HW::XeHPC: return key_hw_kind_t::xehpc;
+        case ngen::HW::Xe2: return key_hw_kind_t::xe2;
         default: ir_error_not_expected(); return key_hw_kind_t::undef;
     }
 }
@@ -150,6 +153,11 @@ enum class key_type_kind_t {
     s32,
     tf32,
     f64,
+    bf8,
+    f8_e5m2 = bf8,
+    hf8,
+    f8_e4m3 = hf8,
+    xf8, // bf8 or hf8
 };
 
 std::string to_string(key_type_kind_t kind) {
@@ -164,6 +172,9 @@ std::string to_string(key_type_kind_t kind) {
         CASE(bf16);
         CASE(f16);
         CASE(x16);
+        CASE(bf8);
+        CASE(hf8);
+        CASE(xf8);
         CASE(f32);
         CASE(s32);
         CASE(tf32);
@@ -181,6 +192,8 @@ key_type_kind_t to_type_kind(data_type_t dt) {
         CASE(s8);
         CASE(u8);
         CASE(bf16);
+        CASE(f8_e5m2);
+        CASE(f8_e4m3);
         CASE(f16);
         CASE(f32);
         CASE(s32);
@@ -205,6 +218,9 @@ key_type_kind_t to_filter(key_type_kind_t kind) {
         case key_type_kind_t::f16:
         case key_type_kind_t::bf16:
         case key_type_kind_t::x16: return key_type_kind_t::x16;
+        case key_type_kind_t::bf8:
+        case key_type_kind_t::hf8:
+        case key_type_kind_t::xf8: return key_type_kind_t::xf8;
         default: ir_error_not_expected();
     }
     return key_type_kind_t::undef;
@@ -218,6 +234,7 @@ struct key_kind_traits_t<key_type_kind_t> {
         switch (kind) {
             case key_type_kind_t::any:
             case key_type_kind_t::x8:
+            case key_type_kind_t::xf8:
             case key_type_kind_t::x16: return true;
             default: return false;
         }
@@ -231,6 +248,9 @@ struct key_kind_traits_t<key_type_kind_t> {
             case key_type_kind_t::x8:
                 return utils::one_of(
                         b, key_type_kind_t::s8, key_type_kind_t::u8);
+            case key_type_kind_t::xf8:
+                return utils::one_of(
+                        b, key_type_kind_t::bf8, key_type_kind_t::hf8);
             case key_type_kind_t::x16:
                 return utils::one_of(
                         b, key_type_kind_t::bf16, key_type_kind_t::f16);
@@ -553,7 +573,7 @@ private:
 
 conv_key_t::conv_key_t(const conv_config_t &cfg, bool make_filter) {
     auto &prb = cfg.prb();
-    auto hw = key_hw_t(to_hw_kind(cfg.hw()));
+    auto hw = key_hw_t(to_hw_kind(cfg.hw().to_ngen()));
     auto fma = key_fma_t(to_fma_kind(cfg.fma_kind()));
     auto prop = key_prop_t(to_prop_kind(prb.prop_kind()));
     auto type_info = key_type_info_t(cfg);

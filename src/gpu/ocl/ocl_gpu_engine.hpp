@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,16 +17,11 @@
 #ifndef GPU_OCL_OCL_GPU_ENGINE_HPP
 #define GPU_OCL_OCL_GPU_ENGINE_HPP
 
-#include "oneapi/dnnl/dnnl.h"
-
 #include "common/c_types_map.hpp"
-#include "common/engine.hpp"
-#include "common/stream.hpp"
 #include "common/utils.hpp"
-#include "gpu/compute/compute.hpp"
+#include "gpu/compute/compute_engine.hpp"
 #include "gpu/gpu_impl_list.hpp"
 #include "gpu/ocl/ocl_gpu_engine_id.hpp"
-#include "gpu/ocl/ocl_gpu_kernel.hpp"
 #include "gpu/ocl/ocl_utils.hpp"
 
 namespace dnnl {
@@ -51,20 +46,9 @@ public:
     status_t create_stream(stream_t **stream, unsigned flags) override;
     status_t create_stream(stream_t **stream, cl_command_queue queue);
 
-    status_t create_compiled_bundle(compute::compiled_bundle_t &generator,
-            const std::vector<const char *> &kernel_names,
-            const compute::kernel_ctx_t &kernel_ctx) const override;
-
-    status_t create_compiled_kernel(compute::compiled_kernel_t &generator,
-            jit::jit_generator_base &jitter) const override;
-
     status_t create_binary_from_ocl_source(compute::binary_t &binary,
             const char *code_string,
             const compute::kernel_ctx_t &kernel_ctx) const;
-
-    status_t create_kernels_from_bundle(std::vector<compute::kernel_t> &kernels,
-            const std::vector<const char *> &kernel_names,
-            const compute::compiled_bundle_t &generator) const override;
 
     status_t create_kernel_from_binary(compute::kernel_t &kernel,
             const compute::binary_t &binary,

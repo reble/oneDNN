@@ -28,19 +28,17 @@
 namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 
-TEST(Execute, BinaryOp) {
+TEST(test_binary_op_execute, BinaryOp) {
     graph::engine_t *eng = get_engine();
 
     std::vector<graph::op_kind_t> op_kinds = {graph::op_kind::Multiply,
             graph::op_kind::Minimum, graph::op_kind::Maximum,
             graph::op_kind::Divide, graph::op_kind::Subtract,
             graph::op_kind::SquaredDifference};
-    std::vector<std::string> pass_names = {"mul_pass", "min_pass", "max_pass",
-            "div_pass", "sub_pass", "squareddifference_pass"};
 
-    test::vector<float> src0 {2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
-    test::vector<float> src1 {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
+    std::vector<float> src1 {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     auto src0_lt
             = utils::logical_tensor_init(0, {1, 3, 3}, graph::data_type::f32);
@@ -60,7 +58,7 @@ TEST(Execute, BinaryOp) {
         g.add_op(&binary_op);
         g.finalize();
 
-        graph::pass::pass_base_ptr apass = get_pass(pass_names[i]);
+        graph::pass::pass_base_ptr apass = get_pass("binary_pass");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -76,22 +74,22 @@ TEST(Execute, BinaryOp) {
 
         ASSERT_EQ(p.compile(&cp, inputs, outputs, eng), graph::status::success);
 
-        graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-        graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-        graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+        test_tensor src0_ts(src0_lt, eng, src0);
+        test_tensor src1_ts(src1_lt, eng, src1);
+        test_tensor dst_ts(dst_lt, eng, dst);
 
         graph::stream_t *strm = get_stream();
-        cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+        cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
         strm->wait();
     }
 }
 
-TEST(Execute, MulEltwise) {
+TEST(test_binary_op_execute, MulEltwise) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
-    test::vector<float> src1 {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
+    std::vector<float> src1 {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::logical_tensor_t src0_lt
             = utils::logical_tensor_init(0, {1, 3, 3}, graph::data_type::f32);
@@ -121,7 +119,7 @@ TEST(Execute, MulEltwise) {
         g.finalize();
 
         graph::pass::pass_base_ptr apass = get_pass("binary_post_ops_fusion");
-        ASSERT_NE(apass.get(), nullptr);
+        ASSERT_NE(apass, nullptr);
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -135,23 +133,23 @@ TEST(Execute, MulEltwise) {
         std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
         ASSERT_EQ(p.compile(&cp, inputs, outputs, eng), graph::status::success);
 
-        graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-        graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-        graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+        test_tensor src0_ts(src0_lt, eng, src0);
+        test_tensor src1_ts(src1_lt, eng, src1);
+        test_tensor dst_ts(dst_lt, eng, dst);
 
         graph::stream_t *strm = get_stream();
-        cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+        cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
         strm->wait();
     }
 }
 
-TEST(Execute, BinaryOpAddFusion) {
+TEST(test_binary_op_execute, BinaryOpAddFusion) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> post_src {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> post_src {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::logical_tensor_t src0_lt
             = utils::logical_tensor_init(0, {1, 3, 3}, graph::data_type::f32);
@@ -197,24 +195,25 @@ TEST(Execute, BinaryOpAddFusion) {
         std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
         p.compile(&cp, inputs, outputs, eng);
 
-        graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-        graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-        graph::tensor_t post_src_ts(post_src_lt, eng, post_src.data());
-        graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+        test_tensor src0_ts(src0_lt, eng, src0);
+        test_tensor src1_ts(src1_lt, eng, src1);
+        test_tensor post_src_ts(post_src_lt, eng, post_src);
+        test_tensor dst_ts(dst_lt, eng, dst);
 
         graph::stream_t *strm = get_stream();
-        cp.execute(strm, {src0_ts, src1_ts, post_src_ts}, {dst_ts});
+        cp.execute(strm, {src0_ts.get(), src1_ts.get(), post_src_ts.get()},
+                {dst_ts.get()});
         strm->wait();
     }
 }
 
-TEST(Execute, BinarySub) {
+TEST(test_binary_op_execute, BinarySub) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {2.0};
-    test::vector<float> src1 {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
-    test::vector<float> dst(src1.size(), 0.0);
-    test::vector<float> ref {1.0, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0};
+    std::vector<float> src0 {2.0};
+    std::vector<float> src1 {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    std::vector<float> dst(src1.size(), 0.0);
+    std::vector<float> ref {1.0, 0.0, -1.0, -2.0, -3.0, -4.0, -5.0, -6.0};
 
     graph::logical_tensor_t src0_lt
             = utils::logical_tensor_init(0, {1}, graph::data_type::f32);
@@ -233,7 +232,7 @@ TEST(Execute, BinarySub) {
     g.add_op(&bin_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sub_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -246,24 +245,25 @@ TEST(Execute, BinarySub) {
     std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
     p.compile(&cp, inputs, outputs, eng);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < ref.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref[i]);
     }
 }
 
-TEST(Execute, MinEltwise) {
+TEST(test_binary_op_execute, MinEltwise) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
-    test::vector<float> src1 {-1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
+    std::vector<float> src1 {-1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::logical_tensor_t src0_lt
             = utils::logical_tensor_init(0, {1, 3, 3}, graph::data_type::f32);
@@ -293,7 +293,7 @@ TEST(Execute, MinEltwise) {
         g.finalize();
 
         graph::pass::pass_base_ptr apass = get_pass("binary_post_ops_fusion");
-        ASSERT_NE(apass.get(), nullptr);
+        ASSERT_NE(apass, nullptr);
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -307,23 +307,23 @@ TEST(Execute, MinEltwise) {
         std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
         p.compile(&cp, inputs, outputs, eng);
 
-        graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-        graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-        graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+        test_tensor src0_ts(src0_lt, eng, src0);
+        test_tensor src1_ts(src1_lt, eng, src1);
+        test_tensor dst_ts(dst_lt, eng, dst);
 
         graph::stream_t *strm = get_stream();
-        cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+        cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
         strm->wait();
     }
 }
 
-TEST(Execute, MaxEltwise) {
+TEST(test_binary_op_execute, MaxEltwise) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {-2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
-    test::vector<float> src1 {-1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0};
-    test::vector<float> ref_dst {0.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {-2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
+    std::vector<float> src1 {-1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0};
+    std::vector<float> ref_dst {0.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::logical_tensor_t src0_lt
             = utils::logical_tensor_init(0, {1, 3, 3}, graph::data_type::f32);
@@ -353,7 +353,7 @@ TEST(Execute, MaxEltwise) {
         g.finalize();
 
         graph::pass::pass_base_ptr apass = get_pass("binary_post_ops_fusion");
-        ASSERT_NE(apass.get(), nullptr);
+        ASSERT_NE(apass, nullptr);
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -367,25 +367,25 @@ TEST(Execute, MaxEltwise) {
         std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
         p.compile(&cp, inputs, outputs, eng);
 
-        graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-        graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-        graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+        test_tensor src0_ts(src0_lt, eng, src0);
+        test_tensor src1_ts(src1_lt, eng, src1);
+        test_tensor dst_ts(dst_lt, eng, dst);
 
         graph::stream_t *strm = get_stream();
-        cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+        cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
         strm->wait();
     }
 }
 
-TEST(ExecuteSubgraphFp32, BinarySwish) {
+TEST(test_binary_op_execute_subgraph_fp32, BinarySwish) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
     std::vector<int64_t> binary_src_shape {2, 2, 2, 2};
     std::vector<int64_t> binary_dst_shape {2, 2, 2, 2};
 
-    test::vector<float> src0_data(product(binary_src_shape));
-    test::vector<float> src1_data(product(binary_src_shape));
+    std::vector<float> src0_data(product(binary_src_shape));
+    std::vector<float> src1_data(product(binary_src_shape));
 
     std::default_random_engine generator(7);
     std::uniform_real_distribution<float> f32_distribution(0.0f, 1.0f);
@@ -433,12 +433,12 @@ TEST(ExecuteSubgraphFp32, BinarySwish) {
         g.add_op(&multiply);
         g.finalize();
 
-        graph::tensor_t binary_src0_ts(binary_src0, engine, src0_data.data());
-        graph::tensor_t binary_src1_ts(binary_src1, engine, src1_data.data());
+        test_tensor binary_src0_ts(binary_src0, engine, src0_data);
+        test_tensor binary_src1_ts(binary_src1, engine, src1_data);
 
         // -------------------------case 1----------------------------------
-        test::vector<float> case1_out_data(product(binary_dst_shape));
-        graph::tensor_t mul_dst_ts(mul_dst, engine, case1_out_data.data());
+        std::vector<float> case1_out_data(product(binary_dst_shape));
+        test_tensor mul_dst_ts(mul_dst, engine, case1_out_data);
 
         ASSERT_EQ(run_graph(g, {binary_src0_ts, binary_src1_ts}, {mul_dst_ts},
                           *engine, *strm),
@@ -461,26 +461,26 @@ TEST(ExecuteSubgraphFp32, BinarySwish) {
 
         p.compile(&cp, lt_ins, lt_outs, engine);
 
-        test::vector<float> case2_out_data(product(binary_dst_shape));
-        graph::tensor_t mul_dst_ts2(mul_dst, engine, case2_out_data.data());
+        std::vector<float> case2_out_data(product(binary_dst_shape));
+        test_tensor mul_dst_ts2(mul_dst, engine, case2_out_data);
 
-        cp.execute(strm, {binary_src0_ts, binary_src1_ts}, {mul_dst_ts2});
+        cp.execute(strm, {binary_src0_ts.get(), binary_src1_ts.get()},
+                {mul_dst_ts2.get()});
         strm->wait();
 
-        for (size_t i = 0; i < case1_out_data.size(); ++i) {
-            ASSERT_FLOAT_EQ(case1_out_data[i], case2_out_data[i]);
-        }
+        ASSERT_TRUE(
+                allclose<float>(mul_dst_ts, mul_dst_ts2, /*rtol*/ 0.1f, 1e-6f));
     }
 }
 
-TEST(Execute, Eltwise3BinaryPostops) {
+TEST(test_binary_op_execute, Eltwise3BinaryPostops) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src = {-2.0, -1.5, 1.0, 0.5};
-    test::vector<float> binary_src1 = {1.0, 2.0, 3.0, 4.0};
-    test::vector<float> binary_src2 = {2.0, 3.0, 4.0, 5.0};
-    test::vector<float> binary_src3 = {3.0, 4.0, 5.0, 6.0};
-    test::vector<float> dst = {0.0, 0.0, 0.0, 0.0};
+    std::vector<float> src = {-2.0, -1.5, 1.0, 0.5};
+    std::vector<float> binary_src1 = {1.0, 2.0, 3.0, 4.0};
+    std::vector<float> binary_src2 = {2.0, 3.0, 4.0, 5.0};
+    std::vector<float> binary_src3 = {3.0, 4.0, 5.0, 6.0};
+    std::vector<float> dst = {0.0, 0.0, 0.0, 0.0};
 
     graph::op_t relu(0, graph::op_kind::ReLU, "relu");
     graph::op_t div(1, graph::op_kind::Divide, "div");
@@ -541,32 +541,33 @@ TEST(Execute, Eltwise3BinaryPostops) {
 
     ASSERT_EQ(p.compile(&cp, inputs, outputs, eng), graph::status::success);
 
-    graph::tensor_t relu_src_ts(relu_src_lt, eng, src.data());
-    graph::tensor_t div_src_ts(div_src_lt, eng, binary_src1.data());
-    graph::tensor_t max_src_ts(max_src_lt, eng, binary_src2.data());
-    graph::tensor_t sub_src_ts(sub_src_lt, eng, binary_src3.data());
-    graph::tensor_t sub_dst_ts(sub_dst_lt, eng, dst.data());
+    test_tensor relu_src_ts(relu_src_lt, eng, src);
+    test_tensor div_src_ts(div_src_lt, eng, binary_src1);
+    test_tensor max_src_ts(max_src_lt, eng, binary_src2);
+    test_tensor sub_src_ts(sub_src_lt, eng, binary_src3);
+    test_tensor sub_dst_ts(sub_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
 
-    ASSERT_EQ(
-            cp.execute(strm, {relu_src_ts, div_src_ts, max_src_ts, sub_src_ts},
-                    {sub_dst_ts}),
+    ASSERT_EQ(cp.execute(strm,
+                      {relu_src_ts.get(), div_src_ts.get(), max_src_ts.get(),
+                              sub_src_ts.get()},
+                      {sub_dst_ts.get()}),
             graph::status::success);
     strm->wait();
 }
 
-TEST(ExecuteSubgraphFp32, Binary3Postops) {
+TEST(test_binary_op_execute_subgraph_fp32, Binary3Postops) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
     std::vector<int64_t> binary_src_shape {2, 2, 2, 2};
     std::vector<int64_t> binary_dst_shape {2, 2, 2, 2};
 
-    test::vector<float> src0_data(product(binary_src_shape));
-    test::vector<float> src1_data(product(binary_src_shape));
-    std::vector<test::vector<float>> src_datas(
-            10, test::vector<float>(product(binary_src_shape)));
+    std::vector<float> src0_data(product(binary_src_shape));
+    std::vector<float> src1_data(product(binary_src_shape));
+    std::vector<std::vector<float>> src_datas(
+            10, std::vector<float>(product(binary_src_shape)));
 
     std::default_random_engine generator(7);
     std::uniform_real_distribution<float> f32_distribution(0.0f, 1.0f);
@@ -635,17 +636,16 @@ TEST(ExecuteSubgraphFp32, Binary3Postops) {
             g.add_op(&pop);
         g.finalize();
 
-        graph::tensor_t binary_src0_ts(lt_vec[0], engine, src_datas[0].data());
-        graph::tensor_t binary_src1_ts(lt_vec[1], engine, src_datas[1].data());
-        std::vector<graph::tensor_t> src_tss {};
+        test_tensor binary_src0_ts(lt_vec[0], engine, src_datas[0]);
+        test_tensor binary_src1_ts(lt_vec[1], engine, src_datas[1]);
+        std::vector<test_tensor> src_tss {};
         for (size_t i = 0; i < input_lts.size(); ++i)
-            src_tss.emplace_back(graph::tensor_t(
-                    lt_vec[input_lts[i]], engine, src_datas[i].data()));
+            src_tss.emplace_back(
+                    test_tensor(lt_vec[input_lts[i]], engine, src_datas[i]));
 
         // -------------------------case 1----------------------------------
-        test::vector<float> case1_out_data(product(binary_src_shape));
-        graph::tensor_t case1_dst_ts(
-                lt_vec[lt_idx], engine, case1_out_data.data());
+        std::vector<float> case1_out_data(product(binary_src_shape));
+        test_tensor case1_dst_ts(lt_vec[lt_idx], engine, case1_out_data);
 
         ASSERT_EQ(run_graph(g, src_tss, {case1_dst_ts}, *engine, *strm),
                 graph::status::success);
@@ -670,26 +670,24 @@ TEST(ExecuteSubgraphFp32, Binary3Postops) {
 
         p.compile(&cp, lt_ins, lt_outs, engine);
 
-        test::vector<float> case2_out_data(product(binary_dst_shape));
-        graph::tensor_t case2_dst_ts(
-                lt_vec[lt_idx], engine, case2_out_data.data());
+        std::vector<float> case2_out_data(product(binary_dst_shape));
+        test_tensor case2_dst_ts(lt_vec[lt_idx], engine, case2_out_data);
 
-        cp.execute(strm, src_tss, {case2_dst_ts});
+        cp.execute(strm, test_tensor::to_graph_tensor(src_tss),
+                {case2_dst_ts.get()});
         strm->wait();
-
-        for (size_t i = 0; i < case1_out_data.size(); ++i) {
-            ASSERT_FLOAT_EQ(case1_out_data[i], case2_out_data[i]);
-        }
+        ASSERT_TRUE(allclose<float>(
+                case1_dst_ts, case2_dst_ts, /*rtol*/ 0.1f, 1e-6f));
     }
 }
 
-TEST(Execute, Add) {
+TEST(test_binary_op_execute, Add) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    std::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -708,7 +706,7 @@ TEST(Execute, Add) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -729,43 +727,45 @@ TEST(Execute, Add) {
     ASSERT_EQ(dst_lt.layout_type, graph::layout_type::any);
     ASSERT_EQ(compiled_dst_lt.layout_type, graph::layout_type::strided);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 
     // the second iteration
-    test::vector<float> src0_2nd {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1_2nd {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> ref_dst_2nd {
+    std::vector<float> src0_2nd {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    std::vector<float> src1_2nd {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    std::vector<float> ref_dst_2nd {
             2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> dst_2nd(src0_2nd.size(), 0.0);
+    std::vector<float> dst_2nd(src0_2nd.size(), 0.0);
 
-    graph::tensor_t src0_2nd_ts(src0_lt, eng, src0_2nd.data());
-    graph::tensor_t src1_2nd_ts(src1_lt, eng, src1_2nd.data());
-    graph::tensor_t dst_2nd_ts(compiled_dst_lt, eng, dst_2nd.data());
-    cp.execute(strm, {src0_2nd_ts, src1_2nd_ts}, {dst_2nd_ts});
+    test_tensor src0_2nd_ts(src0_lt, eng, src0_2nd);
+    test_tensor src1_2nd_ts(src1_lt, eng, src1_2nd);
+    test_tensor dst_2nd_ts(compiled_dst_lt, eng, dst_2nd);
+    cp.execute(
+            strm, {src0_2nd_ts.get(), src1_2nd_ts.get()}, {dst_2nd_ts.get()});
     strm->wait();
-
+    dst_2nd = dst_2nd_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0_2nd.size(); ++i) {
         ASSERT_FLOAT_EQ(dst_2nd[i], ref_dst_2nd[i]);
     }
 }
 
-TEST(Execute, AddWithDifferentFormat) {
+TEST(test_binary_op_execute, AddWithDifferentFormat) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1 {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0};
-    test::vector<float> ref_dst {2.0, 5.0, 8.0, 3.0, 6.0, 9.0, 4.0, 7.0, 10.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    std::vector<float> src1 {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0};
+    std::vector<float> ref_dst {2.0, 5.0, 8.0, 3.0, 6.0, 9.0, 4.0, 7.0, 10.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -784,7 +784,7 @@ TEST(Execute, AddWithDifferentFormat) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -802,29 +802,29 @@ TEST(Execute, AddWithDifferentFormat) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, BroadcastAdd) {
+TEST(test_binary_op_execute, BroadcastAdd) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    std::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1 {
+    std::vector<float> src1 {
             2.0, 2.0, 2.0}; // bianary op's src1 support broadcast
-    test::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,
+    std::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0,
             3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -845,7 +845,7 @@ TEST(Execute, BroadcastAdd) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -863,44 +863,46 @@ TEST(Execute, BroadcastAdd) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 
     // the second iteration
-    test::vector<float> src0_2nd {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    std::vector<float> src0_2nd {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1_2nd {1.0, 1.0, 1.0};
-    test::vector<float> ref_dst_2nd {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
-            2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> dst_2nd(src0_2nd.size(), 0.0);
+    std::vector<float> src1_2nd {1.0, 1.0, 1.0};
+    std::vector<float> ref_dst_2nd {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+            2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> dst_2nd(src0_2nd.size(), 0.0);
 
-    graph::tensor_t src0_2nd_ts(src0_lt, eng, src0_2nd.data());
-    graph::tensor_t src1_2nd_ts(src1_lt, eng, src1_2nd.data());
-    graph::tensor_t dst_2nd_ts(compiled_dst_lt, eng, dst_2nd.data());
-    cp.execute(strm, {src0_2nd_ts, src1_2nd_ts}, {dst_2nd_ts});
+    test_tensor src0_2nd_ts(src0_lt, eng, src0_2nd);
+    test_tensor src1_2nd_ts(src1_lt, eng, src1_2nd);
+    test_tensor dst_2nd_ts(compiled_dst_lt, eng, dst_2nd);
+    cp.execute(
+            strm, {src0_2nd_ts.get(), src1_2nd_ts.get()}, {dst_2nd_ts.get()});
     strm->wait();
 
+    dst_2nd = dst_2nd_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0_2nd.size(); ++i) {
         ASSERT_FLOAT_EQ(dst_2nd[i], ref_dst_2nd[i]);
     }
 }
 
-TEST(Execute, SwapBroadcastAdd) {
+TEST(test_binary_op_execute, SwapBroadcastAdd) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
-    test::vector<float> dst(src1.size(), 0.0);
+    std::vector<float> src0 {1.0, 1.0, 1.0, 1.0};
+    std::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
+    std::vector<float> dst(src1.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -919,7 +921,7 @@ TEST(Execute, SwapBroadcastAdd) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -937,14 +939,15 @@ TEST(Execute, SwapBroadcastAdd) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src1.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
@@ -954,22 +957,23 @@ TEST(Execute, SwapBroadcastAdd) {
     ASSERT_EQ(inplace_pair[0].input_id, src1_lt.id);
     ASSERT_EQ(inplace_pair[0].output_id, dst_lt.id);
 
-    graph::tensor_t dst_ts2(compiled_dst_lt, eng, src1.data());
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts2});
+    test_tensor dst_ts2(compiled_dst_lt, eng, src1);
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts2.get()});
     strm->wait();
 
+    src1 = dst_ts2.as_vec_type<float>();
     for (size_t i = 0; i < src1.size(); ++i) {
         ASSERT_FLOAT_EQ(src1[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, MultidirectionalBroadcastAddBA) {
+TEST(test_binary_op_execute, MultidirectionalBroadcastAddBA) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0};
-    test::vector<float> src1 {2.0, 2.0, 2.0};
-    test::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
-    test::vector<float> dst(ref_dst.size(), 0.0);
+    std::vector<float> src0 {1.0, 1.0, 1.0};
+    std::vector<float> src1 {2.0, 2.0, 2.0};
+    std::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
+    std::vector<float> dst(ref_dst.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -988,7 +992,7 @@ TEST(Execute, MultidirectionalBroadcastAddBA) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1006,43 +1010,45 @@ TEST(Execute, MultidirectionalBroadcastAddBA) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < ref_dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 
     // the second iteration
-    test::vector<float> src0_2nd {1.0, 1.0, 1.0};
-    test::vector<float> src1_2nd {1.0, 1.0, 1.0};
-    test::vector<float> ref_dst_2nd {
+    std::vector<float> src0_2nd {1.0, 1.0, 1.0};
+    std::vector<float> src1_2nd {1.0, 1.0, 1.0};
+    std::vector<float> ref_dst_2nd {
             2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> dst_2nd(ref_dst_2nd.size(), 0.0);
+    std::vector<float> dst_2nd(ref_dst_2nd.size(), 0.0);
 
-    graph::tensor_t src0_2nd_ts(src0_lt, eng, src0_2nd.data());
-    graph::tensor_t src1_2nd_ts(src1_lt, eng, src1_2nd.data());
-    graph::tensor_t dst_2nd_ts(compiled_dst_lt, eng, dst_2nd.data());
-    cp.execute(strm, {src0_2nd_ts, src1_2nd_ts}, {dst_2nd_ts});
+    test_tensor src0_2nd_ts(src0_lt, eng, src0_2nd);
+    test_tensor src1_2nd_ts(src1_lt, eng, src1_2nd);
+    test_tensor dst_2nd_ts(compiled_dst_lt, eng, dst_2nd);
+    cp.execute(
+            strm, {src0_2nd_ts.get(), src1_2nd_ts.get()}, {dst_2nd_ts.get()});
     strm->wait();
 
+    dst_2nd = dst_2nd_ts.as_vec_type<float>();
     for (size_t i = 0; i < ref_dst_2nd.size(); ++i) {
         ASSERT_FLOAT_EQ(dst_2nd[i], ref_dst_2nd[i]);
     }
 }
 
-TEST(Execute, multidirectionalbBroadcastAddAB) {
+TEST(test_binary_op_execute, multidirectionalbBroadcastAddAB) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0};
-    test::vector<float> src1 {2.0, 2.0, 2.0};
-    test::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
-    test::vector<float> dst(ref_dst.size(), 0.0);
+    std::vector<float> src0 {1.0, 1.0, 1.0};
+    std::vector<float> src1 {2.0, 2.0, 2.0};
+    std::vector<float> ref_dst {3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
+    std::vector<float> dst(ref_dst.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -1061,7 +1067,7 @@ TEST(Execute, multidirectionalbBroadcastAddAB) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1079,26 +1085,27 @@ TEST(Execute, multidirectionalbBroadcastAddAB) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < ref_dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, MultidirectionalBroadcastAdd) {
+TEST(test_binary_op_execute, MultidirectionalBroadcastAdd) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0(8, 1.0);
-    test::vector<float> src1(3, 2.0);
-    test::vector<float> ref_dst(24, 3.0);
-    test::vector<float> dst(ref_dst.size(), 0.0);
+    std::vector<float> src0(8, 1.0);
+    std::vector<float> src1(3, 2.0);
+    std::vector<float> ref_dst(24, 3.0);
+    std::vector<float> dst(ref_dst.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -1117,7 +1124,7 @@ TEST(Execute, MultidirectionalBroadcastAdd) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1135,26 +1142,27 @@ TEST(Execute, MultidirectionalBroadcastAdd) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < ref_dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, MultidirectionalBroadcastAddExpandDim) {
+TEST(test_binary_op_execute, MultidirectionalBroadcastAddExpandDim) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0(2, 1.0);
-    test::vector<float> src1(12, 2.0);
-    test::vector<float> ref_dst(24, 3.0);
-    test::vector<float> dst(ref_dst.size(), 0.0);
+    std::vector<float> src0(2, 1.0);
+    std::vector<float> src1(12, 2.0);
+    std::vector<float> ref_dst(24, 3.0);
+    std::vector<float> dst(ref_dst.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -1173,7 +1181,7 @@ TEST(Execute, MultidirectionalBroadcastAddExpandDim) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1191,20 +1199,21 @@ TEST(Execute, MultidirectionalBroadcastAddExpandDim) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < ref_dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Compile, AddShapeMismatchCase0) {
+TEST(test_binary_op_compile, AddShapeMismatchCase0) {
     graph::engine_t *eng = get_engine();
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
@@ -1224,7 +1233,7 @@ TEST(Compile, AddShapeMismatchCase0) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1241,7 +1250,7 @@ TEST(Compile, AddShapeMismatchCase0) {
     ASSERT_EQ(ret, graph::status::invalid_shape);
 }
 
-TEST(Compile, AddShapeMismatch1) {
+TEST(test_binary_op_compile, AddShapeMismatch1) {
     graph::engine_t *eng = get_engine();
 
     graph::op_t add_op(graph::op_kind::Add);
@@ -1261,7 +1270,7 @@ TEST(Compile, AddShapeMismatch1) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1278,7 +1287,7 @@ TEST(Compile, AddShapeMismatch1) {
     ASSERT_EQ(ret, graph::status::success);
 }
 
-TEST(Compile, AddShapeMismatch2) {
+TEST(test_binary_op_compile, AddShapeMismatch2) {
     graph::engine_t *eng = get_engine();
 
     graph::op_t add_op(graph::op_kind::Add);
@@ -1299,7 +1308,7 @@ TEST(Compile, AddShapeMismatch2) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1315,15 +1324,15 @@ TEST(Compile, AddShapeMismatch2) {
     ASSERT_EQ(ret, graph::status::success);
 }
 
-TEST(Execute, ReversedDifferentFormatBroadcastAdd) {
+TEST(test_binary_op_execute, ReversedDifferentFormatBroadcastAdd) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src1 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    std::vector<float> src1 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src0 {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0};
-    test::vector<float> ref_dst {2.0, 5.0, 8.0, 3.0, 6.0, 9.0, 4.0, 7.0, 10.0,
+    std::vector<float> src0 {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0};
+    std::vector<float> ref_dst {2.0, 5.0, 8.0, 3.0, 6.0, 9.0, 4.0, 7.0, 10.0,
             2.0, 5.0, 8.0, 3.0, 6.0, 9.0, 4.0, 7.0, 10.0};
-    test::vector<float> dst(src1.size(), 0.0);
+    std::vector<float> dst(src1.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
 
@@ -1343,7 +1352,7 @@ TEST(Execute, ReversedDifferentFormatBroadcastAdd) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1359,30 +1368,31 @@ TEST(Execute, ReversedDifferentFormatBroadcastAdd) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, BiasAdd) {
+TEST(test_binary_op_execute, BiasAdd) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+    std::vector<float> src {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
             1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> bias {1.0, 2.0};
-    test::vector<float> ref_dst1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
+    std::vector<float> bias {1.0, 2.0};
+    std::vector<float> ref_dst1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0,
             3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
-    test::vector<float> ref_dst2 {2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0,
+    std::vector<float> ref_dst2 {2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0,
             3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0, 2.0, 3.0};
-    test::vector<float> dst(src.size(), 0.0);
+    std::vector<float> dst(src.size(), 0.0);
 
     std::vector<std::vector<graph::dim_t>> src_shapes {
             {1, 2, 3, 3}, {1, 3, 3, 2}};
@@ -1411,7 +1421,7 @@ TEST(Execute, BiasAdd) {
         ASSERT_EQ(g.add_op(&bias_add_op), graph::status::success);
         g.finalize();
 
-        graph::pass::pass_base_ptr apass = get_pass("bias_add_pass");
+        graph::pass::pass_base_ptr apass = get_pass("binary_pass");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -1424,14 +1434,15 @@ TEST(Execute, BiasAdd) {
         std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
         p.compile(&cp, inputs, outputs, eng);
 
-        graph::tensor_t src_ts(src_lt, eng, src.data());
-        graph::tensor_t bias_ts(bias_lt, eng, bias.data());
-        graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+        test_tensor src_ts(src_lt, eng, src);
+        test_tensor bias_ts(bias_lt, eng, bias);
+        test_tensor dst_ts(dst_lt, eng, dst);
 
         graph::stream_t *strm = get_stream();
-        cp.execute(strm, {src_ts, bias_ts}, {dst_ts});
+        cp.execute(strm, {src_ts.get(), bias_ts.get()}, {dst_ts.get()});
         strm->wait();
 
+        dst = dst_ts.as_vec_type<float>();
         if (i == 0) {
             for (size_t i = 0; i < src.size(); ++i) {
                 ASSERT_FLOAT_EQ(dst[i], ref_dst1[i]);
@@ -1444,14 +1455,14 @@ TEST(Execute, BiasAdd) {
     }
 }
 
-TEST(Execute, AddMul) {
+TEST(test_binary_op_execute, AddMul) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> post_src {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> ref_dst {6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    std::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> post_src {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> ref_dst {6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
     graph::op_t mul_op(1, graph::op_kind::Multiply, "mul");
@@ -1497,29 +1508,31 @@ TEST(Execute, AddMul) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t post_src_ts(post_src_lt, eng, post_src.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor post_src_ts(post_src_lt, eng, post_src);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts, post_src_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get(), post_src_ts.get()},
+            {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, AddMulPostSrcAsNxc) {
+TEST(test_binary_op_execute, AddMulPostSrcAsNxc) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> post_src {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0};
-    test::vector<float> ref_dst {
+    std::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    std::vector<float> src1 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> post_src {1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0};
+    std::vector<float> ref_dst {
             3.0, 12.0, 21.0, 6.0, 15.0, 24.0, 9.0, 18.0, 27.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
     graph::op_t mul_op(1, graph::op_kind::Multiply, "mul");
@@ -1564,27 +1577,28 @@ TEST(Execute, AddMulPostSrcAsNxc) {
     graph::logical_tensor_t compiled_dst_lt;
     cp.query_logical_tensor(dst_lt.id, &compiled_dst_lt);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t post_src_ts(post_src_lt, eng, post_src.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor post_src_ts(post_src_lt, eng, post_src);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts, post_src_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get(), post_src_ts.get()},
+            {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, AddRelu) {
+TEST(test_binary_op_execute, AddRelu) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
-    test::vector<float> src1 {-2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> ref_dst {0.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+    std::vector<float> src1 {-2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> ref_dst {0.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0, 3.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
     graph::op_t relu_op(1, graph::op_kind::ReLU, "relu");
@@ -1629,27 +1643,27 @@ TEST(Execute, AddRelu) {
     ASSERT_EQ(dst_lt.layout_type, graph::layout_type::any);
     ASSERT_EQ(compiled_dst_lt.layout_type, graph::layout_type::strided);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, AddSigmoid) {
+TEST(test_binary_op_execute, AddSigmoid) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
-    test::vector<float> src1 {
+    std::vector<float> src0 {2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0};
+    std::vector<float> src1 {
             -2.0, -1.0, -2.0, -1.0, -2.0, -1.0, -2.0, -1.0, -2.0};
-    test::vector<float> ref_dst {0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> ref_dst {0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t add_op(0, graph::op_kind::Add, "add");
     graph::op_t sigmoid_op(1, graph::op_kind::Sigmoid, "sigmoid");
@@ -1692,27 +1706,27 @@ TEST(Execute, AddSigmoid) {
     ASSERT_EQ(dst_lt.layout_type, graph::layout_type::any);
     ASSERT_EQ(compiled_dst_lt.layout_type, graph::layout_type::strided);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t dst_ts(compiled_dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor dst_ts(compiled_dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, AddAdd) {
+TEST(test_binary_op_execute, AddAdd) {
     graph::engine_t *eng = get_engine();
 
     std::vector<int64_t> src_shape = {8, 128, 768};
-    test::vector<float> src0(product(src_shape));
-    test::vector<float> src1(product(src_shape));
-    test::vector<float> post_src(product(src_shape));
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0(product(src_shape));
+    std::vector<float> src1(product(src_shape));
+    std::vector<float> post_src(product(src_shape));
+    std::vector<float> dst(src0.size(), 0.0);
 
     // random generate src, weight data
     // random seed = 7
@@ -1771,30 +1785,33 @@ TEST(Execute, AddAdd) {
     ASSERT_EQ(inplace_pair[0].input_id, post_src_lt.id);
     ASSERT_EQ(inplace_pair[0].output_id, dst_lt.id);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t post_src_ts(post_src_lt, eng, post_src.data());
-    graph::tensor_t dst_inplace_ts(dst_lt, eng, post_src.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor post_src_ts(post_src_lt, eng, post_src);
+    test_tensor dst_inplace_ts(dst_lt, eng, post_src);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts, post_src_ts}, {dst_ts});
-    cp.execute(strm, {src0_ts, src1_ts, post_src_ts}, {dst_inplace_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get(), post_src_ts.get()},
+            {dst_ts.get()});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get(), post_src_ts.get()},
+            {dst_inplace_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
+    post_src = dst_inplace_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(post_src[i], dst[i]);
     }
 }
 
-TEST(Execute, ScalarScalarAdd) {
+TEST(test_binary_op_execute, ScalarScalarAdd) {
     graph::op_t add_op(graph::op_kind::Add);
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0_data {10.f};
-    test::vector<float> src1_data {2.f};
-    test::vector<float> ref_dst_data {12.f};
-    test::vector<float> dst_data(ref_dst_data.size(), 0.0);
+    std::vector<float> src0_data {10.f};
+    std::vector<float> src1_data {2.f};
+    std::vector<float> ref_dst_data {12.f};
+    std::vector<float> dst_data(ref_dst_data.size(), 0.0);
 
     // prepare logical tensor
     graph::logical_tensor_t src0
@@ -1812,7 +1829,7 @@ TEST(Execute, ScalarScalarAdd) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1834,27 +1851,28 @@ TEST(Execute, ScalarScalarAdd) {
     ASSERT_EQ(scalar_lt.layout_type, graph::layout_type::strided);
     ASSERT_EQ(scalar_lt.ndims, 0);
 
-    graph::tensor_t src0_ts(src0, eng, src0_data.data());
-    graph::tensor_t src1_ts(src1, eng, src1_data.data());
-    graph::tensor_t dst_ts(scalar_lt, eng, dst_data.data());
+    test_tensor src0_ts(src0, eng, src0_data);
+    test_tensor src1_ts(src1, eng, src1_data);
+    test_tensor dst_ts(scalar_lt, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
-    ASSERT_EQ(cp.execute(strm, {src0_ts, src1_ts}, {dst_ts}),
+    ASSERT_EQ(cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()}),
             graph::status::success);
     strm->wait();
+    dst_data = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < ref_dst_data.size(); ++i) {
         ASSERT_FLOAT_EQ(dst_data[i], ref_dst_data[i]);
     }
 }
 
-TEST(Execute, ScalarVectorAdd) {
+TEST(test_binary_op_execute, ScalarVectorAdd) {
     graph::op_t add_op(graph::op_kind::Add);
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0_data {10.f};
-    test::vector<float> src1_data {2.f};
-    test::vector<float> ref_dst_data {12.f};
-    test::vector<float> dst_data(ref_dst_data.size(), 0.0);
+    std::vector<float> src0_data {10.f};
+    std::vector<float> src1_data {2.f};
+    std::vector<float> ref_dst_data {12.f};
+    std::vector<float> dst_data(ref_dst_data.size(), 0.0);
 
     // prepare logical tensor
     graph::logical_tensor_t src0
@@ -1872,7 +1890,7 @@ TEST(Execute, ScalarVectorAdd) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -1894,27 +1912,28 @@ TEST(Execute, ScalarVectorAdd) {
     ASSERT_EQ(scalar_lt.layout_type, graph::layout_type::strided);
     ASSERT_EQ(scalar_lt.ndims, 1);
 
-    graph::tensor_t src0_ts(src0, eng, src0_data.data());
-    graph::tensor_t src1_ts(src1, eng, src1_data.data());
-    graph::tensor_t dst_ts(scalar_lt, eng, dst_data.data());
+    test_tensor src0_ts(src0, eng, src0_data);
+    test_tensor src1_ts(src1, eng, src1_data);
+    test_tensor dst_ts(scalar_lt, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
-    ASSERT_EQ(cp.execute(strm, {src0_ts, src1_ts}, {dst_ts}),
+    ASSERT_EQ(cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()}),
             graph::status::success);
     strm->wait();
+    dst_data = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < ref_dst_data.size(); ++i) {
         ASSERT_FLOAT_EQ(dst_data[i], ref_dst_data[i]);
     }
 }
 
-TEST(Execute, MulAddPerTensorBroadcast) {
+TEST(test_binary_op_execute, MulAddPerTensorBroadcast) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> src1 {2.0};
-    test::vector<float> post_src {2.0};
-    test::vector<float> ref_dst {6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> src1 {2.0};
+    std::vector<float> post_src {2.0};
+    std::vector<float> ref_dst {6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t mul_op(0, graph::op_kind::Multiply, "mul");
     graph::op_t add_op(1, graph::op_kind::Add, "add");
@@ -1957,28 +1976,30 @@ TEST(Execute, MulAddPerTensorBroadcast) {
     std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
     p.compile(&cp, inputs, outputs, eng);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t post_src_ts(post_src_lt, eng, post_src.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor post_src_ts(post_src_lt, eng, post_src);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts, post_src_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get(), post_src_ts.get()},
+            {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, MulAddPerHwBroadcast) {
+TEST(test_binary_op_execute, MulAddPerHwBroadcast) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0(18, 2.0);
-    test::vector<float> src1(1, 2.0);
-    test::vector<float> post_src(6, 2.0);
-    test::vector<float> ref_dst(18, 6.0);
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0(18, 2.0);
+    std::vector<float> src1(1, 2.0);
+    std::vector<float> post_src(6, 2.0);
+    std::vector<float> ref_dst(18, 6.0);
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t mul_op(0, graph::op_kind::Multiply, "mul");
     graph::op_t add_op(1, graph::op_kind::Add, "add");
@@ -2021,28 +2042,30 @@ TEST(Execute, MulAddPerHwBroadcast) {
     std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
     ASSERT_EQ(p.compile(&cp, inputs, outputs, eng), graph::status::success);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t post_src_ts(post_src_lt, eng, post_src.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor post_src_ts(post_src_lt, eng, post_src);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts, post_src_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get(), post_src_ts.get()},
+            {dst_ts.get()});
     strm->wait();
 
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, MulAddPerChannelBroadcast) {
+TEST(test_binary_op_execute, MulAddPerChannelBroadcast) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src0 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
-    test::vector<float> src1 {2.0};
-    test::vector<float> post_src {2.0, 2.0, 2.0};
-    test::vector<float> ref_dst {6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0};
-    test::vector<float> dst(src0.size(), 0.0);
+    std::vector<float> src0 {2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0};
+    std::vector<float> src1 {2.0};
+    std::vector<float> post_src {2.0, 2.0, 2.0};
+    std::vector<float> ref_dst {6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0, 6.0};
+    std::vector<float> dst(src0.size(), 0.0);
 
     graph::op_t mul_op(0, graph::op_kind::Multiply, "mul");
     graph::op_t add_op(1, graph::op_kind::Add, "add");
@@ -2085,29 +2108,30 @@ TEST(Execute, MulAddPerChannelBroadcast) {
     std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
     p.compile(&cp, inputs, outputs, eng);
 
-    graph::tensor_t src0_ts(src0_lt, eng, src0.data());
-    graph::tensor_t src1_ts(src1_lt, eng, src1.data());
-    graph::tensor_t post_src_ts(post_src_lt, eng, post_src.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor src0_ts(src0_lt, eng, src0);
+    test_tensor src1_ts(src1_lt, eng, src1);
+    test_tensor post_src_ts(post_src_lt, eng, post_src);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src0_ts, src1_ts, post_src_ts}, {dst_ts});
+    cp.execute(strm, {src0_ts.get(), src1_ts.get(), post_src_ts.get()},
+            {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < src0.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, MulAddAdd) {
+TEST(test_binary_op_execute, MulAddAdd) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> mul_src1(1917, 2.5f);
-    test::vector<float> mul_src2(1, 1.5f);
-    test::vector<float> add1_src(1917, 1.15f);
-    test::vector<float> add2_src(1917, 1.07f);
-    test::vector<float> ref_dst(1917, 5.97f);
-    test::vector<float> dst(1917, 0.f);
+    std::vector<float> mul_src1(1917, 2.5f);
+    std::vector<float> mul_src2(1, 1.5f);
+    std::vector<float> add1_src(1917, 1.15f);
+    std::vector<float> add2_src(1917, 1.07f);
+    std::vector<float> ref_dst(1917, 5.97f);
+    std::vector<float> dst(1917, 0.f);
 
     graph::op_t mul_op(0, graph::op_kind::Multiply, "mul");
     graph::op_t add1_op(1, graph::op_kind::Add, "add");
@@ -2162,23 +2186,25 @@ TEST(Execute, MulAddAdd) {
     std::vector<const graph::logical_tensor_t *> outputs {&dst_lt};
     p.compile(&cp, inputs, outputs, eng);
 
-    graph::tensor_t mul_src1_ts(mul_src1_lt, eng, mul_src1.data());
-    graph::tensor_t mul_src2_ts(mul_src2_lt, eng, mul_src2.data());
-    graph::tensor_t add1_src_ts(add1_src_lt, eng, add1_src.data());
-    graph::tensor_t add2_src_ts(add2_src_lt, eng, add2_src.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor mul_src1_ts(mul_src1_lt, eng, mul_src1);
+    test_tensor mul_src2_ts(mul_src2_lt, eng, mul_src2);
+    test_tensor add1_src_ts(add1_src_lt, eng, add1_src);
+    test_tensor add2_src_ts(add2_src_lt, eng, add2_src);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {mul_src1_ts, mul_src2_ts, add1_src_ts, add2_src_ts},
-            {dst_ts});
+    cp.execute(strm,
+            {mul_src1_ts.get(), mul_src2_ts.get(), add1_src_ts.get(),
+                    add2_src_ts.get()},
+            {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, AddEmptyInput) {
+TEST(test_binary_op_execute, AddEmptyInput) {
     graph::op_t add_op(graph::op_kind::Add);
     graph::engine_t *eng = get_engine();
 
@@ -2198,7 +2224,7 @@ TEST(Execute, AddEmptyInput) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("sum_pass");
+    graph::pass::pass_base_ptr apass = get_pass("binary_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -2222,12 +2248,12 @@ TEST(Execute, AddEmptyInput) {
     ASSERT_EQ(empty_lt.dims[1], 3);
     ASSERT_EQ(empty_lt.dims[2], 0);
 
-    graph::tensor_t src0_ts(src0, eng, nullptr);
-    graph::tensor_t src1_ts(src1, eng, nullptr);
-    graph::tensor_t dst_ts(dst, eng, nullptr);
+    test_tensor src0_ts(src0, eng);
+    test_tensor src1_ts(src1, eng);
+    test_tensor dst_ts(empty_lt, eng);
 
     graph::stream_t *strm = get_stream();
-    ASSERT_EQ(cp.execute(strm, {src0_ts, src1_ts}, {dst_ts}),
+    ASSERT_EQ(cp.execute(strm, {src0_ts.get(), src1_ts.get()}, {dst_ts.get()}),
             graph::status::success);
     strm->wait();
 }

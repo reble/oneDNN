@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,9 @@
 #include "gpu/jit/ir/core.hpp"
 
 #include <algorithm>
+
+#include "gpu/jit/ir/linear_expr.hpp"
+#include "gpu/jit/pass/simplify.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -39,6 +42,8 @@ std::string to_string(type_kind_t kind) {
         CASE(s32);
         CASE(u64);
         CASE(s64);
+        CASE(bf8);
+        CASE(hf8);
         CASE(bf16);
         CASE(f16);
         CASE(tf32);
@@ -66,6 +71,8 @@ int type_t::size() const {
     switch (kind()) {
         case type_kind_t::u8:
         case type_kind_t::s8:
+        case type_kind_t::bf8:
+        case type_kind_t::hf8:
         case type_kind_t::byte: return 1;
         case type_kind_t::u16:
         case type_kind_t::s16:
@@ -91,6 +98,8 @@ data_type_t to_dnnl(const type_t &type) {
     ir_assert(type.elems() == 1) << type;
     ir_assert(!type.is_ptr() == 1) << type;
     switch (type.kind()) {
+        case type_kind_t::bf8: return data_type::f8_e5m2;
+        case type_kind_t::hf8: return data_type::f8_e4m3;
         case type_kind_t::bf16: return data_type::bf16;
         case type_kind_t::f16: return data_type::f16;
         case type_kind_t::tf32: return data_type::tf32;
@@ -129,7 +138,10 @@ std::string to_string(op_kind_t kind) {
 
         case op_kind_t::_add3: return "add3";
         case op_kind_t::_mad: return "mad";
+        case op_kind_t::_div_up: return "div_up";
         case op_kind_t::_prelu: return "prelu";
+        case op_kind_t::_idiv: return "idiv";
+        case op_kind_t::_imod: return "imod";
 
         default: ir_error_not_expected() << "Unknown op_kind_t value.";
     }
@@ -253,6 +265,9 @@ type_t ternary_op_type(
         case op_kind_t::_mad:
             return binary_op_type(op_kind_t::_add, a.type(),
                     binary_op_type(op_kind_t::_mul, b, c));
+        case op_kind_t::_idiv:
+        case op_kind_t::_imod:
+            return a.type().is_signed() ? type_t::s32() : type_t::u32();
         default: ir_error_not_expected();
     }
     return type_t::undef();
@@ -302,6 +317,14 @@ void normalize_ptr(const type_t &type, expr_t &base_expr, expr_t &off) {
     }
     ir_assert(to_cpp<int64_t>(off) % type.scalar().size() == 0)
             << "Incompatible offset: " << off;
+}
+
+expr_t linear_t::to_expr() const {
+    auto ret = c;
+    for (int i = 0; i < nargs(); i++) {
+        ret += u_vec[i] * v_vec[i];
+    }
+    return simplify_rewrite(ret);
 }
 
 expr_t expr_t::operator[](const expr_t &off) const {
@@ -380,6 +403,7 @@ void object_impl_t::_visit(ir_visitor_t &visitor) const {}
     void ir_visitor_t::_visit(const name &obj) {}
 
 DECL_TRAVERSE_LEAF(bool_imm_t)
+DECL_TRAVERSE_LEAF(const_var_t)
 DECL_TRAVERSE_LEAF(float_imm_t)
 DECL_TRAVERSE_LEAF(func_impl_t)
 DECL_TRAVERSE_LEAF(int_imm_t)
@@ -514,6 +538,15 @@ void ir_visitor_t::_visit(const let_t &obj) {
     visit(obj.var);
     visit(obj.value);
     visit(obj.body);
+}
+
+object_t ir_mutator_t::_mutate(const linear_t &obj) {
+    ir_error_not_expected();
+    return obj;
+}
+
+void ir_visitor_t::_visit(const linear_t &obj) {
+    ir_error_not_expected();
 }
 
 object_t ir_mutator_t::_mutate(const load_t &obj) {

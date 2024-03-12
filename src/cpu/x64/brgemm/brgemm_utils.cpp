@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -90,13 +90,14 @@ bool can_dispatch_uker(const brgemm_t *brg) {
 
 void maybe_try_bf32(brgemm_t *brg) {
     const bool try_bf32 = brg->is_f32
-            && brg->brgattr.fpmath_mode == fpmath_mode::bf16
-            && utils::one_of(brg->isa_user, isa_undef, avx512_core_amx)
+            && one_of(brg->brgattr.fpmath_mode, fpmath_mode::bf16,
+                    fpmath_mode::any)
+            && one_of(brg->isa_user, isa_undef, avx512_core_amx)
             && mayiuse(avx512_core_amx);
     if (try_bf32) {
         const bool is_tmm = brg->is_tmm;
         brg->is_tmm = true;
-        if (can_dispatch_uker(brg) /*Requires is_amx to be true*/) {
+        if (can_dispatch_uker(brg) /*Requires is_tmm to be true*/) {
             brg->is_bf32 = true;
         } else {
             brg->is_bf32 = false;
@@ -719,17 +720,6 @@ status_t brdgmm_blocking(brgemm_t *brg) {
 
     const int max_vregs = isa_num_vregs(brg->isa_impl);
 
-    // Note: using avx512_core template, but calculation uses 'brg->isa_impl'
-    // which is dynamic i.e. uses values AVX2, AVX2_VNNI, etc. depending on the
-    // configuration.
-    const int aux_vregs = jit_brdgmm_kernel_base_t<avx512_core_vnni,
-            Xbyak::Zmm>::get_aux_vmm_count(*brg);
-    const int compute_vregs = jit_brdgmm_kernel_base_t<avx512_core_vnni,
-            Xbyak::Zmm>::get_compute_vmm_count(*brg);
-    const int bf16_emu_vregs = brg->is_bf16_emu * 4;
-    const int max_acc_vmms
-            = max_vregs - nstl::max(compute_vregs + aux_vregs, bf16_emu_vregs);
-
     const int simd_w = isa_max_vlen(brg->isa_impl) / brg->typesize_C;
     const bool is_avx2_vnni_2_xf16
             = brg->is_xf16() && brg->isa_impl == avx2_vnni_2;
@@ -763,14 +753,40 @@ status_t brdgmm_blocking(brgemm_t *brg) {
     const int max_n_block2_vmms = 4;
     const int max_n_block2 = max_n_block2_vmms / n_block1_num_steps;
     n_block2 = nstl::min(max_n_block2, nb_n_block1);
+
+    // Note: using avx512_core template, but calculation uses 'brg->isa_impl'
+    // which is dynamic i.e. uses values AVX2, AVX2_VNNI, etc. depending on the
+    // configuration.
+    const int aux_vregs = jit_brdgmm_kernel_base_t<avx512_core_vnni,
+            Xbyak::Zmm>::get_aux_vmm_count(*brg);
+    const int compute_vregs = jit_brdgmm_kernel_base_t<avx512_core_vnni,
+            Xbyak::Zmm>::get_compute_vmm_count(*brg);
+    const int bf16_emu_vregs = brg->is_bf16_emu * 4;
+    const int max_acc_vmms
+            = max_vregs - nstl::max(compute_vregs + aux_vregs, bf16_emu_vregs);
+
+    const auto min_possible_m_block2 = brg->brgattr.bs_group > 1
+            ? (max_acc_vmms / (2 * n_block1_num_steps) - brg->brgattr.bs_group
+                      + 1)
+                    / 2
+            : 1;
+    if (min_possible_m_block2 < 1) brg->brgattr.bs_group = 1;
+
+    if (brg->brgattr.bs_group > 1) n_block2 = n_block2 % 2 == 0 ? 2 : 1;
+
     nb_n_block2 = div_up(nb_n_block1, n_block2);
     n_block2_tail = nb_n_block1 % n_block2;
 
     m_block1 = 1;
     nb_m_block1 = M / m_block1;
     m_block1_tail = M % m_block1;
-    m_block2 = nstl::min(
-            nb_m_block1, max_acc_vmms / (n_block2 * n_block1_num_steps));
+
+    m_block2 = nstl::min(nb_m_block1,
+            brg->brgattr.bs_group > 1
+                    ? (max_acc_vmms / (n_block2 * n_block1_num_steps)
+                              - brg->brgattr.bs_group + 1)
+                            / 2
+                    : max_acc_vmms / (n_block2 * n_block1_num_steps));
     nb_m_block2 = div_up(nb_m_block1, m_block2);
     m_block2_tail = nb_m_block1 % m_block2;
 
@@ -811,8 +827,8 @@ void init_brgemm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
     brg->has_int8_vnni = isa_has_int8_vnni(brg->isa_impl);
 
     set_brg_vmm(brg); // TODO: Investigate if it is really needed here.
-    brg->req_s8s8_compensation = brg->is_int8 && !brg->is_int8_tmm
-            && (brg->isa_impl != avx2_vnni_2) && brg->dt_a == data_type::s8;
+    brg->req_s8s8_compensation = brg->is_int8 && brg->dt_a == data_type::s8
+            && !isa_has_s8s8(brg->isa_impl);
 
     brg->LDA = (brg->is_row_major()) ? static_cast<int>(LDA)
                                      : static_cast<int>(LDB);

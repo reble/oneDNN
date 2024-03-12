@@ -345,18 +345,16 @@ TEST(GCCore_CPU_graph_reshape_cpp, TestSingleOptimizeMultipleUse) {
                                            {{"values", data}})
                                    ->get_outputs()[0];
             }
-            auto tv = expected.make("tensor_view", {in0},
+            auto cp_reorder = expected.make("reorder", {in0}, {},
+                    {{"internal", true}, {"actually_copy", true},
+                            {"out_format", in0->details_.get_format()}});
+            auto tv = expected.make("tensor_view", cp_reorder->get_outputs(),
                     {graph_tensor::make({10, 10, 20, 10})},
                     {{"shape", sc_dims {10, 10, 20, 10}}});
             auto relu_out
                     = expected.make("relu", {tv->get_outputs()[0]}, {}, {})
                               ->get_outputs()[0];
-            auto cp_reorder = expected.make("reorder", tv->get_outputs(), {},
-                    {{"internal", true}, {"actually_copy", true},
-                            {"out_format",
-                                    tv->get_outputs()[0]
-                                            ->details_.get_format()}});
-            expected.make_output({cp_reorder->get_outputs()[0], relu_out});
+            expected.make_output({tv->get_outputs()[0], relu_out});
         }
         EXPECT_TRUE(compare_graph(g, expected));
     }
@@ -373,7 +371,6 @@ TEST(GCCore_CPU_graph_reshape_cpp, TestSingleExecution) {
     auto out = g.make_output(reshape_op->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     graph_driver(g, ctx);
     auto f = lower_graph(ctx, g, {out, in});
     auto fptr = jit_engine_t::make(ctx)->get_entry_func(f, true);

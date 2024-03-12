@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,6 +25,7 @@
 #include "common/cpp_compat.hpp"
 #include "common/math_utils.hpp"
 #include "gpu/jit/ir/ir.hpp"
+#include "gpu/jit/ir/linear_expr.hpp"
 #include "gpu/jit/utils/trace.hpp"
 #include "gpu/jit/utils/utils.hpp"
 
@@ -111,10 +112,10 @@ public:
         if (!obj.is<self_type>()) return false;
         auto &other = obj.as<self_type>();
 
-        return value == other.value;
+        return (id == other.id) && (value == other.value);
     }
 
-    size_t get_hash() const override { return ir_utils::get_hash(value); }
+    size_t get_hash() const override { return ir_utils::get_hash(id, value); }
 
     std::string str() const override {
         std::ostringstream oss;

@@ -32,6 +32,10 @@ sigmoid_backprop_op::sigmoid_backprop_op(
                 std::make_shared<graph_tensor>(this, ins[0]->details_));
     } else {
         info_.outputs_ = outs;
+        COMPILE_ASSERT(info_.outputs_.size() == 1,
+                "sigmoid backprop op shall have only 1 output.")
+        gc::graph::check_logical_tensor_shape_dtype_identical(
+                info_.inputs_[0]->details_, info_.outputs_[0]->details_);
     }
     attrs_ = attrs;
     op_name_ = "sigmoid_backprop";
@@ -45,11 +49,11 @@ void sigmoid_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
 
     // input
     graph->make_input(inputs);
-    bool is_bf16
-            = info_.inputs_[0]->details_.dtype_.is_etype(sc_data_etype::BF16);
+    graph_tensor_ptr inputs0 = inputs[0], inputs1 = inputs[1];
 
-    graph_tensor_ptr inputs0 = inputs[0];
-    graph_tensor_ptr inputs1 = inputs[1];
+    // cast inputs
+    inputs0 = cast_input_dtype(inputs[0], graph);
+    inputs1 = cast_input_dtype(inputs[1], graph);
 
     // sigmoid_grad = sigmoid(x) - sigmoid(x)*sigmoid(x)
     // if "use_dst" is true, inputs0 is the result of forward, which is
@@ -68,6 +72,8 @@ void sigmoid_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
     }
 
     mul1 = graph->make("mul", {sub->get_outputs()[0], inputs1}, {}, {});
+    // cast output
+    mul1 = cast_output_dtype(outputs[0], graph, mul1);
     // output
     graph->make_output(mul1->get_outputs());
 }

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2022 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -114,13 +114,51 @@ CFG_INTERNAL(bf32, f32) {
 }
 
 // f16
-const int f16_max_exact = 1 << 11;
-dt_conf_t::entry_t F16_ENTRY {dnnl_f16, -f16_max_exact, f16_max_exact, 0.0f,
-        0.999999f, 0.5f, 0.01f, epsilon_dt(dnnl_f16)};
+#define MIN_F16 0.0f
+#define MAX_F16 .999999f
+#define MEAN_F16 .5f
+#define STDDEV_F16 0.01f
+#define EPS_F16 epsilon_dt(dnnl_f16)
+dt_conf_t::entry_t F16_ENTRY {dnnl_f16, -f32_max_exact, f32_max_exact, MIN_F16,
+        MAX_F16, MEAN_F16, STDDEV_F16, EPS_F16};
+dt_conf_t::entry_t F16_ENTRY_F32 {dnnl_f32, -f32_max_exact, f32_max_exact,
+        MIN_F32, MAX_F32, MEAN_F32, STDDEV_F32, EPS_F16};
 
 CFG(f16) {
     UNUSED_REG_VAR(f16);
-    return F16_ENTRY;
+    CASE(SRC_LAYER, F16_ENTRY);
+    CASE(SRC_ITER, F16_ENTRY);
+    CASE(SRC_ITER_C, F16_ENTRY);
+    CASE(WEIGHTS_LAYER, F16_ENTRY);
+    CASE(WEIGHTS_ITER, F16_ENTRY);
+    CASE(WEIGHTS_PEEPHOLE, F16_ENTRY_F32);
+    CASE(WEIGHTS_PROJECTION, F16_ENTRY_F32);
+    CASE(BIAS, F16_ENTRY);
+    CASE(DST_ITER, F16_ENTRY);
+    CASE(DST_ITER_C, F16_ENTRY);
+    CASE(DST_LAYER, F16_ENTRY);
+    CASE(AUGRU_ATTENTION, F16_ENTRY);
+    DEFAULT(F16_ENTRY_F32);
+}
+
+CFG(f16f32) {
+    UNUSED_REG_VAR(f16f32);
+    CASE(SRC_LAYER, F16_ENTRY);
+    CASE(SRC_ITER, F16_ENTRY);
+    CASE(WEIGHTS_LAYER, F16_ENTRY);
+    CASE(WEIGHTS_ITER, F16_ENTRY);
+    CASE(DST_ITER, F16_ENTRY);
+    CASE(DST_LAYER, F16_ENTRY);
+    CASE(AUGRU_ATTENTION, F16_ENTRY);
+    DEFAULT(F16_ENTRY_F32);
+}
+
+// f16_math_mode
+dt_conf_t::entry_t F16_MATH_ENTRY {dnnl_f32, -f32_max_exact, f32_max_exact,
+        MIN_F16, MAX_F16, MEAN_F16, STDDEV_F16, EPS_F16};
+CFG_INTERNAL(f16_math, f32) {
+    CASE(BIAS, F32_ENTRY);
+    DEFAULT(F16_MATH_ENTRY);
 }
 
 // s8
@@ -169,6 +207,7 @@ CFG(u8u8u8u8) {
     CASE(DST_ITER, U8_ENTRY_U8);
     CASE(DST_ITER_C, U8_ENTRY_F32);
     CASE(DST_LAYER, U8_ENTRY_U8_EXACT);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -185,6 +224,7 @@ CFG(u8u8u8f32) {
     CASE(DST_ITER, U8_ENTRY_U8);
     CASE(DST_ITER_C, U8_ENTRY_F32);
     CASE(DST_LAYER, U8_ENTRY_F32);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -201,6 +241,7 @@ CFG(f32u8f32u8) {
     CASE(DST_ITER, U8_ENTRY_F32);
     CASE(DST_ITER_C, U8_ENTRY_F32);
     CASE(DST_LAYER, U8_ENTRY_U8_EXACT);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -217,6 +258,7 @@ CFG(f32u8f32f32) {
     CASE(DST_ITER, U8_ENTRY_F32);
     CASE(DST_ITER_C, U8_ENTRY_F32);
     CASE(DST_LAYER, U8_ENTRY_F32);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -233,6 +275,7 @@ CFG(s8s8s8s8) {
     CASE(DST_ITER, S8_ENTRY_S8);
     CASE(DST_ITER_C, S8_ENTRY_F32);
     CASE(DST_LAYER, S8_ENTRY_S8_EXACT);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -249,6 +292,7 @@ CFG(s8s8s8f32) {
     CASE(DST_ITER, S8_ENTRY_S8);
     CASE(DST_ITER_C, S8_ENTRY_F32);
     CASE(DST_LAYER, S8_ENTRY_F32);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -265,6 +309,7 @@ CFG(f32s8f32s8) {
     CASE(DST_ITER, S8_ENTRY_F32);
     CASE(DST_ITER_C, S8_ENTRY_F32);
     CASE(DST_LAYER, S8_ENTRY_S8_EXACT);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
@@ -281,14 +326,19 @@ CFG(f32s8f32f32) {
     CASE(DST_ITER, S8_ENTRY_F32);
     CASE(DST_ITER_C, S8_ENTRY_F32);
     CASE(DST_LAYER, S8_ENTRY_F32);
+    CASE(AUGRU_ATTENTION, U8_ENTRY_U8);
     END_LIST;
 }
 
 } // namespace
 
 const dt_conf_t &dt_conf_t::create(const std::string &str, const attr_t &attr) {
-    if (attr.fpmath_mode == dnnl_fpmath_mode_bf16 && str == "f32")
-        return conf_bf32;
+    if (str == "f32") {
+        if (dnnl::impl::utils::one_of(attr.fpmath_mode.mode,
+                    dnnl_fpmath_mode_bf16, dnnl_fpmath_mode_tf32))
+            return conf_bf32;
+        if (attr.fpmath_mode.mode == dnnl_fpmath_mode_f16) return conf_f16_math;
+    }
     for (const auto cfg : cfg_list)
         if (cfg->str() == str) return *cfg;
     SAFE_V(CRIT);

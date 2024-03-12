@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,11 +47,80 @@ DNNL_BACKEND_REGISTER_PATTERN_DEF_BEGIN(single_op_pass)
             });
 
 // register passes with dnnl backend support
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(abs_pass, Abs, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(abs_bw_pass, AbsBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        avg_pool_bw_pass, AvgPoolBackward, pooling_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(bias_add_pass, BiasAdd, binary_t)
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, eltwise_fwd_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    graph::utils::pm::pb_op_t *p_eltwise
+                            = pgraph->append_alternation(get_unary_ops());
+                    // the round algorithm in eltwise primitive does not
+                    // support other data types.
+                    p_eltwise->append_decision_function([](op_t *graph_op)
+                                                                -> bool {
+                        if (graph_op->get_kind() == graph::op_kind::Round)
+                            return check_input_dtype<graph::data_type::f32>(
+                                    graph_op);
+                        return true;
+                    });
+                })
+        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
+            return std::make_shared<float_eltwise_fwd>();
+        });
+
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, eltwise_bwd_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    pgraph->append_alternation(get_unary_bwd_ops());
+                })
+        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
+            return std::make_shared<eltwise_bwd_t>();
+        });
+
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, binary_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    pgraph->append_alternation({graph::op_kind::BiasAdd,
+                            graph::op_kind::Add, graph::op_kind::Multiply,
+                            graph::op_kind::Maximum, graph::op_kind::Minimum,
+                            graph::op_kind::Divide, graph::op_kind::Subtract,
+                            graph::op_kind::SquaredDifference});
+                })
+        .set_attr<FCreateKernel>("FCreateKernel",
+                []() -> kernel_ptr { return std::make_shared<binary_t>(); });
+
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, quant_dequant_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    pgraph->append_alternation({graph::op_kind::Quantize,
+                            graph::op_kind::Dequantize,
+                            graph::op_kind::DynamicQuantize,
+                            graph::op_kind::DynamicDequantize});
+                })
+        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
+            return std::make_shared<quantize_dequantize_t>();
+        });
+
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, avg_pool_bw_pass)
+        .set_priority(8.f)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    graph::utils::pm::pb_op_t *p_avg_pool_backward
+                            = pgraph->append_op(
+                                    graph::op_kind::AvgPoolBackward);
+                    p_avg_pool_backward->append_decision_function(
+                            check_input_num<1>);
+                })
+        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
+            return std::make_shared<pooling_bwd_t>();
+        });
 
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_pass)
         .set_priority(8.f)
@@ -123,6 +192,8 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, ln_pass)
                     p_layernorm->append_decision_function(
                             check_input_dtype_from_offset<graph::data_type::f32,
                                     1>);
+                    p_layernorm->append_decision_function(
+                            check_begin_norm_axis_attr);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
             return std::make_shared<layernorm_fwd_t>();
@@ -139,95 +210,81 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, ln_bw_pass)
                     p_layernorm_bwd->append_decision_function(
                             check_input_dtype_from_offset<graph::data_type::f32,
                                     2>);
+                    p_layernorm_bwd->append_decision_function(
+                            check_begin_norm_axis_attr);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
             return std::make_shared<layernorm_bwd_t>();
         });
 
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(clamp_pass, Clamp, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(clamp_bw_pass, ClampBackward, eltwise_bwd_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(concat_pass, Concat, float_concat)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(conv_pass, Convolution, float_conv_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        conv_data_bw_pass, ConvolutionBackwardData, conv_bwd_data_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        conv_filter_bw_pass, ConvolutionBackwardWeights, conv_bwd_weights_t)
+
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, conv_data_bw_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    graph::utils::pm::pb_op_t *p_conv_backward_data
+                            = pgraph->append_op(
+                                    graph::op_kind::ConvolutionBackwardData);
+                    // Can be removed after shape tensor is supported
+                    p_conv_backward_data->append_decision_function(
+                            check_input_num<2>);
+                })
+        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
+            return std::make_shared<conv_bwd_data_t>();
+        });
+
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, conv_weights_bwd_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    graph::utils::pm::pb_op_t *p_conv_backward_weights
+                            = pgraph->append_op(
+                                    graph::op_kind::ConvolutionBackwardWeights);
+                    // Can be removed after shape tensor is supported
+                    p_conv_backward_weights->append_decision_function(
+                            check_input_num<2>);
+                })
+        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
+            return std::make_shared<conv_bwd_weights_t>();
+        });
+
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(
         convtranspose_pass, ConvTranspose, float_convtranspose_fwd)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(convtranspose_data_bwd_pass,
         ConvTransposeBackwardData, convtranspose_bwd_data_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(convtranspose_filter_bwd_pass,
-        ConvTransposeBackwardWeights, convtranspose_bwd_weights_t)
+
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, convtranspose_weights_bwd_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    graph::utils::pm::pb_op_t *p_conv_backward_weights
+                            = pgraph->append_op(graph::op_kind::
+                                            ConvTransposeBackwardWeights);
+                    // Can be removed after shape tensor is supported
+                    p_conv_backward_weights->append_decision_function(
+                            check_input_num<2>);
+                })
+        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
+            return std::make_shared<convtranspose_bwd_weights_t>();
+        });
+
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(matmul_pass, MatMul, float_matmul)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(max_pool_pass, MaxPool, float_pooling_fwd)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(
         max_pool_bw_pass, MaxPoolBackward, pooling_bwd_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(prelu_pass, PReLU, float_prelu_fwd)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(prelu_bwd_pass, PReLUBackward, prelu_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(relu_pass, ReLU, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(relu_bw_pass, ReLUBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(gelu_pass, GELU, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(gelu_bw_pass, GELUBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(elu_pass, Elu, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(elu_bw_pass, EluBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(exp_pass, Exp, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        hardsigmoid_pass, HardSigmoid, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        hardsigmoid_bw_pass, HardSigmoidBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(hardswish_pass, HardSwish, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        hardswish_bw_pass, HardSwishBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(leakyrelu_pass, LeakyReLU, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(log_pass, Log, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(sum_pass, Add, binary_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(mul_pass, Multiply, binary_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(max_pass, Maximum, binary_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(min_pass, Minimum, binary_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(mish_pass, Mish, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(mish_bw_pass, MishBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(div_pass, Divide, binary_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(sub_pass, Subtract, binary_t)
-
-DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, round_pass)
-        .set_priority(DEFAULT_P)
-        .set_kind(partition_kind_t::misc_post_ops)
-        .set_attr<FCreatePattern>("FCreatePattern",
-                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
-                    graph::utils::pm::pb_op_t *p_round
-                            = pgraph->append_op(graph::op_kind::Round);
-                    // the round algorithm in eltwise primitive does not
-                    // support other data types.
-                    p_round->append_decision_function(
-                            check_input_dtype<graph::data_type::f32>);
-                })
-        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<float_eltwise_fwd>();
-        });
-
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(sigmoid_pass, Sigmoid, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        sigmoid_bw_pass, SigmoidBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(sqrt_pass, Sqrt, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(sqrt_bw_pass, SqrtBackward, eltwise_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(square_pass, Square, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        squareddifference_pass, SquaredDifference, binary_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(tanh_pass, Tanh, float_eltwise_fwd)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(tanh_bw_pass, TanhBackward, eltwise_bwd_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(logsoftmax_pass, LogSoftmax, logsoftmax_fwd_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(
         logsoftmax_bwd_pass, LogSoftmaxBackward, logsoftmax_bwd_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(softmax_pass, SoftMax, softmax_fwd_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(
         softmax_bwd_pass, SoftMaxBackward, softmax_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(quant_pass, Quantize, quantize_dequantize_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        dequant_pass, Dequantize, quantize_dequantize_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        dync_quant_pass, DynamicQuantize, quantize_dequantize_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(
-        dync_dequant_pass, DynamicDequantize, quantize_dequantize_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(reorder_pass, Reorder, float_reorder)
 
 // if op is interpolate, need to filter out attrs not supported by dnnl
@@ -298,60 +355,34 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, typecast_pass)
             return std::make_shared<float_reorder>();
         });
 
-// pname: pattern name, bname: backend name
-#define DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM(pname, bname, op) \
-    DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(bname, pname) \
-            .set_priority(DEFAULT_P) \
-            .set_attr<FCreatePattern>("FCreatePattern", \
-                    [](const std::shared_ptr<pb_graph_t> &pgraph) -> void { \
-                        graph::utils::pm::pb_op_t *reduction \
-                                = pgraph->append_op(graph::op_kind::op); \
-                        reduction->append_decision_function([](op_t *graph_op) \
-                                                                    -> bool { \
-                            if (graph_op->has_attr(op_attr::axes) \
-                                    && graph_op->get_attr< \
-                                                       std::vector<int64_t>>( \
-                                                       op_attr::axes) \
-                                               .empty()) \
-                                return false; \
-                            return true; \
-                        }); \
-                    }) \
-            .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr { \
-                return std::make_shared<float_reduction>(); \
-            });
-
-DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM(reduce_pass, dnnl, ReduceL1)
-DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM(reduce_pass, dnnl, ReduceL2)
-DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM(reduce_pass, dnnl, ReduceMax)
-DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM(reduce_pass, dnnl, ReduceMean)
-DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM(reduce_pass, dnnl, ReduceMin)
-DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM(reduce_pass, dnnl, ReduceProd)
-DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM(reduce_pass, dnnl, ReduceSum)
-
-DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, softplus_pass)
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, reduce_pass)
         .set_priority(DEFAULT_P)
         .set_kind(partition_kind_t::misc_post_ops)
         .set_attr<FCreatePattern>("FCreatePattern",
                 [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
-                    pgraph->append_op(graph::op_kind::SoftPlus);
+                    graph::utils::pm::pb_op_t *reduction
+                            = pgraph->append_alternation(
+                                    {graph::op_kind::ReduceL1,
+                                            graph::op_kind::ReduceL2,
+                                            graph::op_kind::ReduceMax,
+                                            graph::op_kind::ReduceMean,
+                                            graph::op_kind::ReduceMin,
+                                            graph::op_kind::ReduceProd,
+                                            graph::op_kind::ReduceSum});
+                    reduction->append_decision_function([](op_t *graph_op)
+                                                                -> bool {
+                        if (graph_op->has_attr(op_attr::axes)
+                                && graph_op->get_attr<std::vector<int64_t>>(
+                                                   op_attr::axes)
+                                           .empty())
+                            return false;
+                        return true;
+                    });
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<float_eltwise_fwd>();
+            return std::make_shared<float_reduction>();
         });
 
-DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, softplus_bw_pass)
-        .set_priority(DEFAULT_P)
-        .set_kind(partition_kind_t::misc_post_ops)
-        .set_attr<FCreatePattern>("FCreatePattern",
-                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
-                    pgraph->append_op(graph::op_kind::SoftPlusBackward);
-                })
-        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<eltwise_bwd_t>();
-        });
-
-#undef DNNL_BACKEND_SINGLE_REDUCE_OP_TRANSFORM
 #undef DNNL_BACKEND_SINGLE_OP_TRANSFORM
 #undef DEFAULT_P
 

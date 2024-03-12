@@ -23,13 +23,13 @@
 namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 
-TEST(Execute, InterpolateForwardNearest) {
+TEST(test_interpolate_execute, InterpolateForwardNearest) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
-    test::vector<float> src {-2.0, -1.5, -1.0, -0.5};
-    test::vector<float> dst {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
-    test::vector<float> ref_dst {
+    std::vector<float> src {-2.0, -1.5, -1.0, -0.5};
+    std::vector<float> dst {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    std::vector<float> ref_dst {
             -2.f, -1.5f, -1.5f, -1.f, -0.5f, -0.5f, -1.f, -0.5f, -0.5f};
 
     graph::op_t op(graph::op_kind::Interpolate);
@@ -66,26 +66,27 @@ TEST(Execute, InterpolateForwardNearest) {
     std::vector<const graph::logical_tensor_t *> lt_outs {&dst_lt};
 
     p.compile(&cp, lt_ins, lt_outs, engine);
+    graph::logical_tensor_t lt;
+    cp.query_logical_tensor(dst_lt.id, &lt);
 
-    graph::tensor_t src_ts(src_lt, engine, src.data());
-    graph::tensor_t dst_ts(*lt_outs[0], engine, dst.data());
-    cp.execute(strm, {src_ts}, {dst_ts});
+    test_tensor src_ts(src_lt, engine, src);
+    test_tensor dst_ts(lt, engine, dst);
+    cp.execute(strm, {src_ts.get()}, {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, InterpolateAddForwardNearest) {
+TEST(test_interpolate_execute, InterpolateAddForwardNearest) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
-    test::vector<float> src {-2.0, -1.5, -1.0, -0.5};
-    test::vector<float> src1 {
-            0.f, 0.5f, 1.f, 1.5f, 2.0f, 2.5f, 3.0f, 3.5f, 4.f};
-    test::vector<float> dst_add {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
-    test::vector<float> ref_dst {
+    std::vector<float> src {-2.0, -1.5, -1.0, -0.5};
+    std::vector<float> src1 {0.f, 0.5f, 1.f, 1.5f, 2.0f, 2.5f, 3.0f, 3.5f, 4.f};
+    std::vector<float> dst_add {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    std::vector<float> ref_dst {
             -2.f, -1.f, -0.5f, 0.5f, 1.5f, 2.f, 2.f, 3.f, 3.5f};
 
     graph::op_t interpolate_node(0, graph::op_kind::Interpolate, "interpolate");
@@ -136,23 +137,23 @@ TEST(Execute, InterpolateAddForwardNearest) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    graph::tensor_t src_ts(src_lt, engine, src.data());
-    graph::tensor_t src1_ts(src1_lt, engine, src1.data());
-    graph::tensor_t dst_add_ts(*lt_outs[0], engine, dst_add.data());
-    cp.execute(strm, {src_ts, src1_ts}, {dst_add_ts});
+    test_tensor src_ts(src_lt, engine, src);
+    test_tensor src1_ts(src1_lt, engine, src1);
+    test_tensor dst_add_ts(*lt_outs[0], engine, dst_add);
+    cp.execute(strm, {src_ts.get(), src1_ts.get()}, {dst_add_ts.get()});
     strm->wait();
-
+    dst_add = dst_add_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst_add.size(); ++i) {
         ASSERT_FLOAT_EQ(dst_add[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, InterpolateSwish) {
+TEST(test_interpolate_execute, InterpolateSwish) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
-    test::vector<float> src {-2.0, -1.5, -1.0, -0.5};
-    test::vector<float> dst_mul {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    std::vector<float> src {-2.0, -1.5, -1.0, -0.5};
+    std::vector<float> dst_mul {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
 
     graph::op_t interpolate_node(0, graph::op_kind::Interpolate, "interpolate");
     interpolate_node.set_attr<std::string>(graph::op_attr::mode, "nearest");
@@ -206,20 +207,19 @@ TEST(Execute, InterpolateSwish) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    graph::tensor_t src_ts(src_lt, engine, src.data());
-    graph::tensor_t dst_mul_ts(*lt_outs[0], engine, dst_mul.data());
-    cp.execute(strm, {src_ts}, {dst_mul_ts});
+    test_tensor src_ts(src_lt, engine, src);
+    test_tensor dst_mul_ts(*lt_outs[0], engine, dst_mul);
+    cp.execute(strm, {src_ts.get()}, {dst_mul_ts.get()});
     strm->wait();
 }
 
-TEST(Execute, Interpolate3PostOps) {
+TEST(test_interpolate_execute, Interpolate3PostOps) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
-    test::vector<float> src {-2.0, -1.5, -1.0, -0.5};
-    test::vector<float> src_div {
-            1.0, -1.0, -1.0, -1.5, 2.0, 3.0, 4.0, 5.0, 6.0};
-    test::vector<float> dst_div(9, 1.0);
+    std::vector<float> src {-2.0, -1.5, -1.0, -0.5};
+    std::vector<float> src_div {1.0, -1.0, -1.0, -1.5, 2.0, 3.0, 4.0, 5.0, 6.0};
+    std::vector<float> dst_div(9, 1.0);
 
     graph::op_t interpolate_node(0, graph::op_kind::Interpolate, "interpolate");
     interpolate_node.set_attr<std::string>(graph::op_attr::mode, "nearest");
@@ -280,14 +280,14 @@ TEST(Execute, Interpolate3PostOps) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    graph::tensor_t src_ts(src_lt, engine, src.data());
-    graph::tensor_t src_div_ts(src_div_lt, engine, src_div.data());
-    graph::tensor_t dst_div_ts(dst_div_lt, engine, dst_div.data());
-    cp.execute(strm, {src_ts, src_div_ts}, {dst_div_ts});
+    test_tensor src_ts(src_lt, engine, src);
+    test_tensor src_div_ts(src_div_lt, engine, src_div);
+    test_tensor dst_div_ts(dst_div_lt, engine, dst_div);
+    cp.execute(strm, {src_ts.get(), src_div_ts.get()}, {dst_div_ts.get()});
     strm->wait();
 }
 
-TEST(Execute, InterpolatePostOps) {
+TEST(test_interpolate_execute, InterpolatePostOps) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
@@ -323,10 +323,10 @@ TEST(Execute, InterpolatePostOps) {
     };
 
     for (const auto &post_op_kind : supported_post_ops) {
-        test::vector<float> src {-2.0, -1.5, -1.0, -0.5};
-        test::vector<float> src1 {
+        std::vector<float> src {-2.0, -1.5, -1.0, -0.5};
+        std::vector<float> src1 {
                 0.f, 0.5f, 1.f, 1.5f, 2.0f, 2.5f, 3.0f, 3.5f, 4.f};
-        test::vector<float> dst_add {
+        std::vector<float> dst_add {
                 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
 
         graph::op_t interpolate_node(
@@ -397,28 +397,28 @@ TEST(Execute, InterpolatePostOps) {
 
         p.compile(&cp, lt_ins, lt_outs, engine);
 
-        graph::tensor_t src_ts(src_lt, engine, src.data());
-        graph::tensor_t src1_ts(src1_lt, engine, src1.data());
-        graph::tensor_t dst_add_ts(*lt_outs[0], engine, dst_add.data());
+        test_tensor src_ts(src_lt, engine, src);
+        test_tensor src1_ts(src1_lt, engine, src1);
+        test_tensor dst_add_ts(*lt_outs[0], engine, dst_add);
         if (std::find(
                     two_inputs_ops.begin(), two_inputs_ops.end(), post_op_kind)
                 != two_inputs_ops.end()) {
-            cp.execute(strm, {src_ts, src1_ts}, {dst_add_ts});
+            cp.execute(strm, {src_ts.get(), src1_ts.get()}, {dst_add_ts.get()});
         } else {
-            cp.execute(strm, {src_ts}, {dst_add_ts});
+            cp.execute(strm, {src_ts.get()}, {dst_add_ts.get()});
         }
 
         strm->wait();
     }
 }
 
-TEST(Execute, InterpolateForwardLinear) {
+TEST(test_interpolate_execute, InterpolateForwardLinear) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
-    test::vector<float> src {-2.0, -1.5, -1.0, -0.5};
-    test::vector<float> dst {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
-    test::vector<float> ref_dst {
+    std::vector<float> src {-2.0, -1.5, -1.0, -0.5};
+    std::vector<float> dst {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    std::vector<float> ref_dst {
             -2.f, -1.75f, -1.5f, -1.5f, -1.25f, -1.f, -1.f, -0.75f, -0.5f};
 
     graph::op_t op(graph::op_kind::Interpolate);
@@ -455,24 +455,26 @@ TEST(Execute, InterpolateForwardLinear) {
     std::vector<const graph::logical_tensor_t *> lt_outs {&dst_lt};
 
     p.compile(&cp, lt_ins, lt_outs, engine);
+    graph::logical_tensor_t dst_lt_tmp;
+    cp.query_logical_tensor(dst_lt.id, &dst_lt_tmp);
 
-    graph::tensor_t src_ts(src_lt, engine, src.data());
-    graph::tensor_t dst_ts(*lt_outs[0], engine, dst.data());
-    cp.execute(strm, {src_ts}, {dst_ts});
+    test_tensor src_ts(src_lt, engine, src);
+    test_tensor dst_ts(dst_lt_tmp, engine, dst);
+    cp.execute(strm, {src_ts.get()}, {dst_ts.get()});
     strm->wait();
-
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, InterpolateBackwardNearest) {
+TEST(test_interpolate_execute, InterpolateBackwardNearest) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src {-2.0, -1.5, -1.0, -0.5};
-    test::vector<float> diff_dst {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
-    test::vector<float> diff_src {0.0, 0.0, 0.0, 0.0};
-    test::vector<float> ref_diff_src {0.f, 3.f, 9.f, 24.f};
+    std::vector<float> src {-2.0, -1.5, -1.0, -0.5};
+    std::vector<float> diff_dst {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    std::vector<float> diff_src {0.0, 0.0, 0.0, 0.0};
+    std::vector<float> ref_diff_src {0.f, 3.f, 9.f, 24.f};
 
     graph::op_t op(graph::op_kind::InterpolateBackward);
     op.set_attr(graph::op_attr::sizes, std::vector<int64_t> {3, 3});
@@ -508,26 +510,27 @@ TEST(Execute, InterpolateBackwardNearest) {
 
     ASSERT_EQ(p.compile(&cp, inputs, outputs, eng), graph::status::success);
 
-    graph::tensor_t src_ts(src_lt, eng, src.data());
-    graph::tensor_t diff_dst_ts(diff_dst_lt, eng, diff_dst.data());
-    graph::tensor_t diff_src_ts(diff_src_lt, eng, diff_src.data());
+    test_tensor src_ts(src_lt, eng, src);
+    test_tensor diff_dst_ts(diff_dst_lt, eng, diff_dst);
+    test_tensor diff_src_ts(diff_src_lt, eng, diff_src);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src_ts, diff_dst_ts}, {diff_src_ts});
+    cp.execute(strm, {src_ts.get(), diff_dst_ts.get()}, {diff_src_ts.get()});
     strm->wait();
 
+    diff_src = diff_src_ts.as_vec_type<float>();
     for (size_t i = 0; i < diff_src.size(); ++i) {
         ASSERT_FLOAT_EQ(diff_src[i], ref_diff_src[i]);
     }
 }
 
-TEST(Execute, InterpolateBackwardLinear) {
+TEST(test_interpolate_execute, InterpolateBackwardLinear) {
     graph::engine_t *eng = get_engine();
 
-    test::vector<float> src {-2.0, -1.5, -1.0, -0.5};
-    test::vector<float> diff_dst {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
-    test::vector<float> diff_src {0.0, 0.0, 0.0, 0.0};
-    test::vector<float> ref_diff_src {3.f, 6.f, 12.f, 15.f};
+    std::vector<float> src {-2.0, -1.5, -1.0, -0.5};
+    std::vector<float> diff_dst {0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0};
+    std::vector<float> diff_src {0.0, 0.0, 0.0, 0.0};
+    std::vector<float> ref_diff_src {3.f, 6.f, 12.f, 15.f};
 
     graph::op_t op(graph::op_kind::InterpolateBackward);
     op.set_attr(graph::op_attr::sizes, std::vector<int64_t> {3, 3});
@@ -563,14 +566,14 @@ TEST(Execute, InterpolateBackwardLinear) {
 
     ASSERT_EQ(p.compile(&cp, inputs, outputs, eng), graph::status::success);
 
-    graph::tensor_t src_ts(src_lt, eng, src.data());
-    graph::tensor_t diff_dst_ts(diff_dst_lt, eng, diff_dst.data());
-    graph::tensor_t diff_src_ts(diff_src_lt, eng, diff_src.data());
+    test_tensor src_ts(src_lt, eng, src);
+    test_tensor diff_dst_ts(diff_dst_lt, eng, diff_dst);
+    test_tensor diff_src_ts(diff_src_lt, eng, diff_src);
 
     graph::stream_t *strm = get_stream();
-    cp.execute(strm, {src_ts, diff_dst_ts}, {diff_src_ts});
+    cp.execute(strm, {src_ts.get(), diff_dst_ts.get()}, {diff_src_ts.get()});
     strm->wait();
-
+    diff_src = diff_src_ts.as_vec_type<float>();
     for (size_t i = 0; i < diff_src.size(); ++i) {
         ASSERT_FLOAT_EQ(diff_src[i], ref_diff_src[i]);
     }

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -68,8 +68,14 @@ layout_t::layout_t(const memory_desc_wrapper &mdw, bool do_normalize)
     ir_assert(mdw.is_blocking_desc()) << "Expected blocking memory descriptor.";
 
     ndims_ = mdw.ndims();
-    blocks_ = compute_block_structure(
+    block_layout_t layout(
             mdw, /* inner_only */ false, /* do_normalize */ do_normalize);
+
+    // TODO: Switch blocks_ from std::vector<block_t> to block_layout_t
+    // to avoid this copy
+    for (const auto &block : layout) {
+        blocks_.emplace_back(block);
+    }
 
     sanity_check();
 }
@@ -110,6 +116,13 @@ memory_desc_t layout_t::to_dnnl(const dim_t *dims_hint) const {
             in_inner_block = true;
         }
         seen[b.dim_idx] = true;
+    }
+
+    for (int i = 0; i < ndims(); i++) {
+        if (seen[i]) continue;
+        ir_assert(md.dims[i] == 1);
+        md.padded_dims[i] = md.dims[i];
+        blk.strides[i] = elems();
     }
 
     return md;
@@ -579,6 +592,27 @@ layout_t dim_assignment_t::map(const layout_t &layout) const {
     ir_assert(layout.elems() == ret.elems())
             << "Assignment doesn't preserve number of elements.";
     return ret;
+}
+
+layout_t spatials_to_3d(const layout_t &layout, bool with_groups,
+        const std::array<int, 3> &dhw_map) {
+    const int old_ndims = layout.ndims();
+    const int old_sp_ndims = old_ndims - (with_groups ? 3 : 2);
+    const int new_ndims = old_ndims - old_sp_ndims + 3;
+
+    dim_assignment_t to_3d(old_ndims, new_ndims);
+    for (int i = 0; i < old_ndims; i++) {
+        if (i < old_ndims - old_sp_ndims) {
+            // Non-spatial dimensions.
+            to_3d.assign(i, i);
+        } else {
+            // Spatial dimensions.
+            int old_sp_idx = 3 - (old_ndims - i);
+            int new_sp_idx = dhw_map[old_sp_idx];
+            to_3d.assign(i, new_ndims - (3 - new_sp_idx));
+        }
+    }
+    return to_3d.map(layout);
 }
 
 } // namespace jit

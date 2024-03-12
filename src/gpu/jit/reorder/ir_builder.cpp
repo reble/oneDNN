@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@
 #include <unordered_map>
 
 #include "common/c_types_map.hpp"
+#include "gpu/compute/utils.hpp"
 #include "gpu/jit/ir/epilogue.hpp"
 #include "gpu/jit/ir/gemm_schedule.hpp"
 #include "gpu/jit/ir/ir.hpp"
@@ -134,9 +135,9 @@ void reorder_ir_builder_t::compute_blocks(const exec_config_t &exec_cfg,
         std::vector<int> &loop_blocks, std::vector<int> &tg_blocks,
         dim_t max_iter_tile_bytes, dim_t max_thr_tile_bytes) {
     if (max_iter_tile_bytes <= 0)
-        max_iter_tile_bytes = max_tile_size(exec_cfg.hw_cfg(), dst, src);
+        max_iter_tile_bytes = max_tile_size(exec_cfg.hw(), dst, src);
     if (max_thr_tile_bytes <= 0)
-        max_thr_tile_bytes = max_tile_size(exec_cfg.hw_cfg(), dst, src);
+        max_thr_tile_bytes = max_tile_size(exec_cfg.hw(), dst, src);
 
     ir_assert(src.ndims() == dst.ndims());
     int ndims = src.ndims();
@@ -231,7 +232,7 @@ void reorder_ir_builder_t::compute_blocks(const exec_config_t &exec_cfg,
     }
     ir_assert(!candidate_tiles.empty());
 
-    const auto eu_count = exec_cfg.hw_cfg().eu_count();
+    const auto eu_count = exec_cfg.hw().eu_count();
     std::sort(candidate_tiles.begin(), candidate_tiles.end(),
             [&](const tensor_t &a, const tensor_t &b) {
                 auto a_threads_reqd = padded_src.elems() / a.elems();
@@ -332,7 +333,7 @@ void reorder_ir_builder_t::compute_grid(const layout_t &src,
         if (outer != 1 && grid_idx != max_grid_idx) grid_idx++;
     }
     kernel_grid = grid_info_t(kernel_grid_dims, "grid_idx");
-    tg_grid = grid_info_t(tg_grid_dims, "grid_idx");
+    tg_grid = grid_info_t(tg_grid_dims, "tg_idx");
 }
 
 compute::nd_range_t reorder_ir_builder_t::nd_range(
@@ -347,8 +348,8 @@ compute::nd_range_t reorder_ir_builder_t::nd_range(
     grid_info_t tg_grid;
     compute_grid(src, dst, iter_blocks, loop_blocks, tg_blocks, kernel_grid,
             tg_grid);
-    std::array<size_t, 3> global;
-    std::array<size_t, 3> local;
+    compute::range_t global = compute::range_t::empty(kernel_grid.ndims());
+    compute::range_t local = compute::range_t::empty(kernel_grid.ndims());
     for (int i = 0; i < kernel_grid.ndims(); i++) {
         global[i] = kernel_grid[i] * tg_grid[i];
         local[i] = tg_grid[i];
@@ -357,7 +358,7 @@ compute::nd_range_t reorder_ir_builder_t::nd_range(
             local[i] *= simd;
         }
     }
-    return compute::nd_range_t(global.data(), local.data());
+    return compute::nd_range_t(global, local);
 }
 
 struct normalization_stage_t {
@@ -599,7 +600,7 @@ void reorder_ir_builder_t::build() {
 
     int max_iters = 10;
     int cur_iter_bytes
-            = max_tile_size(cfg_.exec_cfg().hw_cfg(), dst_layout_, src_layout_);
+            = max_tile_size(cfg_.exec_cfg().hw(), dst_layout_, src_layout_);
     for (int i = 0; i < max_iters; i++) {
         if (try_build(iter_blocks, loop_blocks, tg_blocks)) {
             ir_info() << "Reorder configuration:" << std::endl;

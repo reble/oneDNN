@@ -81,7 +81,7 @@ static const char *handle_cpu_name(runtime::cpu_flags_t &flags) {
 }
 
 std::unique_ptr<TargetMachine> get_llvm_target_machine(
-        CodeGenOpt::Level optlevel) {
+        LLVM_CodeGenOptLevel optlevel) {
     auto target_triple = sys::getProcessTriple();
 
     std::string err;
@@ -124,7 +124,7 @@ std::unique_ptr<TargetMachine> get_llvm_target_machine(
 }
 
 std::unique_ptr<TargetMachine> get_llvm_target_machine(
-        CodeGenOpt::Level optlevel = CodeGenOpt::Level::Default);
+        LLVM_CodeGenOptLevel optlevel = LLVM_CodeGenOptLevel::Default);
 
 codegen_llvm_vis_t::codegen_llvm_vis_t(const context_ptr &ctx,
         LLVMContext &context, const std::string &source_dir,
@@ -147,8 +147,14 @@ codegen_llvm_vis_t::codegen_llvm_vis_t(const context_ptr &ctx,
     module_->setTargetTriple(tm->getTargetTriple().str());
     module_->setDataLayout(tm->createDataLayout());
     FastMathFlags fmflag;
-    fmflag.setFast(true);
+    // some optimization in FastMath may cause accuracy loss, which needs
+    // further investigation in the future
+    fmflag.setFast(false);
+    // keep FMA optimization on
     fmflag.setAllowContract(true);
+    // turn on following options for performance
+    fmflag.setAllowReassoc(true);
+    fmflag.setNoNaNs(true);
     builder_.setFastMathFlags(fmflag);
     if (ctx->flags_.debug_info_) {
         dbg_cu_ = dbuilder_->createCompileUnit(dwarf::DW_LANG_C,

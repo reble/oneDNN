@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,26 +51,37 @@ status_t gemm_bf16_matmul_t<dst_type>::pd_t::init(engine_t *engine) {
                         && is_bias_1xN());
     };
 
-    bool ok = is_dense_format_kind() && !has_zero_dim_memory()
-            && src_md()->data_type == src_type
+    VDISPATCH_MATMUL(is_dense_format_kind(), VERBOSE_UNSUPPORTED_SPARSE_CFG);
+    VDISPATCH_MATMUL(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+
+    const bool problem_dt_correct = src_md()->data_type == src_type
             && weights_md()->data_type == weights_type
             && desc()->accum_data_type == acc_type
             && dst_md()->data_type == dst_type
-            && platform::has_data_type_support(data_type::bf16) && check_bias()
-#if DNNL_X64
-            && x64::mayiuse(x64::avx512_core)
-#endif
-            && attr()->has_default_values(
-                    primitive_attr_t::skip_mask_t::scales_runtime
-                    | primitive_attr_t::skip_mask_t::post_ops)
-            && attr()->post_ops_.check_sum_consistency(dst_type,
-                    /* is_int8 */ false)
-            && set_default_formats()
-            && attr_.set_default_formats(dst_md(0)) == status::success
-            && gemm_based::check_gemm_compatible_formats(*this);
-    if (!ok) return status::unimplemented;
+            && platform::has_data_type_support(data_type::bf16);
 
-    CHECK(check_and_configure_attributes());
+    VDISPATCH_MATMUL(problem_dt_correct, VERBOSE_UNSUPPORTED_DT_CFG);
+    VDISPATCH_MATMUL(check_bias(), VERBOSE_UNSUPPORTED_BIAS_CFG);
+#if DNNL_X64
+    VDISPATCH_MATMUL(x64::mayiuse(x64::avx512_core), VERBOSE_UNSUPPORTED_ISA);
+#endif
+
+    VDISPATCH_MATMUL(attr()->has_default_values(
+                             primitive_attr_t::skip_mask_t::scales_runtime
+                             | primitive_attr_t::skip_mask_t::post_ops),
+            VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_MATMUL(attr()->post_ops_.check_sum_consistency(dst_type,
+                             /* is_int8 */ false),
+            VERBOSE_UNSUPPORTED_POSTOP);
+
+    VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
+    bool po_format_ok = attr_.set_default_formats(dst_md(0)) == status::success;
+    VDISPATCH_MATMUL(po_format_ok, VERBOSE_UNSUPPORTED_POSTOP);
+
+    VDISPATCH_MATMUL(gemm_based::check_gemm_compatible_formats(*this),
+            VERBOSE_INCOMPATIBLE_GEMM_FMT);
+
+    CHECK(check_and_configure_attributes(engine));
 
     nthr_ = dnnl_get_max_threads();
     gemm_based::book_acc_scratchpad(*this, params_, sizeof(acc_data_t), nthr_);
@@ -90,7 +101,8 @@ static bool should_gemm_execute_sum_po(const gemm_based::params_t &params,
 }
 
 template <impl::data_type_t dst_type>
-status_t gemm_bf16_matmul_t<dst_type>::pd_t::check_and_configure_attributes() {
+status_t gemm_bf16_matmul_t<dst_type>::pd_t::check_and_configure_attributes(
+        engine_t *engine) {
     auto check_attr_scales = [&]() -> bool {
         bool ok = attr_scales_ok();
         if (!attr()->scales_.get(DNNL_ARG_SRC).has_default_values()
@@ -118,15 +130,17 @@ status_t gemm_bf16_matmul_t<dst_type>::pd_t::check_and_configure_attributes() {
                         binary_injector_utils::extract_bcast_strategies(
                                 post_ops.entry_, dst_md()),
                         broadcasting_strategy_t::per_oc);
+        const bool has_prelu = post_ops.find(prelu) != -1;
         return cpu::inner_product_utils::post_ops_ok(
                        post_ops, dst_md(), enabled_bcast_strategy)
                 && IMPLICATION(is_binary_po_per_oc,
                         gemm_based::check_gemm_binary_per_oc_compatible_formats(
-                                *this));
+                                *this))
+                && IMPLICATION(N() == DNNL_RUNTIME_DIM_VAL, !has_prelu);
     };
 
     // check basic attributes
-    if (!check_attr_scales()) return status::unimplemented;
+    VDISPATCH_MATMUL(check_attr_scales(), VERBOSE_UNSUPPORTED_SCALES_CFG);
 
     // set state
     CHECK(params_.pp_attr_.copy_from(*attr()));
@@ -139,7 +153,8 @@ status_t gemm_bf16_matmul_t<dst_type>::pd_t::check_and_configure_attributes() {
     }
 
     // check post-ops
-    if (!check_attr_post_ops()) return status::unimplemented;
+    VDISPATCH_MATMUL(check_attr_post_ops(), VERBOSE_UNSUPPORTED_POSTOP);
+
     const bool sum_po_via_gemm_beta
             = should_gemm_execute_sum_po(params_, dst_type);
     // set state
@@ -254,7 +269,7 @@ status_t gemm_bf16_matmul_t<dst_type>::execute_ref(
                 batch, M, N, use_single_gemm_call, nthr);
 
 #ifdef GCC_WA_LAMBDA_C_CAST
-        parallel(nthr, [=, &st](int ithr, int nthr) {
+        parallel(nthr, [= WA_THIS_COPY_CAPTURE, &st](int ithr, int nthr) {
 #else
         parallel(nthr, [&](int ithr, int nthr) {
 #endif

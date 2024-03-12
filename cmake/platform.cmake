@@ -218,9 +218,13 @@ elseif(UNIX OR MINGW)
              if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
                  set(DEF_ARCH_OPT_FLAGS "-O3")
              endif()
-             # For native compilation tune for the host processor
              if (CMAKE_SYSTEM_PROCESSOR STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR)
-                 append(DEF_ARCH_OPT_FLAGS "-mcpu=native")
+                 # Defaults to a generic cpu target, equivalent to setting -mtune=generic -march=armv8-a.
+                 # This ensures no implementation specific tuning, or architectural features beyond
+                 # armv8-a are used, for portability across AArch64 systems.
+                 # The DNNL_ARCH_OPT_FLAGS build option can be used to override these defaults
+                 # to optimise for a specific cpu, or revision of the Armv8 architecture.
+                 append(DEF_ARCH_OPT_FLAGS "-mcpu=generic")
              endif()
         elseif(DNNL_TARGET_ARCH STREQUAL "PPC64")
              if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -311,13 +315,23 @@ elseif(UNIX OR MINGW)
             append(CMAKE_CCXX_FLAGS "-Wno-ignored-attributes")
         endif()
 
+        # XXX: Suppress an erroneous warning of nested lambda visibility
+        #  exceeding that of the containing class (GCC Bugzilla - Bug 80947).
+        if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 8 AND CMAKE_CXX_COMPILER_VERSION VERSION_GREATER 6.0)
+            append(CMAKE_CCXX_FLAGS "-Wno-attributes")
+        endif()
+
         if(DNNL_TARGET_ARCH STREQUAL "AARCH64")
             if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
                 set(DEF_ARCH_OPT_FLAGS "-O3")
             endif()
-            # For native compilation tune for the host processor
             if (CMAKE_SYSTEM_PROCESSOR STREQUAL CMAKE_HOST_SYSTEM_PROCESSOR)
-                append(DEF_ARCH_OPT_FLAGS "-mcpu=native")
+                 # Defaults to a generic cpu target, equivalent to setting -mtune=generic -march=armv8-a.
+                 # This ensures no implementation specific tuning, or architectural features beyond
+                 # armv8-a are used, for portability across AArch64 systems.
+                 # The DNNL_ARCH_OPT_FLAGS build option can be used to override these defaults
+                 # to optimise for a specific cpu, or revision of the Armv8 architecture.
+                 append(DEF_ARCH_OPT_FLAGS "-mcpu=generic")
             endif()
         elseif(DNNL_TARGET_ARCH STREQUAL "PPC64")
             if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")

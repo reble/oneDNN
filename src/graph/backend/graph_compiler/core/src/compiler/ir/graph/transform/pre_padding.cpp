@@ -54,15 +54,26 @@ void pre_padding(sc_graph_t &graph, const context_ptr &ctx) {
                 // insert a padding op before current node
 
                 if (node->isa<ops::conv_fwd_core_op_t>()) {
-                    auto input_dims = node->get_inputs()[0]
-                                              ->details_.get_plain_dims()
-                                              .size();
+                    auto data_plain_dims
+                            = node->info_.inputs_[0]->details_.get_plain_dims();
+                    auto weight_plain_dims
+                            = node->info_.inputs_[1]->details_.get_plain_dims();
                     bool is_amx_dtype = ops::is_amx_dtype(
                             ctx, node->get_inputs()[0]->details_.dtype_);
-
+                    sc_dim groups = node->attrs_.get_or_else("groups", 1);
+                    bool is_dw_brdgmm = groups > 1
+                            && weight_plain_dims.size() >= 5
+                            && data_plain_dims.size() >= 5
+                            && 1 == weight_plain_dims[1]
+                            && 1 == data_plain_dims[2];
+                    auto padding_value
+                            = node->attrs_.get_or_else("padding_value", 0);
                     // TODO(xurui)
                     // Only support extract padding op from 2d conv for now.
-                    if (((input_dims != 4) || !is_amx_dtype)) { return; }
+                    if (((data_plain_dims.size() != 4) || !is_amx_dtype
+                                || (is_dw_brdgmm && padding_value == 0))) {
+                        return;
+                    }
                     // Only apply to inference
                     bool is_weight_constant
                             = node->get_inputs()[1]
@@ -92,10 +103,10 @@ void pre_padding(sc_graph_t &graph, const context_ptr &ctx) {
                     auto parent_node = node->get_inputs()[0]->producer_owner_;
 
                     if (parent_node->isa<input_op>()) { return; }
-                    auto padding_node
-                            = graph.make("padding", {node->get_inputs()[0]}, {},
-                                    {{"pads_begin", pads_begin},
-                                            {"pads_end", pads_end}});
+                    auto padding_node = graph.make("padding",
+                            {node->get_inputs()[0]}, {},
+                            {{"pads_begin", pads_begin}, {"pads_end", pads_end},
+                                    {"padding_value", padding_value}});
                     if (node->get_inputs()[0]->details_.get_plain_dims()[0]
                             == 1) {
                         padding_node->attrs_.set(

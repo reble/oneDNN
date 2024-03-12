@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -109,6 +109,7 @@ ostream &operator<<(ostream &os, intrin_type val) {
         HANDLE_CASE(reduce_max)
         HANDLE_CASE(reduce_min)
         HANDLE_CASE(fmadd)
+        HANDLE_CASE(fnmadd)
         HANDLE_CASE(unpack_low)
         HANDLE_CASE(unpack_high)
         HANDLE_CASE(shuffle)
@@ -125,7 +126,8 @@ ostream &operator<<(ostream &os, intrin_type val) {
         HANDLE_CASE(permutexvar)
         HANDLE_CASE(insert)
         HANDLE_CASE(extract)
-        HANDLE_CASE(load_const_mem)
+        HANDLE_CASE(constant_load)
+        HANDLE_CASE(volatile_load)
         HANDLE_CASE(brgemm)
         HANDLE_CASE(list_brgemm)
         HANDLE_CASE(NUM_INTRINSICS)
@@ -245,7 +247,8 @@ expr::lvalue_proxy_t expr::operator[](const span_t &index) const {
     }
 
     return expr::lvalue_proxy_t(
-            builder::make_indexing(*this, idx, index.length_, index.mask_),
+            builder::make_indexing(
+                    *this, idx, index.length_, index.mask_, index.rows_),
             true);
 }
 
@@ -306,32 +309,46 @@ expr constant_node::remake() const {
 
 bool constant_node::equals(expr_c v, ir_comparer &ctx) const {
     ASCAST_OR_RETURN(v, other);
-    if (other->value_.size() != value_.size()) return false;
     sc_data_etype etype = dtype_.is_etype_pointer() ? sc_data_etype::POINTER
                                                     : dtype_.type_code_;
-    switch (etype) {
-        case sc_data_etype::F16:
-        case sc_data_etype::BF16:
-        case sc_data_etype::F32:
-            for (unsigned i = 0; i < value_.size(); i++) {
-                if (other->value_[i].f32 != value_[i].f32) RETURN(false);
-            }
-            RETURN(true);
-        case sc_data_etype::POINTER:
-        case sc_data_etype::S32:
-        case sc_data_etype::U8:
-        case sc_data_etype::U16:
-        case sc_data_etype::U32:
-        case sc_data_etype::S8:
-        case sc_data_etype::INDEX:
-        case sc_data_etype::BOOLEAN:
-            for (unsigned i = 0; i < value_.size(); i++) {
-                if (other->value_[i].s64 != value_[i].s64) RETURN(false);
-            }
-            RETURN(true);
-        default: assert(0 && "Unknown type for const");
-    }
-    return false;
+    bool is_float_category = dtype_.type_code_ != sc_data_etype::POINTER
+            && get_etype_category_nothrow(dtype_.type_code_)
+                    == type_category::CATE_FLOAT;
+
+    auto is_values_equals
+            = [&is_float_category](const std::vector<union_val> &v1,
+                      const std::vector<union_val> &v2) {
+                  assert(v1.size() == 1);
+                  return std::all_of(v2.begin(), v2.end(),
+                          [&v1, &is_float_category](const union_val &x) {
+                              return is_float_category ? x.f32 == v1[0].f32
+                                                       : x.u64 == v1[0].u64;
+                          });
+              };
+    // Our IR is usually written in the form of
+    // make_expr<constant_node>(1.f,f32(8)), and its
+    // constant value size will be 1. After we have checked the dtype is same,
+    // we need to ensure all the union_val value is same.
+    if (other->value_.size() != value_.size()) {
+        bool ok = false;
+        if (value_.size() == 1) {
+            ok = is_values_equals(value_, other->value_);
+        } else if (other->value_.size() == 1) {
+            ok = is_values_equals(other->value_, value_);
+        }
+        RETURN(ok);
+    };
+    // value size is equal
+    bool res = std::equal(value_.begin(), value_.end(), other->value_.begin(),
+            [&](const union_val &x, const union_val &y) {
+                if (is_float_category) {
+                    if (x.f32 != y.f32) { return false; }
+                } else {
+                    if (x.u64 != y.u64) { return false; }
+                }
+                return true;
+            });
+    RETURN(res);
 }
 
 expr var_node::remake() const {
@@ -440,8 +457,9 @@ expr select_node::remake() const {
 }
 
 expr indexing_node::remake() const {
-    return copy_attr(
-            *this, builder::make_indexing(ptr_, idx_, dtype_.lanes_, mask_));
+    return copy_attr(*this,
+            builder::make_indexing(
+                    ptr_, idx_, dtype_.lanes_, mask_, dtype_.rows_));
 }
 
 bool indexing_node::equals(expr_c v, ir_comparer &ctx) const {

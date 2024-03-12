@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@
 
 using namespace dnnl::impl::graph;
 
-TEST(Partition, Unsupported) {
+TEST(test_fake_partition, Unsupported) {
     fake_impl::fake_partition_impl_t p(engine_kind::cpu);
     size_t id = 100;
     std::shared_ptr<op_t> n(new op_t(id, op_kind::Wildcard, "Wildcard"));
@@ -38,6 +38,7 @@ TEST(Partition, Unsupported) {
     std::shared_ptr<partition_impl_t> p_share = p.clone();
     fake_impl::fake_partition_impl_t *p_share_raw
             = dynamic_cast<fake_impl::fake_partition_impl_t *>(p_share.get());
+    ASSERT_NE(p_share_raw, nullptr);
     ASSERT_TRUE(p_share_raw->is_initialized());
     ASSERT_TRUE(
             p_share_raw->get_assigned_backend()->get_name() == "fake_backend");

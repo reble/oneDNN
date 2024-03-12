@@ -31,7 +31,7 @@ namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 namespace dnnl_impl = graph::dnnl_impl;
 
-TEST(Common, GetNxcStride) {
+TEST(test_common_common, GetNxcStride) {
     graph::dims shape {1, 2, 3, 4, 5, 6};
     graph::dims shape_def {720, 1, 240, 60, 12, 2};
     const auto &result = dnnl_impl::get_nxc_strides(shape);
@@ -39,7 +39,7 @@ TEST(Common, GetNxcStride) {
             && std::equal(result.begin(), result.end(), shape_def.begin()));
 }
 
-TEST(Common, GetNcxFormat) {
+TEST(test_common_common, GetNcxFormat) {
     ASSERT_EQ(dnnl_impl::get_ncx_format(1), dnnl_impl::format_tag::a);
     ASSERT_EQ(dnnl_impl::get_ncx_format(2), dnnl_impl::format_tag::ab);
     ASSERT_EQ(dnnl_impl::get_ncx_format(3), dnnl_impl::format_tag::abc);
@@ -49,22 +49,22 @@ TEST(Common, GetNcxFormat) {
     ASSERT_EQ(dnnl_impl::get_ncx_format(7), dnnl_impl::format_tag::undef);
 }
 
-TEST(Common, MakeDnnlMemory) {
+TEST(test_common_common, MakeDnnlMemory) {
     graph::engine_t &eng = *get_engine();
 
     graph::logical_tensor_t lt
             = utils::logical_tensor_init(0, {1, 2}, graph::data_type::f32);
-    graph::tensor_t t1 {lt, &eng, nullptr};
+    test_tensor t1 {lt, &eng};
     if (eng.kind() == graph::engine_kind::cpu) {
         ASSERT_NO_THROW(graph::dnnl_impl::make_dnnl_memory(
-                t1, dnnl::engine(dnnl::engine::kind::cpu, 0)));
+                t1.get(), dnnl::engine(dnnl::engine::kind::cpu, 0)));
     } else if (eng.kind() == graph::engine_kind::gpu) {
         ASSERT_NO_THROW(graph::dnnl_impl::make_dnnl_memory(
-                t1, dnnl::engine(dnnl::engine::kind::gpu, 0)));
+                t1.get(), dnnl::engine(dnnl::engine::kind::gpu, 0)));
     }
 }
 
-TEST(Common, Is4cBlocked) {
+TEST(test_common_common, Is4cBlocked) {
     {
         graph::logical_tensor_t lt = utils::logical_tensor_init(
                 0, {1, 2}, graph::data_type::f32, graph::layout_type::any);
@@ -78,7 +78,7 @@ TEST(Common, Is4cBlocked) {
     }
 }
 
-TEST(CommonDeathTest, FillLayoutInfo) {
+TEST(test_common_common, FillLayoutInfoDeathTest) {
     {
         graph::logical_tensor_t lt = utils::logical_tensor_init(
                 0, {1, 2}, graph::data_type::f32, graph::layout_type::any);

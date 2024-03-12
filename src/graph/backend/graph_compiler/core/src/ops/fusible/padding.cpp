@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include <compiler/ir/graph/fusible_op.hpp>
 #include <compiler/ir/graph/fusible_op_utils.hpp>
 #include <compiler/ir/transform/constant_fold.hpp>
+#include <compiler/ir/transform/dyn_tsr_transform.hpp>
 #include <runtime/dynamic_dispatch/ops/runtime_op_info.hpp>
 
 namespace dnnl {
@@ -148,20 +149,19 @@ void padding_op_t::query_format(context_ptr ctx,
             in_formats, out_formats, supported_ins, supported_outs);
 }
 
-void padding_op_t::prepare_fusion_data(fdata_map &fdmap) {}
+infer_status_code padding_op_t::pre_infer_slice_ranges(
+        const context_ptr &ctx, fslice_map &fsmap) {
+    throw std::runtime_error("Not implemented");
+}
 
-void padding_op_t::pre_slice_ranges(
-        fslice_map &fsmap, infer_status_map_t &stat_map) {}
-
-void padding_op_t::infer_slice_ranges(
-        fslice_map &fsmap, infer_status_map_t &stat_map) {
+infer_status_code padding_op_t::infer_slice_ranges(
+        const context_ptr &ctx, fslice_map &fsmap) {
     // search known ranges from any input of cur fusbile op
-    slice_range_map known_ranges_map
-            = search_known_slice_ranges(this, fsmap, stat_map);
+    slice_range_map known_ranges_map = search_known_input_slice(this, fsmap);
 
     if (attrs_.get_or_else(op_attr_key::break_post_fuse, false)) {
         fsmap.get(get_outputs()[0]) = known_ranges_map[0];
-        return;
+        return infer_status_code::OK;
     }
 
     size_t slice_size = known_ranges_map[0].size();
@@ -172,8 +172,7 @@ void padding_op_t::infer_slice_ranges(
     // check the slice range whether meet the demand of padding op
     for (auto &src_range : fsmap.get(input)) {
         if (!slice_full_on_axis(src_dim, src_range, required_axis)) {
-            stat_map.append_ops_by_status(this, infer_status_code::RETRY);
-            return;
+            return infer_status_code::RETRY;
         }
     }
     slice_range_list ranges_list(slice_size);
@@ -197,6 +196,7 @@ void padding_op_t::infer_slice_ranges(
         }
     }
     fsmap.get(get_outputs()[0]) = std::move(ranges_list);
+    return infer_status_code::OK;
 }
 
 void padding_op_t::compute_block(context_ptr ctx,
@@ -253,6 +253,7 @@ void padding_op_t::compute_block(context_ptr ctx,
                         ? expr(step)
                         : expr(1),
                 std::move(body), true, for_type::NORMAL);
+        bind_loop_axis(get_inputs()[0], cur, i, true);
     }
 
     bld->emit(cur);
@@ -305,6 +306,7 @@ stmt padding_op_t::get_zero_out_stmt(
     const auto pads_begin = attrs_.get<sc_dims>("pads_begin");
     const auto pads_end = attrs_.get<sc_dims>("pads_end");
     auto out_tptr = out_tsl.tptr_;
+    auto padding_value = attrs_.get_or_else("padding_value", 0);
 
     if (plain_ndims_ == 2) {
         // Note: padding on the first dim (km) for 2D.
@@ -316,12 +318,12 @@ stmt padding_op_t::get_zero_out_stmt(
         builder::ir_builder_t bld;
         bld.push_scope();
         if (pt > 0) {
-            builtin::mem_zero(
-                    builder::tensor_ptr(out_tptr, {0, 0}), pt * nm, out_dtype);
+            builtin::brgemm_init(builder::tensor_ptr(out_tptr, {0, 0}), pt, nm,
+                    nm, out_dtype, padding_value);
         }
         if (pb > 0) {
-            builtin::mem_zero(builder::tensor_ptr(out_tptr, {km - pb, 0}),
-                    pb * nm, out_dtype);
+            builtin::brgemm_init(builder::tensor_ptr(out_tptr, {km - pb, 0}),
+                    pb, nm, nm, out_dtype, padding_value);
         }
         auto ret = bld.pop_scope();
         return ret;
@@ -338,7 +340,8 @@ stmt padding_op_t::get_zero_out_stmt(
         auto is_4d_out = ndims == 4;
 
         for (size_t i = real_padding_axis.back() + 1; i < ndims; i++) {
-            c *= get_expr_as_int(out->dims_[i]);
+            c *= range_list.empty() ? get_expr_as_int(out->dims_[i])
+                                    : get_expr_as_int(range[i].second);
         }
 
         // input plain format must be NCHW in conv_fwd_core
@@ -356,7 +359,7 @@ stmt padding_op_t::get_zero_out_stmt(
                                : expr(int(input_plain_dims[plain_ndims_ - 1]
                                        + pads_begin[1] + pads_end[1]));
 
-        for_loop ln, lk;
+        for_loop ln, lk, lp;
         builder::ir_builder_t bld;
         bld.push_scope();
         _named_for_(ln, pad_n, 0, N, 1, for_type::PARALLEL) {
@@ -369,12 +372,16 @@ stmt padding_op_t::get_zero_out_stmt(
                                                        {pad_n, pad_k, 0, 0}))
                             : builder::tensor_ptr(
                                     out_tptr, {pad_n, pad_k, 0, 0, 0});
-                    builtin::mem_zero(ptr, ph1_ * ow * c, out_dtype);
+                    builtin::brgemm_init(
+                            ptr, ph1_ * ow, c, c, out_dtype, padding_value);
                 }
-
-                _for_(p1, 0, ih) {
+            }
+        }
+        _named_for_(ln, pad_n, 0, N, 1, for_type::PARALLEL) {
+            _named_for_(lk, pad_k, 0, K) {
+                _named_for_(lp, p1, 0, ih) {
                     if (pw1_ > 0) {
-                        builtin::mem_zero(
+                        builtin::brgemm_init(
                                 is_4d_out ? (is_channel_last
                                                 ? builder::tensor_ptr(out_tptr,
                                                         {pad_n, p1 + ph1_, 0,
@@ -385,12 +392,11 @@ stmt padding_op_t::get_zero_out_stmt(
                                           : builder::tensor_ptr(out_tptr,
                                                   {pad_n, pad_k, p1 + ph1_, 0,
                                                           0}),
-
-                                pw1_ * c, out_dtype);
+                                pw1_, c, c, out_dtype, padding_value);
                     }
 
                     if (pw2_ > 0) {
-                        builtin::mem_zero(
+                        builtin::brgemm_init(
                                 is_4d_out ? (is_channel_last
                                                 ? builder::tensor_ptr(out_tptr,
                                                         {pad_n, p1 + ph1_,
@@ -405,13 +411,15 @@ stmt padding_op_t::get_zero_out_stmt(
                                           : builder::tensor_ptr(out_tptr,
                                                   {pad_n, pad_k, p1 + ph1_,
                                                           iw + pw1_, 0}),
-
-                                pw2_ * c, out_dtype);
+                                pw2_, c, c, out_dtype, padding_value);
                     }
                 }
-
+            }
+        }
+        _named_for_(ln, pad_n, 0, N, 1, for_type::PARALLEL) {
+            _named_for_(lk, pad_k, 0, K) {
                 if (ph2_ > 0) {
-                    builtin::mem_zero(
+                    builtin::brgemm_init(
                             is_4d_out ? (is_channel_last
                                             ? builder::tensor_ptr(out_tptr,
                                                     {pad_n, ph1_ + ih, 0, 0})
@@ -419,8 +427,8 @@ stmt padding_op_t::get_zero_out_stmt(
                                                     {pad_n, pad_k, ph1_ + ih,
                                                             0}))
                                       : builder::tensor_ptr(out_tptr,
-                                              {pad_n, pad_k, ph1_ + ih, 0}),
-                            ph2_ * ow * c, out_dtype);
+                                              {pad_n, pad_k, ph1_ + ih, 0, 0}),
+                            ph2_ * ow, c, c, out_dtype, padding_value);
                 }
             }
         }
@@ -446,6 +454,25 @@ std::vector<expr> padding_op_t::get_padding_offsets_exprs() {
         offsets[real_padding_axis[i]] = (int)pads_begin[i];
     }
     return offsets;
+}
+
+void padding_op_t::calculate_dynamic_shape_expression() {
+    auto &g = get_owner_graph();
+    auto padding_axis = get_real_padding_axis();
+    auto data_dims = info_.inputs_[0]->details_.get_plain_dims();
+    auto out_dims = get_outputs()[0]->details_.get_plain_dims();
+    auto expr_pads_begin = g.dims_to_expr(attrs_.get<sc_dims>("pads_begin"));
+    auto expr_pads_end = g.dims_to_expr(attrs_.get<sc_dims>("pads_end"));
+    for (size_t i = 0; i < padding_axis.size(); i++) {
+        if (is_dynamic_dim(data_dims[padding_axis[i]])
+                && out_dims[padding_axis[i]] != data_dims[padding_axis[i]]) {
+            auto var_in = g.dim_to_expr(data_dims[padding_axis[i]]);
+            auto var_out = g.dim_to_expr(out_dims[padding_axis[i]]);
+            expr_c cal_expr = do_cast_and_fold(
+                    var_in + expr_pads_begin[i] + expr_pads_end[i]);
+            var_out->attr_->set(attr_keys::cal_expression, cal_expr);
+        }
+    }
 }
 
 OP_REGISTER(padding_op_t, padding)

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -75,6 +75,9 @@ double evaluateW(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
     static constexpr double maxPriority = 10000.;
     double priority = e.model.params[kcatalog::ParamWPriority];
 
+    if (dp.deterministic && e.driverInfo.kParallel())
+        return std::numeric_limits<double>::infinity();
+
     aux.wgK = 1;
     if (e.driverInfo.kParallelLocal()) {
         aux.k0 = alignUp(divUp(dp.sizes.k, e.driverInfo.wg[LoopK]),
@@ -82,6 +85,7 @@ double evaluateW(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
         aux.wgK = std::max(1,
                 std::min(e.driverInfo.wg[LoopK],
                         int(divUp(dp.sizes.k, aux.k0))));
+        if (e.driverInfo.fixedWGK()) aux.wgK = e.driverInfo.wg[LoopK];
     }
 
     if (priority > maxPriority) /* no op */
@@ -128,6 +132,7 @@ double evaluateSCore(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
         aux.k0 = kthread;
         aux.wgK = std::max(
                 1, std::min(e.driverInfo.wg[LoopK], int(divUp(k, kthread))));
+        if (e.driverInfo.fixedWGK()) aux.wgK = e.driverInfo.wg[LoopK];
     }
 
     double threadsFull = std::floor(threads / capacity) * capacity;
@@ -181,6 +186,8 @@ double evaluateS(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
         int wgCountK1 = std::max(1, int(dp.hwThreadCapacity / dp.threadCount));
         int wgCountK2
                 = std::max(1, int(2 * dp.hwThreadCapacity / dp.threadCount));
+
+        if (dp.deterministic) wgCountK1 = wgCountK2 = 1;
 
         int k0_1
                 = alignUp(divUp(dp.sizes.k, wgCountK1 * e.driverInfo.wg[LoopK]),
@@ -250,7 +257,9 @@ double evaluateECore(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
 
     // Choose wgK and per-k thread size.
     aux.wgK = 1;
-    if (aux.kParallel)
+    if (e.driverInfo.fixedWGK())
+        aux.wgK = e.driverInfo.wg[LoopK];
+    else if (aux.kParallel)
         aux.wgK = std::max(1, int(divUp(k, aux.k0)));
     else if (aux.kParallelVariable) {
         /* Variable k-slicing + local k-reduction: use kr only to avoid competing atomics from same subslice */
@@ -261,7 +270,10 @@ double evaluateECore(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
         /* Variable k-slicing disabled: use kr to fill GPU as much as possible */
         if (threads < capacity && !noKR)
             aux.wgK = roundDownSmallPow2(std::floor(capacity / threads));
-    } else
+    } else if (e.driverInfo.shrinkWGK())
+        aux.wgK = roundUpSmallPow2(std::ceil(capacity * e.driverInfo.wg[LoopK]
+                * e.driverInfo.fillGoal() / threads));
+    else
         aux.wgK = e.driverInfo.wg[LoopK];
 
     aux.wgK = std::min(aux.wgK, e.driverInfo.wg[LoopK]);
@@ -335,6 +347,7 @@ double evaluateECore(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
     double etime = (1 - Em) * etimeNoLB + Em * etimeLB;
     etime *= (e.driverInfo.unroll[LoopM] * e.driverInfo.unroll[LoopN]);
     etime *= kthread;
+    etime /= e.driverInfo.wgExpand;
 
     if (!dp.effective) {
         double F = PARAM(Fr0) + double(m) * double(n) * double(k) * PARAM(Fr1);
@@ -357,6 +370,10 @@ double evaluateE(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
                 1, int(dp.hwThreadCapacity / dp.threadCount) - padWGs);
         int wgCountK2 = std::max(
                 1, int(2 * dp.hwThreadCapacity / dp.threadCount) - padWGs);
+
+        if (dp.deterministic)
+            wgCountK1 = wgCountK2
+                    = 1; /* k-parallelization is not deterministic */
 
         int k0_1
                 = alignUp(divUp(dp.sizes.k, wgCountK1 * e.driverInfo.wg[LoopK]),
@@ -420,10 +437,15 @@ double evaluateE(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
             }
         }
 
-        if (dp.sizes.batch > 1) return score;
+        if (dp.batch) return score;
 
         int64_t tcount = dp.threadCount;
-        if ((tcount != dp.threadCount) || (tcount % dp.hwThreadCapacity != 0)) {
+        bool tryKV = (tcount != dp.threadCount)
+                || (tcount % dp.hwThreadCapacity != 0);
+
+        if (dp.deterministic) tryKV &= (dp.threadCount > dp.hwThreadCapacity);
+
+        if (tryKV) {
             EvaluateAuxOutput auxKV;
             auxKV.kParallelVariable = true;
             double scoreKV = evaluateECore(e, dp, auxKV);
@@ -433,7 +455,7 @@ double evaluateE(const kcatalog::Entry &e, const DerivedEvaluateParams &dp,
 
                 auto approxK0
                         = dp.threadCount * dp.sizes.k / dp.hwThreadCapacity;
-                if (approxK0 <= 32) {
+                if (approxK0 <= 32 && !dp.deterministic) {
                     aux.kParallel
                             = true; /* Switch to fixed global k-slicing if k0 is too small */
                     aux.kParallelVariable = false;
@@ -502,7 +524,7 @@ DerivedEvaluateParams getDerivedParams(
         }
     }
 
-    auto threadsPerWG = wgM * wgN;
+    auto threadsPerWG = wgM * wgN * e.driverInfo.wgExpand;
     if (!e.driverInfo.kParallelVariable())
         threadsPerWG *= e.driverInfo.wg[LoopK];
 

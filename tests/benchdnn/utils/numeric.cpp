@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,12 +16,21 @@
 
 #include "src/common/bfloat16.hpp"
 #include "src/common/float16.hpp"
+#include "src/common/float8.hpp"
 #include "src/common/nstl.hpp"
 
 #include "common.hpp"
 
 #include "utils/numeric.hpp"
 
+template <>
+struct prec_traits<dnnl_f8_e5m2> {
+    using type = dnnl::impl::float8_e5m2_t;
+};
+template <>
+struct prec_traits<dnnl_f8_e4m3> {
+    using type = dnnl::impl::float8_e4m3_t;
+};
 template <>
 struct prec_traits<dnnl_bf16> {
     using type = dnnl::impl::bfloat16_t;
@@ -55,9 +64,18 @@ template <>
 struct prec_traits<dnnl_u8> {
     using type = uint8_t;
 };
-
+template <>
+struct prec_traits<dnnl_s4> {
+    using type = dnnl::impl::int4_t;
+};
+template <>
+struct prec_traits<dnnl_u4> {
+    using type = dnnl::impl::uint4_t;
+};
 #define CASE_ALL(dt) \
     switch (dt) { \
+        CASE(dnnl_f8_e5m2); \
+        CASE(dnnl_f8_e4m3); \
         CASE(dnnl_bf16); \
         CASE(dnnl_f16); \
         CASE(dnnl_f32); \
@@ -65,6 +83,8 @@ struct prec_traits<dnnl_u8> {
         CASE(dnnl_s32); \
         CASE(dnnl_s8); \
         CASE(dnnl_u8); \
+        CASE(dnnl_s4); \
+        CASE(dnnl_u4); \
         default: assert(!"bad data_type"); SAFE_V(FAIL); \
     }
 
@@ -130,7 +150,8 @@ float saturate_and_round(dnnl_data_type_t dt, float value) {
 }
 
 bool is_integral_dt(dnnl_data_type_t dt) {
-    return dt == dnnl_s32 || dt == dnnl_s8 || dt == dnnl_u8;
+    return dt == dnnl_s32 || dt == dnnl_s8 || dt == dnnl_u8 || dt == dnnl_s4
+            || dt == dnnl_u4;
 }
 
 float maybe_saturate(dnnl_data_type_t dt, float value) {
@@ -142,11 +163,19 @@ float round_to_nearest_representable(dnnl_data_type_t dt, float value) {
     switch (dt) {
         case dnnl_f32: break;
         case dnnl_f64: break;
+        case dnnl_f8_e5m2:
+            value = (float)dnnl::impl::float8_e5m2_t(value);
+            break;
+        case dnnl_f8_e4m3:
+            value = (float)dnnl::impl::float8_e4m3_t(value);
+            break;
         case dnnl_bf16: value = (float)dnnl::impl::bfloat16_t(value); break;
         case dnnl_f16: value = (float)dnnl::impl::float16_t(value); break;
         case dnnl_s32:
         case dnnl_s8:
-        case dnnl_u8: value = maybe_saturate(dt, value); break;
+        case dnnl_u8:
+        case dnnl_s4:
+        case dnnl_u4: value = maybe_saturate(dt, value); break;
         default: SAFE_V(FAIL);
     }
 

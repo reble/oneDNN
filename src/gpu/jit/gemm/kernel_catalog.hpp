@@ -91,6 +91,7 @@ enum HWTags : char {
     HWTagXeHP = 'D',
     HWTagXeHPG = 'E',
     HWTagXeHPC = 'F',
+    HWTagXe2 = 'G',
 };
 
 struct Selector {
@@ -241,7 +242,7 @@ struct Entry {
         result.append(" ");
         result.append(std::to_string(driverInfo.unroll[LoopM]));
         result.append(" ");
-        result.append(std::to_string(driverInfo.unroll[LoopM]));
+        result.append(std::to_string(driverInfo.unroll[LoopN]));
         result.append(" ");
         result.append(strategy);
         return result;

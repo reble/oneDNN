@@ -10,6 +10,8 @@ where *rnn-knobs* are:
  - `--prop={FWD_I [default], FWD_D, BWD_DW}` -- dnnl_prop_kind_t.
             Refer to [direction](knobs_dir.md) for details.
  - `--cfg={f32 [default], ...}` -- refer to ``Configurations`` below.
+ - `--tag={any:any:any [default], ...}` -- physical src, weights and dst memory
+            layouts. Refer to [tags](knobs_tag.md) for details.
  - `--alg={VANILLA_RNN [default], VANILLA_LSTM, VANILLA_GRU, LBR_GRU,
             VANILLA_AUGRU, LBR_AUGRU}` -- RNN algorithm.
  - `--direction={left2right [default], right2left, concat, sum}` -- RNN
@@ -83,7 +85,6 @@ The table below shows supported name configurations for this driver:
 | f32         | f32           | f32   | f32       | f32            | f32  | f32                    | TBA
 | bf16        | bf16          | bf16  | bf16      | bf16           | bf16 | bf16                   | TBA
 | bf16        | bf16          | bf16  | bf16      | bf16           | f32  | bf16f32                | TBA
-| bf16        | f32           | bf16  | bf16      | bf16           | f32  | bf16f32bf16bf16bf16f32 | TBA
 | u8          | f32           | u8    | u8        | u8             | f32  | u8u8u8u8               | TBA
 | u8          | f32           | u8    | u8        | f32            | f32  | u8u8u8f32              | TBA
 | f32         | f32           | u8    | f32       | u8             | f32  | f32u8f32u8             | TBA

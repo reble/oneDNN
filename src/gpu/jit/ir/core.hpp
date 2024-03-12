@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,7 +24,9 @@
 #include <numeric>
 #include <string>
 
+#include "common/bfloat16.hpp"
 #include "common/c_types_map.hpp"
+#include "common/float16.hpp"
 #include "common/math_utils.hpp"
 #include "gpu/jit/utils/ngen_proxy.hpp"
 #include "gpu/jit/utils/utils.hpp"
@@ -38,9 +40,11 @@
     HANDLE_IR_OBJECT(binary_op_t) \
     HANDLE_IR_OBJECT(bool_imm_t) \
     HANDLE_IR_OBJECT(cast_t) \
+    HANDLE_IR_OBJECT(const_var_t) \
     HANDLE_IR_OBJECT(float_imm_t) \
     HANDLE_IR_OBJECT(iif_t) \
     HANDLE_IR_OBJECT(int_imm_t) \
+    HANDLE_IR_OBJECT(linear_t) \
     HANDLE_IR_OBJECT(load_t) \
     HANDLE_IR_OBJECT(ptr_t) \
     HANDLE_IR_OBJECT(shuffle_t) \
@@ -203,6 +207,10 @@ enum class type_kind_t {
     s64,
 
     // Floating point types.
+    bf8,
+    f8_e5m2 = bf8,
+    hf8,
+    f8_e4m3 = hf8,
     bf16,
     f16,
     tf32,
@@ -258,7 +266,8 @@ public:
         }
         return type_t::undef();
     }
-
+    static type_t bf8(int elems = 1) { return type_t(type_kind_t::bf8, elems); }
+    static type_t hf8(int elems = 1) { return type_t(type_kind_t::hf8, elems); }
     static type_t bf16(int elems = 1) {
         return type_t(type_kind_t::bf16, elems);
     }
@@ -356,12 +365,33 @@ public:
 
     type_t(type_kind_t kind, uint32_t elems = 1) : kind_(kind), elems_(elems) {}
 
+    type_t(const std::string &s) {
+        elems_ = 1;
+#define CASE(x) \
+    if (to_string(type_kind_t::x) == s) { \
+        kind_ = type_kind_t::x; \
+        return; \
+    }
+        CASE(bf16);
+        CASE(f16);
+        CASE(tf32);
+        CASE(f32);
+        CASE(f64);
+        CASE(s32);
+        CASE(s8);
+        CASE(u8);
+#undef CASE
+        ir_error_not_expected();
+    }
+
     // Constructor from dnnl_data_type_t.
     type_t(data_type_t dt) {
         elems_ = 1;
         switch ((int)dt) {
 #define CASE(x) \
     case data_type::x: kind_ = type_kind_t::x; break;
+            CASE(f8_e5m2);
+            CASE(f8_e4m3);
             CASE(bf16);
             CASE(f16);
             CASE(tf32);
@@ -394,6 +424,18 @@ public:
         return ir_utils::get_hash(kind(), elems(), is_ptr());
     }
 
+    void serialize(std::ostream &out) const {
+        ir_utils::serialize(kind_, out);
+        ir_utils::serialize(elems_, out);
+        ir_utils::serialize(is_ptr_, out);
+    }
+
+    void deserialize(std::istream &in) {
+        ir_utils::deserialize(kind_, in);
+        ir_utils::deserialize(elems_, in);
+        ir_utils::deserialize(is_ptr_, in);
+    }
+
     bool is_undef() const { return kind() == type_kind_t::undef; }
 
     bool is_vector() const { return type_t::is_vector(elems()); }
@@ -401,10 +443,13 @@ public:
     bool is_bool() const { return kind() == type_kind_t::_bool; }
 
     bool is_fp() const {
-        return utils::one_of(kind(), type_kind_t::bf16, type_kind_t::f16,
-                type_kind_t::tf32, type_kind_t::f32, type_kind_t::f64);
+        return utils::one_of(kind(), type_kind_t::bf8, type_kind_t::hf8,
+                type_kind_t::bf16, type_kind_t::f16, type_kind_t::tf32,
+                type_kind_t::f32, type_kind_t::f64);
     }
 
+    bool is_bf8() const { return kind() == type_kind_t::bf8; }
+    bool is_hf8() const { return kind() == type_kind_t::hf8; }
     bool is_bf16() const { return kind() == type_kind_t::bf16; }
     bool is_f16() const { return kind() == type_kind_t::f16; }
     bool is_tf32() const { return kind() == type_kind_t::tf32; }
@@ -645,9 +690,10 @@ public:
 #endif
 
     object_t &operator=(const object_t &other) {
-        increment(other.impl());
+        auto *other_impl = other.impl();
+        increment(other_impl);
         decrement_and_maybe_destroy(impl_);
-        impl_ = other.impl();
+        impl_ = other_impl;
 #ifdef SANITY_CHECK
         sanity_check();
 #endif
@@ -948,9 +994,30 @@ enum class op_kind_t {
 
     _and,
 
-    _prelu, // binary relu(a, b)
-    _add3, // a + b + c
-    _mad, // a + b * c
+    // Ternary operations.
+    // Parametric ReLU.
+    // if (a > 0) op = a
+    // else       op = a * b
+    _prelu,
+    // Ternary add.
+    // op = a + b + c
+    _add3,
+    // Multiply-accumulate.
+    // op = a + b * c
+    _mad,
+    // Integer division by a constant with rounding up.
+    // op = (a + b - 1) / b
+    _div_up,
+    // Integer division by a non-constant (rounding down behavior).
+    // if (a % b < 0) op = a / b - 1
+    // else           op = a / b
+    // This is ternary operation, c is a pre-computed value.
+    _idiv,
+    // Integer modulus by a non-constant (rounding down behavior).
+    // if (a % b < 0) op = a % b + b
+    // else           op = a % b
+    // This is ternary operation, c is a pre-computed value.
+    _imod,
 };
 
 std::string to_string(op_kind_t kind);
@@ -984,9 +1051,8 @@ class binary_op_t : public expr_impl_t {
 public:
     IR_DECL_EXPR_TYPE_ID(binary_op_t)
 
-    static expr_t make(op_kind_t op_kind, const expr_t &a, const expr_t &b,
-            type_t ty = type_t()) {
-        return expr_t(new binary_op_t(op_kind, a, b, ty));
+    static expr_t make(op_kind_t op_kind, const expr_t &a, const expr_t &b) {
+        return expr_t(new binary_op_t(op_kind, a, b));
     }
 
     bool is_equal(const object_impl_t &obj) const override {
@@ -1008,9 +1074,8 @@ public:
     expr_t b;
 
 private:
-    binary_op_t(op_kind_t op_kind, const expr_t &a, const expr_t &b, type_t ty)
-        : expr_impl_t(_type_info(),
-                (ty.is_undef()) ? binary_op_type(op_kind, a, b) : ty)
+    binary_op_t(op_kind_t op_kind, const expr_t &a, const expr_t &b)
+        : expr_impl_t(_type_info(), binary_op_type(op_kind, a, b))
         , op_kind(op_kind)
         , a(a)
         , b(b) {}
@@ -1073,7 +1138,7 @@ public:
         if (!obj.is<self_type>()) return false;
         auto &other = obj.as<self_type>();
 
-        return (type == other.type) && expr.is_equal(other.expr)
+        return type.is_equal(other.type) && expr.is_equal(other.expr)
                 && (saturate == other.saturate);
     }
 
@@ -1110,6 +1175,31 @@ private:
     }
 };
 
+// Constant variable, used as a coefficient in a linear expression.
+class const_var_t : public expr_impl_t {
+public:
+    IR_DECL_EXPR_TYPE_ID(const_var_t)
+
+    static expr_t make(const type_t &type, const std::string &name) {
+        return expr_t(new const_var_t(type, name));
+    }
+
+    bool is_equal(const object_impl_t &obj) const override {
+        // Do not allow variable cloning.
+        return this == &obj;
+    }
+
+    size_t get_hash() const override { return ir_utils::get_hash(name); }
+
+    IR_DECLARE_TRAVERSERS()
+
+    std::string name;
+
+private:
+    const_var_t(const type_t &type, const std::string &name)
+        : expr_impl_t(_type_info(), type), name(name) {}
+};
+
 // Floating-point immediate value.
 class float_imm_t : public expr_impl_t {
 public:
@@ -1124,7 +1214,7 @@ public:
         if (!obj.is<self_type>()) return false;
         auto &other = obj.as<self_type>();
 
-        return value == other.value;
+        return type.is_equal(other.type) && (value == other.value);
     }
 
     size_t get_hash() const override { return ir_utils::get_hash(value); }
@@ -1154,7 +1244,7 @@ public:
         if (!obj.is<self_type>()) return false;
         auto &other = obj.as<self_type>();
 
-        return value == other.value;
+        return type.is_equal(other.type) && (value == other.value);
     }
 
     size_t get_hash() const override { return ir_utils::get_hash(value); }
@@ -1225,6 +1315,59 @@ private:
         , cond(cond)
         , true_expr(true_expr)
         , false_expr(false_expr) {}
+};
+
+// Linear combination expression:
+//   u[0] * v[0] + u[1] * v[1] + ... u[n - 1] * v[n - 1] + c,
+// where:
+// - c/u[i] is either an integer immediate (int_imm_t) or a constant variable
+//  (const_var_t)
+// - v[i] is a non-constant variable (var_t)
+class linear_t : public expr_impl_t {
+public:
+    IR_DECL_EXPR_TYPE_ID(linear_t)
+    static expr_t make(const expr_t &c, const std::vector<expr_t> &u_vec,
+            const std::vector<expr_t> &v_vec) {
+        return expr_t(new linear_t(c, u_vec, v_vec));
+    }
+    static expr_t make(const expr_t &c) { return make(c, {}, {}); }
+    static expr_t make(const expr_t &c, const std::vector<expr_t> &v_vec) {
+        std::vector<expr_t> ones(v_vec.size(), expr_t(1));
+        return make(c, ones, v_vec);
+    }
+    static expr_t to_expr(const expr_t &c, const std::vector<expr_t> &u_vec,
+            const std::vector<expr_t> &v_vec) {
+        auto e = linear_t::make(c, u_vec, v_vec);
+        return e.as<linear_t>().to_expr();
+    }
+    int nargs() const { return int(v_vec.size()); }
+    expr_t to_expr() const;
+
+    bool is_equal(const object_impl_t &obj) const override {
+        if (!obj.is<self_type>()) return false;
+        auto &other = obj.as<self_type>();
+
+        return c.is_equal(other.c) && ir_utils::is_equal(u_vec, other.u_vec)
+                && ir_utils::is_equal(v_vec, other.v_vec);
+    }
+
+    size_t get_hash() const override {
+        return ir_utils::get_hash(c, u_vec, v_vec);
+    }
+
+    IR_DECLARE_TRAVERSERS()
+
+    expr_t c;
+    std::vector<expr_t> u_vec;
+    std::vector<expr_t> v_vec;
+
+private:
+    linear_t(const expr_t &c, const std::vector<expr_t> &u_vec,
+            const std::vector<expr_t> &v_vec)
+        : expr_impl_t(_type_info(), type_t::s32())
+        , c(c)
+        , u_vec(u_vec)
+        , v_vec(v_vec) {}
 };
 
 // Updates `base_expr` and `off` so that after return:
@@ -1498,8 +1641,8 @@ public:
     IR_DECL_EXPR_TYPE_ID(ternary_op_t)
 
     static expr_t make(op_kind_t op_kind, const expr_t &a, const expr_t &b,
-            const expr_t &c, type_t ty = type_t()) {
-        return expr_t(new ternary_op_t(op_kind, a, b, c, ty));
+            const expr_t &c) {
+        return expr_t(new ternary_op_t(op_kind, a, b, c));
     }
 
     bool is_equal(const object_impl_t &obj) const override {
@@ -1523,9 +1666,8 @@ public:
 
 private:
     ternary_op_t(op_kind_t op_kind, const expr_t &a, const expr_t &b,
-            const expr_t &c, type_t ty)
-        : expr_impl_t(_type_info(),
-                (ty.is_undef()) ? ternary_op_type(op_kind, a, b, c) : ty)
+            const expr_t &c)
+        : expr_impl_t(_type_info(), ternary_op_type(op_kind, a, b, c))
         , op_kind(op_kind)
         , a(a)
         , b(b)
@@ -1601,6 +1743,8 @@ expr_t to_expr(T value, const type_t &type) {
     if (type == type_t::ir_type()) return expr_t((cpp_type)value)
 
     CASE(_bool, bool);
+    CASE(bf16, bfloat16_t);
+    CASE(f16, float16_t);
     CASE(f32, float);
     CASE(f64, double);
     CASE(s16, int16_t);
@@ -1672,6 +1816,10 @@ T to_cpp(const expr_t &e) {
 
     ir_error_not_expected();
     return 0;
+}
+
+inline int to_int(const expr_t &e) {
+    return to_cpp<int>(e);
 }
 
 expr_t operator-(const expr_t &a);
@@ -1791,9 +1939,7 @@ public:
         return this == &obj;
     }
 
-    size_t get_hash() const override {
-        return std::hash<const self_type *>()(this);
-    }
+    size_t get_hash() const override { return 0; }
 
     std::shared_ptr<grf_permutation_t> grf_perm;
 
@@ -1819,9 +1965,7 @@ public:
         return this == &obj;
     }
 
-    size_t get_hash() const override {
-        return std::hash<const self_type *>()(this);
-    }
+    size_t get_hash() const override { return ir_utils::get_hash(buf_sizes); }
 
     // List of buffers accessed from instructions.
     std::vector<expr_t> bufs;

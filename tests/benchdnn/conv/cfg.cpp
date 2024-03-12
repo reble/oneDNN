@@ -112,6 +112,8 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
             {{dnnl_f32}, {-32, 32}},
             {{dnnl_bf16}, {-4, 4}},
             {{dnnl_f16}, {-4, 4}},
+            {{dnnl_f8_e5m2}, {-4, 4}},
+            {{dnnl_f8_e4m3}, {-4, 4}},
             {{dnnl_s8}, {-4, 4}},
             {{dnnl_u8}, {0, 8}},
     };
@@ -121,6 +123,8 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
             {{dnnl_f32}, {-32, 32}},
             {{dnnl_bf16}, {-4, 4}},
             {{dnnl_f16}, {-2, 2}},
+            {{dnnl_f8_e5m2}, {-2, 2}},
+            {{dnnl_f8_e4m3}, {-2, 2}},
             {{dnnl_s8}, {-4, 4}},
     };
 
@@ -129,6 +133,8 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
             {{dnnl_f32}, {-8, 8}},
             {{dnnl_bf16}, {-8, 8}},
             {{dnnl_f16}, {-8, 8}},
+            {{dnnl_f8_e5m2}, {-8, 8}},
+            {{dnnl_f8_e4m3}, {-8, 8}},
             {{dnnl_s8}, {-8, 8}},
             {{dnnl_u8}, {0, 8}},
             {{dnnl_s32}, {-8, 8}},
@@ -139,6 +145,8 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
             {{dnnl_f32}, {-8, 8}},
             {{dnnl_bf16}, {-4, 4}},
             {{dnnl_f16}, {-4, 4}},
+            {{dnnl_f8_e5m2}, {-4, 4}},
+            {{dnnl_f8_e4m3}, {-4, 4}},
             {{dnnl_s8}, {-4, 4}},
             {{dnnl_u8}, {0, 160}},
             {{dnnl_s32}, {-128, 128}},
@@ -153,120 +161,6 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
     }
     static cfg_t::cfg_entry_t::cfg_map_t dummy;
     return dummy;
-}
-
-std::string str2cfg(const char *str) {
-    std::string s;
-#define CASE(cfg) \
-    if (!strcasecmp(STRINGIFY(cfg), str)) return s = str, s
-    CASE(f16);
-    CASE(f32);
-    CASE(f32_wino);
-    CASE(f64);
-    CASE(u8s8f32);
-    CASE(u8s8f16);
-    CASE(u8s8bf16);
-    CASE(u8s8s32);
-    CASE(u8s8s8);
-    CASE(u8s8u8);
-    CASE(s8s8f32);
-    CASE(s8s8f16);
-    CASE(s8s8bf16);
-    CASE(s8s8s32);
-    CASE(s8s8s8);
-    CASE(s8s8u8);
-    CASE(bf16bf16f32);
-    CASE(bf16bf16f16);
-    CASE(bf16bf16s8);
-    CASE(bf16bf16u8);
-    CASE(bf16bf16bf16);
-    CASE(f32bf16bf16);
-    CASE(bf16f32bf16);
-    CASE(f32f32s8);
-    CASE(f32f32u8);
-    CASE(f16f16f32);
-    CASE(f16f16s8);
-    CASE(f16f16u8);
-    CASE(f32f16f16);
-    CASE(f16f32f16);
-#undef CASE
-    BENCHDNN_PRINT(0, "Config name \'%s\' is not supported.\n", str);
-    SAFE_V(CRIT);
-    return std::string();
-}
-
-int handle_legacy_cfg(
-        std::vector<dnnl_data_type_t> &dt, const std::string &cfg) {
-    BENCHDNN_PRINT(0, "%s\n",
-            "Warning: `--cfg=CFG` option is deprecated. Use `--dt=DT[:DT:DT] "
-            "instead.");
-
-    if (cfg == "f32")
-        dt = {dnnl_f32};
-    else if (cfg == "f32_wino")
-        dt = {dnnl_f32};
-    else if (cfg == "bf16bf16bf16")
-        dt = {dnnl_bf16};
-    else if (cfg == "f16")
-        dt = {dnnl_f16};
-    else if (cfg == "f64")
-        dt = {dnnl_f64};
-    else if (cfg == "u8s8f32")
-        dt = {dnnl_u8, dnnl_s8, dnnl_f32};
-    else if (cfg == "u8s8f16")
-        dt = {dnnl_u8, dnnl_s8, dnnl_f16};
-    else if (cfg == "u8s8bf16")
-        dt = {dnnl_u8, dnnl_s8, dnnl_bf16};
-    else if (cfg == "u8s8s32")
-        dt = {dnnl_u8, dnnl_s8, dnnl_s32};
-    else if (cfg == "u8s8s8")
-        dt = {dnnl_u8, dnnl_s8, dnnl_s8};
-    else if (cfg == "u8s8u8")
-        dt = {dnnl_u8, dnnl_s8, dnnl_u8};
-    else if (cfg == "s8s8f32")
-        dt = {dnnl_s8, dnnl_s8, dnnl_f32};
-    else if (cfg == "s8s8f16")
-        dt = {dnnl_s8, dnnl_s8, dnnl_f16};
-    else if (cfg == "s8s8bf16")
-        dt = {dnnl_s8, dnnl_s8, dnnl_bf16};
-    else if (cfg == "s8s8s32")
-        dt = {dnnl_s8, dnnl_s8, dnnl_s32};
-    else if (cfg == "s8s8s8")
-        dt = {dnnl_s8, dnnl_s8, dnnl_s8};
-    else if (cfg == "s8s8u8")
-        dt = {dnnl_s8, dnnl_s8, dnnl_u8};
-    else if (cfg == "f16f16f32")
-        dt = {dnnl_f16, dnnl_f16, dnnl_f32};
-    else if (cfg == "f16f16s8")
-        dt = {dnnl_f16, dnnl_f16, dnnl_s8};
-    else if (cfg == "f16f16u8")
-        dt = {dnnl_f16, dnnl_f16, dnnl_u8};
-    else if (cfg == "bf16bf16f32")
-        dt = {dnnl_bf16, dnnl_bf16, dnnl_f32};
-    else if (cfg == "bf16bf16f16")
-        dt = {dnnl_bf16, dnnl_bf16, dnnl_f16};
-    else if (cfg == "bf16bf16s8")
-        dt = {dnnl_bf16, dnnl_bf16, dnnl_s8};
-    else if (cfg == "bf16bf16u8")
-        dt = {dnnl_bf16, dnnl_bf16, dnnl_u8};
-    else if (cfg == "f32bf16bf16")
-        dt = {dnnl_f32, dnnl_bf16, dnnl_bf16};
-    else if (cfg == "f32f32s8")
-        dt = {dnnl_f32, dnnl_f32, dnnl_s8};
-    else if (cfg == "f32f32u8")
-        dt = {dnnl_f32, dnnl_f32, dnnl_u8};
-    else if (cfg == "bf16f32bf16")
-        dt = {dnnl_bf16, dnnl_f32, dnnl_bf16};
-    else if (cfg == "f32f16f16")
-        dt = {dnnl_f32, dnnl_f16, dnnl_f16};
-    else if (cfg == "f16f32f16")
-        dt = {dnnl_f16, dnnl_f32, dnnl_f16};
-    else {
-        BENCHDNN_PRINT(0, "Error: Config name \'%s\' is not supported.\n",
-                cfg.c_str());
-        return FAIL;
-    }
-    return OK;
 }
 
 } // namespace conv

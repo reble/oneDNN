@@ -16,10 +16,11 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/ocl/gen9_batch_normalization.hpp"
-#include "gpu/ocl/nhwc_batch_normalization.hpp"
-#include "gpu/ocl/ref_batch_normalization.hpp"
-#include "gpu/ocl/simple_bnorm.hpp"
+#include "gpu/ocl/bnorm/gen9_batch_normalization.hpp"
+#include "gpu/ocl/bnorm/nhwc_batch_normalization.hpp"
+#include "gpu/ocl/bnorm/ref_batch_normalization.hpp"
+#include "gpu/ocl/bnorm/reusable_bnorm.hpp"
+#include "gpu/ocl/bnorm/simple_bnorm.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -35,6 +36,7 @@ const std::map<pk_impl_key_t, std::vector<impl_list_item_t>>
         INSTANCE(ocl::nhwc_batch_normalization_fwd_t)
         INSTANCE(ocl::gen9_batch_normalization_fwd_t)
         INSTANCE(ocl::simple_batch_normalization_fwd_t)
+        INSTANCE(ocl::reusable_batch_normalization_fwd_t)
         INSTANCE(ocl::ref_batch_normalization_fwd_t)
         nullptr,
     }},
@@ -42,6 +44,7 @@ const std::map<pk_impl_key_t, std::vector<impl_list_item_t>>
         INSTANCE(ocl::nhwc_batch_normalization_bwd_t)
         INSTANCE(ocl::gen9_batch_normalization_bwd_t)
         INSTANCE(ocl::simple_batch_normalization_bwd_t)
+        INSTANCE(ocl::reusable_batch_normalization_bwd_t)
         INSTANCE(ocl::ref_batch_normalization_bwd_t)
         nullptr,
     })},

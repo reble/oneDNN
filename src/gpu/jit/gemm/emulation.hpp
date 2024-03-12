@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -45,12 +45,13 @@ struct EmulationStrategy {
         if (hw_ >= HW::Gen11) emulateDWxDW = true;
         if (hw_ == HW::Gen12LP) emulate64 = true;
         if (hw_ == HW::XeHPG) emulate64 = true;
-        if (hw_ == HW::XeHPC) {
-            if (stepping >= SteppingPVCXTB0)
-                emulate64_mul = emulate64_logic = true;
-            else
+        if (hw_ >= HW::XeHPC) {
+            if (hw_ == HW::XeHPC && stepping < SteppingPVCXTB0)
                 emulate64 = noemulate64_shift = true;
+            else
+                emulate64_mul = emulate64_logic = true;
         }
+        emulate64_mul |= emulate64;
     }
 };
 
@@ -191,9 +192,33 @@ struct EmulationImplementation {
         return uint16_t(static_cast<uint64_t>(in) & 0xffff);
     }
 
+    static ngen::RegData highWord(ngen::RegData in) {
+        auto out = lowWord(in);
+        out.setOffset(out.getOffset() + 1);
+        return out;
+    }
+
+    static ngen::Immediate highWord(const ngen::Immediate &in) {
+        return uint16_t(static_cast<uint64_t>(in) >> 16);
+    }
+
     static bool isUnitStride(const ngen::RegData &rd) {
         return (rd.getHS() == 1 && rd.getVS() == rd.getWidth());
     }
+
+    static void regionVSAdvance(ngen::HW hw, ngen::RegData &rd, int i) {
+        int ne = ngen::GRF::bytes(hw) / rd.getBytes();
+        int advance = rd.getWidth() > 0 ? (i / rd.getWidth()) * rd.getVS()
+                                        : i * rd.getHS();
+        int noffset = rd.getOffset() + advance;
+        if (noffset >= ne) {
+            noffset--;
+            rd.setBase(rd.getBase() + 1);
+        }
+        rd.setOffset(noffset);
+    }
+
+    static void regionVSAdvance(ngen::HW hw, ngen::Immediate &imm, int i) {}
 
     // Move, emulating 64-bit moves with 32-bit (generally a good idea).
     template <typename DT = void, typename Generator>
@@ -539,8 +564,7 @@ struct EmulationImplementation {
         bool s1Signed = isSigned(src1.getType());
         auto mulHiType = (s0Signed || s1Signed) ? DataType::d : DataType::ud;
 
-        bool emulate64 = strategy.emulate64;
-        emulate64 |= strategy.emulate64_mul;
+        bool emulate64 = strategy.emulate64_mul;
 
         if (s0Q || s1Q) {
             stub();
@@ -575,16 +599,29 @@ struct EmulationImplementation {
             g.mov(mod, dstHi, dstLo);
             g.mov(mod, dstLo, acc);
         } else if (dstD && s0D && s1D && strategy.emulateDWxDW) {
-            auto acc = g.acc0.retype(mulHiType)[dst.getOffset()](dst.getHS());
-            auto dummy = g.null.retype(mulHiType)[dst.getOffset()](dst.getHS());
+            int ne1 = ngen::GRF::bytes(g.hardware) >> 2;
 
-            g.mul(mod, acc, src0, lowWord(src1));
+            for (int r = 0; r < mod.getExecSize(); r += ne1) {
+                auto mmod = mod;
+                mmod.setExecSize(std::min(mod.getExecSize() - r, ne1));
 
-            if (g.hardware < HW::Gen10) {
-                g.mach(mod, dummy, src0, src1);
-                g.mov(mod, dst, acc);
-            } else {
-                g.macl(mod, dst, src0, src1);
+                auto acc = g.acc0.retype(mulHiType)[dst.getOffset()](
+                        dst.getHS());
+                auto dummy = g.null.retype(mulHiType)[dst.getOffset()](
+                        dst.getHS());
+
+                g.mul(mmod, acc, src0, lowWord(src1));
+
+                if (g.hardware < HW::Gen10) {
+                    g.mach(mmod, dummy, src0, src1);
+                    g.mov(mmod, dst, acc);
+                } else {
+                    g.macl(mmod, dst, src0, src1);
+                }
+
+                regionVSAdvance(g.hardware, dst, ne1);
+                regionVSAdvance(g.hardware, src0, ne1);
+                regionVSAdvance(g.hardware, src1, ne1);
             }
         } else
             g.mul(mod, dst, src0, src1);

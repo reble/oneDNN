@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@
 #include <compiler/ir/builder.hpp>
 #include <compiler/ir/graph/fusible_op.hpp>
 #include <compiler/ir/graph/fusible_op_utils.hpp>
-#include <compiler/ir/graph/fusion_mgr.hpp>
 #include <unordered_map>
 #include <util/utils.hpp>
 
@@ -94,7 +93,7 @@ static slice_range_list infer_broadcast_slice(slice_range_list known_range_list,
         COMPILE_ASSERT(known_range.size() == bc_dim.size()
                         || bc_axis == std::vector<int> {-1},
                 "Unexpected cases found")
-        for (size_t j = 0; j < known_range.size(); j++) {
+        for (size_t j = 0; j < bc_dim.size(); j++) {
             if (bc_axis.end() != std::find(bc_axis.begin(), bc_axis.end(), j)) {
                 bc_range_list[i].emplace_back(known_range.at(j));
             } else if (bc_dim.size() != 1) {
@@ -128,9 +127,9 @@ static slice_range_list infer_broadcast_arg_slice(
     return bc_arg_range_list;
 }
 
-static bound_axis infer_broadcast_axis_binding(
-        bound_axis known_axis_list, const std::vector<int> &bc_axis) {
-    bound_axis bc_axis_list(known_axis_list.size());
+static binding_axis infer_broadcast_axis_binding(
+        binding_axis known_axis_list, const std::vector<int> &bc_axis) {
+    binding_axis bc_axis_list(known_axis_list.size());
     for (size_t i = 0; i < bc_axis_list.size(); i++) {
         auto &known_ax = known_axis_list[i];
         for (size_t j = 0; j < known_ax.size(); j++) {
@@ -141,9 +140,9 @@ static bound_axis infer_broadcast_axis_binding(
     return bc_axis_list;
 }
 
-static bound_axis infer_broadcast_arg_axis_binding(
-        bound_axis known_axis_list, const std::vector<int> &bc_axis) {
-    bound_axis bc_arg_axis_list(known_axis_list.size());
+static binding_axis infer_broadcast_arg_axis_binding(
+        binding_axis known_axis_list, const std::vector<int> &bc_axis) {
+    binding_axis bc_arg_axis_list(known_axis_list.size());
     for (size_t i = 0; i < bc_arg_axis_list.size(); i++) {
         auto &known_ax = known_axis_list[i];
         for (size_t j = 0; j < known_ax.size(); j++) {
@@ -186,7 +185,9 @@ select_op_t::select_op_t(const std::vector<graph_tensor_ptr> &ins,
     } else {
         info_.outputs_ = outs;
     }
-    COMPILE_ASSERT(info_.outputs_[0]->details_.get_plain_dims() == output_shape,
+    COMPILE_ASSERT(
+            gc::graph::check_shape_equal(
+                    info_.outputs_[0]->details_.get_plain_dims(), output_shape),
             "Select op's output doesn't have the correct shape");
 
     attrs_ = attrs;
@@ -284,15 +285,13 @@ void select_op_t::query_format(context_ptr ctx,
 
 // The logic below might be suitable for most fusible op, which has same
 // slice ranges on inputs and outputs
-void select_op_t::infer_slice_ranges(
-        fslice_map &fsmap, infer_status_map_t &stat_map) {
+infer_status_code select_op_t::infer_slice_ranges(
+        const context_ptr &ctx, fslice_map &fsmap) {
     COMPILE_ASSERT(
             get_inputs().size() == 3, "Select op is expected to have 3 inputs");
     // search known ranges from any input of cur fusbile op
-    slice_range_map known_ranges_map
-            = search_known_slice_ranges(this, fsmap, stat_map);
-    if (known_ranges_map.empty()) return;
-    auto &outslice = fsmap.get(get_outputs()[0]);
+    slice_range_map known_ranges_map = search_known_input_slice(this, fsmap);
+    if (known_ranges_map.empty()) return infer_status_code::RETRY;
     // if unkown slice ranges exist.
     int maxtensor_idx = get_ref_input_index(true);
     if (known_ranges_map.size() < get_inputs().size()) {
@@ -348,12 +347,6 @@ void select_op_t::infer_slice_ranges(
                     known_ranges_map[remaining_idx] = bc_range_list;
                 }
             }
-            // set the other unknown slice range by achieved
-            // known_ranges_list
-            set_unknown_slice_ranges(this, known_ranges_map, fsmap, stat_map);
-            // set outputs slice range
-            outslice = known_ranges_map[maxtensor_idx];
-            return;
         } else {
             auto it = std::find(known_idx.begin(), known_idx.end(), 1);
             COMPILE_ASSERT(it != known_idx.end(), "No known idx found.");
@@ -365,17 +358,19 @@ void select_op_t::infer_slice_ranges(
             }
         }
         // set the other unknown slice range by achieved known_ranges_list
-        set_unknown_slice_ranges(this, known_ranges_map, fsmap, stat_map);
+        set_unknown_input_slice(this, known_ranges_map, fsmap);
     }
     // set outputs slice range
+    auto &outslice = fsmap.get(get_outputs()[0]);
     outslice = known_ranges_map[maxtensor_idx > -1 ? maxtensor_idx : 1];
+    return infer_status_code::OK;
 }
 
-void select_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
+void select_op_t::infer_binding_axis(binding_axis_map &bdax_map) {
     COMPILE_ASSERT(
             get_inputs().size() == 3, "Select op is expected to have 3 inputs");
     // search known axis from any input of cur fusbile op
-    auto known_axis_map = search_known_bound_axis(this, bdax_map);
+    auto known_axis_map = search_known_input_axis(this, bdax_map);
     if (!bdax_map.get(get_outputs()[0]).empty()) return;
 
     // if unkown slice ranges exist.
@@ -404,7 +399,7 @@ void select_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
                                             == sc_dims {1},
                                     "Select op's infer binding axis "
                                     "encountered unaligned input shapes.");
-                            bound_axis bc_arg_axis_list(
+                            binding_axis bc_arg_axis_list(
                                     known_axis_map[maxtensor_idx].size());
                             known_axis_map[i] = bc_arg_axis_list;
                         }
@@ -465,7 +460,7 @@ void select_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
                                         == sc_dims {1},
                                 "Select op's infer binding axis encountered "
                                 "unaligned input shapes.");
-                        bound_axis bc_arg_axis_list(
+                        binding_axis bc_arg_axis_list(
                                 known_axis_map[maxtensor_idx].size());
                         known_axis_map[remaining_idx] = bc_arg_axis_list;
                     }
@@ -487,10 +482,10 @@ void select_op_t::infer_binding_axis(bound_axis_map &bdax_map) {
     bdax_map.get(get_outputs()[0])
             = known_axis_map[maxtensor_idx > -1 ? maxtensor_idx : 1];
     // set the other unknown axis binding by achieved known_axis_map
-    set_unknown_axis_binding(this, known_axis_map, bdax_map);
+    set_unknown_binding_axis(this, known_axis_map, bdax_map);
 }
 
-void select_op_t::pre_binding_axis(bound_axis_map &bdax_map) {}
+void select_op_t::pre_infer_binding_axis(binding_axis_map &bdax_map) {}
 
 std::vector<int> select_op_t::get_bc_axis(
         const int axis1, const int axis2) const {
@@ -554,7 +549,7 @@ void compute_block_select(const context_ptr &ctx,
         sc_op_info_t &info, const int maxtensor_idx,
         const std::vector<std::vector<int>> &blocking_bc_axis,
         const vectorized_info_t &vx_info, const mask_compute_func_t &compute,
-        sc_data_type_t dtype = datatypes::f32, size_t wkld = 0UL) {
+        const graph_tensor_ptr &expand_gt, size_t wkld = 0UL) {
     bool use_vectorize = false;
     vec_backend_require(ctx, use_vectorize);
     // nested loop vars
@@ -707,6 +702,7 @@ void compute_block_select(const context_ptr &ctx,
                     cur = make_stmt<for_loop_node_t>(iter_vars.at(i), expr(0),
                             expr(floor), expr(int(vx_info.lanes)), cur, true,
                             for_type::NORMAL);
+                    bind_loop_axis(expand_gt, cur, i, true);
                 }
                 tcur.emplace_back(cur);
             }
@@ -763,6 +759,7 @@ void compute_block_select(const context_ptr &ctx,
                 cur = make_stmt<for_loop_node_t>(tail_var, expr(floor),
                         slice_len, use_scalar ? expr(1) : lanes,
                         bld->pop_scope(), true, for_type::NORMAL);
+                bind_loop_axis(expand_gt, cur, i, true);
                 tcur.emplace_back(cur);
             }
         } else if (iter_vars.at(i).isa<var>()) {
@@ -812,6 +809,7 @@ void compute_block_select(const context_ptr &ctx,
                         dst.get_shape().at(i), expr(1), bld->pop_scope(), true,
                         for_type::NORMAL);
             }
+            bind_loop_axis(expand_gt, cur, i, true);
         }
     }
     if (!tcur.empty() && tcur[0].defined()) {
@@ -864,15 +862,14 @@ void select_op_t::compute_block(context_ptr ctx,
     }
     compute_block_select(ctx, inputs, *dst[0], info_, maxtensor_idx,
             blocking_bc_axis, vx_info_, mask_compute_func_t(func),
-            info_.outputs_[0]->details_.dtype_, wkld);
+            get_outputs()[0], wkld);
 }
 
 // Pure virtual function in fusible_op_t class.
-void select_op_t::pre_slice_ranges(
-        fslice_map &fsmap, infer_status_map_t &stat_map) {}
-
-// Pure virtual function in fusible_op_t class.
-void select_op_t::prepare_fusion_data(fdata_map &fdmap) {}
+infer_status_code select_op_t::pre_infer_slice_ranges(
+        const context_ptr &ctx, fslice_map &fsmap) {
+    throw std::runtime_error("Not implemented");
+}
 
 OP_REGISTER(select_op_t, select)
 

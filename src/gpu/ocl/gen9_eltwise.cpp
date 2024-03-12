@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include <algorithm>
 
 #include "gpu/ocl/gen9_eltwise.hpp"
+#include "gpu/primitive_conf.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -74,14 +75,7 @@ compute::kernel_ctx_t gen9_eltwise_jit_params_t::get_kernel_ctx() const {
 
     kernel_ctx.define_int("NELEMS_OVERFLOW", with_overflow);
 
-    // attribute for wg-size and subgroup-size
-    kernel_ctx.define_int("GWS_WITH_SG_DEFAULT", 1);
-    // wg-size
-    kernel_ctx.define_int("GWS_LWS0_DEFAULT", work_group_size);
-    kernel_ctx.define_int("GWS_LWS1_DEFAULT", 1);
-    kernel_ctx.define_int("GWS_LWS2_DEFAULT", 1);
-    // subgroup-size
-    kernel_ctx.define_int("GWS_SGS_DEFAULT", sub_group_size);
+    kernel_ctx.define_int("SIMD", sub_group_size);
 
     return kernel_ctx;
 }
@@ -113,8 +107,9 @@ status_t gen9_eltwise_fwd_t::execute_forward_dense(
     arg_list.set(3, alpha);
     arg_list.set(4, beta);
 
-    dim_t lws = conf.work_group_size;
-    dim_t total_wi = utils::div_up(nelems, conf.vector_size);
+    size_t lws = gpu_utils::into<size_t>(conf.work_group_size);
+    size_t total_wi
+            = gpu_utils::into<size_t>(utils::div_up(nelems, conf.vector_size));
     compute::nd_range_t nd_range({utils::rnd_up(total_wi, lws)}, {lws});
 
     status = parallel_for(ctx, nd_range, kernel_, arg_list);
@@ -162,8 +157,9 @@ status_t gen9_eltwise_bwd_t::execute_backward_dense(
     arg_list.set(4, alpha);
     arg_list.set(5, beta);
 
-    dim_t lws = conf.work_group_size;
-    dim_t total_wi = utils::div_up(nelems, conf.vector_size);
+    size_t lws = gpu_utils::into<size_t>(conf.work_group_size);
+    size_t total_wi
+            = gpu_utils::into<size_t>(utils::div_up(nelems, conf.vector_size));
     compute::nd_range_t nd_range({utils::rnd_up(total_wi, lws)}, {lws});
 
     status = parallel_for(ctx, nd_range, kernel_, arg_list);

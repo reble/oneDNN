@@ -21,6 +21,7 @@
 #include <compiler/ir/graph/lowering.hpp>
 #include <compiler/ir/graph/pass/pass.hpp>
 #include <compiler/ir/ir_comparer.hpp>
+#include <compiler/ir/ir_utils.hpp>
 #include <compiler/ir/transform/concat_memory_planning.hpp>
 #include <compiler/ir/transform/index_flatten.hpp>
 #include <compiler/jit/jit.hpp>
@@ -42,7 +43,6 @@ static void ir_compare_test_on_graph(
     REQUIRE_AVX2();
     SET_THREADS_OR_SKIP(16);
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.concat_optimization_ = true;
     builder::ir_builder_t bld;
     auto graph = graph_builder();
@@ -72,7 +72,6 @@ static void accuracy_test_on_graph(
     REQUIRE_AVX2();
     SET_THREADS_OR_SKIP(56);
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     builder::ir_builder_t bld;
     sc_graph_t graph0 = graph_builder();
     sc_graph_t graph1 = graph_builder();
@@ -160,7 +159,6 @@ static const int D = 32;
 TEST(GCCore_CPU_concat_optimization_cpp, MergeConsecutiveConcats) {
     SET_THREADS_OR_SKIP(16);
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     builder::ir_builder_t bld;
 
     sc_graph_t graph0;
@@ -786,4 +784,78 @@ static sc_graph_t build_concats_standalone_and_in_one_partition() {
 
 TEST(GCCore_CPU_concat_optimization_cpp, StandaloneAndInOnePartitionConcats) {
     accuracy_test_on_graph(build_concats_standalone_and_in_one_partition);
+}
+
+// Both standalone and fused concats exist in this simple graph with one graph
+// output as another concat input. Check ir to see if the vectorization and
+// memory optimization can co-work.
+static sc_graph_t build_concats_standalone_and_in_one_partition2() {
+    static const int A = 1, B = 28, C = 28, D = 32;
+    sc_graph_t graph0;
+    auto in0 = graph0.make_input({graph_tensor::make({A, B, C, D},
+            sc_data_format_t(format_kinds::ABCD), datatypes::f32)});
+    auto in1 = graph0.make_input({graph_tensor::make({A, B, C, D},
+            sc_data_format_t(format_kinds::ABCD), datatypes::f32)});
+    auto add0 = graph0.make(
+            "add", {in0->get_outputs()[0], in0->get_outputs()[0]}, {}, {});
+    auto relu1 = graph0.make("relu", {add0->get_outputs()[0]}, {}, {});
+    auto concat2 = graph0.make("concat",
+            {in1->get_outputs()[0], relu1->get_outputs()[0]}, {},
+            {{"axis", 2}});
+    // concat2 output: [A, B, C*2, D]
+    auto relu3 = graph0.make("relu", {concat2->get_outputs()[0]}, {}, {});
+    auto concat4 = graph0.make("concat",
+            {concat2->get_outputs()[0], relu3->get_outputs()[0]}, {},
+            {{"axis", 2}, {op_attr_key::break_pre_fuse, true},
+                    {op_attr_key::break_post_fuse, true}});
+    // concat4 output: [A, B, C*4, D], standalone
+    auto relu5 = graph0.make("relu", {concat4->get_outputs()[0]}, {}, {});
+    auto out = graph0.make_output(relu5->get_outputs());
+    auto out2 = graph0.make_output(relu3->get_outputs());
+    return graph0;
+}
+
+TEST(GCCore_CPU_concat_optimization_cpp, StandaloneAndInOnePartitionConcats2) {
+    REQUIRE_AVX2();
+    SET_THREADS_OR_SKIP(56);
+
+    accuracy_test_on_graph(build_concats_standalone_and_in_one_partition2);
+
+    auto ctx = std::make_shared<context_t>(*get_test_ctx());
+    builder::ir_builder_t bld;
+    sc_graph_t graph = build_concats_standalone_and_in_one_partition2();
+
+    std::vector<sc_op_ptr> graph_args;
+    for (auto &op : graph.get_input_ops()) {
+        graph_args.push_back(op);
+    }
+    for (auto &op : graph.get_output_ops()) {
+        graph_args.push_back(op);
+    }
+    ctx->flags_.concat_optimization_ = true;
+    graph_driver(graph, ctx);
+    ir_module_ptr f = lower_graph(ctx, graph, graph_args);
+
+    concat_memory_planning_t pass;
+    auto f_opt = pass(f);
+    auto main_entry = f_opt->get_entry_func();
+
+    for (auto &stmt : main_entry->body_.checked_as<stmts>()->seq_) {
+        if (stmt.isa<evaluate_c>()) {
+            auto call = stmt.checked_as<evaluate_c>()
+                                ->value_.checked_as<call_c>();
+            if (is_standalone_concat_call(call)) {
+                for (auto &arg : call->args_) {
+                    auto &dims = arg.checked_as<tensor_c>()->dims_;
+                    auto &strides = arg.checked_as<tensor>()->strides_;
+                    auto expected_strides = dims_to_dense_stride(dims);
+                    EXPECT_EQ(strides.size(), expected_strides.size());
+                    for (size_t i = 0; i < strides.size(); ++i) {
+                        EXPECT_EQ(get_expr_as_int(strides[i]),
+                                get_expr_as_int(expected_strides[i]));
+                    }
+                }
+            }
+        }
+    }
 }

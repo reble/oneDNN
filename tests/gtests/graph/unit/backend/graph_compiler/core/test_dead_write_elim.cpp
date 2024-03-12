@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,7 +50,11 @@ class dep_printer_t : public ir_viewer_t {
 } // namespace ut
 
 static std::shared_ptr<stmt_base_t> get_builder_top() {
-    return builder::get_current_builder()->get_current_scope().body.back().impl;
+    return builder::get_current_builder()
+            ->get_current_scope()
+            .as_seq()
+            .back()
+            .impl;
 }
 
 static void check_dep(const std::shared_ptr<stmt_base_t> &ptr,
@@ -161,6 +165,8 @@ TEST(GCCore_CPU_dead_write_elimination, TestDWE) {
             C[0] = 1.0f;
             // constant index, required by the code after the loop
             C[2] = 1.0f;
+            // constant index, overlap with SIMD load
+            C[5] = 1.0f;
         }
         _for_(i, 0, 100) {
             _var_(t, datatypes::f32);
@@ -168,7 +174,7 @@ TEST(GCCore_CPU_dead_write_elimination, TestDWE) {
             t = t + 1;
             E[i] = t;
         }
-        _return_(C[2]);
+        _return_(C[2] + builder::make_reduce_add(C[span_t {{4}, 4}]));
     }
     dead_write_eliminator_t dwe;
     auto out = dwe(ccc);
@@ -197,6 +203,8 @@ TEST(GCCore_CPU_dead_write_elimination, TestDWE) {
             builder.push_scope();
             builder.emit(builder.pop_scope());
             C[2] = 1.0f;
+            // constant index, overlap with SIMD load
+            C[5] = 1.0f;
         }
         _for_(i, 0, 100) {
             _var_(t, datatypes::f32);
@@ -205,7 +213,7 @@ TEST(GCCore_CPU_dead_write_elimination, TestDWE) {
             builder.push_scope();
             builder.emit(builder.pop_scope());
         }
-        _return_(C[2]);
+        _return_(C[2] + builder::make_reduce_add(C[span_t {{4}, 4}]));
     }
     ir_comparer cmper;
     EXPECT_TRUE(cmper.compare(out, expected));

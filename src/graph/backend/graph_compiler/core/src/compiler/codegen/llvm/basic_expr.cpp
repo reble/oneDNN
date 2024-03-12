@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "compiler/ir/attr_keys.hpp"
 #include "shared_include.hpp"
 #include "util/fp16.hpp"
 
@@ -36,6 +37,13 @@ void codegen_llvm_vis_t::generate_bin_op(
     auto cate = get_etype_category_nothrow(l->dtype_.type_code_);
     auto lhs = generate_expr(l);
     auto rhs = generate_expr(r);
+    auto original_fmf = builder_.getFastMathFlags();
+    if (!any_map_t::fetch_or_else(v->attr_.get(), attr_keys::fast_math, true)) {
+        FastMathFlags fmflag;
+        fmflag.setFast(false);
+        fmflag.setAllowContract(false);
+        builder_.setFastMathFlags(fmflag);
+    }
 #define HANDLE_BIN_OP2(scname, intname, fpname, case_other) \
     case sc_expr_type::scname: \
         switch (cate) { \
@@ -107,6 +115,7 @@ void codegen_llvm_vis_t::generate_bin_op(
             break;
         default: assert(0);
     }
+    builder_.setFastMathFlags(original_fmf);
 }
 
 void codegen_llvm_vis_t::view(binary_c v) {
@@ -214,6 +223,7 @@ void codegen_llvm_vis_t::view(cast_c v) {
         COMPILE_ASSERT(
                 v->dtype_ == datatypes::generic, "Unexpected outtype " << v);
     };
+
     if (v->in_->dtype_.is_etype(sc_data_etype::F32)
             && v->dtype_.is_etype(sc_data_etype::BF16)) {
 #if SC_LLVM_BACKEND > 10
@@ -315,9 +325,13 @@ void codegen_llvm_vis_t::view(cast_c v) {
                     current_val_ = builder_.CreateZExtOrTrunc(in_v, outtype);
                     break;
                 case CATE_OTHER: {
-                    check_cate();
-                    current_val_ = builder_.CreateZExtOrBitCast(
-                            in_v, builder_.getInt64Ty());
+                    if (v->dtype_.is_pointer()) {
+                        current_val_ = builder_.CreateIntToPtr(in_v, outtype);
+                    } else {
+                        check_cate();
+                        current_val_ = builder_.CreateZExtOrBitCast(
+                                in_v, builder_.getInt64Ty());
+                    }
                 } break;
             }
         } break;
@@ -346,8 +360,8 @@ void codegen_llvm_vis_t::view(cast_c v) {
                     // pointer to pointer
                     current_val_ = builder_.CreatePointerCast(in_v, outtype);
                 } else {
-                    // pointer to generic val
-                    check_cate();
+                    // pointer to generic val or uint64
+                    if (v->dtype_ != datatypes::index) { check_cate(); }
                     current_val_ = builder_.CreatePtrToInt(
                             in_v, builder_.getInt64Ty());
                 }

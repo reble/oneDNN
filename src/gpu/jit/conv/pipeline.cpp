@@ -825,7 +825,7 @@ public:
 // buffers.
 class sbid_manager_t {
 public:
-    sbid_manager_t(ngen::HW hw = ngen::HW::Unknown)
+    sbid_manager_t(const hw_t &hw = hw_t())
         : sbid_count_(hw >= ngen::HW::XeHPC ? 32 : 16)
         , tuple_func_(builtin_t::make("tuple")) {}
 
@@ -879,7 +879,7 @@ private:
 // Helper to assign SBIDs to IR function calls.
 class sbid_assigner_t {
 public:
-    sbid_assigner_t(ngen::HW hw) : local_sbid_mgr_(hw) {}
+    sbid_assigner_t(const hw_t &hw) : local_sbid_mgr_(hw) {}
 
     sbid_assigner_t(sbid_manager_t &external_sbid_mgr)
         : external_sbid_mgr_(&external_sbid_mgr) {}
@@ -1447,9 +1447,9 @@ public:
         }
 
         if (assign_sbids(cfg_))
-            loop = sbid_assigner_t(ir_ctx_.hw_cfg().hw()).assign(loop);
+            loop = sbid_assigner_t(ir_ctx_.hw()).assign(loop);
 
-        const auto grf_size = ir_ctx_.hw_cfg().grf_size();
+        const auto grf_size = ir_ctx_.hw().grf_size();
         loop = alloc_t::make(slm_idx_buf, grf_size, alloc_kind_t::grf, loop);
 
         alloc_updater_t alloc_updater;
@@ -1568,7 +1568,7 @@ public:
         };
 
         bmnk_dim_helper_t h(cfg_);
-        int k_iter_blk = h.iter_dim(gemm_dims::k);
+        int k_iter_blk = h.iter_dim(prb_dims::k);
         int reduce_iter_bytes = k_iter_blk * cfg_.prb().a_data_type_size;
         // Add periodic signal-wait thread group synchronization in some cases.
         // This is to ensure threads access close reduction blocks and able to

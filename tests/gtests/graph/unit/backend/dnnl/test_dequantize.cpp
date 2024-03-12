@@ -24,7 +24,7 @@
 namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 
-TEST(Execute, DequantizePerTensor) {
+TEST(test_dequantize_execute, DequantizePerTensor) {
     graph::engine_t *engine = get_engine();
     std::vector<float> scales = {1.f, 0.1f};
     std::vector<int64_t> zps = {0, 10};
@@ -38,13 +38,13 @@ TEST(Execute, DequantizePerTensor) {
         dequantize.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
         dequantize.set_attr<int64_t>(graph::op_attr::axis, 0);
 
-        test::vector<uint8_t> src {0, 10, 20, 30};
-        test::vector<float> dst(src.size(), 0);
+        std::vector<uint8_t> src {0, 10, 20, 30};
+        std::vector<float> dst(src.size(), 0);
 
         // f32 = scales * (int8 - zero_points)
-        test::vector<float> ref_dst = zp == 0
-                ? test::vector<float> {0.0, 10.0, 20.0, 30.0}
-                : test::vector<float> {-10.0, 0.0, 10.0, 20.0};
+        std::vector<float> ref_dst = zp == 0
+                ? std::vector<float> {0.0, 10.0, 20.0, 30.0}
+                : std::vector<float> {-10.0, 0.0, 10.0, 20.0};
         for (size_t i = 0; i < ref_dst.size(); i++)
             ref_dst[i] *= scale;
         // prepare input/output logical tensor
@@ -60,7 +60,7 @@ TEST(Execute, DequantizePerTensor) {
         g.add_op(&dequantize);
         g.finalize();
 
-        graph::pass::pass_base_ptr apass = get_pass("dequant_pass");
+        graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -78,19 +78,21 @@ TEST(Execute, DequantizePerTensor) {
         cp.query_logical_tensor(dst_lt.id, &lt);
         ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-        graph::tensor_t src_ts(src_lt, engine, src.data());
-        graph::tensor_t dst_ts(dst_lt, engine, dst.data());
+        test_tensor src_ts(src_lt, engine, src);
+        test_tensor dst_ts(dst_lt, engine, dst);
 
         graph::stream_t *strm = get_stream();
-        ASSERT_EQ(cp.execute(strm, {src_ts}, {dst_ts}), graph::status::success);
+        ASSERT_EQ(cp.execute(strm, {src_ts.get()}, {dst_ts.get()}),
+                graph::status::success);
         strm->wait();
+        dst = dst_ts.as_vec_type<float>();
         for (size_t i = 0; i < dst.size(); ++i) {
             ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
         }
     }
 }
 
-TEST(Execute, DequantizePerTensorAnyLayout) {
+TEST(test_dequantize_execute, DequantizePerTensorAnyLayout) {
     graph::engine_t *engine = get_engine();
 
     graph::op_t dequantize(graph::op_kind::Dequantize);
@@ -100,13 +102,13 @@ TEST(Execute, DequantizePerTensorAnyLayout) {
     dequantize.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
     dequantize.set_attr<int64_t>(graph::op_attr::axis, 0);
 
-    test::vector<uint8_t> src {0, 10, 20, 30};
-    test::vector<float> dst(src.size(), 0);
+    std::vector<uint8_t> src {0, 10, 20, 30};
+    std::vector<float> dst(src.size(), 0);
 
     // f32 = scales * (int8 - zero_points)
-    test::vector<float> ref_dst = engine->kind() == graph::engine_kind::gpu
-            ? test::vector<float> {0.0, 1.0, 2.0, 3.0}
-            : test::vector<float> {-1.0, 0.0, 1.0, 2.0};
+    std::vector<float> ref_dst = engine->kind() == graph::engine_kind::gpu
+            ? std::vector<float> {0.0, 1.0, 2.0, 3.0}
+            : std::vector<float> {-1.0, 0.0, 1.0, 2.0};
 
     // prepare input/output logical tensor
     graph::logical_tensor_t src_lt
@@ -121,7 +123,7 @@ TEST(Execute, DequantizePerTensorAnyLayout) {
     g.add_op(&dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -138,18 +140,21 @@ TEST(Execute, DequantizePerTensorAnyLayout) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    graph::tensor_t src_ts(src_lt, engine, src.data());
-    graph::tensor_t dst_ts(dst_lt, engine, dst.data());
+    test_tensor src_ts(src_lt, engine, src);
+    test_tensor dst_ts(lt, engine, dst);
 
     graph::stream_t *strm = get_stream();
-    ASSERT_EQ(cp.execute(strm, {src_ts}, {dst_ts}), graph::status::success);
+
+    ASSERT_EQ(cp.execute(strm, {src_ts.get()}, {dst_ts.get()}),
+            graph::status::success);
     strm->wait();
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, DequantizePerChannelSymmetric) {
+TEST(test_dequantize_execute, DequantizePerChannelSymmetric) {
     graph::engine_t *engine = get_engine();
 
     graph::op_t dequantize(graph::op_kind::Dequantize);
@@ -159,11 +164,11 @@ TEST(Execute, DequantizePerChannelSymmetric) {
     dequantize.set_attr<std::string>(graph::op_attr::qtype, "per_channel");
     dequantize.set_attr<int64_t>(graph::op_attr::axis, 1);
 
-    test::vector<int8_t> src {0, 10, 20, 30};
-    test::vector<float> dst(src.size(), 0);
+    std::vector<int8_t> src {0, 10, 20, 30};
+    std::vector<float> dst(src.size(), 0);
 
     // f32 = scales * int8
-    test::vector<float> ref_dst {0.0, 1, 4, 6};
+    std::vector<float> ref_dst {0.0, 1, 4, 6};
 
     // prepare input/output logical tensor
     graph::logical_tensor_t src_lt
@@ -178,7 +183,7 @@ TEST(Execute, DequantizePerChannelSymmetric) {
     g.add_op(&dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -195,18 +200,20 @@ TEST(Execute, DequantizePerChannelSymmetric) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    graph::tensor_t src_ts(src_lt, engine, src.data());
-    graph::tensor_t dst_ts(dst_lt, engine, dst.data());
+    test_tensor src_ts(src_lt, engine, src);
+    test_tensor dst_ts(dst_lt, engine, dst);
 
     graph::stream_t *strm = get_stream();
-    ASSERT_EQ(cp.execute(strm, {src_ts}, {dst_ts}), graph::status::success);
+    ASSERT_EQ(cp.execute(strm, {src_ts.get()}, {dst_ts.get()}),
+            graph::status::success);
     strm->wait();
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, DynamicDequantizeS32ZpsPerTensor) {
+TEST(test_dequantize_execute, DynamicDequantizeS32ZpsPerTensor) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -217,12 +224,12 @@ TEST(Execute, DynamicDequantizeS32ZpsPerTensor) {
     dync_dequantize.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
     dync_dequantize.set_attr<int64_t>(graph::op_attr::axis, 0);
 
-    test::vector<uint8_t> src {0, 10, 20, 30};
-    test::vector<float> scales {0.1f};
-    test::vector<int32_t> zps {10};
-    test::vector<float> dst(src.size(), 0);
+    std::vector<uint8_t> src {0, 10, 20, 30};
+    std::vector<float> scales {0.1f};
+    std::vector<int32_t> zps {10};
+    std::vector<float> dst(src.size(), 0);
     // f32 = scales * (int8 - zero_points)
-    test::vector<float> ref_dst {-1.0, 0.0, 1.0, 2.0};
+    std::vector<float> ref_dst {-1.0, 0.0, 1.0, 2.0};
 
     // prepare logical tensor
     graph::logical_tensor_t src_lt
@@ -243,7 +250,7 @@ TEST(Execute, DynamicDequantizeS32ZpsPerTensor) {
     g.add_op(&dync_dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dync_dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -263,21 +270,23 @@ TEST(Execute, DynamicDequantizeS32ZpsPerTensor) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    graph::tensor_t src_ts(src_lt, eng, src.data());
-    graph::tensor_t scales_ts(scales_lt, eng, scales.data());
-    graph::tensor_t zps_ts(zps_lt, eng, zps.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor src_ts(src_lt, eng, src);
+    test_tensor scales_ts(scales_lt, eng, scales);
+    test_tensor zps_ts(zps_lt, eng, zps);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    ASSERT_EQ(cp.execute(strm, {src_ts, scales_ts, zps_ts}, {dst_ts}),
+    ASSERT_EQ(cp.execute(strm, {src_ts.get(), scales_ts.get(), zps_ts.get()},
+                      {dst_ts.get()}),
             graph::status::success);
     strm->wait();
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, DynamicDequantizeS8ZpsPerTensor) {
+TEST(test_dequantize_execute, DynamicDequantizeS8ZpsPerTensor) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -288,12 +297,12 @@ TEST(Execute, DynamicDequantizeS8ZpsPerTensor) {
     dync_dequantize.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
     dync_dequantize.set_attr<int64_t>(graph::op_attr::axis, 0);
 
-    test::vector<uint8_t> src {0, 10, 20, 30};
-    test::vector<float> scales {0.1f};
-    test::vector<int8_t> zps {10};
-    test::vector<float> dst(src.size(), 0);
+    std::vector<uint8_t> src {0, 10, 20, 30};
+    std::vector<float> scales {0.1f};
+    std::vector<int8_t> zps {10};
+    std::vector<float> dst(src.size(), 0);
     // f32 = scales * (int8 - zero_points)
-    test::vector<float> ref_dst {-1.0, 0.0, 1.0, 2.0};
+    std::vector<float> ref_dst {-1.0, 0.0, 1.0, 2.0};
 
     // prepare logical tensor
     graph::logical_tensor_t src_lt
@@ -314,7 +323,7 @@ TEST(Execute, DynamicDequantizeS8ZpsPerTensor) {
     g.add_op(&dync_dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dync_dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -334,21 +343,23 @@ TEST(Execute, DynamicDequantizeS8ZpsPerTensor) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    graph::tensor_t src_ts(src_lt, eng, src.data());
-    graph::tensor_t scales_ts(scales_lt, eng, scales.data());
-    graph::tensor_t zps_ts(zps_lt, eng, zps.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor src_ts(src_lt, eng, src);
+    test_tensor scales_ts(scales_lt, eng, scales);
+    test_tensor zps_ts(zps_lt, eng, zps);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    ASSERT_EQ(cp.execute(strm, {src_ts, scales_ts, zps_ts}, {dst_ts}),
+    ASSERT_EQ(cp.execute(strm, {src_ts.get(), scales_ts.get(), zps_ts.get()},
+                      {dst_ts.get()}),
             graph::status::success);
     strm->wait();
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }
 }
 
-TEST(Execute, DynamicDequantizeNoZpsPerTensor) {
+TEST(test_dequantize_execute, DynamicDequantizeNoZpsPerTensor) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -359,11 +370,11 @@ TEST(Execute, DynamicDequantizeNoZpsPerTensor) {
     dync_dequantize.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
     dync_dequantize.set_attr<int64_t>(graph::op_attr::axis, 0);
 
-    test::vector<uint8_t> src {0, 10, 20, 30};
-    test::vector<float> scales {0.1f};
-    test::vector<float> dst(src.size(), 0);
+    std::vector<uint8_t> src {0, 10, 20, 30};
+    std::vector<float> scales {0.1f};
+    std::vector<float> dst(src.size(), 0);
     // f32 = scales * (int8 - zero_points)
-    test::vector<float> ref_dst {0, 1.0, 2.0, 3.0};
+    std::vector<float> ref_dst {0, 1.0, 2.0, 3.0};
 
     // prepare logical tensor
     graph::logical_tensor_t src_lt
@@ -381,7 +392,7 @@ TEST(Execute, DynamicDequantizeNoZpsPerTensor) {
     g.add_op(&dync_dequantize);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass = get_pass("dync_dequant_pass");
+    graph::pass::pass_base_ptr apass = get_pass("quant_dequant_pass");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -400,14 +411,15 @@ TEST(Execute, DynamicDequantizeNoZpsPerTensor) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    graph::tensor_t src_ts(src_lt, eng, src.data());
-    graph::tensor_t scales_ts(scales_lt, eng, scales.data());
-    graph::tensor_t dst_ts(dst_lt, eng, dst.data());
+    test_tensor src_ts(src_lt, eng, src);
+    test_tensor scales_ts(scales_lt, eng, scales);
+    test_tensor dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
-    ASSERT_EQ(cp.execute(strm, {src_ts, scales_ts}, {dst_ts}),
+    ASSERT_EQ(cp.execute(strm, {src_ts.get(), scales_ts.get()}, {dst_ts.get()}),
             graph::status::success);
     strm->wait();
+    dst = dst_ts.as_vec_type<float>();
     for (size_t i = 0; i < dst.size(); ++i) {
         ASSERT_FLOAT_EQ(dst[i], ref_dst[i]);
     }

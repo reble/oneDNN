@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,19 +15,13 @@
 *******************************************************************************/
 
 #include <algorithm>
-#include <cstdio>
 #include <cstring>
 #include <iostream>
-#include <mutex>
 #include <CL/cl_ext.h>
 
 #include "gpu/ocl/ocl_gpu_engine.hpp"
 #include "gpu/ocl/ocl_gpu_kernel.hpp"
 #include "gpu/ocl/ocl_utils.hpp"
-
-#ifndef DNNL_ENABLE_JIT_DUMP
-#define DNNL_ENABLE_JIT_DUMP 1
-#endif
 
 #ifndef CL_KERNEL_BINARY_PROGRAM_INTEL
 #define CL_KERNEL_BINARY_PROGRAM_INTEL 0x407D
@@ -45,6 +39,14 @@
 #define CL_DEVICE_NUM_EUS_PER_SUB_SLICE_INTEL 0x4254
 #endif
 
+#ifndef CL_DEVICE_FEATURE_CAPABILITIES_INTEL
+#define CL_DEVICE_FEATURE_CAPABILITIES_INTEL 0x4256
+#endif
+
+#ifndef CL_DEVICE_FEATURE_FLAG_DPAS_INTEL
+#define CL_DEVICE_FEATURE_FLAG_DPAS_INTEL (1 << 1)
+#endif
+
 namespace dnnl {
 namespace impl {
 namespace gpu {
@@ -55,21 +57,21 @@ static std::string get_ocl_name(T obj, F get_func, cl_uint name_query) {
     size_t name_size;
     cl_int err = get_func(obj, name_query, 0, nullptr, &name_size);
     // Ignore error.
-    if (err != CL_SUCCESS) return {};
+    UNUSED_OCL_RESULT(err);
 
     // Include null terminator explicitly - to safely overwrite it in
     // clGetKernelInfo
     std::string name(name_size, 0);
     err = get_func(obj, name_query, name_size, &name[0], nullptr);
     // Ignore error.
-    if (err != CL_SUCCESS) return {};
+    UNUSED_OCL_RESULT(err);
 
     // Remove the null terminator as std::string already includes it
     name.resize(name_size - 1);
     return name;
 }
 
-static std::string get_kernel_name(cl_kernel kernel) {
+std::string get_kernel_name(cl_kernel kernel) {
     return get_ocl_name(kernel, clGetKernelInfo, CL_KERNEL_FUNCTION_NAME);
 }
 
@@ -168,6 +170,34 @@ status_t get_ocl_devices(
         }
     }
     // No devices found but still return success
+    return status::success;
+}
+
+status_t get_ocl_devices(std::vector<cl_device_id> *devices,
+        std::vector<ocl_wrapper_t<cl_device_id>> *sub_devices,
+        cl_device_type device_type) {
+    std::vector<cl_device_id> devices_tmp;
+    std::vector<ocl_wrapper_t<cl_device_id>> sub_devices_tmp;
+
+    CHECK(get_ocl_devices(&devices_tmp, device_type));
+
+    for (cl_device_id d : devices_tmp) {
+        cl_uint max_sub_devices;
+        cl_device_partition_property properties[3]
+                = {CL_DEVICE_PARTITION_BY_AFFINITY_DOMAIN,
+                        CL_DEVICE_AFFINITY_DOMAIN_NEXT_PARTITIONABLE, 0};
+        cl_int err = clCreateSubDevices(
+                d, properties, 0, nullptr, &max_sub_devices);
+        if (err == CL_DEVICE_PARTITION_FAILED) continue;
+        OCL_CHECK(err);
+        std::vector<cl_device_id> sds(max_sub_devices);
+        OCL_CHECK(clCreateSubDevices(
+                d, properties, max_sub_devices, sds.data(), nullptr));
+        for (cl_device_id sd : sds)
+            sub_devices_tmp.emplace_back(sd);
+    }
+    *devices = devices_tmp;
+    *sub_devices = std::move(sub_devices_tmp);
     return status::success;
 }
 
@@ -328,64 +358,17 @@ status_t get_ocl_program_binary(
     return get_ocl_program_binary(program, device, binary);
 }
 
-#if DNNL_ENABLE_JIT_DUMP
-void dump_kernel_binary(
-        const compute::binary_t &binary, const std::string &name) {
-    if (!get_jit_dump()) return;
-
-    static std::mutex m;
-    std::lock_guard<std::mutex> guard(m);
-
-    static int counter = 0;
-    std::ostringstream fname;
-    fname << "dnnl_dump_gpu_" << name << "." << counter << ".bin";
-
-    FILE *fp = fopen(fname.str().c_str(), "wb+");
-
-    // Ignore error.
-    if (!fp) return;
-
-    fwrite(binary.data(), binary.size(), 1, fp);
-    fclose(fp);
-
-    counter++;
-}
-
-void dump_kernel_binary(cl_kernel ocl_kernel) {
-    if (!get_jit_dump()) return;
-
-    cl_int err;
-
+status_t get_ocl_kernel_binary(
+        cl_kernel ocl_kernel, compute::binary_t &binary) {
+    binary.clear();
     size_t binary_size;
-    err = clGetKernelInfo(ocl_kernel, CL_KERNEL_BINARY_PROGRAM_INTEL, 0,
-            nullptr, &binary_size);
-    // Ignore error.
-    if (err != CL_SUCCESS) return;
-
-    std::vector<uint8_t> binary(binary_size);
-    err = clGetKernelInfo(ocl_kernel, CL_KERNEL_BINARY_PROGRAM_INTEL,
-            binary.size(), binary.data(), nullptr);
-    // Ignore error.
-    if (err != CL_SUCCESS) return;
-
-    auto name = get_kernel_name(ocl_kernel);
-    // Ignore error.
-    if (name.empty()) return;
-    dump_kernel_binary(binary, name);
+    OCL_CHECK(clGetKernelInfo(ocl_kernel, CL_KERNEL_BINARY_PROGRAM_INTEL, 0,
+            nullptr, &binary_size));
+    binary.resize(binary_size);
+    OCL_CHECK(clGetKernelInfo(ocl_kernel, CL_KERNEL_BINARY_PROGRAM_INTEL,
+            binary.size(), binary.data(), nullptr));
+    return status::success;
 }
-
-void dump_kernel_binary(
-        const engine_t *engine, const compute::kernel_t &kernel) {
-    if (!get_jit_dump()) return;
-    auto *kernel_impl
-            = utils::downcast<const ocl_gpu_kernel_t *>(kernel.impl());
-    dump_kernel_binary(kernel_impl->ocl_kernel());
-}
-#else
-void dump_kernel_binary(const engine_t *, const compute::kernel_t &) {}
-void dump_kernel_binary(compute::binary_t binary, const std::string &name) {}
-void dump_kernel_binary(cl_kernel) {}
-#endif
 
 void debugdump_processed_source(const std::string &source,
         const std::string &options, const std::string &cl_options) {
@@ -441,9 +424,9 @@ void debugdump_processed_source(const std::string &source,
         // Due to the use of a different C preprocessor, warnings should not be
         // ignored, as they may correspond to a different behavior in the OpenCL
         // C preprocessor
-        auto o = get_defines(options);
+        auto o = get_defines(options) + get_defines(cl_options);
         std::string preprocess_cmd
-                = std::string() + "cpp -P " + o.c_str() + " | clang-format";
+                = std::string() + "cpp -P " + o + " | clang-format";
         execute_command(preprocess_cmd, source);
         std::cout << "OCL_ARCH_OPTIONS: " << cl_options << std::endl;
     }
@@ -484,6 +467,15 @@ static status_t get_ocl_device_eu_count_intel(
 
     *eu_count = (int32_t)(
             num_slices * num_sub_slices_per_slice * num_eus_per_sub_slice);
+    return status::success;
+}
+
+status_t get_ocl_device_enabled_systolic_intel(
+        cl_device_id device, bool &enabled_systolic) {
+    cl_bitfield res;
+    OCL_CHECK(clGetDeviceInfo(device, CL_DEVICE_FEATURE_CAPABILITIES_INTEL,
+            sizeof(cl_bitfield), &res, nullptr));
+    enabled_systolic = res & CL_DEVICE_FEATURE_FLAG_DPAS_INTEL;
     return status::success;
 }
 
@@ -538,6 +530,30 @@ status_t create_ocl_program(gpu::ocl::ocl_wrapper_t<cl_program> &ocl_program,
     OCL_CHECK(err);
 
     return status::success;
+}
+
+status_t get_device_uuid(
+        gpu::compute::device_uuid_t &uuid, cl_device_id ocl_dev) {
+    // This function is used only with SYCL that works with OpenCL 3.0
+    // that supports `cl_khr_device_uuid` extension.
+#if defined(cl_khr_device_uuid)
+    static_assert(
+            CL_UUID_SIZE_KHR == 16, "CL_UUID_SIZE_KHR is expected to be 16");
+
+    cl_uchar ocl_dev_uuid[CL_UUID_SIZE_KHR] = {};
+    OCL_CHECK(clGetDeviceInfo(ocl_dev, CL_DEVICE_UUID_KHR, CL_UUID_SIZE_KHR,
+            ocl_dev_uuid, nullptr));
+
+    uint64_t uuid_packed[CL_UUID_SIZE_KHR / sizeof(uint64_t)] = {};
+    for (size_t i = 0; i < CL_UUID_SIZE_KHR; ++i) {
+        size_t shift = i % sizeof(uint64_t) * CHAR_BIT;
+        uuid_packed[i / sizeof(uint64_t)]
+                |= (((uint64_t)ocl_dev_uuid[i]) << shift);
+    }
+    uuid = gpu::compute::device_uuid_t(uuid_packed[0], uuid_packed[1]);
+    return status::success;
+#endif
+    return status::runtime_error;
 }
 
 } // namespace ocl

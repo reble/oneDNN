@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,9 +19,12 @@
 
 #include "common/cpp_compat.hpp"
 
+#include "common/impl_registration.hpp"
+#include "gpu/compute/utils.hpp"
 #include "gpu/jit/codegen/operand.hpp"
 #include "gpu/jit/codegen/register_allocator.hpp"
 #include "gpu/jit/ir/ir.hpp"
+#include "gpu/jit/ir/kernel_desc.hpp"
 #include "gpu/jit/ir/kernel_info.hpp"
 #include "gpu/jit/ir/message.hpp"
 #include "gpu/jit/ir/tensor.hpp"
@@ -44,6 +47,7 @@ inline size_t icache_size(ngen::HW arch) {
         case gpu_xe_hp: return 48 * 1024;
         case gpu_xe_hpg: return 96 * 1024;
         case gpu_xe_hpc: return 80 * 1024;
+        case gpu_xe2: return 96 * 1024;
         default: return 0;
     }
 }
@@ -90,6 +94,7 @@ compute::kernel_t make_kernel(
         REG_XEHP_ISA(CASE(gpu_xe_hp));
         REG_XEHPG_ISA(CASE(gpu_xe_hpg));
         REG_XEHPC_ISA(CASE(gpu_xe_hpc));
+        REG_XE2_ISA(CASE(gpu_xe2));
         default: break;
     }
 #undef CASE
@@ -103,6 +108,7 @@ compute::kernel_t make_kernel(
         case gpu_arch_t::xe_hp: actual_arch = gpu_xe_hp; break;
         case gpu_arch_t::xe_hpg: actual_arch = gpu_xe_hpg; break;
         case gpu_arch_t::xe_hpc: actual_arch = gpu_xe_hpc; break;
+        case gpu_arch_t::xe2: actual_arch = gpu_xe2; break;
         case gpu_arch_t::unknown: actual_arch = ngen::HW::Unknown; break;
     }
     ir_assert(actual_arch == arch)
@@ -116,6 +122,45 @@ compute::kernel_t make_kernel(
     if (status != status::success) return kernel_t();
     return kernel;
 }
+
+template <template <ngen::HW> class KernelT>
+struct ir_generator_t : public jit_generator_base {
+    ir_generator_t(const kernel_desc_base_t &kernel_desc)
+        : kernel_name_(kernel_desc.kernel_name()), kernel_desc_(kernel_desc) {}
+
+    const char *kernel_name() const override { return kernel_name_.c_str(); }
+
+    gpu::compute::binary_t get_binary(
+            cl_context context, cl_device_id device) override {
+        kernel_info_t kernel_info;
+        auto status = kernel_desc_.init_kernel_info(kernel_info);
+        if (status != status::success) return gpu::compute::binary_t();
+        try {
+#define CASE(hw) \
+    case ngen::HW::hw: { \
+        KernelT<ngen::HW::hw> kernel(kernel_desc_, kernel_info); \
+        return kernel.getBinary(context, device); \
+    }
+            switch (kernel_desc_.hw().to_ngen()) {
+                REG_GEN9_ISA(CASE(Gen9));
+                REG_GEN11_ISA(CASE(Gen11));
+                REG_XELP_ISA(CASE(XeLP));
+                REG_XEHP_ISA(CASE(XeHP));
+                REG_XEHPG_ISA(CASE(XeHPG));
+                REG_XEHPC_ISA(CASE(XeHPC));
+                default: break;
+            }
+#undef CASE
+        } catch (ngen::out_of_registers_exception &) {
+            return gpu::compute::binary_t();
+        }
+        return gpu::compute::binary_t();
+    }
+
+private:
+    std::string kernel_name_;
+    const kernel_desc_base_t &kernel_desc_;
+};
 
 class expr_binding_t {
 public:
@@ -227,6 +272,20 @@ public:
     friend class ir_to_ngen_t<hw>;
     friend class send_impl_t;
 
+    ir_kernel_t(
+            const kernel_desc_base_t &desc, const kernel_info_t &kernel_info)
+        : kernel_name_(desc.kernel_name())
+        , exec_cfg_(desc.exec_cfg())
+        , kernel_info_(kernel_info)
+        , with_nd_range_(false)
+        , require_dpas_(desc.with_dpas())
+        , regs_(exec_cfg_.regs())
+        , ra_(hw, desc.kernel_name(), reg_allocator_t::warn_default)
+        , emu_strategy(hw, exec_cfg_.hw().stepping_id()) {
+        setStepping(exec_cfg_.hw().stepping_id());
+        ra_.setRegisterCount(regs_);
+    }
+
     ir_kernel_t(const std::string &kernel_name, const exec_config_t &exec_cfg,
             const kernel_info_t &kernel_info,
             const compute::nd_range_t &nd_range, bool require_dpas,
@@ -235,6 +294,7 @@ public:
         , exec_cfg_(exec_cfg)
         , kernel_info_(kernel_info)
         , nd_range_(nd_range)
+        , with_nd_range_(true)
         , require_dpas_(require_dpas)
         , regs_((grf_mode == grf_mode_t::large)             ? 256
                           : (grf_mode == grf_mode_t::small) ? 128
@@ -242,10 +302,12 @@ public:
         , ra_(hw, kernel_name,
                   grf_mode == grf_mode_t::any ? reg_allocator_t::warn_all
                                               : reg_allocator_t::warn_default)
-        , emu_strategy(hw, exec_cfg.hw_cfg().stepping_id()) {
-        setStepping(exec_cfg.hw_cfg().stepping_id());
+        , emu_strategy(hw, exec_cfg.hw().stepping_id()) {
+        setStepping(exec_cfg.hw().stepping_id());
         ra_.setRegisterCount(regs_);
     }
+
+    const exec_config_t &exec_cfg() { return exec_cfg_; }
 
     void setup_interface(const stmt_t &kernel_body = stmt_t()) {
         externalName(kernel_name_);
@@ -267,7 +329,7 @@ public:
             }
         }
 
-        if (!kernel_body.is_empty()) {
+        if (!kernel_body.is_empty() && with_nd_range_) {
             int slm_size = alloc_manager_t(kernel_body)
                                    .total_size(alloc_kind_t::slm);
             int max_slm_size = compute::device_info_t::max_slm_size_per_tg(
@@ -302,8 +364,8 @@ public:
             emu_state.temp[0] = ra_.alloc();
             emu_state.temp[1] = ra_.alloc();
         }
-        // Enable IEEE f32 -> s32 rounding and f32/f16 denormals.
-        or_(1, cr0, cr0, uint16_t(0x1480));
+        // Enable IEEE f32 -> s32 rounding and f64/f32/f16 denormals.
+        or_(1, cr0, cr0, uint16_t(0x14C0));
 
         // Allocate and initialize signal header for future use.
         if (require_signal_header_) {
@@ -316,6 +378,16 @@ public:
             const grid_info_t &kernel_grid,
             const std::array<expr_t, 3> &local_id,
             expr_binding_t &expr_binding) {
+        grid_context_t grid_ctx(/*create_empty=*/true);
+        for (int i = 0; i < 3; i++) {
+            grid_ctx.set_tg_idx(i, kernel_grid.idx(i));
+            grid_ctx.set_local_id(i, local_id[i]);
+        }
+        bind_external_vars(kernel_body, grid_ctx, expr_binding);
+    }
+
+    void bind_external_vars(const stmt_t &kernel_body,
+            const grid_context_t &grid_ctx, expr_binding_t &expr_binding) {
         alloc_manager_t alloc_mgr(kernel_body);
 
         // Bind grid indices.
@@ -323,12 +395,12 @@ public:
         for (int i = 0; i < 3; i++) {
             auto tmp = ra_.template alloc_sub<int32_t>();
             mov(1, tmp, r0.ud(r0_sub_idxs[i]));
-            expr_binding.bind(kernel_grid.idx(i), tmp);
+            expr_binding.bind(grid_ctx.tg_idx(i), tmp);
         }
 
         // Bind local IDs.
         for (int i = 0; i < 3; i++) {
-            expr_binding.bind(local_id[i], getLocalID(i).uw(0));
+            expr_binding.bind(grid_ctx.local_id(i), getLocalID(i).uw(0));
         }
 
         // Bind arguments.
@@ -532,10 +604,16 @@ public:
             }
         } else {
             auto &src1_imm = src1.immediate();
-            int32_t src1_value = to_cpp<int32_t>(src1_imm);
-            ir_assert(0 < src1_value && src1_value <= INT32_MAX) << src1_value;
-            eidiv(mod, dst.reg_data(), ngen::Subregister(), src0.reg_data(),
-                    src1_value);
+            if (to_ir(src0.type()).is_fp()) {
+                ngen::Immediate src1_inv_value(1.f / to_cpp<float>(src1_imm));
+                emul(mod, dst, src0, src1_inv_value);
+            } else {
+                int32_t src1_value = to_cpp<int32_t>(src1_imm);
+                ir_assert(0 < src1_value && src1_value <= INT32_MAX)
+                        << src1_value;
+                eidiv(mod, dst.reg_data(), ngen::Subregister(), src0.reg_data(),
+                        src1_value);
+            }
         }
     }
 
@@ -578,9 +656,12 @@ public:
             bool force_spill = overlaps(div_esize, d, s0)
                     || overlaps(div_esize, d, s1)
                     || overlaps(div_esize, s0, s1);
-            auto dst_rd = w_spill(d, div_esize, force_spill);
-            auto src0_rd = r_spill(s0, div_esize, force_spill);
-            auto src1_rd = r_spill(s1, div_esize, force_spill);
+            bool d_spill = force_spill || (d.getHS() != 1);
+            bool s0_spill = force_spill || (s0.getHS() != 1);
+            bool s1_spill = force_spill || (s1.getHS() != 1);
+            auto dst_rd = w_spill(d, div_esize, d_spill);
+            auto src0_rd = r_spill(s0, div_esize, s0_spill);
+            auto src1_rd = r_spill(s1, div_esize, s1_spill);
             // Enable mask as fdiv_ieee relies on masked if/endif flow.
             setDefaultNoMask(false);
             fdiv_ieee(div_mod, f0[0], dst_rd(), src0_rd(), src1_rd(), zero, one,
@@ -669,22 +750,67 @@ public:
         }
     }
 
-    // Adapted version of magicgu function from Hacker's Delight 10-15.
-    static void eidiv_magicgu(uint32_t d, uint32_t &m, uint32_t &p) {
-        uint32_t s32_max = std::numeric_limits<int32_t>::max();
-        ir_assert(d != 0 && d <= s32_max);
-        uint64_t nc = (s32_max / d) * d - 1;
-        for (p = 32; p < 64; p++) {
-            uint64_t _2p = 1LL << p;
-            if (_2p > nc * (d - 1 - (_2p - 1) % d)) {
-                m = (_2p + d - 1 - (_2p - 1) % d) / d;
-                return;
-            }
+    // Emulates integer division by a non-constant (rounding towards negative
+    // infinity).
+    // Requirements:
+    //     INT32_MIN <= x <= UINT32_MAX
+    //     0         <  y <= INT32_MAX
+    // Computes:
+    //     qot = x / y
+    //     rem = x % y
+    // See ir_utils::idiv_magicgu_packed() for information
+    // about magic calculation.
+    void eidiv(const ngen::InstructionModifier &mod, const ngen::RegData &qot,
+            const ngen::RegData &rem, const ngen::RegData &x,
+            const ngen::RegData &_y, const ngen::RegData &_magic) {
+        ir_assert(x.getHS() == 0);
+        ir_assert(_y.getType() == ngen::DataType::ud);
+        ir_assert(_magic.getHS() == 0);
+        ir_assert(_magic.getType() == ngen::DataType::uq);
+
+        bool x_signed = utils::one_of(x.getType(), ngen::DataType::b,
+                ngen::DataType::w, ngen::DataType::d);
+        auto div_type = (x_signed ? ngen::DataType::d : ngen::DataType::ud);
+        auto magic = ngen::Subregister(
+                _magic, _magic.getOffset(), _magic.getType());
+        auto y = ngen::Subregister(_y, _y.getOffset(), _y.getType());
+        auto m = magic.ud(0);
+        auto p = magic.ud(1);
+
+        auto x_tmp = ra_.alloc().retype(div_type);
+        auto qot_tmp = ra_.alloc().retype(div_type);
+        auto p_tmp = ra_.alloc_sub<uint32_t>();
+        auto _x = x_tmp[0];
+        auto _qot = qot_tmp[0];
+        mov(1, _x, x);
+
+        auto acc = acc0.retype(div_type);
+        mul(1, acc[0], _x, m.uw(0));
+        mach(1, _qot, _x, m);
+        add(1, p_tmp, p, -32);
+        cmp(1 | ge | f0[0], p, 32);
+        shr<uint32_t>(1 | f0[0], _qot, _qot, p_tmp);
+        shr<uint32_t>(1 | ~f0[0], _qot, _x, p);
+        if (!qot.isInvalid()) mov(mod, qot, _qot);
+
+        if (!rem.isInvalid()) {
+            // rem = x - qot * y
+            auto tmp = ra_.alloc_sub<uint64_t>();
+            mul(1, tmp.ud(0), _qot, y.uw(0));
+            mul(1, tmp.ud(1), _qot, y.uw(1));
+            shl<uint32_t>(1, tmp.ud(1), tmp.ud(1), 16);
+            add(1, tmp.ud(0), tmp.ud(1), tmp.ud(0));
+            add(mod, rem, x, -tmp.ud(0));
+            ra_.safeRelease(tmp);
         }
-        ir_error_not_expected();
+
+        ra_.safeRelease(x_tmp);
+        ra_.safeRelease(qot_tmp);
+        ra_.safeRelease(p_tmp);
     }
 
-    // Emulates integer division by a constant.
+    // Emulates integer division by a non-constant (rounding towards negative
+    // infinity)
     // Requirements:
     //     INT32_MIN <= x <= UINT32_MAX
     //     0         <  y <= INT32_MAX
@@ -712,7 +838,7 @@ public:
         }
 
         uint32_t m = 0, p = 0;
-        eidiv_magicgu(y, m, p);
+        ir_utils::idiv_magicgu(y, m, p);
 
         auto x_tmp = ra_.alloc().retype(div_type);
         auto qot_tmp = ra_.alloc().retype(div_type);
@@ -899,6 +1025,7 @@ protected:
     }
 
     int thread_group_size() const {
+        ir_assert(with_nd_range_);
         int local_size = 1;
         ir_assert(nd_range_.local_range());
         for (int i = 0; i < (int)nd_range_.ndims(); i++) {
@@ -911,6 +1038,7 @@ protected:
     exec_config_t exec_cfg_;
     kernel_info_t kernel_info_;
     compute::nd_range_t nd_range_;
+    bool with_nd_range_ = false;
     bool require_dpas_;
     bool require_signal_header_ = false;
     int regs_;

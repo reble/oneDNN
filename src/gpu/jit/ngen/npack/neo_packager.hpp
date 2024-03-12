@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -180,6 +180,7 @@ inline HW decodeGfxCoreFamily(GfxCoreFamily family)
         case GfxCoreFamily::XeHP:     return HW::XeHP;
         case GfxCoreFamily::XeHPG:    return HW::XeHPG;
         case GfxCoreFamily::XeHPC:    return HW::XeHPC;
+        case GfxCoreFamily::Xe2:      return HW::Xe2;
         default:                      return HW::Unknown;
     }
 }
@@ -194,6 +195,7 @@ inline GfxCoreFamily encodeGfxCoreFamily(HW hw)
         case HW::XeHP:    return GfxCoreFamily::XeHP;
         case HW::XeHPG:   return GfxCoreFamily::XeHPG;
         case HW::XeHPC:   return GfxCoreFamily::XeHPC;
+        case HW::Xe2:     return GfxCoreFamily::Xe2;
         default:          return GfxCoreFamily::Unknown;
     }
 }
@@ -208,6 +210,8 @@ inline ngen::ProductFamily decodeProductFamily(ProductFamily family)
     if (family == ProductFamily::DG2) return ngen::ProductFamily::DG2;
     if (family == ProductFamily::MTL) return ngen::ProductFamily::MTL;
     if (family == ProductFamily::PVC) return ngen::ProductFamily::PVC;
+    if (family == ProductFamily::ARL) return ngen::ProductFamily::ARL;
+    if (family >= ProductFamily::LNL && family <= ProductFamily::LNL_M) return ngen::ProductFamily::GenericXe2;
     return ngen::ProductFamily::Unknown;
 }
 
@@ -258,11 +262,14 @@ inline ngen::Product decodeHWIPVersion(uint32_t rawVersion)
                 outProduct.family = ngen::ProductFamily::GenericXeHP;
             else if (version.release > 50 && version.release <= 59)
                 outProduct.family = ngen::ProductFamily::DG2;
-            else if (version.release == 60)
+            else if (version.release >= 60 && version.release <= 61)
                 outProduct.family = ngen::ProductFamily::PVC;
             else if (version.release >= 70 && version.release <= 71)
                 outProduct.family = ngen::ProductFamily::MTL;
+            else if (version.release >= 73 && version.release <= 74)
+                 outProduct.family = ngen::ProductFamily::ARL;
             break;
+        case 20: outProduct.family = ngen::ProductFamily::GenericXe2; break;
         default: outProduct.family = ngen::ProductFamily::Unknown; break;
     }
 

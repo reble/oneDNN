@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,11 +20,13 @@
 #include "dynamic_lower_info.hpp"
 #include "utils.hpp"
 #include <compiler/ir/builder.hpp>
+#include <compiler/ir/builtin.hpp>
 #include <compiler/ir/graph/fused_op.hpp>
 #include <compiler/ir/graph/graph.hpp>
 #include <compiler/ir/graph/pass/pass.hpp>
 #include <compiler/ir/graph/transform/transform.hpp>
 #include <compiler/ir/graph/tunable_op.hpp>
+#include <compiler/ir/pass/ir_copy.hpp>
 #include <compiler/ir/sc_data_format.hpp>
 #include <compiler/ir/transform/constant_fold.hpp>
 #include <compiler/ir/transform/dyn_tsr_transform.hpp>
@@ -32,6 +34,7 @@
 #include <ops/fusible/binary_elemwise.hpp>
 #include <ops/fusible/memory_movement.hpp>
 #include <ops/fusible/padding.hpp>
+#include <ops/fusible/pooling.hpp>
 #include <ops/fusible/reduce.hpp>
 #include <ops/fusible/ternary_elemwise.hpp>
 #include <ops/fusible/unary_elemwise.hpp>
@@ -345,11 +348,7 @@ runtime::dynamic_tensor_t convert_graph_tensor_to_dynamic_tensor(
 static bool need_query_next_first(const sc_op_ptr &node) {
     bool has_tail_reorder = node->isa<reorder_op_t>();
     std::vector<sc_op_ptr> out_ops;
-    if (node->isa<fused_op_t>()) {
-        out_ops = node->stc_cast<fused_op_t>()
-                          ->mgr_->get_graph()
-                          .get_output_ops();
-    } else if (node->isa<mixed_fuse_op_t>()) {
+    if (node->isa<mixed_fuse_op_t>()) {
         out_ops = node->stc_cast<mixed_fuse_op_t>()
                           ->sub_graph_.get_output_ops();
     }
@@ -530,6 +529,9 @@ expr call_op_dynamic_query_function(
     } else if (op->isa<padding_op_t>()) {
         return builtin::call_padding_op_query_format(
                 args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
+    } else if (op->isa<pooling_op_t>()) {
+        return builtin::call_pooling_op_query_format(
+                args[0], args[1], args[2], args[3], args[4], args[5], args[6]);
     } else {
         COMPILE_ASSERT(
                 false, "unsupported op query function: " << op->op_name_);
@@ -539,14 +541,11 @@ expr call_op_dynamic_query_function(
 
 void create_internal_dispatch_funcs_by_node(const context_ptr &ctx,
         ir_module_ptr &ret_mod, const std::string &table_name,
-        const sc_op_ptr &node, const std::shared_ptr<const bool> &use_mtp) {
+        const sc_op_ptr &node,
+        const std::shared_ptr<const thread_pool_mode_t> &use_mtp) {
     if (node->isa<mixed_fuse_op_t>()) {
         node->stc_cast<mixed_fuse_op_t>()->create_internal_dispatch_funcs(
                 ctx, ret_mod, use_mtp);
-    } else if (node->isa<fused_op_t>()) {
-        throw std::runtime_error(
-                "Internal function call does not plan to support old fusion "
-                "manager.");
     } else {
         auto internal_keys = node->get_internal_dispatch_key_set(ctx);
         std::vector<expr> op_dispatch_kernel;
@@ -564,7 +563,8 @@ void create_dispatch_funcs_by_keys(const context_ptr &ctx,
         ir_module_ptr &ret_mod, const std::string &table_name,
         const sc_op_ptr &node, const op_dispatch_key_base_t *key,
         expr &op_dispatch_kernel, int &dyn_idx,
-        const std::shared_ptr<const bool> &use_mtp, bool internal) {
+        const std::shared_ptr<const thread_pool_mode_t> &use_mtp,
+        bool internal) {
     auto cur_table = ret_mod->get_op_table_map()[table_name];
     assert(cur_table);
     bool should_compile_later = false;

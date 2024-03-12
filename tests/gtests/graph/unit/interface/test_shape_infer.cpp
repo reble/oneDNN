@@ -28,7 +28,7 @@ namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 using graph::dims;
 
-TEST(ShapeInfer, OneWayBroadcast) {
+TEST(test_interface_shape_infer, OneWayBroadcast) {
     using dims = graph::dims;
     dims src_shape {2, 3};
     dims dst1_shape {2};
@@ -49,7 +49,7 @@ TEST(ShapeInfer, OneWayBroadcast) {
             graph::status::success);
 }
 
-TEST(ShapeInfer, InvalidShapeForMatmul) {
+TEST(test_interface_shape_infer, InvalidShapeForMatmul) {
     graph::op_t matmul {0, graph::op_kind::MatMul, std::string("matmul")};
     graph::logical_tensor_t src0
             = utils::logical_tensor_init(1, {4}, graph::data_type::f32);
@@ -124,7 +124,7 @@ TEST(ShapeInfer, InvalidShapeForMatmul) {
             graph::status::invalid_shape);
 }
 
-TEST(ShapeInfer, InvalidShapeForConv) {
+TEST(test_interface_shape_infer, InvalidShapeForConv) {
     using dims = graph::dnnl_impl::dims;
 
     graph::op_t conv_op {0, graph::op_kind::Convolution, std::string("conv")};
@@ -160,35 +160,38 @@ TEST(ShapeInfer, InvalidShapeForConv) {
             graph::status::invalid_shape);
 }
 
-TEST(ShapeInfer, InvalidShapeForPool) {
-    graph::op_t max_pool_op {
-            0, graph::op_kind::MaxPool, std::string("maxPool")};
+TEST(test_interface_shape_infer, InvalidShapeForPoolBackward) {
+    graph::op_t max_pool_bk_op {
+            0, graph::op_kind::MaxPoolBackward, std::string("max_pool_bk_op")};
     graph::op_t avg_pool_bk_op {
-            0, graph::op_kind::AvgPoolBackward, std::string("avg_pool_bk_op")};
+            1, graph::op_kind::AvgPoolBackward, std::string("avg_pool_bk_op")};
+
     graph::logical_tensor_t src_lt = utils::logical_tensor_init(
             0, {1, 1, 4, 4}, graph::data_type::f32);
     graph::logical_tensor_t dst_lt = utils::logical_tensor_init(
             1, {1, 1, 2, 2}, graph::data_type::f32, graph::layout_type::any);
     graph::logical_tensor_t dst_lt2 = utils::logical_tensor_init(
-            1, graph::data_type::f32, graph::layout_type::any);
+            2, graph::data_type::f32, graph::layout_type::any);
 
     std::vector<graph::logical_tensor_t *> inputs {&src_lt};
     std::vector<graph::logical_tensor_t *> outputs {&dst_lt};
     std::vector<graph::logical_tensor_t *> outputs2 {&dst_lt2};
-    ASSERT_EQ(graph::infer_pool_bwd_output_shape(&max_pool_op, inputs, outputs),
+
+    ASSERT_EQ(graph::infer_pool_bwd_output_shape(
+                      &max_pool_bk_op, inputs, outputs),
             graph::status::invalid_shape);
     ASSERT_EQ(graph::infer_pool_bwd_output_shape(
                       &avg_pool_bk_op, inputs, outputs2),
             graph::status::unimplemented);
 }
 
-TEST(ShapeInferDeathTest, CanonicalizeError) {
+TEST(test_interface_shape_infer, CanonicalizeErrorDeathTest) {
 #ifndef NDEBUG
     ASSERT_DEATH(graph::canonicalize({1, 2, 3, 4}, "XXXX"), "invalid format");
 #endif
 }
 
-TEST(ShapeInfer, InferConvOuputShapeError) {
+TEST(test_interface_shape_infer, InferConvOuputShapeError) {
     graph::op_t conv_op(graph::op_kind::Convolution);
     conv_op.set_attr<dims>(graph::op_attr::strides, dims {1, 1});
     conv_op.set_attr<dims>(graph::op_attr::dilations, dims {1, 1});
@@ -225,7 +228,7 @@ TEST(ShapeInfer, InferConvOuputShapeError) {
     }
 }
 
-TEST(ShapeInfer, InferConvBpropDataOuputShape) {
+TEST(test_interface_shape_infer, InferConvBpropDataOuputShape) {
     graph::op_t conv_op(graph::op_kind::ConvolutionBackwardData);
     conv_op.set_attr<dims>(graph::op_attr::strides, dims {1, 1});
     conv_op.set_attr<dims>(graph::op_attr::dilations, dims {1, 1});
@@ -265,7 +268,7 @@ TEST(ShapeInfer, InferConvBpropDataOuputShape) {
     }
 }
 
-TEST(ShapeInfer, InferConvtransposeNcxOixError) {
+TEST(test_interface_shape_infer, InferConvtransposeNcxOixError) {
     graph::op_t conv {graph::op_kind::ConvTransposeBackwardData,
             graph::op_t::kind2str(graph::op_kind::ConvTransposeBackwardData)};
     std::vector<int64_t> strides = {1, 1};

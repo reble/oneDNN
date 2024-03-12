@@ -72,7 +72,7 @@ endif()
 
 set(PROJECT_NAME "oneDNN")
 set(PROJECT_FULL_NAME "oneAPI Deep Neural Network Library (oneDNN)")
-set(PROJECT_VERSION "3.3.0")
+set(PROJECT_VERSION "3.5.0")
 
 if (CMAKE_VERSION VERSION_LESS 3.0)
     project(${PROJECT_NAME} C CXX)
@@ -166,13 +166,13 @@ endif()
 
 enable_testing()
 
-include_directories_with_host_compiler(${PROJECT_SOURCE_DIR}/include)
+include_directories_with_host_compiler_before(${PROJECT_SOURCE_DIR}/include)
 
 configure_file(
     "${PROJECT_SOURCE_DIR}/include/oneapi/dnnl/dnnl_config.h.in"
     "${PROJECT_BINARY_DIR}/include/oneapi/dnnl/dnnl_config.h"
 )
-include_directories_with_host_compiler(${PROJECT_BINARY_DIR}/include)
+include_directories_with_host_compiler_before(${PROJECT_BINARY_DIR}/include)
 
 configure_file(
     "${PROJECT_SOURCE_DIR}/README.binary.in"

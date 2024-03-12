@@ -52,7 +52,7 @@ public:
         : host_(host)
         , expr_binding_(expr_binding)
         , simd_size_(host->getSIMD())
-        , eu_count_(host->exec_cfg_.hw_cfg().eu_count()) {}
+        , eu_count_(host->exec_cfg_.hw().eu_count()) {}
 
     ~ir_to_ngen_t() {
 #ifdef DNNL_DEV_MODE
@@ -70,20 +70,22 @@ public:
         bool do_alloc = (obj.kind == alloc_kind_t::grf);
         bool use_bc_alloc = false;
         if (do_alloc) {
-            reg_buf_t rb;
+            const int max_ngen_type_bits = 64;
+            reg_buf_data_t rbd;
             if (obj.has_attr<bank_conflict_attr_t>()) {
-                rb = create_bank_conflict_allocation(obj);
+                rbd = create_bank_conflict_allocation(obj);
                 use_bc_alloc = true;
+            } else if (obj.size * 8 <= max_ngen_type_bits) {
+                rbd = scope.alloc_reg_data(type_t::u(obj.size * 8));
             } else {
-                int grf_size = ngen::GRF::bytes(hw);
-                int regs = utils::div_up(obj.size, grf_size);
-                rb = scope.alloc_reg_buf(regs);
+                const int regs = utils::div_up(obj.size, ngen::GRF::bytes(hw));
+                rbd = scope.alloc_reg_buf(regs);
             }
             if (obj.has_attr<grf_permute_attr_t>()) {
                 auto &attr = obj.get_attr<grf_permute_attr_t>();
-                rb.set_grf_permutation(*attr.grf_perm);
+                rbd.set_grf_permutation(*attr.grf_perm);
             }
-            expr_binding_.bind(obj.buf, reg_buf_data_t(rb));
+            expr_binding_.bind(obj.buf, rbd);
         }
         visit(obj.body);
         if (do_alloc) expr_binding_.unbind(obj.buf);
@@ -511,9 +513,10 @@ private:
         int grf_size = ngen::GRF::bytes(hw);
         int step = 2 * grf_size;
         for (int i = 0; i < size; i += step) {
-            int exec_size = std::min(step, size - i) / type.size();
+            step = std::min(step, size - i);
+            step = utils::rnd_down_pow2(step);
+            int exec_size = step / type.size();
             auto sub_rd_mov = rd.format(i, to_ngen(type), exec_size).reg_data();
-            ir_assert(math::is_pow2(exec_size));
             host_->emov(exec_size, sub_rd_mov, ngen::Immediate(0.0f));
         }
     }
@@ -568,14 +571,14 @@ private:
                           type_kind_t::qword)
                 && (size == 32 || size == 64))
                 << "expected atomic message dwordx8 or qwordx8";
-        auto load_func
-                = send_t::make(send_func.hw, send_op_t::load, send_func.address,
-                        send_func.type, send_func.slots, send_func.cache_hint);
+        auto load_func = send_t::make(send_func.hw, send_op_t::load,
+                send_func.address, send_func.type, send_func.slots,
+                send_func.zero_out, send_func.cache_hint);
         auto &load_send = load_func.as<send_t>();
         send_impl_t load(load_send);
         auto cmpwr_func = send_t::make(send_func.hw, send_op_t::atomic_cmpwr,
                 send_func.address, send_func.type, send_func.slots,
-                send_func.cache_hint);
+                send_func.zero_out, send_func.cache_hint);
         auto &cmpwr_send = cmpwr_func.as<send_t>();
         send_impl_t cmpwr(cmpwr_send);
         bool is_df = size == 64;
@@ -648,8 +651,9 @@ private:
             mod |= to_ngen(attr.as<instruction_modifier_attr_t>().mod);
         if (!mask_op.is_invalid()) mod |= mask_op.flag_register_mod();
 
-        // Zero-out inactive channels.
-        if ((send_func.is_load() || send_func.is_load_2d())
+        // Zero-out inactive channels unless told not to.
+        if (send_func.zero_out
+                && (send_func.is_load() || send_func.is_load_2d())
                 && mod.getPredCtrl() != ngen::PredCtrl::None) {
             zero_out(reg_buf_op, send_func.payload_size());
         }
@@ -1106,25 +1110,32 @@ public:
     }
 
     void _visit(const ternary_op_t &obj) override {
+        flag_setter_t no_vs(&allow_vert_stride_region_, false);
+        auto dst_op = alloc_dst_op(obj);
+        auto mod = dst_op.mod();
+        auto src0_op = eval(obj.a);
+        auto src1_op = eval(obj.b);
+        auto src2_op = eval(obj.c);
         switch (obj.op_kind) {
             case op_kind_t::_add3:
-            case op_kind_t::_mad: {
-                flag_setter_t no_vs(&allow_vert_stride_region_, false);
-                auto dst_op = alloc_dst_op(obj);
-                auto mod = dst_op.mod();
-                auto src0_op = eval(obj.a);
-                auto src1_op = eval(obj.b);
-                auto src2_op = eval(obj.c);
-                if (obj.op_kind == op_kind_t::_add3) {
-                    host_->eadd3(mod, dst_op, src0_op, src1_op, src2_op);
-                } else {
-                    host_->emad(mod, dst_op, src0_op, src1_op, src2_op);
-                }
-                bind(obj, dst_op);
+                host_->eadd3(mod, dst_op, src0_op, src1_op, src2_op);
                 break;
-            }
+            case op_kind_t::_mad:
+                host_->emad(mod, dst_op, src0_op, src1_op, src2_op);
+                break;
+            case op_kind_t::_idiv:
+                host_->eidiv(mod, dst_op.reg_data(), ngen::Subregister(),
+                        src0_op.reg_data(), src1_op.reg_data(),
+                        src2_op.reg_data());
+                break;
+            case op_kind_t::_imod:
+                host_->eidiv(mod, ngen::Subregister(), dst_op.reg_data(),
+                        src0_op.reg_data(), src1_op.reg_data(),
+                        src2_op.reg_data());
+                break;
             default: ir_error_not_expected();
         }
+        bind(obj, dst_op);
     }
 
     void _visit(const unary_op_t &obj) override {
@@ -1250,8 +1261,17 @@ private:
                 auto temp = scope_.alloc_reg_buf_data(regs).format(
                         off, ngen::DataType::f, esize);
                 host_->emul(mod, temp, dst, src1);
-                host_->csel(mod | host_->le, dst.reg_data(), temp,
-                        dst.reg_data(), dst.reg_data());
+                // Workaround for regioning restriction.
+                if (esize == 2) {
+                    host_->csel(mod | host_->le, dst.reg_data(),
+                            temp.subregister(0)(1),
+                            dst.reg_buf_data().subregister(0)(1),
+                            dst.reg_buf_data().subregister(0)(1));
+                } else {
+                    host_->csel(mod | host_->le, dst.reg_data(), temp,
+                            dst.reg_data(), dst.reg_data());
+                }
+
                 break;
             }
             default:
@@ -1514,6 +1534,8 @@ REG_XEHP_ISA(template void convert_ir_to_ngen(const stmt_t &body,
 REG_XEHPG_ISA(template void convert_ir_to_ngen(const stmt_t &body,
         ir_kernel_t<ngen::HW::XeHPG> *host,
         const expr_binding_t &expr_binding));
+REG_XE2_ISA(template void convert_ir_to_ngen(const stmt_t &body,
+        ir_kernel_t<ngen::HW::Xe2> *host, const expr_binding_t &expr_binding));
 REG_XEHPC_ISA(template void convert_ir_to_ngen(const stmt_t &body,
         ir_kernel_t<ngen::HW::XeHPC> *host,
         const expr_binding_t &expr_binding));

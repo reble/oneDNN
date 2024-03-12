@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include "context.hpp"
 #include <compiler/ir/easy_build.hpp>
 #include <compiler/ir/ir_comparer.hpp>
+#include <compiler/ir/pass/ir_copy.hpp>
 #include <compiler/ir/transform/buffer_schedule.hpp>
 #include <compiler/ir/transform/pointer_alias_info.hpp>
 #include <compiler/ir/transform/tensor_inplace.hpp>
@@ -36,7 +37,7 @@ static context_ptr make_ctx() {
     return ret;
 }
 
-TEST(GCCore_CPU_tensor_inplace_cpp, TestSimpleSchedule) {
+static void do_test(bool copyit) {
     ir_builder_t bld;
     _function_(datatypes::void_t, aaa, _arg_("A", datatypes::f32, {100}),
             _arg_("B", datatypes::f32, {100}),
@@ -59,7 +60,11 @@ TEST(GCCore_CPU_tensor_inplace_cpp, TestSimpleSchedule) {
     for (auto &arg : bbb->decl_->params_) {
         arg = arg->remake();
     }
-
+    std::unordered_map<expr_c, expr> replace_map;
+    ir_copier_t cpyer {replace_map};
+    func_t bbb_decl_copy = copyit
+            ? std::const_pointer_cast<func_base>(cpyer(bbb->decl_))
+            : bbb->decl_;
     _function_(
             datatypes::void_t, main_entry, _arg_("C", datatypes::f32, {100})) {
         _bind_(C);
@@ -82,24 +87,25 @@ TEST(GCCore_CPU_tensor_inplace_cpp, TestSimpleSchedule) {
         E[0] = 1;
         _tensor_(temp2, datatypes::f32, 100);
         // we can reuse E for temp1
-        _evaluate_call_(bbb, E, B, temp2);
+        _evaluate_call_(bbb_decl_copy, E, B, temp2);
         C[1] = temp2[1];
     }
     auto ctx = make_ctx();
     auto mod = ir_module_t::from_entry_func(ctx, main_entry);
+    mod->add_func({bbb});
     auto out_mod = tensor_inplace_t(ctx)(mod);
 
     _function_(datatypes::void_t, expected, _arg_("C", datatypes::f32, {100})) {
         _bind_(C);
         _tensor_(sched, datatypes::s8, UINT64_C(1344));
         _tensor_(A, datatypes::f32, 100);
-        bld.get_current_scope().body.back().checked_as<define>()->init_
+        bld.get_current_scope().as_seq().back().checked_as<define>()->init_
                 = builder::tensor_ptr(sched, {UINT64_C(0)});
         _tensor_(B, datatypes::f32, 100);
-        bld.get_current_scope().body.back().checked_as<define>()->init_
+        bld.get_current_scope().as_seq().back().checked_as<define>()->init_
                 = builder::tensor_ptr(sched, {UINT64_C(448)});
         _tensor_(temp1, datatypes::f32, 100);
-        bld.get_current_scope().body.back().checked_as<define>()->init_
+        bld.get_current_scope().as_seq().back().checked_as<define>()->init_
                 = builder::tensor_ptr(sched, {UINT64_C(896)});
         A[0] = 1;
         B[0] = 1;
@@ -109,21 +115,21 @@ TEST(GCCore_CPU_tensor_inplace_cpp, TestSimpleSchedule) {
         C[0] = A[0];
 
         _tensor_(D, datatypes::f32, 100);
-        bld.get_current_scope().body.back().checked_as<define>()->init_
+        bld.get_current_scope().as_seq().back().checked_as<define>()->init_
                 = builder::tensor_ptr(sched, {UINT64_C(0)});
         // check that we cannot reuse D for temp1, because call of aaa is not
         // the first use of temp1
         _evaluate_call_(aaa->decl_, D, B, temp1);
 
         _tensor_(E, datatypes::f32, 100);
-        bld.get_current_scope().body.back().checked_as<define>()->init_
+        bld.get_current_scope().as_seq().back().checked_as<define>()->init_
                 = builder::tensor_ptr(sched, {UINT64_C(896)});
         E[0] = 1;
         _tensor_(temp2, datatypes::f32, 100);
-        bld.get_current_scope().body.back().checked_as<define>()->init_
+        bld.get_current_scope().as_seq().back().checked_as<define>()->init_
                 = builder::tensor_ptr(sched, {UINT64_C(896)});
         // we can reuse E for temp1
-        _evaluate_call_(bbb->decl_, E, B, temp2);
+        _evaluate_call_(bbb_decl_copy, E, B, temp2);
         C[1] = temp2[1];
     }
 
@@ -153,4 +159,12 @@ TEST(GCCore_CPU_tensor_inplace_cpp, TestSimpleSchedule) {
     auto after_sched = scheduler(out_mod->get_entry_func());
     ir_comparer cmper {true};
     EXPECT_TRUE(cmper.compare(after_sched, expected, false));
+}
+
+TEST(GCCore_CPU_tensor_inplace_cpp, TestSimpleSchedule) {
+    do_test(false);
+}
+
+TEST(GCCore_CPU_tensor_inplace_cpp, TestSimpleScheduleDeclCopied) {
+    do_test(true);
 }

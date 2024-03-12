@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2022 Intel Corporation
+* Copyright 2019-2023 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -13,8 +13,6 @@
 * See the License for the specific language governing permissions and
 * limitations under the License.
 *******************************************************************************/
-
-#include "oneapi/dnnl/dnnl_config.h"
 
 #include "ngen_register_allocator.hpp"
 #include "ngen_utils.hpp"
@@ -36,6 +34,7 @@ int Bundle::first_reg(HW hw) const
         return (bundle0 << 8) | (bank0 << 1);
     case HW::Gen12LP:
     case HW::XeHPC:
+    case HW::Xe2:
         return (bundle0 << 1) | bank0;
     case HW::XeHP:
     case HW::XeHPG:
@@ -70,6 +69,7 @@ int Bundle::stride(HW hw) const
     case HW::Gen11:
         return 4;
     case HW::Gen12LP:
+    case HW::Xe2:
         return 16;
     case HW::XeHP:
     case HW::XeHPG:
@@ -98,6 +98,7 @@ int64_t Bundle::reg_mask(HW hw, int offset) const
         if (bank_id != any)                             bank_mask = 0x3333333333333333 << (bank_id << 1);
         return bundle_mask & bank_mask;
     case HW::Gen12LP:
+    case HW::Xe2:
         if (bundle_id != any)                           base_mask  = 0x0003000300030003;
         if (bank_id != any)                             base_mask &= 0x5555555555555555;
         return base_mask << (bank0 + (bundle0 << 1));
@@ -126,6 +127,7 @@ Bundle Bundle::locate(HW hw, RegData reg)
         case HW::Gen11:
             return Bundle((base >> 1) & 1, base >> 6);
         case HW::Gen12LP:
+        case HW::Xe2:
             return Bundle(base & 1, (base >> 1) & 7);
         case HW::XeHP:
         case HW::XeHPG:
@@ -288,7 +290,8 @@ FlagRegister RegisterAllocator::alloc_flag(bool sub)
 
 GRFRange RegisterAllocator::try_alloc_range(int nregs, Bundle base_bundle, BundleGroup bundle_mask)
 {
-    int64_t *free_whole64 = (int64_t *) free_whole;
+    int64_t free_whole64[sizeof(free_whole) / sizeof(int64_t)];
+    std::memcpy(free_whole64, free_whole, sizeof(free_whole));
     bool ok = false;
     int r_base = -1;
 
@@ -353,7 +356,8 @@ Subregister RegisterAllocator::try_alloc_sub(DataType type, Bundle bundle)
     auto find_alloc_sub = [&,bundle,dwords](bool search_full_grf) -> bool {
         static const uint16_t alloc_patterns[4] = {0b1111111111111111, 0b0101010101010101, 0, 0b0001000100010001};
         auto alloc_pattern = alloc_patterns[(dwords - 1) & 3];
-        int64_t *free_whole64 = (int64_t *) free_whole;
+        int64_t free_whole64[sizeof(free_whole) / sizeof(int64_t)];
+        std::memcpy(free_whole64, free_whole, sizeof(free_whole));
 
         for (int rchunk = 0; rchunk < (max_regs >> 6); rchunk++) {
             int64_t free = search_full_grf ? free_whole64[rchunk] : -1;

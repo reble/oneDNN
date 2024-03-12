@@ -31,6 +31,10 @@ gelu_op::gelu_op(const std::vector<graph_tensor_ptr> &ins,
                 std::make_shared<graph_tensor>(this, ins[0]->details_));
     } else {
         info_.outputs_ = outs;
+        COMPILE_ASSERT(
+                info_.outputs_.size() == 1, "gelu op shall have only 1 output.")
+        gc::graph::check_logical_tensor_shape_dtype_identical(
+                info_.inputs_[0]->details_, info_.outputs_[0]->details_);
     }
     attrs_ = attrs;
     op_name_ = "gelu";
@@ -40,11 +44,19 @@ gelu_backprop_op::gelu_backprop_op(const std::vector<graph_tensor_ptr> &ins,
         const std::vector<graph_tensor_ptr> &outs, const any_map_t &attrs) {
     COMPILE_ASSERT(ins.size() == 2, "Wrong op input size.\n");
     info_.inputs_ = ins;
+    COMPILE_ASSERT(gc::graph::check_shape_equal(
+                           info_.inputs_[0]->details_.get_plain_dims(),
+                           info_.inputs_[1]->details_.get_plain_dims()),
+            "2 inputs of gelu backprop op shall have the same shape.");
     if (outs.empty()) {
         info_.outputs_.emplace_back(
                 std::make_shared<graph_tensor>(this, ins[0]->details_));
     } else {
         info_.outputs_ = outs;
+        COMPILE_ASSERT(info_.outputs_.size() == 1,
+                "gelu backprop op shall have only 1 output.")
+        gc::graph::check_logical_tensor_shape_dtype_identical(
+                info_.inputs_[0]->details_, info_.outputs_[0]->details_);
     }
     attrs_ = attrs;
     op_name_ = "gelu_backprop";
@@ -55,12 +67,13 @@ void gelu_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
     std::vector<graph_tensor_ptr> inputs, outputs;
     inputs = remake_logical_tensors(info_.inputs_);
     outputs = remake_logical_tensors(info_.outputs_);
+    graph->make_input(inputs);
+    graph_tensor_ptr inputs0 = inputs[0];
+    sc_op_ptr output_op;
+    // cast input if it is bf16
+    inputs0 = cast_input_dtype(inputs[0], graph);
     if (attrs_.get_or_else("gelu_type", std::string("erf")) == "tanh") {
         // tanh impl
-        // input
-        graph->make_input(inputs);
-        bool is_bf16 = info_.inputs_[0]->details_.dtype_.is_etype(
-                sc_data_etype::BF16);
         sc_op_ptr sqrt_2_over_pi, fitting_const, one, half;
         sqrt_2_over_pi = graph->make<constant_op_t>(
                 std::make_shared<static_data_t>(
@@ -75,12 +88,6 @@ void gelu_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
         half = graph->make<constant_op_t>(
                 std::make_shared<static_data_t>(std::vector<float> {0.5f}),
                 datatypes::f32, sc_dims {1});
-        graph_tensor_ptr inputs0 = inputs[0];
-        if (is_bf16) {
-            auto cast0 = graph->make(
-                    "cast", {inputs[0]}, {}, {{"dtype", datatypes::f32}});
-            inputs0 = cast0->get_outputs()[0];
-        }
         auto mul0 = graph->make("mul", {inputs0, inputs0}, {}, {});
         auto mul1 = graph->make("mul",
                 {mul0->get_outputs()[0], fitting_const->get_outputs()[0]}, {},
@@ -99,18 +106,9 @@ void gelu_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
                 = graph->make("mul", {inputs0, add1->get_outputs()[0]}, {}, {});
         auto mul5 = graph->make("mul",
                 {mul4->get_outputs()[0], half->get_outputs()[0]}, {}, {});
-        if (is_bf16) {
-            mul5 = graph->make("cast", mul5->get_outputs(), {},
-                    {{"dtype", datatypes::bf16}});
-        }
-        // output
-        graph->make_output(mul5->get_outputs());
+        output_op = mul5;
     } else {
         // erf impl
-        // input
-        graph->make_input(inputs);
-        bool is_bf16 = info_.inputs_[0]->details_.dtype_.is_etype(
-                sc_data_etype::BF16);
         sc_op_ptr one_over_sqrt_2, one, half;
         union {
             float v;
@@ -126,12 +124,6 @@ void gelu_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
         half = graph->make<constant_op_t>(
                 std::make_shared<static_data_t>(std::vector<float> {0.5f}),
                 datatypes::f32, sc_dims {1});
-        graph_tensor_ptr inputs0 = inputs[0];
-        if (is_bf16) {
-            auto cast0 = graph->make(
-                    "cast", {inputs[0]}, {}, {{"dtype", datatypes::f32}});
-            inputs0 = cast0->get_outputs()[0];
-        }
         auto mul0 = graph->make(
                 "mul", {inputs0, one_over_sqrt_2->get_outputs()[0]}, {}, {});
         auto erf0 = graph->make("erf", {mul0->get_outputs()[0]}, {}, {});
@@ -141,13 +133,11 @@ void gelu_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
                 = graph->make("mul", {add0->get_outputs()[0], inputs0}, {}, {});
         auto mul2 = graph->make("mul",
                 {mul1->get_outputs()[0], half->get_outputs()[0]}, {}, {});
-        if (is_bf16) {
-            mul2 = graph->make("cast", mul2->get_outputs(), {},
-                    {{"dtype", datatypes::bf16}});
-        }
-        // output
-        graph->make_output(mul2->get_outputs());
+        output_op = mul2;
     }
+    output_op = cast_output_dtype(outputs[0], graph, output_op);
+    // output
+    graph->make_output(output_op->get_outputs());
 }
 
 void gelu_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
@@ -158,11 +148,11 @@ void gelu_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
 
     // input
     graph->make_input(inputs);
-    bool is_bf16
-            = info_.inputs_[0]->details_.dtype_.is_etype(sc_data_etype::BF16);
+    sc_op_ptr output_op;
     graph_tensor_ptr inputs0 = inputs[0];
     graph_tensor_ptr inputs1 = inputs[1];
-
+    inputs0 = cast_input_dtype(inputs0, graph);
+    inputs1 = cast_input_dtype(inputs1, graph);
     if (attrs_.get_or_else("gelu_type", std::string("erf")) == "tanh") {
         sc_op_ptr fitting_const1, fitting_const2, fitting_const3,
                 fitting_const4, two, one, neg_one, half;
@@ -192,11 +182,6 @@ void gelu_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
         half = graph->make<constant_op_t>(
                 std::make_shared<static_data_t>(std::vector<float> {0.5f}),
                 datatypes::f32, sc_dims {1});
-        if (is_bf16) {
-            auto cast0 = graph->make(
-                    "cast", {inputs[0]}, {}, {{"dtype", datatypes::f32}});
-            inputs0 = cast0->get_outputs()[0];
-        }
         // x*x
         auto mul0 = graph->make("mul", {inputs0, inputs0}, {}, {});
         // 0.0356774x*x
@@ -253,15 +238,9 @@ void gelu_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
                 {mul3->get_outputs()[0], mul8->get_outputs()[0]}, {}, {});
         auto add4 = graph->make("add",
                 {add3->get_outputs()[0], half->get_outputs()[0]}, {}, {});
-
-        if (is_bf16) {
-            add4 = graph->make("cast", add4->get_outputs(), {},
-                    {{"dtype", datatypes::bf16}});
-        }
         auto mul10
                 = graph->make("mul", {add4->get_outputs()[0], inputs1}, {}, {});
-        // output
-        graph->make_output(mul10->get_outputs());
+        output_op = mul10;
     } else {
         auto one = graph->make<constant_op_t>(
                 std::make_shared<static_data_t>(std::vector<float> {1.0f}),
@@ -279,14 +258,6 @@ void gelu_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
         auto fitting_const2 = graph->make<constant_op_t>(
                 std::make_shared<static_data_t>(std::vector<float> {0.707106f}),
                 datatypes::f32, sc_dims {1});
-        if (is_bf16) {
-            auto cast0 = graph->make(
-                    "cast", {inputs[0]}, {}, {{"dtype", datatypes::f32}});
-            auto cast1 = graph->make(
-                    "cast", {inputs[1]}, {}, {{"dtype", datatypes::f32}});
-            inputs0 = cast0->get_outputs()[0];
-            inputs1 = cast1->get_outputs()[0];
-        }
         // x*x
         auto mul0 = graph->make("mul", {inputs0, inputs0}, {}, {});
         // -0.5f*x*x
@@ -309,13 +280,12 @@ void gelu_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
                 {mul3->get_outputs()[0], mul5->get_outputs()[0]}, {}, {});
         auto mul6
                 = graph->make("mul", {add1->get_outputs()[0], inputs1}, {}, {});
-        if (is_bf16) {
-            mul6 = graph->make("cast", mul6->get_outputs(), {},
-                    {{"dtype", datatypes::bf16}});
-        }
-        // output
-        graph->make_output(mul6->get_outputs());
+        output_op = mul6;
     }
+    // cast output
+    output_op = cast_output_dtype(outputs[0], graph, output_op);
+    // output
+    graph->make_output(output_op->get_outputs());
 }
 
 void gelu_op::query_format(context_ptr ctx,

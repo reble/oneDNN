@@ -37,6 +37,10 @@ static context_ptr get_ctx() {
 
 TEST(GCCore_CPU_codegenc_cpp, TestCodegenC) {
     REQUIRE_PARALLEL();
+    if (runtime_config_t::get().managed_thread_pool_
+            == thread_pool_mode_t::DYNAMIC) {
+        GTEST_SKIP();
+    }
     builder::ir_builder_t builder;
     const int shape1 = 128;
     for_loop li, lj, lk, lp;
@@ -71,9 +75,9 @@ TEST(GCCore_CPU_codegenc_cpp, TestCodegenC) {
         _tensor_(E, datatypes::f32, 100, 20);
         _tensor_(F, datatypes::f32, len);
         _tensor_(F_view, datatypes::s32, 10);
-        builder.get_current_scope().body.back().checked_as<define>()->init_
+        builder.get_current_scope().as_seq().back().checked_as<define>()->init_
                 = builder::tensor_ptr(F, {3});
-        builder.get_current_scope().body.back()->attr()["comments"]
+        builder.get_current_scope().as_seq().back()->attr()["comments"]
                 = std::vector<std::string> {"hello", "hi"};
         _named_for_(li, i, 0, shape1) {
             _named_for_(lj, j, 0, shape1) {
@@ -315,6 +319,10 @@ alignas(64) uint8_t aaa_data[40512] = {)";
 
 TEST(GCCore_CPU_codegenc_cpp, TestCodegenCParallelFor) {
     REQUIRE_PARALLEL();
+    if (runtime_config_t::get().managed_thread_pool_
+            == thread_pool_mode_t::DYNAMIC) {
+        GTEST_SKIP();
+    }
     builder::ir_builder_t builder;
     const int shape1 = 128;
     for_loop li, lj, lk, lp;

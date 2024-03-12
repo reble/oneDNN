@@ -26,20 +26,19 @@
 namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 
-TEST(Tensor, SetDataHandle) {
-    test::vector<int> data;
+TEST(test_interface_tensor, SetDataHandle) {
+    void *p = nullptr;
     auto tensor = dnnl_graph_tensor();
-    tensor.set_data_handle(data.data());
-    ASSERT_EQ(tensor.get_data_handle(), data.data());
+    tensor.set_data_handle(p);
+    ASSERT_EQ(tensor.get_data_handle(), p);
 }
 
-TEST(Tensor, GetEngine) {
+TEST(test_interface_tensor, GetEngine) {
     graph::engine_t &engine = *get_engine();
     graph::logical_tensor_t lt = utils::logical_tensor_init(
             0, {1, 2}, graph::data_type::f32, graph::layout_type::strided);
-    test::vector<float> data;
-    auto tensor = dnnl_graph_tensor(lt, &engine, data.data());
-    ASSERT_EQ(tensor.get_engine(), &engine);
+    test_tensor tmp(lt, &engine);
+    ASSERT_EQ(tmp.get().get_engine(), &engine);
 }
 
 #define DESTROY_TENSOR(t) \
@@ -48,7 +47,7 @@ TEST(Tensor, GetEngine) {
         (t) = nullptr; \
     } while (0);
 
-TEST(Tensor, DnnlGraphTensorCreate) {
+TEST(test_interface_tensor, DnnlGraphTensorCreate) {
     graph::tensor_t *tensor;
     graph::logical_tensor_t lt = utils::logical_tensor_init(
             0, {1, 2}, graph::data_type::f32, graph::layout_type::strided);
@@ -62,9 +61,15 @@ TEST(Tensor, DnnlGraphTensorCreate) {
 
     ASSERT_EQ_SAFE(dnnl_graph_tensor_create(&tensor, nullptr, &engine, handle),
             graph::status::invalid_arguments, DESTROY_TENSOR(tensor));
+
+    ASSERT_EQ_SAFE(dnnl_graph_tensor_create(
+                           &tensor, &lt, &engine, DNNL_MEMORY_ALLOCATE),
+            graph::status::success, DESTROY_TENSOR(tensor));
+
+    DESTROY_TENSOR(tensor);
 }
 
-TEST(Tensor, DnnlGraphTensorSetDataHandle) {
+TEST(test_interface_tensor, DnnlGraphTensorSetDataHandle) {
     auto tensor = dnnl_graph_tensor();
     void *handle = nullptr;
 
@@ -75,7 +80,7 @@ TEST(Tensor, DnnlGraphTensorSetDataHandle) {
             graph::status::success);
 }
 
-TEST(Tensor, DnnlGraphTensorGetEngine) {
+TEST(test_interface_tensor, DnnlGraphTensorGetEngine) {
     graph::tensor_t *tensor;
     graph::logical_tensor_t lt = utils::logical_tensor_init(
             0, {1, 2}, graph::data_type::f32, graph::layout_type::strided);

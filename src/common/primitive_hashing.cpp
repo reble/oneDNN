@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,19 +28,20 @@ namespace primitive_hashing {
 
 key_t::key_t(const engine_t *engine, const op_desc_t *op_desc,
         const primitive_attr_t *attr, int pd_iterator_offset,
-        const std::vector<memory_desc_t> &hint_mds)
+        const std::vector<memory_desc_t> &hint_mds, int skip_idx)
     : primitive_kind_(op_desc->kind)
     , op_desc_(op_desc)
     , attr_(attr)
     , pd_iterator_offset_(pd_iterator_offset)
     , impl_nthr_(dnnl_get_max_threads())
+    , skip_idx_(skip_idx)
     , hint_mds_(hint_mds)
     , engine_id_(engine->engine_id())
     , thread_id_(std::this_thread::get_id()) {}
 
 key_t::key_t(const primitive_desc_t *pd, const engine_t *engine)
     : key_t(engine, pd->op_desc(), pd->attr(), pd->pd_iterator_offset(),
-            pd->hint_mds(false /* is_hint */)) {}
+            pd->hint_mds(false /* is_hint */), pd->skip_idx()) {}
 
 bool key_t::operator==(const key_t &rhs) const {
     DNNL_SHORT_CIRCUIT_SELF_COMPARISON(rhs);
@@ -52,6 +53,7 @@ bool key_t::operator==(const key_t &rhs) const {
         && hint_mds_.size() == rhs.hint_mds_.size()
         && pd_iterator_offset_ == rhs.pd_iterator_offset_
         && impl_nthr_ == rhs.impl_nthr_
+	&& skip_idx_ == rhs.skip_idx_
         && (*attr_) == (*rhs.attr_);
 
     if (!ret) return false;
@@ -199,7 +201,10 @@ size_t get_attr_hash(const primitive_attr_t &attr) {
     // scratchpad_mode
     seed = hash_combine(seed, static_cast<size_t>(attr.scratchpad_mode_));
     // fpmath_mode
-    seed = hash_combine(seed, static_cast<size_t>(attr.fpmath_mode_));
+    seed = hash_combine(seed, static_cast<size_t>(attr.fpmath_.mode_));
+    seed = hash_combine(seed, static_cast<size_t>(attr.fpmath_.apply_to_int_));
+    // acc_mode
+    seed = hash_combine(seed, static_cast<size_t>(attr.acc_mode_));
 
     if (!attr.output_scales_.has_default_values()) {
         // output_scales: mask

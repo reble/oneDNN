@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -95,8 +95,8 @@ class zp_comp_init_plan_t : public base_plan_t {
 public:
     using base_plan_t::base_plan_t;
 
-    zp_comp_init_plan_t(const ngen::HW hw, bool is_fwd,
-            const layout_t &zp_layout, const layout_t &wei_layout)
+    zp_comp_init_plan_t(const hw_t &hw, bool is_fwd, const layout_t &zp_layout,
+            const layout_t &wei_layout)
         : base_plan_t(hw), zp_layout_(zp_layout), wei_layout_(wei_layout) {
         init_idxs(is_fwd);
         init_comp_layout();
@@ -778,7 +778,7 @@ private:
                 auto &name = vvar.as<var_t>().name;
                 if (utils::one_of(name, "g", "ic", "oc")) continue;
                 int padded = cfg.padded_dim(
-                        conv_dim_t::from_name(vvar.as<var_t>().name));
+                        prb_dim_t::from_name(vvar.as<var_t>().name));
                 int dim = a_view.vdims()[vidx];
                 if (dim != padded) add_mask_desc(mask_descs_, vvar < dim);
                 continue;
@@ -874,7 +874,7 @@ class zp_comp_apply_plan_t : public base_plan_t {
 public:
     using base_plan_t::base_plan_t;
 
-    zp_comp_apply_plan_t(const ngen::HW hw, bool is_fwd,
+    zp_comp_apply_plan_t(const hw_t &hw, bool is_fwd,
             const layout_t &comp_layout, const layout_t &mask_layout,
             const layout_t &c_layout, const bmnk_mapper_t &mapper)
         : base_plan_t(hw)
@@ -908,20 +908,104 @@ public:
 
     stmt_t create_stmt(const expr_t &comp_buf, const expr_t &mask_buf,
             const expr_t &c_buf, int subtile_idx) const {
-        int kw_dim = comp_layout_.dim(comp_kw_idx_);
-        stmt_t stmt;
+        const auto comp_type = comp_layout_.type();
+        const auto mask_type = mask_layout_.type();
+        const int kw_dim = comp_layout_.dim(comp_kw_idx_);
+        std::vector<int> comp_off;
+        std::vector<int> mask_off;
         c_layout_.for_each_tile(
                 get_simd_tile(), [&](const std::vector<dim_t> &start) {
                     if (!split_.in_subtile(start, subtile_idx)) return;
                     for (int kw = 0; kw < kw_dim; kw++) {
-                        auto comp = comp_buf[get_comp_off(start, kw)];
-                        auto mask = mask_buf.is_empty()
-                                ? expr_t()
-                                : mask_buf[get_mask_off(start, kw)];
-                        auto c = c_buf[get_c_off(start, kw)];
-                        stmt = stmt.append(create_tile_stmt(comp, mask, c));
+                        comp_off.emplace_back(get_comp_off(start, kw));
+                        mask_off.emplace_back((mask_buf.is_empty())
+                                        ? -1
+                                        : get_mask_off(start, kw));
                     }
                 });
+
+        std::vector<std::pair<int, stmt_t>> precomp;
+        for (int i = 0; i < int(comp_off.size()) / kw_dim; i++) {
+            bool is_same = i > 0;
+            for (int kw = i * kw_dim; is_same && (kw < (i + 1) * kw_dim); kw++)
+                is_same &= (comp_off[kw - kw_dim] == comp_off[kw])
+                        && (mask_off[kw - kw_dim] == mask_off[kw]);
+            if (is_same) continue;
+
+            precomp.emplace_back(i, stmt_t());
+            auto &stmt = precomp.back().second;
+            auto comp0 = comp_buf[comp_off[i * kw_dim]];
+            auto comp0_load
+                    = load_t::make(comp_type.with_elems(simd_), comp0, 0);
+            if (mask_buf.is_empty()) {
+                for (int kw = i * kw_dim + 1; kw < (i + 1) * kw_dim; kw++) {
+                    auto comp = comp_buf[comp_off[kw]];
+                    auto comp_load = load_t::make(
+                            comp_type.with_elems(simd_), comp, 0);
+                    stmt = stmt.append(
+                            store_t::make(comp0, 0, comp0_load + comp_load));
+                }
+            } else {
+                auto mask0 = mask_buf[mask_off[i * kw_dim]];
+                auto mask0_load = shuffle_t::make_broadcast(
+                        load_t::make(mask_type.with_elems(1), mask0, 0), simd_);
+                stmt = stmt.append(
+                        store_t::make(comp0, 0, comp0_load * mask0_load));
+                for (int kw = i * kw_dim + 1; kw < (i + 1) * kw_dim; kw++) {
+                    auto comp = comp_buf[comp_off[kw]];
+                    auto mask = mask_buf[mask_off[kw]];
+                    auto comp_load = load_t::make(
+                            comp_type.with_elems(simd_), comp, 0);
+                    auto mask_load = shuffle_t::make_broadcast(
+                            load_t::make(mask_type.with_elems(1), mask, 0),
+                            simd_);
+                    stmt = stmt.append(store_t::make(comp0, 0,
+                            ternary_op_t::make(op_kind_t::_mad, comp0_load,
+                                    comp_load, mask_load)));
+                }
+            }
+        }
+        precomp.emplace_back(-1, stmt_t());
+
+        stmt_t stmt;
+        // N.B.: if irreducible, kw_dim * precomp.size() > comp_off.size()
+        if (kw_dim * precomp.size() < comp_off.size()) {
+            const bool do_precomp = (subtile_idx == 0)
+                    || ((split_.abc() == abc_kind_t::b)
+                            && (split_.factor() > 1));
+            int p_iter = -1, t_iter = 0;
+            c_layout_.for_each_tile(
+                    get_simd_tile(), [&](const std::vector<dim_t> &start) {
+                        if (!split_.in_subtile(start, subtile_idx)) return;
+                        if (precomp[p_iter + 1].first == t_iter++) {
+                            p_iter++;
+                            if (do_precomp)
+                                stmt = stmt.append(precomp[p_iter].second);
+                        }
+                        auto off = comp_off[precomp[p_iter].first * kw_dim];
+                        auto comp_load = load_t::make(
+                                comp_type.with_elems(simd_), comp_buf[off], 0);
+                        auto c = c_buf[get_c_off(start, 0)];
+                        auto c_load = load_t::make(
+                                c_layout_.type().with_elems(simd_), c, 0);
+                        stmt = stmt.append(store_t::make(c, 0,
+                                (mask_buf.is_empty()) ? (c_load - comp_load)
+                                                      : (c_load + comp_load)));
+                    });
+        } else {
+            c_layout_.for_each_tile(
+                    get_simd_tile(), [&](const std::vector<dim_t> &start) {
+                        if (!split_.in_subtile(start, subtile_idx)) return;
+                        for (int kw = 0; kw < kw_dim; kw++) {
+                            auto comp = comp_buf[get_comp_off(start, kw)];
+                            auto mask = mask_buf.is_empty()
+                                    ? expr_t()
+                                    : mask_buf[get_mask_off(start, kw)];
+                            auto c = c_buf[get_c_off(start, kw)];
+                            stmt = stmt.append(create_tile_stmt(comp, mask, c));
+                        }
+                    });
+        }
         return stmt;
     }
 
@@ -1139,7 +1223,7 @@ struct zp_plan_impl_t : public base_plan_t {
     zp_mask_init_plan_t mask_init;
     zp_comp_apply_plan_t comp_apply;
 
-    zp_plan_impl_t(ngen::HW hw)
+    zp_plan_impl_t(const hw_t &hw)
         : base_plan_t(hw), comp_init(hw), mask_init(hw), comp_apply(hw) {}
 
     explicit operator bool() const { return (bool)load; }
@@ -1176,7 +1260,7 @@ struct zp_plan_impl_t : public base_plan_t {
     IR_DEFINE_DUMP()
 };
 
-zp_plan_t::zp_plan_t(ngen::HW hw)
+zp_plan_t::zp_plan_t(const hw_t &hw)
     : impl(utils::make_unique<zp_plan_impl_t>(hw)) {};
 
 zp_plan_t::~zp_plan_t() = default;

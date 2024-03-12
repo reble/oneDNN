@@ -26,17 +26,27 @@ relu_backprop_op::relu_backprop_op(const std::vector<graph_tensor_ptr> &ins,
         const std::vector<graph_tensor_ptr> &outs, const any_map_t &attrs) {
     COMPILE_ASSERT(ins.size() == 2, "Wrong op input size.\n");
     info_.inputs_ = ins;
+    COMPILE_ASSERT(gc::graph::check_shape_equal(
+                           info_.inputs_[0]->details_.get_plain_dims(),
+                           info_.inputs_[1]->details_.get_plain_dims()),
+            "2 inputs of relu backprop op shall have the same shape.");
     if (outs.empty()) {
         info_.outputs_.emplace_back(
                 std::make_shared<graph_tensor>(this, ins[0]->details_));
     } else {
         info_.outputs_ = outs;
+        COMPILE_ASSERT(info_.outputs_.size() == 1,
+                "relu backprop op shall have only 1 output.")
+        gc::graph::check_logical_tensor_shape_dtype_identical(
+                info_.inputs_[0]->details_, info_.outputs_[0]->details_);
     }
     attrs_ = attrs;
     op_name_ = "relu_backprop";
 }
 
 void relu_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
+    // no need to insert explicit cast for relu_backprop, since the computation
+    // of "select_one" is not sensitive to dtype.
     // create new input logical tensors
     std::vector<graph_tensor_ptr> inputs, outputs;
     inputs = remake_logical_tensors(info_.inputs_);
@@ -51,7 +61,6 @@ void relu_backprop_op::get_graph_impl(std::shared_ptr<sc_graph_t> &graph) {
     sc_op_ptr select_one = graph->make("select_one", {inputs[0]}, {}, {});
     sc_op_ptr mul = graph->make(
             "mul", {inputs[1], select_one->get_outputs()[0]}, {}, {});
-
     // output
     graph->make_output(mul->get_outputs());
 }

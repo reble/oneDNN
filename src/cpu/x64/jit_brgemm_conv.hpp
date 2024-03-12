@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@
 #include "cpu/x64/cpu_barrier.hpp"
 #include "cpu/x64/cpu_reducer.hpp"
 #include "cpu/x64/jit_avx512_core_amx_conv_kernel.hpp"
+#include "cpu/x64/jit_avx512_core_scale_precompute.hpp"
 #include "cpu/x64/jit_brgemm_conv_comp_pad_kernel.hpp"
 #include "cpu/x64/jit_brgemm_conv_trans_kernel.hpp"
 #include "cpu/x64/jit_brgemm_conv_utils.hpp"
@@ -75,6 +76,8 @@ struct brgemm_convolution_fwd_t : public primitive_t {
         dim_t wei_g_stride, wei_ic_stride, wei_ocb_stride;
         dim_t wei_kw_stride, wei_kh_stride, wei_kd_stride;
         dim_t pbuf_w_sz, pbuf_h_sz, pbuf_d_sz;
+        int ndims {0};
+        int rd {0};
 
         // batch sizes info for unrolled kernels
         int bs_c;
@@ -103,6 +106,16 @@ struct brgemm_convolution_fwd_t : public primitive_t {
         int get_brg_idx(int m, bool do_initialization, bool is_N_tail,
                 bool is_K_tail, int kd_b, int kd_e, int kh_b, int kh_e) const;
 
+        inline int get_bs(int kd_b, int kd_e, int kh_b, int kh_e) const {
+            const auto kd_l = nstl::min(KD_BLOCK, kd_e - kd_b);
+            const auto kh_l = nstl::min(KH_BLOCK, kh_e - kh_b);
+            const auto bs = kd_l
+                    * (jcp_.is_relo_whi()
+                                    ? 1
+                                    : (kh_l * (jcp_.is_relo_wi() ? 1 : KW)));
+            return bs;
+        }
+
         int get_any_brg_idx(bool is_N_tail, bool is_K_tail) const;
 
         inline int maybe_invert(int k, int K) const {
@@ -123,8 +136,6 @@ struct brgemm_convolution_fwd_t : public primitive_t {
 
         status_t add_brg_descriptor(int M, bool is_N_tail, bool is_K_tail,
                 bool do_init, int kd_b, int kd_e, int kh_b, int kh_e);
-
-        int ndims = 0;
 
     protected:
         bool arg_scales_ok() const {
@@ -246,6 +257,8 @@ private:
 
     std::unique_ptr<jit_generator> comp_vpad_pbuffer_;
 
+    std::unique_ptr<jit_avx512_core_scale_precompute_t> jit_scale_precompute_;
+
     size_t acc_dsz, bia_dsz, src_dsz, wei_dsz, dst_dsz;
 
     const memory_desc_wrapper bias_d;
@@ -262,6 +275,7 @@ private:
     dim_t src_w_sz, src_h_sz, src_d_sz, dst_w_sz, dst_h_sz, dst_d_sz;
     dim_t ker_vpad_sz, comp_ocb_sz, comp_ker_sz, comp_kw_sz, comp_ow_sz;
 
+    bool is_relo_with_relo_weights;
     bool need_compensation;
     bool is_amx;
 };

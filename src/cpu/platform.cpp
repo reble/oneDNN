@@ -117,6 +117,8 @@ bool has_data_type_support(data_type_t data_type) {
 #if defined(USE_CBLAS) && defined(BLAS_HAS_SBGEMM) && defined(__MMA__)
             return true;
 #endif
+#elif DNNL_AARCH64_USE_ACL
+            return arm_compute::CPUInfo::get().has_bf16();
 #else
             return false;
 #endif
@@ -126,6 +128,13 @@ bool has_data_type_support(data_type_t data_type) {
                     || x64::mayiuse(x64::avx2_vnni_2);
 #elif DNNL_AARCH64_USE_ACL
             return arm_compute::CPUInfo::get().has_fp16();
+#else
+            return false;
+#endif
+        case data_type::f8_e5m2:
+        case data_type::f8_e4m3:
+#if DNNL_X64
+            return x64::mayiuse(x64::avx512_core_fp16);
 #else
             return false;
 #endif
@@ -144,6 +153,8 @@ bool has_training_support(data_type_t data_type) {
 #if defined(USE_CBLAS) && defined(BLAS_HAS_SBGEMM) && defined(__MMA__)
             return true;
 #endif
+#elif DNNL_AARCH64_USE_ACL
+            return arm_compute::CPUInfo::get().has_bf16();
 #else
             return false;
 #endif

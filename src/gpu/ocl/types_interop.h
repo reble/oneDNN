@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,8 +28,33 @@ typedef long int64_t;
 #endif
 
 typedef struct {
+    int64_t array[2];
+} int64x2_t;
+
+typedef struct {
     int64_t array[3];
 } int64x3_t;
+
+typedef struct {
+    int64_t array[4];
+} int64x4_t;
+
+typedef struct {
+    int64_t array[5];
+} int64x5_t;
+
+typedef struct {
+    int64_t array[6];
+} int64x6_t;
+
+// Number of terms usable by a single dispatcher, each defined in ocl_types.h
+#define MAX_INDEXING_TERMS 10
+
+typedef struct {
+    int64_t sizes[MAX_INDEXING_TERMS];
+    int64_t strides[MAX_INDEXING_TERMS];
+    int64_t blocks[MAX_INDEXING_TERMS];
+} dispatch_gws_rt_params_t;
 
 #define ZERO_PAD_MASK_DATA_TYPE uint8_t
 #define ZERO_PAD_MASK_DT_BITS (8 * sizeof(ZERO_PAD_MASK_DATA_TYPE))

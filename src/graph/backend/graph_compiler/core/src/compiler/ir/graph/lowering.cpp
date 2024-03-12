@@ -324,6 +324,9 @@ std::string get_tensor_name(graph_tensor *t, sc_op *linked_output) {
         tensor_name
                 = linked_output->attrs_.get_or_else("temp.name", tensor_name);
     }
+    for (auto &ch : tensor_name) {
+        if (ch == '*') { ch = '_'; }
+    }
     return tensor_name;
 }
 } // namespace graph
@@ -682,24 +685,15 @@ expr create_op_query_func(const context_ptr &ctx, general_lower_params_t &gp,
     }
     // input before reorder
     if (node->isa<tunable_op_t>()
-            || (node->isa<fused_op_t>()
-                    && !node->stc_cast<fused_op_t>()->main_op_.empty())
             || (node->isa<mixed_fuse_op_t>()
                     && !node->stc_cast<mixed_fuse_op_t>()
                                 ->get_internal_tunable_input_indices()
                                 .empty())) {
         auto &inputs = node->get_inputs();
         std::vector<size_t> query_idxs;
-        if (node->isa<fused_op_t>() || node->isa<tunable_op_t>()) {
+        if (node->isa<tunable_op_t>()) {
             size_t sz;
-            if (node->isa<fused_op_t>()) {
-                sz = node->stc_cast<fused_op_t>()
-                             ->main_op_.ops_[1]
-                             ->get_inputs()
-                             .size();
-            } else {
-                sz = inputs.size();
-            }
+            sz = inputs.size();
             query_idxs.reserve(sz);
             for (size_t i = 0; i < sz; i++) {
                 query_idxs.emplace_back(i);
@@ -798,14 +792,7 @@ expr create_op_query_func(const context_ptr &ctx, general_lower_params_t &gp,
                 query_func_args.end(), size_outs.begin(), size_outs.end());
         query_func_args.push_back(dyn_ker_ptr);
         expr query_call; // call node
-        if (node->isa<fused_op_t>()) {
-            auto fused_node = node->stc_cast<fused_op_t>();
-            auto query_mod = fused_node->get_dynamic_query_func(ctx);
-            gp.ret_mod->merge(*query_mod);
-            assert(table_ptr);
-            query_call = builder::make_call(
-                    query_mod->get_entry_func(), query_func_args);
-        } else if (node->isa<mixed_fuse_op_t>()) {
+        if (node->isa<mixed_fuse_op_t>()) {
             auto fused_node = node->stc_cast<mixed_fuse_op_t>();
             auto query_mod = fused_node->get_dynamic_query_func(ctx);
             gp.ret_mod->merge(*query_mod);
@@ -1132,7 +1119,8 @@ ir_module_ptr lower_graph(context_ptr ctx, sc_graph_t &graph,
     int tensor_counter = 0;
     int global_tensor_counter = 0;
     auto ret_mod = ir_module_t::from_entry_func(ctx, func);
-    auto use_managed_tp = std::make_shared<bool>(false);
+    auto use_managed_tp
+            = std::make_shared<thread_pool_mode_t>(thread_pool_mode_t::DIRECT);
 
     expr dump_out_path;
     if (graph.attrs_.get_or_else("folded_input", false)) {
@@ -1361,6 +1349,7 @@ ir_module_ptr lower_graph(context_ptr ctx, sc_graph_t &graph,
                     COMPILE_ASSERT(itr != ltsr_rtsr.end(),
                             "Cannot find the input op in the generated "
                             "function");
+                    itr->second.tensor_->attr()["read_buffer"] = true;
                     new_param.emplace_back(itr->second.tensor_);
                 }
             } else if (auto outop = v->dyn_cast<output_op>()) {
@@ -1369,6 +1358,7 @@ ir_module_ptr lower_graph(context_ptr ctx, sc_graph_t &graph,
                     COMPILE_ASSERT(itr != ltsr_rtsr.end(),
                             "Cannot find the output op in the generated "
                             "function");
+                    itr->second.tensor_->attr()["write_buffer"] = true;
                     new_param.emplace_back(itr->second.tensor_);
                 }
             } else {
@@ -1478,14 +1468,16 @@ ir_module_ptr lower_graph(context_ptr ctx, sc_graph_t &graph,
     // 24-core cascade lake, 1.6Gflop is turning point of choosing
     // managed/native thread pool
     auto &rtl_cfg = runtime_config_t::get();
-    bool use_managed_thread_pool = false;
-    if (rtl_cfg.managed_thread_pool_) {
+    thread_pool_mode_t use_managed_thread_pool = thread_pool_mode_t::DIRECT;
+    if (rtl_cfg.managed_thread_pool_ == thread_pool_mode_t::MANAGED) {
         if (num_ops > 2 || rtl_cfg.get_num_threads() == 1
                 || gflop / rtl_cfg.get_num_threads() > 0.0666f) {
-            use_managed_thread_pool = true;
+            use_managed_thread_pool = thread_pool_mode_t::MANAGED;
         } else if (ctx->use_amx()) {
-            use_managed_thread_pool = true;
+            use_managed_thread_pool = thread_pool_mode_t::MANAGED;
         }
+    } else if (rtl_cfg.managed_thread_pool_ == thread_pool_mode_t::DYNAMIC) {
+        use_managed_thread_pool = thread_pool_mode_t::DYNAMIC;
     }
     ret_mod->attr_[ir_module_t::attr_key_t::MANAGED_THREAD_POOL]
             = use_managed_thread_pool;

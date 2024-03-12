@@ -38,7 +38,8 @@ namespace graph {
 namespace gc {
 
 SC_DECL_PASS_INFO(module_globals_resolver,
-        SC_PASS_DEPENDS_ON(closurizer_cpu, kernel_lowering_cpu),
+        SC_PASS_DEPENDS_ON(closurizer_cpu, kernel_lowering_cpu,
+                dynamic_parallel_transform),
         SC_PASS_REQUIRE_STATE(), SC_PASS_REQUIRE_NOT_STATE(),
         SC_PASS_SET_STATE(), SC_PASS_UNSET_STATE());
 
@@ -113,6 +114,20 @@ public:
         return copy_attr(*v, builder::make_call(itr->second->decl_, ret));
     }
 
+    expr_c visit(constant_c v) override {
+        if (v->dtype_ == datatypes::pointer && v->value_[0].u64 == 0) {
+            if (any_map_t::fetch_or_else(
+                        v->attr_.get(), "auto_fill_stream", false)) {
+                return current_rtl_ctx;
+            }
+            if (any_map_t::fetch_or_else(
+                        v->attr_.get(), "auto_fill_module_data", false)) {
+                return builder::make_reinterpret(
+                        current_base, datatypes::pointer);
+            }
+        }
+        return v;
+    }
     expr_c visit(func_addr_c v) override {
         auto itr = map->find(v->func_->name_);
         if (itr == map->end()) { return ir_visitor_t::visit(v); }
@@ -455,6 +470,9 @@ const_ir_module_ptr module_globals_resolver_t::operator()(
                 && f->attr_->get_or_else(function_attrs::low_level, false)) {
             continue;
         }
+        if (any_map_t::fetch_or_else(f->attr_.get(), "device_func", false)) {
+            continue;
+        }
         auto params = f->params_;
         // insert two placeholders
         params.insert(params.begin(), 2, expr());
@@ -490,6 +508,10 @@ const_ir_module_ptr module_globals_resolver_t::operator()(
         if (funcs[i]->attr_
                 && funcs[i]->attr_->get_or_else(
                         function_attrs::low_level, false)) {
+            continue;
+        }
+        if (any_map_t::fetch_or_else(
+                    funcs[i]->attr_.get(), "device_func", false)) {
             continue;
         }
         module_globals_resolver_impl_t impl;

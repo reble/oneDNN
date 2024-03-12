@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -40,6 +40,7 @@ AccessType getAccessType(char c) {
         case 'm': return AccessType::Block2D;
         case 't': return AccessType::Block2DTranspose;
         case 'v': return AccessType::Block2DVNNI;
+        case 'c': return AccessType::CacheLine;
         default: throw std::runtime_error("Unknown access type.");
     }
 }
@@ -84,26 +85,34 @@ CacheSettingsLSC getCaching(char l1, char l3) {
     }
 }
 
+CacheSettingsLSC getCachingEntry(std::stringstream &s, HW hw) {
+    {
+        char l1, l3;
+        s >> l1 >> l3;
+        return getCaching(l1, l3);
+    }
+}
+
 void getCaching(
         std::stringstream &s, HW hw, MatrixAddressingStrategy &astrategy) {
     auto &cachingR = astrategy.cachingR;
     auto &cachingW = astrategy.cachingW;
 
     cachingR = CacheSettingsLSC::L1C_L3C;
-    cachingW = (hw >= HW::XeHPC) ? CacheSettingsLSC::L1UC_L3WB
-                                 : CacheSettingsLSC::L1WB_L3WB;
+    cachingW = CacheSettingsLSC::L1WB_L3WB;
+
+    if (hw >= HW::XeHPC) cachingW = CacheSettingsLSC::L1UC_L3WB;
 
     if (s.peek() == '{') {
-        char eat, l1, l3;
-        s >> eat >> l1 >> l3 >> eat;
-        if (eat != '}' && eat != '/')
-            throw std::runtime_error("Invalid caching syntax");
-        cachingR = getCaching(l1, l3);
+        char eat;
+        s >> eat;
+        cachingR = getCachingEntry(s, hw);
+        s >> eat;
         if (eat == '/') {
-            s >> l1 >> l3 >> eat;
-            if (eat != '}') throw std::runtime_error("Invalid caching syntax");
-            cachingW = getCaching(l1, l3);
+            cachingW = getCachingEntry(s, hw);
+            s >> eat;
         }
+        if (eat != '}') throw std::runtime_error("Invalid caching syntax");
     }
 }
 
@@ -179,7 +188,7 @@ void parseStrategy(const char *str, HW hw, const GEMMProblem &problem,
     strategy.A.base = strategy.A_prefetch.base = getAddressBase(asA);
     strategy.B.base = strategy.B_prefetch.base = getAddressBase(asB);
     strategy.C.base = strategy.C_prefetch.base = getAddressBase(asC);
-    strategy.CO.base = (hw >= HW::XeHPC) ? AddressBase::createA64(true)
+    strategy.CO.base = (hw >= HW::XeHPG) ? AddressBase::createA64(true)
                                          : AddressBase::createBTS(0);
     strategy.A.newDP = bool(std::isupper(accessA));
     strategy.B.newDP = bool(std::isupper(accessB));
@@ -192,6 +201,7 @@ void parseStrategy(const char *str, HW hw, const GEMMProblem &problem,
     strategy.unalignedAccB = getAccessType(accessBUnaligned);
     strategy.A.cachingW = CacheSettingsLSC::Default;
     strategy.B.cachingW = CacheSettingsLSC::Default;
+    strategy.CO.cachingR = CacheSettingsLSC::L1C_L3C;
     strategy.A_prefetch.prefetch = true;
     strategy.B_prefetch.prefetch = true;
     strategy.C_prefetch.prefetch = true;
@@ -239,9 +249,10 @@ void parseStrategy(const char *str, HW hw, const GEMMProblem &problem,
             strategy.systolic = true;
         else if (mod == "dw")
             strategy.dpasw = true;
-        else if (mod == "fs")
+        else if (mod == "fs") {
             strategy.fixedSystolic = strategy.systolic = true;
-        else if (mod == "ar")
+            strategy.CO.base = AddressBase::createBTS(0);
+        } else if (mod == "ar")
             strategy.altCRemainder = true;
         else if (mod == "sr") {
             strategy.altCRemainder = false;
@@ -266,8 +277,12 @@ void parseStrategy(const char *str, HW hw, const GEMMProblem &problem,
             strategy.splitCopy = true;
         else if (mod == "sm")
             strategy.coopA = CoopSplit::MN;
+        else if (mod == "ska")
+            strategy.coopA = CoopSplit::FullK;
         else if (mod == "sn")
             strategy.coopB = CoopSplit::MN;
+        else if (mod == "skb")
+            strategy.coopB = CoopSplit::FullK;
         else if (mod == "ni")
             strategy.slmUseIncrCopy = false;
         else if (mod == "ek")
@@ -284,6 +299,8 @@ void parseStrategy(const char *str, HW hw, const GEMMProblem &problem,
             strategy.atomicFMA = strategy.extendedAtomicFMA = true;
         else if (mod == "st")
             strategy.stallAfterLoad = true;
+        else if (mod == "fx")
+            strategy.fmaBoustrophedon = true;
         else if (mod == "ch")
             strategy.checkAdd32 = true;
         else if (mod == "ws")
@@ -337,13 +354,19 @@ void parseStrategy(const char *str, HW hw, const GEMMProblem &problem,
             strategy.kParallelLocal = true;
         else if (mod == "akr")
             strategy.kParallelLocal = strategy.shrinkWGK = true;
+        else if (mod == "ikr")
+            strategy.kParallelLocal = strategy.kInterleave = true;
         else if (mod == "fb")
             strategy.fuseBeta = true;
         else if (mod == "fp")
             strategy.fusePostOps = true;
         else if (mod == "afb")
             strategy.fuseBeta = strategy.altFusedBeta = true;
-        else if (mod == "au")
+        else if (mod == "fg") {
+            float fillGoal;
+            s >> fillGoal;
+            strategy.fillGoal = fillGoal * 16;
+        } else if (mod == "au")
             strategy.C.atomic = strategy.CO.atomic = true;
         else if (mod == "nau")
             strategy.C.atomic = strategy.CO.atomic = strategy.autoatomic
@@ -400,7 +423,10 @@ void parseStrategy(const char *str, HW hw, const GEMMProblem &problem,
                 strategy.splitBarrier = true;
             } else if (mod.substr(0, 2) == "pk")
                 strategy.kPadding = stoi(mod.substr(2));
-            else if (mod.substr(0, 2) == "ql") {
+            else if (mod.substr(0, 2) == "wx") {
+                strategy.wgPadFactor = stoi(mod.substr(2));
+                strategy.forceWGUpdate = WGFixed;
+            } else if (mod.substr(0, 2) == "ql") {
                 strategy.skewLocalIDs = true;
             } else
                 switch (mod[0]) {
@@ -477,7 +503,7 @@ void parseStrategy(const char *str, HW hw, const GEMMProblem &problem,
 
     if (strategy.block2DCRemainder && !gotSR) strategy.altCRemainder = true;
 
-    int poCount = problem.postOps.len();
+    size_t poCount = problem.postOps.len();
     strategy.binary.resize(poCount);
     for (auto &astrategy : strategy.binary) {
         astrategy.base = (hw >= HW::XeHPC) ? AddressBase::createA64(true)

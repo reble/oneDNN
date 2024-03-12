@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -59,6 +59,10 @@ static expr gen_vec_const(uint32_t lanes, float f) {
 
 static expr gen_vec_const_int(uint32_t lanes, int64_t f) {
     return make_expr<constant_node>(f, sc_data_type_t::s32(lanes));
+}
+
+static expr gen_vec_const_u32(uint32_t lanes, int64_t f) {
+    return make_expr<constant_node>(f, sc_data_type_t::u32(lanes));
 }
 
 static std::vector<expr> make_args_by_intrinsic(const intrin_call_c &node) {
@@ -160,6 +164,145 @@ static expr_c create_cast_f32_to_bf16(const context_ptr &ctx, const cast_c &v) {
     }
 }
 
+static expr_c create_cast_fp16_to_f32(const context_ptr &ctx, const cast_c &v) {
+    if (ctx->machine_.device_type_ == runtime::target_machine_t::type::cpu
+            && (ctx->machine_.cpu_flags_.fAVX512FP16)) {
+        return v;
+    } else {
+        auto &in = v->in_;
+        const auto lanes = in->dtype_.lanes_;
+        auto u32_dtype = sc_data_type_t::u32(lanes);
+
+        auto uint32_v = builder::make_cast(u32_dtype,
+                builder::make_reinterpret(in, sc_data_type_t::u16(lanes)));
+        // const uint32_t e = (x & 0x7C00) >> 10;
+        auto e = (builder::make_int_and(
+                         uint32_v, gen_vec_const_u32(lanes, UINT64_C(0X7C00))))
+                >> gen_vec_const_u32(lanes, UINT64_C(10));
+        // const uint32_t m = (x & 0x03FF) << 13;
+        auto m = (builder::make_int_and(
+                         uint32_v, gen_vec_const_u32(lanes, UINT64_C(0X03FF))))
+                << gen_vec_const_u32(lanes, UINT64_C(13));
+        // const uint32_t v = as_uint((float)m) >> 23;
+        auto l = (builder::make_reinterpret(
+                         builder::make_cast(sc_data_type_t::f32(lanes), m),
+                         u32_dtype))
+                >> gen_vec_const_u32(lanes, UINT64_C(23));
+
+        // (x & 0x8000) << 16
+        auto cond1 = (builder::make_int_and(uint32_v,
+                             gen_vec_const_u32(lanes, UINT64_C(0x8000))))
+                << gen_vec_const_u32(lanes, UINT64_C(16));
+        // (e != 0) *  ((e + 112) << 23 | m)
+        auto tmp_cond_2 = builder::make_int_or(
+                (e + gen_vec_const_u32(lanes, UINT64_C(112)))
+                        << gen_vec_const_u32(lanes, UINT64_C(23)),
+                m);
+        auto cond2 = builder::make_select(
+                e != gen_vec_const_u32(lanes, UINT64_C(0)), tmp_cond_2,
+                gen_vec_const_u32(lanes, UINT64_C(0)));
+        //((e == 0) & (m != 0)) * ((l - 37) << 23 | ((m << (150 - l)) &
+        // 0x007FE000))
+        auto tmp_cond_3 = builder::make_int_or(
+                (l - gen_vec_const_u32(lanes, UINT64_C(37)))
+                        << gen_vec_const_u32(lanes, UINT64_C(23)),
+                builder::make_int_and(
+                        (m << (gen_vec_const_u32(lanes, UINT64_C(150)) - l)),
+                        gen_vec_const_u32(lanes, UINT64_C(0X007FE000))));
+        auto cond3 = builder::make_select(
+                e == gen_vec_const_u32(lanes, UINT64_C(0)),
+                builder::make_select(m != gen_vec_const_u32(lanes, UINT64_C(0)),
+                        tmp_cond_3, gen_vec_const_u32(lanes, UINT64_C(0))),
+                gen_vec_const_u32(lanes, UINT64_C(0)));
+        /*
+        (x & 0x8000) << 16 | (e != 0) * ((e + 112) << 23 | m)
+                    | ((e == 0) & (m != 0))
+                            * ((l - 37) << 23 | ((m << (150 - l)) & 0x007FE000))
+        */
+        auto f32_v = builder::make_int_or(
+                builder::make_int_or(cond1, cond2), cond3);
+        auto tmpf32 = copy_attr(*v,
+                builder::make_reinterpret(f32_v, sc_data_type_t::f32(lanes)));
+        if (!v->dtype_.is_etype(sc_data_etype::F32)) {
+            tmpf32 = builder::make_cast(v->dtype_, tmpf32);
+        }
+        return tmpf32;
+    }
+}
+
+static expr_c create_cast_f32_to_fp16(const context_ptr &ctx, const cast_c &v) {
+    auto &in = v->in_;
+    if (ctx->machine_.device_type_ == runtime::target_machine_t::type::cpu
+            && (ctx->machine_.cpu_flags_.fAVX512FP16)) {
+        return v;
+    } else {
+        COMPILE_ASSERT(in->dtype_.is_etype(sc_data_etype::F32),
+                "fp16 should be cast from f32.");
+        const auto lanes = in->dtype_.lanes_;
+        auto u32_dtype = sc_data_type_t::u32(lanes);
+
+        auto uint32_v = builder::make_reinterpret(in, u32_dtype);
+        auto b = uint32_v + gen_vec_const_u32(lanes, UINT64_C(0x00001000));
+        auto e = builder::make_int_and(
+                         b, gen_vec_const_u32(lanes, UINT64_C(0x7F800000)))
+                >> gen_vec_const_u32(lanes, UINT64_C(23));
+        auto m = builder::make_int_and(
+                b, gen_vec_const_u32(lanes, UINT64_C(0x007FFFFF)));
+        // (b & 0x80000000) >> 16
+        auto cond1 = builder::make_int_and(
+                             b, gen_vec_const_u32(lanes, UINT64_C(0x80000000)))
+                >> gen_vec_const_u32(lanes, UINT64_C(16));
+        // (e > 112) * (((e - 112) << 10) & 0x7C00)
+        auto tmp_cond_2 = builder::make_int_and(
+                (e - gen_vec_const_u32(lanes, UINT64_C(112)))
+                        << gen_vec_const_u32(lanes, UINT64_C(10)),
+                builder::make_constant(std::vector<union_val>(in->dtype_.lanes_,
+                                               (int64_t)0x7C00),
+                        sc_data_type_t::u32(in->dtype_.lanes_)));
+        // (e > 112) * ((((e - 112) << 10) & 0x7C00) | m >> 13)
+        auto cond2 = builder::make_select(
+                e > gen_vec_const_u32(lanes, UINT64_C(112)),
+                builder::make_int_or(tmp_cond_2,
+                        m >> gen_vec_const_u32(lanes, UINT64_C(13))),
+                gen_vec_const_u32(lanes, UINT64_C(0)));
+        // ((e < 113) & (e > 101)) * ((((0x007FF000 + m) >> (125 - e)) + 1) >>
+        // 1)
+        auto tmp_cond_3
+                = (((gen_vec_const_u32(lanes, UINT64_C(0x007FF000)) + m)
+                           >> (gen_vec_const_u32(lanes, UINT64_C(125)) - e))
+                          + gen_vec_const_u32(lanes, UINT64_C(1)))
+                >> gen_vec_const_u32(lanes, UINT64_C(1));
+        //((e < 113) & (e > 101)) * ((((0x007FF000 + m) >> (125 - e)) + 1)
+        //>> 1)
+        auto cond3 = builder::make_select(
+                e < gen_vec_const_u32(lanes, UINT64_C(113)),
+                builder::make_select(
+                        e > gen_vec_const_u32(lanes, UINT64_C(101)), tmp_cond_3,
+                        gen_vec_const_u32(lanes, UINT64_C(0))),
+                gen_vec_const_u32(lanes, UINT64_C(0)));
+        // (e > 143) * 0x7FFF
+        auto cond4 = builder::make_select(
+                e > gen_vec_const_u32(lanes, UINT64_C(143)),
+                gen_vec_const_u32(lanes, UINT64_C(0x7FFF)),
+                gen_vec_const_u32(lanes, UINT64_C(0)));
+        /*
+        (b & 0x80000000) >> 16
+                | (e > 112) * ((((e - 112) << 10) & 0x7C00) | m >> 13)
+                | ((e < 113) & (e > 101))
+                * ((((0x007FF000 + m) >> (125 - e)) + 1) >> 1)
+                | (e > 143) * 0x7FFF
+        */
+        auto fp16_v = builder::make_int_or(
+                builder::make_int_or(builder::make_int_or(cond1, cond2), cond3),
+                cond4);
+        return copy_attr(*v,
+                builder::make_reinterpret(
+                        builder::make_cast(
+                                sc_data_type_t::u16(in->dtype_.lanes_), fp16_v),
+                        sc_data_type_t::f16(in->dtype_.lanes_)));
+    }
+}
+
 static std::string get_isnan_func_name(const intrin_call_c &node) {
     std::stringstream ss;
     ss << "_should_inline_isnan_" << node->dtype_;
@@ -217,28 +360,28 @@ static func_t create_exp_func(const ir_module_ptr &mod,
     auto ln2 = gen_vec_const(elements, 0.693147181f);
     auto minus_ln2 = gen_vec_const(elements, -0.693147181f);
     auto one_over_ln2 = gen_vec_const(elements, 1.442695041f);
+    auto half_float = gen_vec_const(elements, 0.5f);
     auto ONE_f = gen_vec_const(elements, 1.0f);
     auto ONE_i = make_expr<constant_node>(
             INT64_C(1), sc_data_type_t::s32(elements));
     auto ty_epi_32 = sc_data_type_t::s32(elements);
+    auto overflow_x = gen_vec_const(elements, 88.72283935f);
+    auto underflow_x = gen_vec_const(elements, -87.33654785f);
+    auto ret_infinity = make_expr<constant_node>(
+            std::numeric_limits<float>::infinity(), type);
 
     builder::ir_builder_t builder;
     _function_(type, the_exp_func, make_args_by_intrinsic(node)) {
         assert(node->args_.size() == 1);
         _bind_(inval);
+        _var_(res, type);
         // to avoid overflow
-
         _var_init_(a_, type, inval);
-        if (overflow_check) {
-            a_ = builder::make_min(inval, gen_vec_const(elements, 88.60f));
-        }
-        // TODO(xxx): currenly clip the input if the value is larger than
-        // the upper limit to prevent overflow
 
         // e^x = 2^k_int * e^r
         _var_(k_float, type);
-        k_float = builder::make_floor(
-                a_ * one_over_ln2); // k_float = floor(x / ln2)
+        k_float = builder::make_floor(a_ * one_over_ln2
+                + half_float); // k_float = floor(x / ln2 + 0.5f)
         _var_(k_int, ty_epi_32);
         k_int = builder::make_cast(ty_epi_32, k_float); // k_int = int(k_float)
 
@@ -273,11 +416,14 @@ static func_t create_exp_func(const ir_module_ptr &mod,
         _var_(result, ty_epi_32);
         result = p + builder::make_reinterpret(Tn, ty_epi_32);
 
-        // to avoid underflow
-        expr l_min_mask = inval >= gen_vec_const(elements, -87.33f);
-        _return_(builder::make_select(
-                l_min_mask, builder::make_reinterpret(result, type), ZERO));
-    }
+        res = builder::make_reinterpret(result, type);
+        if (overflow_check) {
+            res = builder::make_select(inval > overflow_x, ret_infinity, res);
+        }
+        res = builder::make_select(inval < underflow_x, ZERO, res);
+        _return_(res);
+    } // namespace gc
+
     std::string fixed_name = get_exp_func_name(node);
     the_exp_func->name_ = fixed_name;
     the_exp_func->decl_->name_ = fixed_name;
@@ -394,15 +540,45 @@ public:
         auto intype = v->args_[0]->dtype_;
         auto outtype = v->dtype_;
         auto ths = this;
+        bool is_s8 = outtype.type_code_ == sc_data_etype::S8;
+        float i8_min = is_s8 ? (float)std::numeric_limits<int8_t>::min()
+                             : (float)std::numeric_limits<uint8_t>::min();
+        float i8_max = is_s8 ? (float)std::numeric_limits<int8_t>::max()
+                             : (float)std::numeric_limits<uint8_t>::max();
+        auto i8_min_constant = gen_vec_const(intype.lanes_, i8_min);
+        auto i8_max_constant = gen_vec_const(intype.lanes_, i8_max);
+        bool use_avx512_path = true;
+        auto u8s8_valid_val = [&]() {
+            if (use_avx512_path) {
+                if (is_s8) {
+                    return builder::make_min(i8_max_constant, inval1);
+                } else {
+                    // u8
+                    return builder::make_max(i8_min_constant, inval1);
+                }
+            }
+            return builder::make_min(i8_max_constant,
+                    builder::make_max(i8_min_constant, inval1));
+        };
+        auto u8s8_saturate_cast = [&]() {
+            auto real_in = u8s8_valid_val();
+            auto cast_target_type = (is_s8 || !use_avx512_path)
+                    ? sc_data_type_t::s32(intype.lanes_)
+                    : sc_data_type_t::u32(intype.lanes_);
+            real_in = builder::make_round_and_cast(real_in, cast_target_type);
+            if (use_avx512_path) {
+                return builder::make_saturated_cast(real_in, v->dtype_);
+            } else {
+                return builder::make_cast(v->dtype_, real_in);
+            }
+        };
         if (mod_->ctx_->machine_.cpu_flags_.fAVX512F) {
             // the fast path for AVX512
             if (v->dtype_ == sc_data_type_t::s8(16)) {
                 if (intype == sc_data_type_t::s32(16)) {
                     return v;
                 } else if (intype == sc_data_type_t::f32(16)) {
-                    auto real_in = builder::make_round_and_cast(
-                            inval1, sc_data_type_t::s32(16));
-                    return builder::make_saturated_cast(real_in, v->dtype_);
+                    return u8s8_saturate_cast();
                 }
             } else if (v->dtype_ == sc_data_type_t::u8(16)) {
                 if (intype == sc_data_type_t::s32(16)) {
@@ -411,11 +587,7 @@ public:
                     return builder::make_saturated_cast(
                             builder::make_max(inval1, zero), v->dtype_);
                 } else if (intype == sc_data_type_t::f32(16)) {
-                    auto zero = gen_vec_const(16, 0.0f);
-                    auto real_in = builder::make_max(inval1, zero);
-                    real_in = builder::make_round_and_cast(
-                            real_in, sc_data_type_t::s32(16));
-                    return builder::make_saturated_cast(real_in, v->dtype_);
+                    return u8s8_saturate_cast();
                 }
             } else if (v->dtype_ == sc_data_type_t::s32(16)) {
                 assert(intype == sc_data_type_t::f32(16));
@@ -447,8 +619,8 @@ public:
                                                  << v->dtype_ << ')');
         expr_c real_in = inval1;
         if (intype.type_code_ == sc_data_etype::F32) {
-            real_in = builder::make_round_and_cast(
-                    inval1, sc_data_type_t::s32(intype.lanes_));
+            use_avx512_path = false;
+            return u8s8_saturate_cast();
         }
         return cast_s32_u8s8(real_in);
     }
@@ -542,7 +714,10 @@ public:
                 // in barrier call
                 return 0;
             }
-            if (!runtime_config_t::get().managed_thread_pool_) { return 0; }
+            if (runtime_config_t::get().managed_thread_pool_
+                    != thread_pool_mode_t::MANAGED) {
+                return 0;
+            }
             return builtin::get_set_idle_func_managed_func()(
                     v->args_[0], args_pack);
         } else if (v->type_ == intrin_type::get_group_thread_id) {
@@ -557,6 +732,21 @@ public:
                     "get_group_id cannot be used outside of nested parallel.");
             return expr();
         }
+#ifndef NDEBUG
+        else if (v->type_ == intrin_type::min || v->type_ == intrin_type::max) {
+            COMPILE_ASSERT(v->args_.size() == 2,
+                    "Invalid arg size: " << v->args_.size() << ", should be 2");
+            auto l = ret.checked_as<intrin_call_c>()->args_[0];
+            auto r = ret.checked_as<intrin_call_c>()->args_[1];
+            if (!l.isa<constant>() && r.isa<constant>()
+                    && get_etype_category_nothrow(r->dtype_)
+                            == type_category::CATE_FLOAT) {
+                // min(x, c) => min(c, x)
+                // max(x, c) => max(c, x)
+                return builder::remake_binary(r, l, v);
+            }
+        }
+#endif
         intrin_func_creator lower_func = nullptr;
         intrin_func_namer namer_func = nullptr;
         switch (v->type_) {
@@ -642,20 +832,26 @@ public:
 
     expr_c visit(cast_c v) override {
         auto ret = ir_visitor_t::visit(v).checked_as<cast_c>().remove_const();
-        if (ret->in_->dtype_.is_etype(sc_data_etype::BF16)) {
+        if (ret->in_->dtype_.is_etype(sc_data_etype::BF16)
+                || ret->in_->dtype_.is_etype(sc_data_etype::F16)) {
             expr new_in = visit_need_def_args({ret->in_})[0].remove_const();
             if (!new_in.ptr_same(ret->in_)) {
                 ret = ret->remake().static_as<cast>();
             }
             ret->in_ = new_in;
-            return create_cast_bf16_to_f32(ctx_, ret);
-        } else if (ret->dtype_.is_etype(sc_data_etype::BF16)) {
+            return ret->in_->dtype_.is_etype(sc_data_etype::BF16)
+                    ? create_cast_bf16_to_f32(ctx_, ret)
+                    : create_cast_fp16_to_f32(ctx_, ret);
+        } else if (ret->dtype_.is_etype(sc_data_etype::BF16)
+                || ret->dtype_.is_etype(sc_data_etype::F16)) {
             expr new_in = visit_need_def_args({ret->in_})[0].remove_const();
             if (!new_in.ptr_same(ret->in_)) {
                 ret = ret->remake().static_as<cast>();
             }
             ret->in_ = new_in;
-            return create_cast_f32_to_bf16(ctx_, ret);
+            return ret->dtype_.is_etype(sc_data_etype::BF16)
+                    ? create_cast_f32_to_bf16(ctx_, ret)
+                    : create_cast_f32_to_fp16(ctx_, ret);
         }
 
         return ret;

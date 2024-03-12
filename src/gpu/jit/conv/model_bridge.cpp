@@ -21,7 +21,6 @@
 #include "gpu/jit/conv/config.hpp"
 #include "gpu/jit/conv/model.hpp"
 #include "gpu/jit/conv/model_data.hpp"
-#include "gpu/jit/conv/params.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -32,6 +31,8 @@ namespace model {
 type_t to_type(data_type_t dt) {
     switch (static_cast<int>(dt)) {
         case data_type::s8:
+        case data_type::f8_e5m2:
+        case data_type::f8_e4m3:
         case data_type::u8: return type_t::d8;
         case data_type::f16:
         case data_type::bf16: return type_t::d16;
@@ -51,6 +52,7 @@ hw_t to_hw(ngen::HW hw) {
         case ngen::HW::XeHP:
         case ngen::HW::XeHPG: return hw_t::xehpg;
         case ngen::HW::XeHPC: return hw_t::xehpc;
+        case ngen::HW::Xe2: return hw_t::xehpc;
         default: ir_error_not_expected() << "Unknown HW: " << to_string(hw);
     }
     return hw_t::undef;
@@ -63,21 +65,20 @@ fma_t to_fma(fma_kind_t fma) {
         case fma_kind_t::dpas:
         case fma_kind_t::dpasw: return fma_t::dpas;
         default:
-            ir_error_not_expected()
-                    << "Unknown FMA kind: " << fma_kind::to_string(fma);
+            ir_error_not_expected() << "Unknown FMA kind: " << to_string(fma);
     }
     return fma_t::undef;
 }
 
 hw_config_t to_hw_config(const conv_config_t &cfg) {
     auto &prb = cfg.prb();
-    auto &hw_cfg = cfg.hw_cfg();
-    return hw_config_t(to_hw(cfg.hw()), to_fma(cfg.fma_kind()),
-            to_type(prb.a_data_type), hw_cfg.eu_count());
+    auto &hw = cfg.hw();
+    return hw_config_t(to_hw(hw.to_ngen()), to_fma(cfg.fma_kind()),
+            to_type(prb.a_data_type), hw.eu_count());
 }
 
 conv_sample_t to_conv_sample(
-        const conv_config_t &cfg, const conv_params_t &params) {
+        const conv_config_t &cfg, const blocking_params_t &params) {
     auto &prb = cfg.prb();
     conv_sample_t ret;
     ret.prop = (prb.is_fwd ? prop_t::fwd
@@ -88,18 +89,18 @@ conv_sample_t to_conv_sample(
     ret.transpose = prb.ab_swap_transpose;
 
     auto &blk = params.blocking();
-    auto shape = get_conv_shape(cfg, /*pad=*/false);
+    auto shape = cfg.shape(/*pad=*/false);
 #define HANDLE(name) \
     do { \
         ret.shape.name = -1; \
         ret.loop.name = -1; \
         ret.tg.name = -1; \
         ret.iter.name = -1; \
-        if (!shape.has(conv_dims::name)) break; \
-        ret.shape.name = shape.at(conv_dims::name); \
-        ret.loop.name = blk.loop().at(conv_dims::name, 1); \
-        ret.tg.name = blk.thread_group().at(conv_dims::name, 1); \
-        ret.iter.name = blk.iter().at(conv_dims::name, 1); \
+        if (!shape.has(prb_dims::name)) break; \
+        ret.shape.name = shape.get(prb_dims::name); \
+        ret.loop.name = blk.loop().get(prb_dims::name, 1); \
+        ret.tg.name = blk.thread_group().get(prb_dims::name, 1); \
+        ret.iter.name = blk.iter().get(prb_dims::name, 1); \
     } while (false)
     HANDLE(g);
     HANDLE(mb);
@@ -176,7 +177,7 @@ gradient_boost_regressor_t &get_gbr(const conv_config_t &cfg) {
     return gbr_map.at(kind);
 }
 
-float get_score(const conv_config_t &cfg, const conv_params_t &params) {
+float get_score(const conv_config_t &cfg, const blocking_params_t &params) {
     auto conv_sample = to_conv_sample(cfg, params);
     conv_sample = fixup(conv_sample);
     auto bmnk_sample = conv_sample.to_bmnk_conv_sample();

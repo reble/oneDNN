@@ -20,6 +20,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include "compiler/ir/attr_keys.hpp"
 #include "unary_elemwise.hpp"
 #include <compiler/ir/builder.hpp>
 #include <compiler/ir/graph/brgemm_fusion.hpp>
@@ -49,13 +50,13 @@ unary_elementwise_op_impl_t::unary_elementwise_op_impl_t(
         info_.outputs_.emplace_back(
                 std::make_shared<graph_tensor>(this, ins[0]->details_));
     } else {
-        COMPILE_ASSERT(outs.size() == 1, "Wrong op output size.\n");
-        COMPILE_ASSERT(outs[0]->details_.get_plain_dims()
-                        == ins[0]->details_.get_plain_dims(),
-                "Wrong op output shapes.\n");
         info_.outputs_ = outs;
+        COMPILE_ASSERT(info_.outputs_.size() == 1, "Wrong op output size.\n");
+        COMPILE_ASSERT(gc::graph::check_shape_equal(
+                               info_.inputs_[0]->details_.get_plain_dims(),
+                               info_.outputs_[0]->details_.get_plain_dims()),
+                "Unary elementwise op's output is incorrect.")
     }
-    info_.tensor_share_info_ = {{0, {0}}};
     attrs_ = attrs;
 }
 
@@ -102,69 +103,58 @@ void unary_elementwise_op_impl_t::compute_block(context_ptr ctx,
     }
     compute_vectorized_op(ctx, get_owner_graph(), inputs, *dst[0], info_,
             vx_info_, mask_compute_func_t(func), mask_compute_func_t(func),
-            attrs_, wkld, use_mask);
+            attrs_, get_outputs()[0], wkld, use_mask);
 }
 
-void unary_elementwise_op_impl_t::prepare_fusion_data(fdata_map &fdmap) {
-    COMPILE_ASSERT(info_.outputs_.size() == 1, "Wrong op output size.\n");
-    auto &in_detail0 = fdmap.get(info_.inputs_[0]);
-    in_detail0.use_count_++;
-}
-
-static void infer_unary_slice_ranges(
-        fusible_op_t *cur, fslice_map &fsmap, infer_status_map_t &stat_map) {
+static infer_status_code infer_unary_slice_ranges(
+        fusible_op_t *cur, fslice_map &fsmap) {
     COMPILE_ASSERT(cur->get_inputs().size() == 1, "unary op is expected");
     // search known ranges from any input of cur fusbile op
-    slice_range_map known_ranges_map
-            = search_known_slice_ranges(cur, fsmap, stat_map);
-    if (known_ranges_map.empty()) return;
+    slice_range_map known_ranges_map = search_known_input_slice(cur, fsmap);
+    if (known_ranges_map.empty()) return infer_status_code::RETRY;
     // set outputs slice range
     fsmap.get(cur->get_outputs()[0]) = known_ranges_map[0];
+    return infer_status_code::OK;
 }
 
-void unary_elementwise_op_impl_t::infer_slice_ranges(
-        fslice_map &fsmap, infer_status_map_t &stat_map) {
-    infer_unary_slice_ranges(this, fsmap, stat_map);
+infer_status_code unary_elementwise_op_impl_t::infer_slice_ranges(
+        const context_ptr &ctx, fslice_map &fsmap) {
+    return infer_unary_slice_ranges(this, fsmap);
 }
 
-static void pre_unary_slice_ranges(
-        fusible_op_t *cur, fslice_map &fsmap, infer_status_map_t &stat_map) {
+static infer_status_code pre_infer_unary_slice_ranges(
+        fusible_op_t *cur, fslice_map &fsmap) {
     auto &input = cur->get_inputs()[0];
     auto &out_ranges = fsmap.get(cur->get_outputs()[0]);
-    if (out_ranges.empty()) {
-        stat_map.append_ops_by_status(cur, infer_status_code::RETRY);
-        return;
-    }
+    if (out_ranges.empty()) { return infer_status_code::RETRY; }
     auto &in_ranges = fsmap.get(input);
-    if (in_ranges.empty()) {
-        in_ranges = out_ranges;
-        if (stat_map.is_recursive_mode()) {
-            input->producer_owner_->dyn_cast<fusible_op_t>()->pre_slice_ranges(
-                    fsmap, stat_map);
-        }
-    }
+    if (in_ranges.empty()) { in_ranges = out_ranges; }
+    return infer_status_code::OK;
 }
 
-void unary_elementwise_op_impl_t::pre_slice_ranges(
-        fslice_map &fsmap, infer_status_map_t &stat_map) {
-    pre_unary_slice_ranges(this, fsmap, stat_map);
+infer_status_code unary_elementwise_op_impl_t::pre_infer_slice_ranges(
+        const context_ptr &ctx, fslice_map &fsmap) {
+    return pre_infer_unary_slice_ranges(this, fsmap);
 }
 
-void infer_identical_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map) {
-    auto known_axis_map = search_known_bound_axis(cur, bdax_map);
+void infer_identical_binding_axis(
+        fusible_op_t *cur, binding_axis_map &bdax_map) {
+    auto known_axis_map = search_known_input_axis(cur, bdax_map);
     if (!bdax_map.get(cur->get_outputs()[0]).empty()) return;
     bdax_map.get(cur->get_outputs()[0]) = known_axis_map[0];
-    set_unknown_axis_binding(cur, known_axis_map, bdax_map);
+    set_unknown_binding_axis(cur, known_axis_map, bdax_map);
 }
 
-void unary_elementwise_op_impl_t::infer_binding_axis(bound_axis_map &bdax_map) {
+void unary_elementwise_op_impl_t::infer_binding_axis(
+        binding_axis_map &bdax_map) {
     infer_identical_binding_axis(this, bdax_map);
 }
 
-void pre_identical_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map) {
+void pre_infer_identical_binding_axis(
+        fusible_op_t *cur, binding_axis_map &bdax_map) {
     auto &outaxis = bdax_map.get(cur->get_outputs()[0]);
     COMPILE_ASSERT(!outaxis.empty(),
-            "Unknown output axis found, could not pre bind axis")
+            "Unknown output axis found, could not pre infer binding axis")
     auto &input = cur->get_inputs()[0];
     auto &inpaxis = bdax_map.get(input);
     if (inpaxis.empty()) {
@@ -172,13 +162,14 @@ void pre_identical_binding_axis(fusible_op_t *cur, bound_axis_map &bdax_map) {
         if (auto bd_op
                 = input->producer_owner_
                           ->dyn_cast<op_traits::mixed_partition_acceptable>()) {
-            bd_op->pre_binding_axis(bdax_map);
+            bd_op->pre_infer_binding_axis(bdax_map);
         }
     }
 }
 
-void unary_elementwise_op_impl_t::pre_binding_axis(bound_axis_map &bdax_map) {
-    pre_identical_binding_axis(this, bdax_map);
+void unary_elementwise_op_impl_t::pre_infer_binding_axis(
+        binding_axis_map &bdax_map) {
+    pre_infer_identical_binding_axis(this, bdax_map);
 }
 
 shape_rl_vec unary_elementwise_op_impl_t::get_dynamic_shape_relations() const {
@@ -202,16 +193,9 @@ bool unary_elementwise_op_impl_t::register_brgemm_fusion(const context_ptr &ctx,
             shared_from_this(), outputs[0]->get_tensor_ptr());
 }
 
-sc_dims unary_elementwise_op_impl_t::get_bwise_fuse_shrink_dims() {
-    auto output_dims = info_.outputs_[0]->details_.get_blocking_dims();
-    int offset = op_traits::batchwise_shrinkable_t::get_shrinkable_offset(
-            info_.outputs_[0]);
-    return {output_dims.begin(), output_dims.begin() + offset};
-}
-
 expr relu_op_t::compute_element(expr in) {
     return builder::make_max(
-            in, make_expr<constant_node>((int64_t)0, in->dtype_));
+            make_expr<constant_node>((int64_t)0, in->dtype_), in);
 }
 
 expr leaky_relu_op_t::compute_element(expr in) {
@@ -402,7 +386,6 @@ cast_op_t::cast_op_t(const std::vector<graph_tensor_ptr> &ins,
     dtype_ = attrs.get<sc_data_type_t>("dtype");
     saturated_ = attrs.get_or_else("saturated", false);
     info_.outputs_[0]->details_.dtype_ = dtype_;
-    info_.tensor_share_info_.clear();
     alg_kind_ = brgemm::out_dtype;
 }
 
@@ -412,7 +395,6 @@ cast_op_t::cast_op_t(
     , dtype_(out_dtype)
     , saturated_(saturated) {
     info_.outputs_[0]->details_.dtype_ = out_dtype;
-    info_.tensor_share_info_.clear();
 }
 
 expr cast_op_t::compute_element(expr in) {
@@ -424,13 +406,10 @@ expr cast_op_t::compute_element(expr in) {
 
 expr clamp_op_t::compute_element(expr in) {
     auto dtype = in->dtype_;
-    COMPILE_ASSERT(dtype.type_code_ == sc_data_etype::F32,
-            "clamp_op_t currently only supports fp32");
     float clamp_min = attrs_.get<float>("min");
     float clamp_max = attrs_.get<float>("max");
-    return builder::make_max(
-            builder::make_min(in, make_expr<constant_node>(clamp_max, dtype)),
-            make_expr<constant_node>(clamp_min, dtype));
+    return builder::make_max(make_expr<constant_node>(clamp_min, dtype),
+            builder::make_min(make_expr<constant_node>(clamp_max, dtype), in));
 }
 
 #define DEFINE_AND_ASSERT_DTYPE(op) \
@@ -484,10 +463,17 @@ expr log_op_t::compute_element(expr in) {
 // mish(x) = x * ((e^x + 1)^2 - 1)/((e^x + 1)^2 + 1).
 expr mish_op_t::compute_element(expr in) {
     DEFINE_AND_ASSERT_DTYPE("mish");
+    auto tmp = builder::make_min(
+            make_expr<constant_node>(44.361415f, dtype), in);
     auto f_one = make_expr<constant_node>(1.f, dtype);
-    auto f_temp = builder::make_exp(in) + f_one;
+    auto f_temp = builder::make_exp(tmp) + f_one;
     f_temp = f_temp * f_temp;
-    return in * ((f_temp - f_one) / (f_temp + f_one));
+    auto f_div = (f_temp - f_one) / (f_temp + f_one);
+    // for llvm disnable fast math
+    f_div->attr()[attr_keys::fast_math] = false;
+    auto f_mul = in * f_div;
+    f_mul->attr()[attr_keys::fast_math] = false;
+    return f_mul;
 }
 
 expr soft_plus_op_t::compute_element(expr in) {
@@ -536,7 +522,6 @@ OP_REGISTER(soft_plus_op_t, soft_plus)
 OP_REGISTER(square_op_t, square)
 OP_REGISTER(swish_op_t, swish)
 OP_REGISTER(hardsigmoid_op_t, hardsigmoid)
-
 } // namespace gc
 } // namespace graph
 } // namespace impl

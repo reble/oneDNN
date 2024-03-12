@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include <set>
 #include <utility>
 #include <vector>
+#include "buffer_schedule_utils.hpp"
 #include "constant_fold.hpp"
 #include "pointer_alias_info.hpp"
 #include "static_memory_planner.hpp"
@@ -111,60 +112,6 @@ public:
                     builder::make_if_else_unattached(cond, then, else_case));
         }
         return v;
-    }
-};
-
-// the struct to track the call site which may have inplace reuse
-struct call_site_info_t {
-    func_c func_;
-    // the tensors passed to the function on the caller side. It has length of
-    // func->args_. If an arg is not tensor related, the element in this array
-    // will be empty.
-    std::vector<expr_c> tensors_passed_;
-};
-
-// the tensor is not thread local
-static constexpr uint64_t NOT_THREAD_LOCAL = 0;
-struct tensor_tick_info_t {
-    // first read/write tick, will not be reset by complex scopes, useful for
-    // sorting the tensors
-    int64_t real_first_access_ = TICK_NOT_EXIST;
-    int64_t first_access_ = TICK_NOT_EXIST; // first read/write tick
-    int64_t last_read_ = TICK_NOT_EXIST; // last read tick
-    std::set<int64_t> writes_; // all write ticks
-    int64_t create_ = TICK_NOT_EXIST; // tensor creation tick
-    int64_t delete_ = TICK_NOT_EXIST; // the tick that the tensor scope is done
-    bool is_arg_ = false; // if is the tensor defined in function args
-    // if the tensor is already scheduled, infered from the define stmt's
-    // init_. If the tensor is arg tensor, already_scheduled_base_ is the tensor
-    // itself
-    expr_c already_scheduled_base_;
-    uint64_t scope_ = NOT_THREAD_LOCAL; // parallel scope id
-    bool has_hint_ = false; // if the tensor has hint tick info
-    // the tensors that the current tensor can inplace reuse buffer with. Not
-    // all of the tensors in this set is valid. Only if last_access_tick of the
-    // tensor in the set == the first_access_tick of the current tensor can
-    // the tensor be reused.
-    std::vector<std::pair<expr_c, inplace_kind>> inplace_reuse_;
-    // the call site of the inplace function call. may be null. It is used to
-    // back-propagate the inplace result to the function to be called, to inform
-    // it that some of the args has pointer alias
-    std::shared_ptr<call_site_info_t> inplace_call_site_;
-    // Only valid when this tensor is an argument to list_brgemm calls. The set
-    // is used to record the A and B data tensors that the address list tensor
-    // of list_brgemm points to.
-    std::unique_ptr<std::unordered_set<expr_c>> list_brgemm_tensors_;
-
-    bool is_already_scheduled() const {
-        return already_scheduled_base_.defined();
-    }
-    int64_t get_last_access() const {
-        int64_t last_access = last_read_;
-        if (!writes_.empty()) {
-            last_access = std::max(last_access, *writes_.rbegin());
-        }
-        if (last_access == TICK_NOT_EXIST) { last_access = first_access_; }
-        return last_access;
     }
 };
 
@@ -686,8 +633,9 @@ public:
                     || (v->type_ == intrin_type::list_brgemm
                             && v->check_brgemm_arg_size(
                                     brgemm_args::NUM_FULL_ARGS_LIST)));
-            for (int i = 0; i < brgemm_args::C + 1; i++) {
+            for (auto i = 0UL; i < v->args_.size(); i++) {
                 auto &p = v->args_[i];
+                if (!p.defined()) continue;
                 tensor_c tsr = get_base_tensor_of(p);
                 if (tsr.defined()) {
                     switch (i) {
@@ -707,7 +655,7 @@ public:
                             }
                             break;
                         case brgemm_args::C: set_write_tick(tsr, tick_); break;
-                        default: break;
+                        default: set_read_tick(tsr, tick_); break;
                     }
                 }
             }
@@ -720,7 +668,8 @@ public:
     void parse_func_params(const std::vector<expr> &params) {
         for (auto &p : params) {
             if (p.isa<tensor>() && p->attr_
-                    && p->attr_->has_key("write_buffer")) {
+                    && (p->attr_->has_key("write_buffer")
+                            || p->attr_->has_key("read_buffer"))) {
                 auto &info = (out_[p] = {});
                 info.create_ = 0;
                 info.delete_ = std::numeric_limits<int64_t>::max();
@@ -736,6 +685,13 @@ public:
         return v;
     }
 };
+
+void annotate_ticks(const func_c &f,
+        std::unordered_map<expr_c, tensor_tick_info_t> &ticks,
+        std::vector<expr_c> &defined) {
+    reference_tick_finder_t finder(ticks, defined);
+    finder.dispatch(f);
+}
 
 class dead_tsr_write_remover_t : public tick_visitor_t {
 public:
@@ -1061,7 +1017,12 @@ static const tensor_node *get_inplace_target_if_single_inplace(
                 return utils::find_map_value(
                         identity_to_tensor, (*v)[0].to_reuse_.get());
             })
-            .map([](const expr_c *v) { return v->as<tensor_c>().get(); })
+            .map([](const expr_c *v) {
+                // identity_to_tensor might map to empty pointer if the identity
+                // is mapped to multiple buffers. Let's filter that out.
+                return *v;
+            })
+            .map([](const expr_c &v) { return v.as<tensor_c>().get(); })
             .filter([base](const tensor_node *v) {
                 return base->elem_dtype_ == v->elem_dtype_
                         && get_const_as_int(
@@ -1104,12 +1065,40 @@ static std::vector<size_t> schedule_tensor_memory_planner(
                 return x->first.checked_as<tensor>()->name_
                         < y->first.checked_as<tensor>()->name_;
             });
+    // collect alias info of func args
+    std::vector<alias_info::tensor_alias_identity_t *> arg_identities;
+    for (auto &itr_ptr : sorted_ticks) {
+        auto &itr = *itr_ptr;
+        auto tsr = itr.first.checked_as<tensor>();
+        if (itr.second.is_arg_) {
+            auto alias_data = alias_info::get_alias_info(*tsr);
+            if (alias_data) { arg_identities.emplace_back(alias_data); }
+        }
+    }
     for (auto &itr_ptr : sorted_ticks) {
         auto &itr = *itr_ptr;
         auto tsr = itr.first.checked_as<tensor>();
         if (itr.second.is_arg_) {
             auto inplace_parent = get_inplace_target_if_single_inplace(
                     identity_to_tensor, tsr.get(), tsr.get());
+            if (inplace_parent) {
+                // if this output buffer in func arg has already an alias with
+                // another arg by arg-tensor-inplace, temp buffers cannot
+                // in-place reuse this buffer
+                auto alias_data = alias_info::get_alias_info(*tsr);
+                if (alias_data) {
+                    for (auto &tid : arg_identities) {
+                        if (tid != alias_data && alias_data->is_alias_of(tid)) {
+                            SC_MODULE_INFO
+                                    << "Cannot in-place reuse output buffer"
+                                    << tsr
+                                    << ", because it is reusing other buffers";
+                            inplace_parent = nullptr;
+                            break;
+                        }
+                    }
+                }
+            }
             while (inplace_parent) {
                 if (auto pinfo = utils::find_map_value(
                             ticks, inplace_parent->node_ptr_from_this())
@@ -1254,6 +1243,9 @@ static std::vector<size_t> schedule_tensor_memory_planner(
                                 = alias_info::get_or_create_alias_info(
                                         *cur_arg);
                         if (!arg.defined()) { arg = cur_arg; }
+                        SC_MODULE_INFO << "inplace-func "
+                                       << callsite->func_->name_
+                                       << " Add arg1:" << cur_arg;
                         cur_aliasinfo->add_to_clique(aliasinfo);
                     }
                 }
@@ -1268,6 +1260,9 @@ static std::vector<size_t> schedule_tensor_memory_planner(
                             auto cur_aliasinfo
                                     = alias_info::get_or_create_alias_info(
                                             *cur_arg);
+                            SC_MODULE_INFO << "inplace-func "
+                                           << callsite->func_->name_
+                                           << " Add arg2:" << cur_arg;
                             cur_aliasinfo->add_to_clique(aliasinfo);
                         }
                     }

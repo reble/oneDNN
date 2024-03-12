@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -89,37 +89,47 @@ status_t gemm_x8s8s32x_matmul_t::pd_t::init(engine_t *engine) {
                         binary_injector_utils::extract_bcast_strategies(
                                 post_ops.entry_, dst_md()),
                         broadcasting_strategy_t::per_oc);
+        const bool has_prelu = post_ops.find(prelu) != -1;
         return cpu::inner_product_utils::post_ops_ok(
                        post_ops, dst_md(), enabled_bcast_strategy)
                 && IMPLICATION(is_binary_po_per_oc,
                         gemm_based::check_gemm_binary_per_oc_compatible_formats(
-                                *this));
+                                *this))
+                && IMPLICATION(N() == DNNL_RUNTIME_DIM_VAL, !has_prelu);
     };
 
-    bool ok = is_dense_format_kind() && !has_zero_dim_memory()
-            && one_of(src_md()->data_type, s8, u8)
+    VDISPATCH_MATMUL(is_dense_format_kind(), VERBOSE_UNSUPPORTED_SPARSE_CFG);
+    VDISPATCH_MATMUL(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
+
+    const bool problem_dt_correct = one_of(src_md()->data_type, s8, u8)
             && weights_md()->data_type == s8 && desc()->accum_data_type == s32
             && one_of(dst_md()->data_type, f32, s32, s8, u8)
             && IMPLICATION(with_bias(),
                     one_of(weights_md(1)->data_type, f32, s32, s8, u8)
-                            && is_bias_1xN())
-            && attr()->has_default_values(
+                            && is_bias_1xN());
+    VDISPATCH_MATMUL(problem_dt_correct, VERBOSE_UNSUPPORTED_DT_CFG);
+
+    VDISPATCH_MATMUL(
+            attr()->post_ops_.check_sum_consistency(dst_md()->data_type,
+                    /* is_int8 */ true),
+            VERBOSE_UNSUPPORTED_POSTOP);
+    VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_MATMUL(check_attr_scales(), VERBOSE_UNSUPPORTED_SCALES_CFG);
+    VDISPATCH_MATMUL(check_attr_zero_points(), VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_MATMUL(
+            attr()->has_default_values(
                     primitive_attr_t::skip_mask_t::scales_runtime
                             | primitive_attr_t::skip_mask_t::zero_points_runtime
                             | primitive_attr_t::skip_mask_t::post_ops
                             | primitive_attr_t::skip_mask_t::sum_dt,
-                    dst_md()->data_type)
-            && attr_.post_ops_.check_sum_consistency(dst_md()->data_type,
-                    /* is_int8 */ true)
-            // need to set up default formats first, so that latter checks can
-            // be perfomed properly
-            && set_default_formats() && check_attr_scales()
-            && check_attr_zero_points() && check_attr_post_ops()
-            && gemm_based::check_gemm_compatible_formats(*this)
-            && attr_.set_default_formats(dst_md(0)) == status::success;
-    if (!ok) return status::unimplemented;
+                    dst_md()->data_type),
+            VERBOSE_UNSUPPORTED_ATTR);
 
-    // set states
+    VDISPATCH_MATMUL(check_attr_post_ops(), VERBOSE_UNSUPPORTED_POSTOP);
+    VDISPATCH_MATMUL(gemm_based::check_gemm_compatible_formats(*this),
+            VERBOSE_INCOMPATIBLE_GEMM_FMT);
+    bool po_format_ok = attr_.set_default_formats(dst_md(0)) == status::success;
+    VDISPATCH_MATMUL(po_format_ok, VERBOSE_UNSUPPORTED_POSTOP);
 
     // copy attributes and drop src and weights zero points
     CHECK(params_.pp_attr_.copy_from(*attr()));
@@ -281,8 +291,11 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
         const dim_t acc_stride = gemm_based::get_scratchpad_block_elements(
                 batch, M, N, use_single_gemm_call, nthr);
 
+        bool postops_in_matmul = need_post_processing(pd(), dst_zero_point_f32);
+        assert(IMPLICATION(postops_in_matmul, params.has_pp_kernel_));
+
 #ifdef GCC_WA_LAMBDA_C_CAST
-        parallel(nthr, [=, &st](int ithr, int nthr) {
+        parallel(nthr, [= WA_THIS_COPY_CAPTURE, &st](int ithr, int nthr) {
 #else
         parallel(nthr, [&](int ithr, int nthr) {
 #endif
@@ -404,10 +417,6 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
                     } break;
                     default: assert(!"unsupported data type"); break;
                 }
-
-                bool postops_in_matmul
-                        = need_post_processing(pd(), dst_zero_point_f32);
-                assert(IMPLICATION(postops_in_matmul, params.has_pp_kernel_));
 
                 if (postops_in_matmul) {
                     const size_t dst_logical_off = i_work;

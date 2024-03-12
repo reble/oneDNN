@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,9 +25,8 @@
 
 #include <graph/utils/utils.hpp>
 
-#include "graph/interface/backend.hpp"
-
 #include "graph/backend/dnnl/common.hpp"
+#include "graph/backend/dnnl/dnnl_constant_tensor_cache.hpp"
 #include "graph/backend/dnnl/fusion_info.hpp"
 #include "graph/backend/dnnl/internal_attrs.hpp"
 #include "graph/backend/dnnl/op_executable.hpp"
@@ -355,7 +354,7 @@ matmul_executable_t::desc_t matmul_executable_t::create_desc(
             = logical_tensor_wrapper_t(
                       op->get_input_value(0)->get_logical_tensor())
                       .is_constant()
-            && is_constant_cache_enabled();
+            && is_constant_cache_enabled(p_engine);
     const bool use_strided_src = !const_activation
             && ((src.get_ndims() == 4
                         && is_format(src, dnnl::memory::format_tag::acbd))
@@ -373,7 +372,7 @@ matmul_executable_t::desc_t matmul_executable_t::create_desc(
     bool const_weight = logical_tensor_wrapper_t(
                                 op->get_input_value(1)->get_logical_tensor())
                                 .is_constant()
-            && is_constant_cache_enabled();
+            && is_constant_cache_enabled(p_engine);
     const bool use_strided_wei = !const_weight
             && (wei.get_ndims() == 4
                     && (is_format(wei, dnnl::memory::format_tag::adbc)
@@ -1590,7 +1589,7 @@ bn_folding_t::desc_t bn_folding_t::create_desc(std::shared_ptr<op_t> &op,
     add_post_ops.append_eltwise(algorithm::eltwise_sqrt, 0.0f, 0.0f);
 
     primitive_attr add_attr;
-    add_attr.set_post_ops(add_post_ops);
+    add_attr.set_post_ops(std::move(add_post_ops));
     desc.add_pd_ = dnnl::binary::primitive_desc(p_engine, algorithm::binary_add,
             variance, desc.epsilon_desc_, variance, add_attr);
 
@@ -1626,7 +1625,7 @@ bn_folding_t::desc_t bn_folding_t::create_desc(std::shared_ptr<op_t> &op,
     mul_post_ops.append_binary(algorithm::binary_div, desc.new_variance_desc_);
 
     primitive_attr mul_attr;
-    mul_attr.set_post_ops(mul_post_ops);
+    mul_attr.set_post_ops(std::move(mul_post_ops));
     desc.mul_pd_ = dnnl::binary::primitive_desc(p_engine, algorithm::binary_mul,
             weights, desc.new_scale_desc_, weights, mul_attr);
 
@@ -1644,7 +1643,7 @@ bn_folding_t::desc_t bn_folding_t::create_desc(std::shared_ptr<op_t> &op,
     sub_post_ops.append_binary(algorithm::binary_add, shift);
 
     primitive_attr sub_attr;
-    sub_attr.set_post_ops(sub_post_ops);
+    sub_attr.set_post_ops(std::move(sub_post_ops));
     desc.sub_pd_ = dnnl::binary::primitive_desc(p_engine, algorithm::binary_sub,
             valid_bias, mean, valid_bias, sub_attr);
 
@@ -1678,6 +1677,10 @@ static void get_arg_indices_for_post_ops(const op_t *op, fusion_info_mgr_t &mgr,
         } else if (pops[i]->get_op()->get_kind() == op_kind::dnnl_convolution) {
             indices.insert({DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS,
                     indices_t {input, base_index++}});
+            if (pops[i]->get_op()->num_inputs() > 2) {
+                indices.insert({DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS,
+                        indices_t {input, base_index++}});
+            }
         } else {
         }
     }

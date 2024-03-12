@@ -34,25 +34,29 @@ namespace utils = dnnl::graph::tests::unit::utils;
 namespace dnnl {
 namespace graph {
 
-TEST(CompiledPartitionCache, SingleOpCase) {
+TEST(test_interface_compiled_partition_cache, SingleOpCase) {
+#if !defined(NDEBUG) && (DNNL_CPU_RUNTIME == DNNL_RUNTIME_THREADPOOL)
+    // TODO:
+    // Due to symbol duplication of dnnl_get_max_threads(), when building with
+    // option ONEDNN_CPU_RUNTIME=THREADPOOL under debug mode, this unit test
+    // case will run into the dnnl_get_max_threads() in test namespace while it
+    // should target at the library one. We will improve graph ut linkage to
+    // solve this issue in future. For the time being, we take this temporary
+    // solution of skipping this case.
+    GTEST_SKIP();
+#else
     const size_t max_batch = 4;
-
     impl::engine_t *eng = get_engine();
     std::vector<impl::graph::op_kind_t> kind_set {impl::graph::op_kind::ReLU,
             impl::graph::op_kind::ReLU, impl::graph::op_kind::Tanh};
-
     const size_t num_eltwise_kind = kind_set.size();
-
     // Flush the cache
     set_compiled_partition_cache_capacity(0);
     set_compiled_partition_cache_capacity(1024);
-
     const int n_compiled_partitions
             = static_cast<int>(num_eltwise_kind * max_batch);
-
     std::vector<std::thread> tasks;
     tasks.reserve(n_compiled_partitions * 2);
-
     for (size_t batch = 0; batch < max_batch; ++batch) {
         for (size_t op_i = 0; op_i < kind_set.size(); ++op_i) {
             impl::graph::op_kind_t kind = kind_set[op_i];
@@ -68,12 +72,10 @@ TEST(CompiledPartitionCache, SingleOpCase) {
             impl::graph::op_t elt {batch * op_i, kind, "elt"};
             elt.add_input(input);
             elt.add_output(output);
-
             // Create graph
             impl::graph::graph_t g {eng->kind()};
             g.add_op(&elt);
             g.finalize();
-
             // Create single-op partition
             std::vector<const impl::graph::backend_t *> &backends
                     = impl::graph::backend_registry_t::get_singleton()
@@ -83,12 +85,10 @@ TEST(CompiledPartitionCache, SingleOpCase) {
                         = const_cast<impl::graph::backend_t *>(cbkd);
                 bkd->get_partitions(g, impl::graph::partition_policy::fusion);
             }
-
             // wrap into the partition
             impl::graph::partition_t par = impl::graph::partition_t();
             std::vector<impl::graph::partition_t *> parts {&par};
             g.get_ordered_partitions(parts);
-
             // highly possibly cache_miss
             tasks.emplace_back([eng, par, input, output]() {
                 impl::graph::compiled_partition_t cp(par);
@@ -101,7 +101,6 @@ TEST(CompiledPartitionCache, SingleOpCase) {
                 // Partition compilation
                 par.compile(cpcache, inputs, outputs, eng);
             });
-
             // highly possibly cache_hit
             tasks.emplace_back([eng, par, input, output]() {
                 impl::graph::compiled_partition_t cp(par);
@@ -116,21 +115,17 @@ TEST(CompiledPartitionCache, SingleOpCase) {
             });
         }
     }
-
     // join tasks
     for (auto &t : tasks)
         t.join();
-
 #ifdef DNNL_GRAPH_DISABLE_COMPILED_PARTITION_CACHE
     ASSERT_EQ(get_compiled_partition_cache_size(), 0);
 #else
     ASSERT_EQ(get_compiled_partition_cache_size(), n_compiled_partitions);
 #endif
-
     // test evict(n_compiled_partitions - 2)
     const int new_capacity = 2;
     set_compiled_partition_cache_capacity(new_capacity);
-
 #ifdef DNNL_GRAPH_DISABLE_COMPILED_PARTITION_CACHE
     ASSERT_EQ(get_compiled_partition_cache_size(), 0);
 #else
@@ -138,9 +133,10 @@ TEST(CompiledPartitionCache, SingleOpCase) {
     ASSERT_EQ(impl::graph::compiled_partition_cache().get_capacity(),
             new_capacity);
 #endif
+#endif
 }
 
-TEST(LruCompiledPartitionCache, Method) {
+TEST(test_interface_lru_compiled_partition_cache, Method) {
     namespace graph = dnnl::impl::graph;
 
     graph::engine_t &eng = *get_engine();
@@ -191,7 +187,7 @@ TEST(LruCompiledPartitionCache, Method) {
 #endif
 }
 
-TEST(CompiledPartition, InvalidArguments) {
+TEST(test_interface_compiled_partition, InvalidArguments) {
     namespace graph = dnnl::impl::graph;
 
     graph::partition_t pti;

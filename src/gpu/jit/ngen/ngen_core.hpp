@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -93,6 +93,7 @@ static constexpr bool _safe_ = 0;
 class RegData;
 class Register;
 class GRFDisp;
+class Offset2D;
 class Subregister;
 class RegisterRegion;
 class NullRegister;
@@ -204,6 +205,10 @@ class invalid_execution_size_exception : public std::runtime_error {
 public:
     invalid_execution_size_exception() : std::runtime_error("Invalid execution size") {}
 };
+class invalid_address_modifier_exception : public std::runtime_error {
+public:
+    invalid_address_modifier_exception() : std::runtime_error("Invalid address offset") {}
+};
 #endif
 
 // Graphics core generations.
@@ -220,6 +225,7 @@ enum class Core {
     Gen12p7 = XeHPG,    /* Deprecated -- will be removed in the future */
     XeHPC,
     Gen12p8 = XeHPC,    /* Deprecated -- will be removed in the future */
+    Xe2,
 };
 
 typedef Core HW;
@@ -238,8 +244,10 @@ enum class ProductFamily : int {
     GenericXeHPG,
     DG2,
     MTL,
+    ARL,
     GenericXeHPC,
     PVC,
+    GenericXe2,
 };
 
 struct Product {
@@ -264,12 +272,14 @@ static inline constexpr14 ProductFamily genericProductFamily(HW hw)
         case HW::XeHP:  return ProductFamily::GenericXeHP;
         case HW::XeHPG: return ProductFamily::GenericXeHPG;
         case HW::XeHPC: return ProductFamily::GenericXeHPC;
+        case HW::Xe2:   return ProductFamily::GenericXe2;
         default:        return ProductFamily::Unknown;
     }
 }
 
 static inline constexpr14 Core getCore(ProductFamily family)
 {
+    if (family >= ProductFamily::GenericXe2)   return Core::Xe2;
     if (family >= ProductFamily::GenericXeHPC) return Core::XeHPC;
     if (family >= ProductFamily::GenericXeHPG) return Core::XeHPG;
     if (family >= ProductFamily::GenericXeHP)  return Core::XeHP;
@@ -419,6 +429,7 @@ enum class SyncFunction : uint8_t {
     nop   = 0,
     allrd = 2,
     allwr = 3,
+    flush = 12,
     bar   = 14,
     host  = 15
 };
@@ -426,7 +437,7 @@ enum class SyncFunction : uint8_t {
 #ifdef NGEN_ASM
 static inline std::ostream &operator<<(std::ostream &str, SyncFunction func)
 {
-    static const char *names[16] = {"nop", "", "allrd", "allwr", "", "", "", "", "", "", "", "", "", "", "bar", "host"};
+    static const char *names[16] = {"nop", "", "allrd", "allwr", "", "", "", "", "", "", "", "", "flush", "", "bar", "host"};
     str << names[static_cast<uint8_t>(func) & 0xF];
     return str;
 }
@@ -453,6 +464,7 @@ enum class SharedFunction : uint8_t {
     tgm = 0xD,
     slm = 0xE,
     ugm = 0xF,
+    automatic = 0xFF,
 
     // alias
     sampler = smpl,
@@ -581,6 +593,11 @@ public:
 #ifdef NGEN_ASM
     static const bool emptyOp = false;
     inline void outputText(std::ostream &str, PrintDetail detail, LabelManager &man);
+
+    friend inline bool operator==(const Label &r1, const Label &r2) {
+        return !std::memcmp(&r1, &r2, sizeof(Label));
+    }
+    friend inline bool operator!=(const Label &r1, const Label &r2) { return !(r1 == r2); }
 #endif
 };
 
@@ -1020,26 +1037,15 @@ public:
     inline GRFDisp operator+(int offset) const;
     inline GRFDisp operator-(int offset) const;
 
+    inline GRFDisp operator+(Offset2D offset) const;
+    inline GRFDisp operator-(Offset2D offset) const;
+
     static constexpr int log2Bytes(HW hw)                  { return (hw >= HW::XeHPC) ? 6 : 5;  }
     static constexpr int bytes(HW hw)                      { return (1 << log2Bytes(hw)); }
     static constexpr int bytesToGRFs(HW hw, unsigned x)    { return (x + bytes(hw) - 1) >> log2Bytes(hw); }
+
+    static constexpr int maxRegs()                         { return 256; }
 };
-
-class GRFDisp {
-protected:
-    GRF base;
-    int32_t disp;
-
-public:
-    GRFDisp(const GRF &base_, int32_t disp_) : base(base_), disp(disp_) {}
-    /* implicit */ GRFDisp(const RegData &rd) : base(reinterpret_cast<const GRF &>(rd)), disp(0) {}
-
-    constexpr GRF     getBase() const { return base; }
-    constexpr int32_t getDisp() const { return disp; }
-};
-
-GRFDisp GRF::operator+(int offset) const { return GRFDisp(*this, offset); }
-GRFDisp GRF::operator-(int offset) const { return *this + (-offset); }
 
 class ARF : public Register
 {
@@ -1075,8 +1081,11 @@ public:
     AccumulatorRegister &operator=(const Invalid &i) { this->invalidate(); return *this; }
 
     static constexpr14 int count(HW hw, DataType dt = DataType::invalid) {
-        if (hw == HW::Gen9  && dt == DataType::df) return 0;
-        if (hw == HW::XeHPG && dt == DataType::df) return 0;
+        if (dt == DataType::df) {
+            if (hw == HW::Gen9)  return 0;
+            if (hw == HW::XeHPG) return 0;
+            if (hw == HW::Xe2)   return 0;
+        }
         if (hw >= HW::XeHP) return 4;
         return 2;
     }
@@ -1231,6 +1240,41 @@ public:
     explicit constexpr FlowControlRegister(int reg_ = 0) : ARF(ARFType::fc, reg_, DataType::ud) {}
 };
 
+class Offset2D {
+public:
+    int16_t x, y;
+
+    constexpr Offset2D(int16_t x_, int16_t y_) : x(x_), y(y_) {}
+    constexpr Offset2D operator-() const { return Offset2D(-x, -y); }
+};
+
+class GRFDisp {
+protected:
+    GRF base;
+    int32_t disp;
+
+public:
+    GRFDisp(const GRF &base_, int32_t disp_) : base(base_), disp(disp_) {}
+    /* implicit */ GRFDisp(const RegData &rd) : base(reinterpret_cast<const GRF &>(rd)), disp(0) {}
+
+    GRFDisp(const GRF &base_, Offset2D offset) : base(base_), disp((uint32_t(uint16_t(offset.y)) << 16) | uint16_t(offset.x)) {}
+
+    constexpr GRF     getBase()  const { return base; }
+    constexpr int32_t getDisp()  const { return disp; }
+
+    constexpr int16_t getDispX() const { return disp & 0xFFFF; }
+    constexpr int16_t getDispY() const { return disp >> 16; }
+
+    GRFDisp operator+(int offset) const { return GRFDisp(base, disp + offset); }
+    GRFDisp operator-(int offset) const { return GRFDisp(base, disp - offset); }
+};
+
+GRFDisp GRF::operator+(int offset)      const { return GRFDisp(*this, offset); }
+GRFDisp GRF::operator-(int offset)      const { return *this + (-offset); }
+
+GRFDisp GRF::operator+(Offset2D offset) const { return GRFDisp(*this, offset); }
+GRFDisp GRF::operator-(Offset2D offset) const { return *this + (-offset); }
+
 inline RegisterRegion Subregister::operator()(int vs, int width, int hs) const
 {
     RegisterRegion rr(*this, vs, width, hs);
@@ -1342,8 +1386,8 @@ public:
 
 static inline GRFRange operator-(const GRF &reg1, const GRF &reg2)
 {
-    uint8_t b1 = reg1.getBase(), b2 = reg2.getBase();
-    int len = int(b2) + 1 - int(b1);
+    auto b1 = reg1.getBase(), b2 = reg2.getBase();
+    int len = b2 + 1 - b1;
 
 #ifdef NGEN_SAFE
     if (len < 0) throw invalid_range_exception();
@@ -1547,20 +1591,42 @@ enum class Opcode {
     bfi1_gen12 = 0x79,
     bfi2_gen12 = 0x7A,
     nop = 0x7E,
-    wrdep = 0x7F,   /* not a valid opcode; used internally by nGEN */
+    directive = 0x7F,   /* not a valid opcode; used internally by nGEN */
 };
+
+enum class Operand {dst = 0, src0 = 1, src1 = 2, src2 = 3};
+
+enum class Directive {
+    ignoredep_dst = 0,
+    ignoredep_src0 = 1,
+    ignoredep_src1 = 2,
+    ignoredep_src2 = 3,
+    wrdep = 0x10,
+};
+
+static inline bool isSend(Opcode op)
+{
+    switch (op) {
+        case Opcode::send:
+        case Opcode::sendc:
+        case Opcode::sends:
+        case Opcode::sendsc:
+            return true;
+        default:
+            return false;
+    }
+}
 
 static inline bool trackedByToken(HW hw, Opcode op, unsigned dstTypecode)
 {
     switch (op) {
         case Opcode::math:
             if (hw >= HW::XeHPC) return false;
-        case Opcode::send:
-        case Opcode::sendc:
         case Opcode::dpas:
         case Opcode::dpasw:
             return true;
         default:
+            if (isSend(op)) return true;
             if (hw == HW::XeHPG && dstTypecode == 0b1011 /* :df */) return true;
             return false;
     }
@@ -1668,9 +1734,10 @@ public:
 // Token count.
 constexpr inline int tokenCount(HW hw, int grfCount = 128)
 {
-    return (hw >= HW::XeHPC) ? 32 :
-         (hw >= HW::Gen12LP) ? 16
-                             : 0;
+    return (hw == HW::Xe2 && grfCount < 256) ? 16 :
+                           (hw >= HW::XeHPC) ? 32 :
+                         (hw >= HW::Gen12LP) ? 16
+                                             : 0;
 }
 
 class SBID
@@ -2233,6 +2300,11 @@ union ExtendedMessageDescriptor {
         unsigned : 6;
         unsigned index : 26;
     } surface;
+    struct {
+        unsigned : 12;
+        signed xOffset : 10;
+        signed yOffset : 10;
+    } block2D;
 
     ExtendedMessageDescriptor() : all(0) {}
     ExtendedMessageDescriptor& operator=(SharedFunction sfid_) { parts.sfid = static_cast<int>(sfid_); return *this; }
@@ -2354,6 +2426,9 @@ public:
     inline constexpr bool isStateless() const {
         return model & (ModelA32 | ModelA64);
     }
+    inline constexpr bool isA64() const {
+        return model & ModelA64;
+    }
 
     void checkModel(uint8_t allowed) { checkModel(static_cast<AddressModel>(allowed)); }
     void checkModel(AddressModel allowed) {
@@ -2367,6 +2442,9 @@ public:
 class hdc_base {
 protected:
     void hwCheck(HW hw) const {
+#ifdef NGEN_SAFE
+        if (hw >= HW::Xe2) throw unsupported_message();
+#endif
     }
 };
 
@@ -2377,7 +2455,7 @@ protected:
 public:
     block_hword(int count_ = 1) : count(count_) {};
 
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2415,7 +2493,7 @@ public:
     block_oword(int count_ = 1) : count(count_), highHalf(false) {}
     static block_oword high() { return block_oword(1, true); }
 
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2451,7 +2529,7 @@ public:
     aligned_block_oword(int count_ = 1) : count(count_), highHalf(false) {}
     static aligned_block_oword high() { return aligned_block_oword(1, true); }
 
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2486,7 +2564,7 @@ protected:
 public:
     scattered_byte(int count_ = 1) : count(count_) {}
 
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2536,7 +2614,7 @@ public:
 
 class scattered_word : public scattered_atomic {
 public:
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2578,7 +2656,7 @@ protected:
 public:
     scattered_dword(int count_ = 1) : count(count_) {}
 
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2630,7 +2708,7 @@ protected:
 public:
     scattered_qword(int count_ = 1) : count(count_) {}
 
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2686,7 +2764,7 @@ protected:
 public:
     surface_dword(ChannelMask cmask_ = ChannelMask::r, bool structured_ = false) : cmask(cmask_), structured(structured_) {}
 
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2730,7 +2808,7 @@ public:
         vls_offset(vls_offset_), width(width_), height(height_) {}
     media_block() : media_block(0, 0) {}
 
-    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const RegData &addr) const
+    template <Access access> void getDescriptors(HW hw, const InstructionModifier &mod, AddressBase base, MessageDescriptor &desc, ExtendedMessageDescriptor &exdesc, const GRFDisp &addr) const
     {
         hwCheck(hw);
 
@@ -2814,6 +2892,8 @@ enum class CacheSettingsLSC : uint8_t {
     L1S_L3UC  = 10,
     L1S_L3C   = 12,   L1S_L3WB  = 12,
     L1IAR_L3C = 14,   L1WB_L3WB = 14,
+    L1UC_L3CC = 5,
+    L1C_L3CC  = 9,
 };
 
 enum FenceScopeLSC : uint8_t {
@@ -2883,11 +2963,19 @@ struct DataSpecLSC {
             case ModelSLM:
                 desc.standardLSC.model = AddrFlat;
                 exdesc.flat.offset = addr.getDisp();
+#ifdef NGEN_SAFE
+                if (exdesc.flat.offset != addr.getDisp())
+                    throw invalid_address_modifier_exception();
+#endif
                 break;
             case ModelBTS:
                 desc.standardLSC.model = AddrBTI;
                 exdesc.bti.index = base.getIndex();
                 exdesc.bti.offset = addr.getDisp();
+#ifdef NGEN_SAFE
+                if (exdesc.bti.offset != addr.getDisp())
+                    throw invalid_address_modifier_exception();
+#endif
                 break;
             case ModelSS:
             case ModelBSS:
@@ -2919,6 +3007,7 @@ struct DataSpecLSC {
     {
         desc.standardLSC.opcode = static_cast<uint16_t>(op) >> 8;
     }
+
 };
 
 static inline DataSpecLSC scattered(const DataSpecLSC &dtype, int vsize = 1) { return dtype(vsize); }
@@ -2955,8 +3044,11 @@ public:
         desc.parts.responseLen = std::min(count * GRF::bytesToGRFs(hw, utils::roundup_pow2(w) * h * this->dbytes), 31);
 
         exdesc = SharedFunction::ugm;
-        exdesc.flat.offset = addr.getDisp();
+
+        exdesc.block2D.xOffset = addr.getDispX();
+        exdesc.block2D.yOffset = addr.getDispY();
     }
+
 };
 
 // Generate descriptors for a load operation.

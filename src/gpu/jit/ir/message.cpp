@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -132,8 +132,8 @@ bool send_t::is_supported() const {
     return true;
 }
 
-std::vector<func_t> send_t::get_all(ngen::HW hw, send_op_t op,
-        send_address_t address, const type_t &mem_type,
+std::vector<func_t> send_t::get_all(const hw_t &hw, send_op_t op,
+        send_address_t address, const type_t &mem_type, bool zero_out,
         send_cache_hint_t cache_hint) {
     std::vector<func_t> filtered;
     for (int slots : {1, 2, 4, 8, 16}) {
@@ -146,7 +146,7 @@ std::vector<func_t> send_t::get_all(ngen::HW hw, send_op_t op,
                     continue;
 
                 auto f = send_t::make(hw, op, address, type.with_elems(elems),
-                        slots, cache_hint);
+                        slots, zero_out, cache_hint);
                 if (!f.as<send_t>().is_supported()) continue;
                 filtered.push_back(f);
             }
@@ -185,18 +185,17 @@ std::vector<func_t> send_t::get_all(ngen::HW hw, send_op_t op,
     return ret;
 }
 
-ngen::CacheSettingsLSC get_cache_settings(
-        const send_t &send, const hw_config_t &hw_cfg) {
+ngen::CacheSettingsLSC get_cache_settings(const send_t &send, const hw_t &hw) {
     auto ret = ngen::CacheSettingsLSC::Default;
     bool is_load = send.is_load() || send.is_load_2d();
     bool is_store = send.is_store() || send.is_store_2d();
     bool is_prefetch = send.is_prefetch() || send.is_prefetch_2d();
     switch (send.cache_hint) {
         case send_cache_hint_t::undef:
-            switch (send.hw) {
+            switch (send.hw.to_ngen()) {
                 case ngen::HW::XeHPG:
                     // Use default cache policy on xelpg to avoid suspected driver issue.
-                    if (is_store && hw_cfg.systolic_support())
+                    if (is_store && hw.systolic_support())
                         ret = ngen::CacheSettingsLSC::L1WB_L3WB;
                     break;
                 case ngen::HW::XeHPC:
@@ -469,7 +468,7 @@ private:
 access_builder_t::access_builder_t(ir_context_t &ir_ctx, const view_t &mem_view,
         const expr_t &mem_buf, const expr_t &reg_buf, send_op_t send_op,
         send_address_t send_address, send_cache_hint_t send_cache_hint,
-        send_params_t &send_params)
+        send_params_t &send_params, bool zero_out)
     : ir_ctx_(&ir_ctx)
     , mem_view_(mem_view)
     , mem_buf_(mem_buf)
@@ -477,9 +476,11 @@ access_builder_t::access_builder_t(ir_context_t &ir_ctx, const view_t &mem_view,
     , send_op_(send_op)
     , send_address_(send_address)
     , send_cache_hint_(send_cache_hint)
-    , mem_type_(mem_view.type()) {
+    , mem_type_(mem_view.type())
+    , zero_out_(zero_out) {
     if (send_params.use_send_plan) {
-        auto sp = create_send_plan(ir_ctx.exec_cfg(), mem_view, send_params);
+        auto sp = create_send_plan(
+                ir_ctx.exec_cfg(), mem_view, send_params, zero_out);
         if (sp && !sp.is_2d()) send_params.hint_2d = send_2d_hint_t();
         if (!sp) return;
         reg_layout_ = sp.reg_layout();
@@ -568,7 +569,7 @@ static stmt_t try_promote_to_lsc(const stmt_t &_call) {
     send_t::arg_mask(new_args) = mask;
 
     auto lsc_send = send_t::make(send.hw, send.op, send.address, send.type,
-            send.slots, /*is_lsc=*/true, send.cache_hint);
+            send.slots, /*is_lsc=*/true, send.zero_out, send.cache_hint);
     return lsc_send.call(new_args);
 }
 
@@ -714,7 +715,8 @@ bool access_builder_t::try_build_2d(send_params_t &send_params) {
     hint.width = w;
     hint.height = h;
     auto _send = send_t::make_2d(ir_ctx_->hw(), send_params.convert(send_op_),
-            send_type, W, H, P, w, h, c, vnni, transpose, send_cache_hint_);
+            send_type, W, H, P, w, h, c, vnni, transpose, zero_out_,
+            send_cache_hint_);
     auto &send = _send.as<send_t>();
 
     stmt_ = stmt_t();
@@ -786,7 +788,7 @@ bool access_builder_t::try_build_2d(send_params_t &send_params) {
 
         // Check alignment requirements.
         int64_t align = get_max_const_factor(off, ir_ctx_->cset());
-        if (align % block_2d_base_alignment(ir_ctx_->hw_cfg()) != 0) {
+        if (align % block_2d_base_alignment(ir_ctx_->hw()) != 0) {
             ok = false;
             return;
         }
@@ -817,7 +819,7 @@ bool access_builder_t::fixup_send_2d_params(const type_t &send_type, bool vnni,
     auto whp_ok = [&]() {
         return block_2d_width_ok(W, send_type.size()) && block_2d_height_ok(H)
                 && block_2d_pitch_ok(
-                        ir_ctx_->hw_cfg(), P, send_type.size(), use_xy);
+                        ir_ctx_->hw(), P, send_type.size(), use_xy);
     };
 
     // No VNNI permute by default.
@@ -896,7 +898,7 @@ bool access_builder_t::try_build(
             = (try_layout_blocks.empty() ? 0
                                          : (int)try_layout_blocks[0].stride);
     auto send_list = send_t::get_all(ir_ctx_->hw(), send_op_, send_address_,
-            mem_type_, send_cache_hint_);
+            mem_type_, zero_out_, send_cache_hint_);
     reg_layout_walker_
             = utils::make_unique<layout_walker_t>(try_layout, grf_size());
     stmt_ = stmt_t();
@@ -1157,13 +1159,12 @@ send_2d_hint_t get_send_2d_hint(const exec_config_t &exec_cfg,
         int k_blk = 32 / view.type().size();
         bool is_b0_k = (bmnk_mapper.bmnk_kind(abc_kind, b0.dim_idx)
                 == bmnk_kind_t::k);
-        bool vnni = is_dpas_src1;
         bool transpose = (is_dpas_src1 == is_b0_k);
         int b0_blk = is_b0_k ? k_blk : mn_blk;
         int b1_blk = !is_b0_k ? k_blk : mn_blk;
         if (b0_blk != any_block && b0.block % b0_blk != 0) return hint;
         if (b1_blk != any_block && b1.block % b1_blk != 0) return hint;
-        if (vnni && transpose) return hint;
+        bool vnni = is_dpas_src1 && !transpose;
         hint = get_send_2d_hint(send_op, view.type(), vnni, transpose, b0.block,
                 b1.block, b0_blk, b1_blk);
     } else {

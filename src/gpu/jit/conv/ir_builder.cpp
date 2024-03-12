@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -324,16 +324,19 @@ private:
     void build_prefetch() {
         auto &prefetch = plan_.prefetch;
         if (prefetch.has_a()) {
-            build_prefetch_x(ap_buf_, prefetch.a_prefetch);
+            build_prefetch_x(ap_buf_, prefetch.a_prefetch, prefetch.a_grid);
         }
         if (prefetch.has_b()) {
-            build_prefetch_x(bp_buf_, prefetch.b_prefetch);
+            build_prefetch_x(bp_buf_, prefetch.b_prefetch, prefetch.b_grid);
         }
     }
 
-    void build_prefetch_x(const expr_t &mem_buf, const send_plan_t &prefetch) {
+    void build_prefetch_x(const expr_t &mem_buf, const send_plan_t &prefetch,
+            const grid_info_t &grid) {
         prefetch_stmt_ = prefetch_stmt_.append(
                 prefetch.create_stmt(mem_buf, expr_t()));
+        prefetch_stmt_ = add_grid_guard(
+                prefetch_stmt_, cfg_.thread_group_grid(), grid);
     }
 
     void build_x2r_mul() {
@@ -435,9 +438,10 @@ private:
         auto &a_layout = fma.a_layout;
         auto &b_layout = fma.b_layout;
         auto &c_layout = fma.c_layout;
+        int c_buf_size = utils::rnd_up(c_layout.size(), ir_ctx_.grf_size());
         auto a_buf = buf_mgr_.get("a");
         auto b_buf = buf_mgr_.get("b");
-        auto c_buf = buf_mgr_.get("c", c_layout.size());
+        auto c_buf = buf_mgr_.get("c", c_buf_size);
         int b0 = fma.bmnk_start_idx(bmnk_kind_t::b, subtile_idx);
         int b1 = fma.bmnk_stop_idx(bmnk_kind_t::b, subtile_idx);
         int m0 = fma.bmnk_start_idx(bmnk_kind_t::m, subtile_idx);
@@ -532,8 +536,8 @@ private:
 
     void build_x_reduce_store() {
         auto &gemm_schedule = plan_.gemm_schedule;
-        bool use_atomic
-                = gemm_schedule.with_kernel_grid_k_slicing() || cfg_.slm().b();
+        bool use_atomic = (gemm_schedule.with_kernel_grid_k_slicing()
+                || !plan_.slm.x_reduce_tile.is_empty());
         auto x_reduce_buf = buf_mgr_.find("x_reduce", /*allow_empty=*/true).buf;
         if (x_reduce_buf.is_empty()) return;
         auto x_reduce_view

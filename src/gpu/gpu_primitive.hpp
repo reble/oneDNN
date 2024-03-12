@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,20 +18,19 @@
 #define GPU_GPU_PRIMITIVE_HPP
 
 #include <cassert>
-
-#ifndef DISABLE_VERBOSE
-#include <iostream>
-#include <sstream>
-#include "common/verbose.hpp"
-#endif
+#include "gpu/compute/utils.hpp"
 
 #include "common/cache_blob.hpp"
 #include "common/primitive.hpp"
 #include "common/utils.hpp"
-#include "gpu/compute/compute.hpp"
+#include "gpu/compute/compute_engine.hpp"
+#include "gpu/compute/compute_stream.hpp"
+#include "gpu/compute/kernel.hpp"
 #include "gpu/gemm/gpu_gemm_exec_types.hpp"
 #include "gpu/gpu_resource.hpp"
+#include "gpu/jit/jit_generator_base.hpp"
 #include "gpu/kernel_cache.hpp"
+#include "gpu/ocl/types_interop.hpp"
 
 #define CTX_GPU_RES_STORAGE(arg) \
     (*(ctx.get_resource_mapper() \
@@ -138,7 +137,7 @@ struct gpu_primitive_t : public primitive_t {
         auto *compute_engine
                 = utils::downcast<compute::compute_engine_t *>(engine);
         CHECK(compute_engine->create_kernel(kernel, jitter, cache_blob()));
-        register_kernels({*kernel});
+        CHECK(register_kernels({*kernel}));
         return status::success;
     }
 
@@ -148,22 +147,9 @@ struct gpu_primitive_t : public primitive_t {
             const compute::kernel_ctx_t &kernel_ctx) {
         auto *compute_engine
                 = utils::downcast<compute::compute_engine_t *>(engine);
-
-#ifndef DISABLE_VERBOSE
-        // Print out kernel options if the correct verbosity is set
-        if (get_verbose(verbose_t::debuginfo) >= 5) {
-            std::ostringstream oss;
-            for (const char *name : kernel_names)
-                oss << name << " ";
-
-            VFORMAT(get_msec(), primitive, exec, VERBOSE_debug,
-                    "kernel options,%s,%s", oss.str().c_str(),
-                    kernel_ctx.options().c_str());
-        }
-#endif
         CHECK(compute_engine->create_kernels(
                 kernels, kernel_names, kernel_ctx, cache_blob()));
-        register_kernels(*kernels);
+        CHECK(register_kernels(*kernels));
         return status::success;
     }
 
@@ -181,28 +167,20 @@ struct gpu_primitive_t : public primitive_t {
     status_t create_kernels(engine_t *engine,
             std::vector<compute::kernel_t> &kernels,
             const std::vector<const char *> &kernel_names, const T &params) {
-        auto arch = utils::downcast<compute::compute_engine_t *>(engine)
-                            ->device_info()
-                            ->gpu_arch();
-        return create_kernels(
-                engine, kernels, kernel_names, trivial_key_t<T>(params, arch));
-    }
-    template <typename T>
-    status_t create_kernels(engine_t *engine,
-            std::vector<compute::kernel_t> &kernels,
-            const std::vector<const char *> &kernel_names,
-            const trivial_key_t<T> &params) {
-        if (!params.is_valid()) return status::runtime_error;
         auto *compute_engine
                 = utils::downcast<compute::compute_engine_t *>(engine);
         if (cache_blob())
             return compute_engine->create_kernels_from_cache_blob(
                     cache_blob(), kernels, kernel_names);
 
-        gpu_kernel_key_t key(params);
-        CHECK(key.get_kernels(engine, kernels, kernel_names));
+        auto key = std::make_shared<trivial_key_container_t<T>>(
+                params, compute_engine->engine_id());
+        gpu_assert(key->key.is_valid());
 
-        register_kernels(kernels);
+        CHECK(get_cached_kernels<typename trivial_key_t<T>::value_type>(
+                std::move(key), engine, kernels, kernel_names));
+
+        CHECK(register_kernels(kernels));
 
         return status::success;
     }
@@ -223,30 +201,10 @@ struct gpu_primitive_t : public primitive_t {
         return status::success;
     }
 
-protected:
-    int32_t version() const { return version_; }
-
-    void set_version(int32_t version) { version_ = version; }
-
-    void register_primitive(const primitive_t *primitive) {
-        registered_compute_blocks_.emplace_back(primitive);
-    }
-
-    void register_kernels(const std::vector<compute::kernel_t> &kernels) {
-        for (const auto &k : kernels) {
-            registered_compute_blocks_.emplace_back(k);
-        }
-    }
-
-    virtual status_t init_res_storage(
-            engine_t *engine, gpu_resource_t *r) const {
-        return status::success;
-    }
-
     // TODO: use inheritance for exec_ctx_t to get rid of such places...
-    status_t parallel_for(const gemm_exec_ctx_t &ctx,
+    static status_t parallel_for(const gemm_exec_ctx_t &ctx,
             const compute::nd_range_t &range, const compute::kernel_t &kernel,
-            const compute::kernel_arg_list_t &arg_list) const {
+            const compute::kernel_arg_list_t &arg_list) {
         auto compute_stream
                 = utils::downcast<compute::compute_stream_t *>(ctx.stream());
         return parallel_for(*compute_stream, range, kernel, arg_list,
@@ -254,9 +212,9 @@ protected:
                 compute_stream->ctx().get_deps());
     }
 
-    status_t parallel_for(const exec_ctx_t &ctx,
+    static status_t parallel_for(const exec_ctx_t &ctx,
             const compute::nd_range_t &range, const compute::kernel_t &kernel,
-            const compute::kernel_arg_list_t &arg_list) const {
+            const compute::kernel_arg_list_t &arg_list) {
         auto compute_stream
                 = utils::downcast<compute::compute_stream_t *>(ctx.stream());
         return parallel_for(*compute_stream, range, kernel, arg_list,
@@ -268,35 +226,70 @@ protected:
     // be at most uint32_t. This function works around that by passing an offset
     // argument. The OpenCL native offset cannot be used due to lack of SYCL
     // interop support.
-    status_t large_parallel_for(const exec_ctx_t &ctx,
+    static status_t large_parallel_for(const exec_ctx_t &ctx,
             const compute::nd_range_t &nd_range,
             const compute::kernel_t &kernel,
-            compute::kernel_arg_list_t &arg_list, int offset_idx) const {
+            compute::kernel_arg_list_t &arg_list, int offset_idx) {
 
         auto global_range = nd_range.global_range();
         auto local_range = nd_range.local_range();
 
-        size_t off_inc[3] = {};
-        for (int i = 0; i < 3; i++)
-            off_inc[i] = local_range ? UINT32_MAX * local_range[i] : UINT32_MAX;
+        // Convert global_range to an equivalent 3D nd_range_t
+        constexpr size_t range_ndims = 3;
+        assert(global_range.ndims() <= range_ndims);
+        auto gws = compute::range_t::one(range_ndims);
+        for (size_t i = 0; i < global_range.ndims(); i++) {
+            gws[i] = global_range[i];
+        }
+
+        compute::range_t off_inc(UINT32_MAX, UINT32_MAX, UINT32_MAX);
+        if (local_range) {
+            for (size_t i = 0; i < local_range.ndims(); i++) {
+                off_inc[i] *= local_range[i];
+            }
+        }
 
         int64x3_t offset_arg = {};
         auto &offset = offset_arg.array;
-        for_(offset[2] = 0; static_cast<size_t>(offset[2]) < global_range[2];
+        static_assert(range_ndims == 3,
+                "Large parallel for loop doesn't match ndims.");
+        for_(offset[2] = 0; static_cast<size_t>(offset[2]) < gws[2];
                 offset[2] += off_inc[2])
-        for_(offset[1] = 0; static_cast<size_t>(offset[1]) < global_range[1];
+        for_(offset[1] = 0; static_cast<size_t>(offset[1]) < gws[1];
                 offset[1] += off_inc[1])
-        for_(offset[0] = 0; static_cast<size_t>(offset[0]) < global_range[0];
+        for_(offset[0] = 0; static_cast<size_t>(offset[0]) < gws[0];
                 offset[0] += off_inc[0])
         {
             arg_list.set(offset_idx, offset_arg);
-            size_t range[3];
-            for (int i = 0; i < 3; i++)
-                range[i] = std::min(off_inc[i], global_range[i] - offset[i]);
+            auto range = compute::range_t::empty(range_ndims);
+            for (size_t i = 0; i < range_ndims; i++)
+                range[i] = std::min(off_inc[i], gws[i] - offset[i]);
 
-            CHECK(parallel_for(ctx, compute::nd_range_t(3, range, local_range),
+            CHECK(parallel_for(ctx, compute::nd_range_t(range, local_range),
                     kernel, arg_list));
         }
+        return status::success;
+    }
+
+protected:
+    int32_t version() const { return version_; }
+
+    void set_version(int32_t version) { version_ = version; }
+
+    void register_primitive(const primitive_t *primitive) {
+        registered_compute_blocks_.emplace_back(primitive);
+    }
+
+    status_t register_kernels(const std::vector<compute::kernel_t> &kernels) {
+        for (const auto &k : kernels) {
+            CHECK(k.dump());
+            registered_compute_blocks_.emplace_back(k);
+        }
+        return status::success;
+    }
+
+    virtual status_t init_res_storage(
+            engine_t *engine, gpu_resource_t *r) const {
         return status::success;
     }
 
@@ -305,10 +298,10 @@ private:
         return registered_compute_blocks_;
     }
 
-    status_t parallel_for(stream_t &stream, const compute::nd_range_t &range,
-            const compute::kernel_t &kernel,
+    static status_t parallel_for(stream_t &stream,
+            const compute::nd_range_t &range, const compute::kernel_t &kernel,
             const compute::kernel_arg_list_t &arg_list,
-            const compute::event_t &deps, compute::event_t &out_dep) const {
+            const compute::event_t &deps, compute::event_t &out_dep) {
         return kernel.parallel_for(stream, range, arg_list, deps, out_dep);
     }
 

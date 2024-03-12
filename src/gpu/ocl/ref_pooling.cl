@@ -14,6 +14,7 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include "gpu/ocl/dispatch.h"
 #include "gpu/ocl/ocl_post_ops.h"
 #include "gpu/ocl/ocl_types.h"
 
@@ -31,6 +32,10 @@
 #define DST_DATA_MIN 0
 #elif DST_DT_F16
 #define DST_DATA_MIN -HALF_MAX
+#elif DST_DT_HF8
+#define DST_DATA_MIN (uchar)0xFE
+#elif DST_DT_BF8
+#define DST_DATA_MIN (uchar)0xFB
 #else
 #define DST_DATA_MIN DATA_MIN
 #endif
@@ -53,7 +58,7 @@ __kernel void ref_pooling_fwd(__global DATA_T *src, __global int *ws,
 
     if (mb >= SRC_D0 || oc >= SRC_D1) {
         const uint dst_off = DST_OFF(mb, oc, od, oh, ow);
-        dst[dst_off] = TO_DST(0.f);
+        dst[dst_off] = TO_DST(0.0f);
 #if ALG_MAX && IS_TRAINING
         ws[dst_off] = 0;
 #endif

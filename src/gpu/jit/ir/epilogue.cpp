@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -420,6 +420,7 @@ private:
     }
 
     void register_buffer(const expr_t &buf, int size) {
+        size = utils::rnd_up(size, ir_ctx_->grf_size());
         for (auto &_a : allocs_) {
             auto &a = _a.as<alloc_t>();
             if (a.buf.is_same(buf)) {
@@ -497,7 +498,7 @@ private:
 // Builds statements to apply a post-op for a given tile.
 class post_op_builder_t {
 public:
-    post_op_builder_t(ngen::HW hw, const post_op_t &post_op)
+    post_op_builder_t(const hw_t &hw, const post_op_t &post_op)
         : hw_(hw), post_op_(post_op) {}
 
     const post_op_t &post_op() const { return post_op_; }
@@ -572,7 +573,7 @@ private:
             inner_dim_idx = b0.dim_idx;
 
             int inner_block = b0.block;
-            int max_step = 2 * ngen::GRF::bytes(hw_) / lhs_type.size();
+            int max_step = 2 * hw_.grf_size() / lhs_type.size();
             inner_block = std::max(8, math::gcd(inner_block, max_step));
 
             for (auto &kv : args) {
@@ -605,7 +606,7 @@ private:
         return bcast_mutator.mutate(expr);
     }
 
-    ngen::HW hw_;
+    hw_t hw_;
     post_op_t post_op_;
 };
 
@@ -814,8 +815,18 @@ private:
         auto tmp_type = (post_op_builders_.empty() ? c_mem_view_.type()
                                                    : type_t::f32());
         int tmp_buf_elems = tile_size_ / tmp_type.size();
-        auto base_tile = c_mem_view_.split_into_max_tile(
-                tmp_buf_elems, /*is_dense=*/false);
+        tensor_t base_tile;
+        while (tmp_buf_elems) {
+            base_tile = c_mem_view_.split_into_max_tile(
+                    tmp_buf_elems, /*is_dense=*/false);
+            try {
+                c_reg_layout.map(base_tile);
+                break;
+            } catch (std::runtime_error &) {
+                tmp_buf_elems /= 2;
+                if (!tmp_buf_elems) throw;
+            }
+        }
 
         // Generate preload statements.
         for (auto &t : post_op_tensors_) {
@@ -936,7 +947,7 @@ private:
         const bool allow_2d = !offset.is<int_imm_t>()
                 || (offset.as<int_imm_t>().value % cache_line_size == 0);
         auto send_params = get_send_params(ir_ctx_.exec_cfg(), send_op,
-                send_address_t::a64, fma_kind_t::unknown, abc_kind_t::c,
+                send_address_t::a64, fma_kind_t::undef, abc_kind_t::c,
                 c_mem_tile_view, gemm_schedule_, allow_2d);
         auto r2g = make_access_builder(
                 ir_ctx_, c_mem_tile_view, c_mem_buf_, tmp_reg_buf, send_params);
@@ -957,8 +968,11 @@ private:
             c_stages.emplace_back(c_fx_layout, 0, make_c_tmp_buffer()); // R_f32
         }
         if (restore_zero_padding_) {
-            c_zero_pad_stage_idx = int(c_stages.size());
-            c_stages.emplace_back(c_fx_layout, 0, make_c_tmp_buffer()); // Z_f32
+            auto buf = make_c_tmp_buffer();
+            if (!zero_pad_builder_.build_stmt(c_fx_layout, buf).is_empty()) {
+                c_zero_pad_stage_idx = int(c_stages.size());
+                c_stages.emplace_back(c_fx_layout, 0, buf); // Z_f32
+            }
         }
         c_stages.emplace_back(r2g.reg_layout(), r2g.reg_buf_size(), tmp_reg_buf,
                 r2g.stmt()); // S_y
@@ -1139,7 +1153,7 @@ stmt_t create_epilogue_stmt(const exec_config_t &exec_cfg, ir_context_t &ir_ctx,
     epilogue_builder_t builder(ir_ctx, exec_cfg, gemm_schedule, force_c_reorder,
             post_op_ctx, thr_tile, c_mem_view, c_reg_layout, c_mem_buf,
             c_reg_buf, preload_max_size, post_op_blk);
-    c_reg_buf_size = builder.c_reg_buf_size();
+    c_reg_buf_size = utils::rnd_up(builder.c_reg_buf_size(), ir_ctx.grf_size());
     return builder.stmt();
 }
 

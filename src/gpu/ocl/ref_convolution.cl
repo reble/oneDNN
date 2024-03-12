@@ -14,6 +14,7 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include "gpu/ocl/dispatch.h"
 #include "gpu/ocl/ocl_post_ops.h"
 #include "gpu/ocl/ocl_types.h"
 
@@ -117,7 +118,6 @@ __kernel void ref_convolution_fwd(const __global SRC_DATA_T *src,
     const int dst_zp = dst_zpoints[WITH_DST_ZPOINTS_PER_OC ? g * OC + oc : 0];
     tmp += dst_zp;
 #endif // WITH_DST_ZPOINTS
-
     dst[DST_OFF(n, g * OC + oc, od, oh, ow)] = TO_DST(tmp);
 }
 #endif

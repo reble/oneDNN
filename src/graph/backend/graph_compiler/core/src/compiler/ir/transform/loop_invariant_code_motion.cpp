@@ -44,6 +44,8 @@ struct licm_analysis_data_t {
     // The loop vars stmt depending on
     std::unordered_set<expr_c> dep_vars_;
     std::unordered_set<expr_c> dep_tensors_;
+    // scope
+    size_t if_for_depth_ = 0;
 
     licm_analysis_data_t(const stmt_base_t *parent) : parent_(parent) {}
 };
@@ -264,70 +266,258 @@ static std::vector<stmt_c> *find_stmt_in_map(
     return nullptr;
 }
 
-static stmt get_same_scope_owner(stmt owner, const stmt_base_t *scope) {
-    while (owner.defined()
-            && owner->temp_data().get_or_null<licm_analysis_data_t>()) {
-        auto owner_scope
-                = owner->temp_data().get<licm_analysis_data_t>().parent_;
-        if (!owner_scope || owner_scope == scope) { break; }
-        owner = owner_scope->node_ptr_from_this().remove_const();
-    }
-    return owner;
+template <class T>
+static stmt get_owner(T &data) {
+    assert(data.defined());
+    return data->ssa_data_->get_owner();
 }
 
-static void process_with_non_loop_phi(
-        std::unordered_map<expr_c, std::vector<stmt_c>> &m,
-        const std::vector<expr> &phi_values, const ssa_phi_c &phi) {
-    size_t index = 0;
-    bool dont_hoist = false;
-    std::vector<stmt_c> *hoist_scope = nullptr;
-    auto cur_scope = phi->temp_data().get<licm_analysis_data_t>().parent_;
-    cur_scope = cur_scope->temp_data().get<licm_analysis_data_t>().parent_;
-    while (index < phi_values.size()) {
-        auto owner = phi_values[index]->ssa_data_->get_owner();
-        owner = get_same_scope_owner(owner, cur_scope);
-        if (owner.defined()) {
-            hoist_scope = find_stmt_in_map(m, owner);
-            break;
+static bool get_licm_data_volatile(const stmt &owner) {
+    assert(owner.defined());
+    return owner->temp_data().get<licm_analysis_data_t>().volatile_;
+}
+
+static void set_licm_data_volatile(const stmt &owner, bool vlt) {
+    owner->temp_data().get<licm_analysis_data_t>().volatile_ = vlt;
+}
+
+static size_t get_owner_depth(const stmt &owner) {
+    assert(owner.defined());
+    return owner->temp_data().get<licm_analysis_data_t>().if_for_depth_;
+}
+
+struct var_exist_analysis_t : public ssa_viewer_t {
+    using ir_viewer_t::dispatch;
+    using ir_viewer_t::view;
+    bool has_loop_var = false;
+    var_c cur_loop_var_need_find;
+
+    void view(var_c v) override {
+        if (cur_loop_var_need_find.defined()) {
+            if (v.ptr_same(cur_loop_var_need_find)) { has_loop_var = true; }
         }
-        index++;
     }
 
-    for (size_t i = index + 1; i < phi_values.size(); i++) {
-        auto owner = phi_values[i]->ssa_data_->get_owner();
-        owner = get_same_scope_owner(owner, cur_scope);
-        if (owner.defined()) {
-            if (hoist_scope) {
-                // need all hoist in the same scope
-                if (std::find_if(hoist_scope->begin(), hoist_scope->end(),
-                            [&owner](const stmt_c &in) {
-                                return in.ptr_same(owner);
-                            })
-                        == hoist_scope->end()) {
-                    dont_hoist = true;
-                    break;
+    void view(ssa_phi_c v) override {
+        if (v->is_loop_phi_) { has_loop_var = true; }
+        if (has_loop_var) { return; }
+        ssa_viewer_t::view(v);
+    }
+
+    void view(stmts_c v) override {
+        for (auto &s : v->seq_) {
+            dispatch(s);
+            if (has_loop_var) { break; }
+        }
+    }
+};
+
+struct var_property_set_t : public ssa_viewer_t {
+    using ir_viewer_t::dispatch;
+    using ir_viewer_t::view;
+    var_c cur_property_var_;
+    bool find_property_var_ = false;
+    std::unordered_set<expr_c> &visited_set_;
+    std::vector<expr_c> &modified_vars_;
+
+    var_property_set_t(std::unordered_set<expr_c> &set_vars,
+            std::vector<expr_c> &changed_vars)
+        : visited_set_(set_vars), modified_vars_(changed_vars) {}
+
+    void view(ssa_phi_c v) override { // ssa phi already have proper attribute
+    }
+
+    void view(stmts_c v) override {
+        for (auto &s : v->seq_) {
+            dispatch(s);
+        }
+    }
+
+    void view(var_c v) override {
+        if (cur_property_var_.defined()) {
+            if (v.ptr_same(cur_property_var_)) { find_property_var_ = true; }
+        }
+    }
+    void process_vars_property(
+            expr &var, expr &value, licm_analysis_data_t *v_licm) {
+        if (var.defined() && visited_set_.count(var)) { return; }
+        if (value.defined()) {
+            find_property_var_ = false;
+            dispatch(value);
+            if (find_property_var_) {
+                auto property_var_owner = get_owner<var_c>(cur_property_var_);
+                if (property_var_owner.defined()) {
+                    auto property_var_prop
+                            = property_var_owner->temp_data()
+                                      .get_or_null<licm_analysis_data_t>();
+                    licm_analysis_data_t *cur_licm = v_licm;
+                    if (!visited_set_.count(var) && cur_licm != nullptr) {
+                        cur_licm->dep_vars_.insert(
+                                property_var_prop->dep_vars_.begin(),
+                                property_var_prop->dep_vars_.end());
+                        cur_licm->volatile_ = property_var_prop->volatile_;
+                        modified_vars_.emplace_back(var);
+                        visited_set_.insert(var);
+                    }
                 }
-            } else {
-                if (find_stmt_in_map(m, owner)) {
-                    dont_hoist = true;
-                    break;
+            }
+            find_property_var_ = false;
+        }
+    }
+
+    void view(define_c v) override {
+        process_vars_property(v.remove_const()->var_, v.remove_const()->init_,
+                v->temp_data().get_or_null<licm_analysis_data_t>());
+    }
+};
+
+static void set_loop_var_stmt_dep_var(std::vector<expr_c> &cur_loop_vars_,
+        std::vector<expr> &phi_values, stmt &owner,
+        std::unordered_set<expr_c> &modified_vars) {
+    for (int j = cur_loop_vars_.size() - 1; j >= 0; j--) {
+        auto &x = cur_loop_vars_[j];
+        var_exist_analysis_t loop_var_analysis;
+        loop_var_analysis.cur_loop_var_need_find = x.dyn_as<var_c>();
+        loop_var_analysis.dispatch(owner);
+        if (loop_var_analysis.has_loop_var) {
+            auto x_owner = x->ssa_data_->get_owner();
+            if (x_owner.defined()) {
+                auto loop_depth = get_owner_depth(x_owner);
+                for (size_t i = 0; i < phi_values.size(); i++) {
+                    auto cur_phi_owner = phi_values[i]->ssa_data_->get_owner();
+                    if (cur_phi_owner.defined()) {
+                        auto &st_data = cur_phi_owner->temp_data_
+                                                ->get<licm_analysis_data_t>();
+                        // if already define in outer scope or same
+                        // scope as for loop, don't need to move
+                        if (loop_depth < get_owner_depth(cur_phi_owner)) {
+                            st_data.dep_vars_.insert(x);
+                            auto parent_stmt
+                                    = cur_phi_owner->temp_data()
+                                              .get<licm_analysis_data_t>()
+                                              .parent_->node_ptr_from_this()
+                                              .remove_const();
+                            if (parent_stmt.defined()) {
+                                modified_vars.insert(phi_values[0]);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
-    if (dont_hoist) {
-        for (size_t i = 0; i < phi_values.size(); i++) {
-            auto owner = phi_values[i]->ssa_data_->get_owner();
-            owner = get_same_scope_owner(owner, cur_scope);
-            if (owner.defined()
-                    && owner->temp_data().get_or_null<licm_analysis_data_t>()) {
-                owner->temp_data().get<licm_analysis_data_t>().volatile_ = true;
+}
+
+struct non_loop_phi_volatile_set_t : public ssa_viewer_t {
+    using ir_viewer_t::dispatch;
+    using ir_viewer_t::view;
+    std::vector<expr_c> cur_loop_vars_;
+    std::vector<expr> phi_values_;
+    // used to avoid visit repeatly
+    std::unordered_set<expr_c> visited_set_;
+    // modified_vars
+    std::unordered_set<expr_c> &changed_vars_;
+
+    non_loop_phi_volatile_set_t(const std::vector<expr_c> &loop_vars_,
+            const std::vector<expr> &values_phi,
+            std::unordered_set<expr_c> &modified_vars)
+        : cur_loop_vars_(loop_vars_)
+        , phi_values_(values_phi)
+        , changed_vars_(modified_vars) {}
+
+    void view(var_c v) override {
+        if (visited_set_.count(v)) { return; }
+        auto owner = v->ssa_data_->get_owner();
+        auto is_loopvar = std::find_if(cur_loop_vars_.begin(),
+                cur_loop_vars_.end(),
+                [&v](expr_c &x) { return x.dyn_as<var_c>().ptr_same(v); });
+        // non loop var need to find whether relate with loop var
+        if (is_loopvar == cur_loop_vars_.end() && owner.defined()) {
+            set_loop_var_stmt_dep_var(
+                    cur_loop_vars_, phi_values_, owner, changed_vars_);
+            if (visited_set_.count(v) == 0 && !v->ssa_data_->is_garbage()) {
+                visited_set_.insert(v);
+                dispatch(owner);
             }
         }
-        auto owner = phi->ssa_data_->get_owner();
-        if (owner.defined()
-                && owner->temp_data().get_or_null<licm_analysis_data_t>()) {
-            owner->temp_data().get<licm_analysis_data_t>().volatile_ = true;
+    }
+
+    void view(ssa_phi_c v) override { ssa_viewer_t::view(v); }
+
+    void view(stmts_c v) override {
+        for (auto &s : v->seq_) {
+            dispatch(s);
+        }
+    }
+};
+
+static void process_with_non_loop_phi(std::vector<expr> &phi_values,
+        ssa_phi_c &phi, std::vector<expr_c> &cur_loop_vars_) {
+    std::unordered_set<expr_c> modified_vars_set;
+    std::vector<expr_c> modified_vars;
+    for (size_t i = 1; i < phi_values.size(); i++) {
+        auto owner = phi_values[i]->ssa_data_->get_owner();
+        if (owner.defined()) {
+            // first parent is {} scope, second parent is if scope
+            // if{}
+            assert(owner->temp_data_->get<licm_analysis_data_t>().parent_);
+            auto cur_owner_scope
+                    = owner->temp_data_->get<licm_analysis_data_t>()
+                              .parent_->temp_data()
+                              .get<licm_analysis_data_t>()
+                              .parent_->node_ptr_from_this()
+                              .remove_const();
+            // All the current phi value need to be same volatile to avoid
+            // error.
+            if (get_licm_data_volatile(cur_owner_scope)) {
+                auto cur_owner = phi_values[0]->ssa_data_->get_owner();
+                if (cur_owner.defined()) {
+                    auto cur_depth = get_owner_depth(cur_owner);
+                    // be in same scope
+                    if (cur_depth + 1 == get_owner_depth(owner)
+                            && cur_owner.defined()) {
+                        set_licm_data_volatile(cur_owner, true);
+                        auto parent_stmt
+                                = cur_owner->temp_data()
+                                          .get<licm_analysis_data_t>()
+                                          .parent_->node_ptr_from_this()
+                                          .remove_const();
+                        // propagation
+                        if (parent_stmt.defined()) {
+                            modified_vars_set.insert(phi_values[0]);
+                        }
+                    }
+                }
+            }
+            // Find vars that may be affected by loop var
+            non_loop_phi_volatile_set_t vlt_set(
+                    cur_loop_vars_, phi_values, modified_vars_set);
+            vlt_set.dispatch(cur_owner_scope);
+            // need to find more accurate owner that have loop var
+            set_loop_var_stmt_dep_var(cur_loop_vars_, phi_values,
+                    cur_owner_scope, modified_vars_set);
+        }
+    }
+    // propagation
+    modified_vars.reserve(modified_vars_set.size());
+    for (auto &x : modified_vars_set) {
+        modified_vars.emplace_back(x);
+    }
+    while (!modified_vars.empty()) {
+        auto x = modified_vars.back();
+        modified_vars.pop_back();
+        auto cur_owner = x->ssa_data_->get_owner();
+        if (cur_owner.defined()) {
+            auto parent_stmt = cur_owner->temp_data()
+                                       .get<licm_analysis_data_t>()
+                                       .parent_->node_ptr_from_this()
+                                       .remove_const();
+            if (parent_stmt.defined()) {
+                var_property_set_t property_set(
+                        modified_vars_set, modified_vars);
+                property_set.cur_property_var_ = x.dyn_as<var_c>();
+                property_set.dispatch(parent_stmt);
+            }
         }
     }
 }
@@ -336,6 +526,7 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
     using ssa_viewer_t::dispatch;
     using ssa_viewer_t::view;
     const stmt_base_t *current_ = nullptr;
+    size_t if_for_depth_count_ = 0;
     //
     std::vector<stmt_c> cur_if_scopes_;
     std::vector<expr_c> cur_loop_vars_;
@@ -343,65 +534,11 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
     // how loop invariants interact with it
     std::unordered_map<expr_c, stmt_c> if_scope_loop_map_;
     std::unordered_map<stmt_c, std::unordered_set<expr_c>> if_scope_var_map_;
-    // output map: loop var => vector of invariants, the invariants will
-    // be inserted just before their correspond loop vars.
-    std::unordered_map<expr_c, std::vector<stmt_c>> loop_invariant_map_;
-    std::unordered_set<stmt_c> stmt_to_remove_set_;
-    // input map: call and tensor info
-    std::unordered_map<expr_c, bool> &call_volatile_map_;
-    std::unordered_map<expr_c, std::unordered_set<expr_c>>
-            &tensor_volatile_map_;
     //
-    licm_analysis_viewer_t(std::unordered_map<expr_c, bool> &call_volatile_map,
-            std::unordered_map<expr_c, std::unordered_set<expr_c>>
-                    &tensor_volatile_map)
-        : call_volatile_map_(call_volatile_map)
-        , tensor_volatile_map_(tensor_volatile_map) {
+    licm_analysis_viewer_t() {
         // Create a dummy if_scope
         cur_if_scopes_.emplace_back(
                 builder::make_if_else_unattached(false, {}, {}));
-    }
-    void register_loop_invariant_stmt() {
-        assert(current_ != nullptr);
-        // if stmts (need follow parent if or for), return
-        if (current_->node_type_ == sc_stmt_type::stmts) { return; }
-        // if the stmt is not in loop, return.
-        if (cur_loop_vars_.empty()) { return; }
-        auto &st_data = current_->temp_data().get<licm_analysis_data_t>();
-        if (st_data.volatile_) { return; }
-        // Find the loop to promote, from inner-most to out-most
-        auto it = cur_loop_vars_.rbegin();
-        for (; it != cur_loop_vars_.rend(); it++) {
-            // If any dep_tensors_ is defined or to be stored in the loop
-            // cannot promote
-            bool volatile_by_tensor = unordered_intersects(
-                    st_data.dep_tensors_, tensor_volatile_map_[*it]);
-            // If any dep_vars_ is the loop var, cannot promote
-            bool volatile_by_var = //
-                    st_data.dep_vars_.end()
-                    != std::find_if(st_data.dep_vars_.begin(),
-                            st_data.dep_vars_.end(),
-                            [&](const expr_c &v) { return v.ptr_same(*it); });
-            // If loop contains call node, cannot promote
-            bool volatile_by_call = call_volatile_map_[*it];
-            // If loop outside current if scope, cannot promote
-            bool outside_if_scope
-                    = !if_scope_loop_map_[*it].ptr_same(cur_if_scopes_.back());
-            // If depends not volatile, continue find the loop to promote
-            if (volatile_by_tensor || volatile_by_var || volatile_by_call
-                    || outside_if_scope) {
-                break;
-            }
-        }
-        if (it != cur_loop_vars_.rbegin()) {
-            stmt_c s = current_->node_ptr_from_this();
-            loop_invariant_map_[*(it - 1)].emplace_back(s);
-            stmt_to_remove_set_.insert(s);
-            return;
-        } else {
-            // current_ is volatile in its loop, cannot promote
-            return;
-        }
     }
     stmt_c dispatch(stmt_c s) override {
         if (!s->get_temp_data().isa<licm_analysis_data_t>()) {
@@ -419,7 +556,6 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
         auto old = current_;
         current_ = s.get();
         auto ret = ssa_viewer_t::dispatch(std::move(s));
-        register_loop_invariant_stmt();
         current_ = old;
         return ret;
     }
@@ -437,6 +573,9 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
     void view(for_loop_c v) override {
         if_scope_loop_map_[v->var_] = cur_if_scopes_.back();
         cur_loop_vars_.emplace_back(v->var_);
+        v->temp_data().get<licm_analysis_data_t>().if_for_depth_
+                = if_for_depth_count_;
+        ++if_for_depth_count_;
         ssa_viewer_t::view(v);
         cur_loop_vars_.pop_back();
         auto &v_data = v->temp_data().get<licm_analysis_data_t>();
@@ -446,6 +585,7 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
                 body_data.dep_vars_.begin(), body_data.dep_vars_.end());
         v_data.dep_tensors_.insert(
                 body_data.dep_tensors_.begin(), body_data.dep_tensors_.end());
+        --if_for_depth_count_;
     }
     void view(stmts_c v) override {
         ssa_viewer_t::view(v);
@@ -466,6 +606,7 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
     }
     void view(define_c v) override {
         auto &st_data = v->temp_data().get<licm_analysis_data_t>();
+        st_data.if_for_depth_ = if_for_depth_count_;
         dispatch(v->var_);
         if (v->init_.defined()) { dispatch(v->init_); }
         // synchronize volatile attribute between define node and its var node;
@@ -480,6 +621,7 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
         }
     }
     void view(if_else_c v) override {
+        ++if_for_depth_count_;
         cur_if_scopes_.emplace_back(v);
         ssa_viewer_t::view(v);
         auto &st_data = v->temp_data().get<licm_analysis_data_t>();
@@ -512,6 +654,7 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
         vars_in_if_scope_.clear();
         // End of this if_scopes
         cur_if_scopes_.pop_back();
+        --if_for_depth_count_;
     }
 
     void view(var_c v) override {
@@ -574,8 +717,110 @@ struct licm_analysis_viewer_t : public ssa_viewer_t {
                 }
             }
         } else if (!cur_loop_vars_.empty() && v->values_.size() > 1) {
-            process_with_non_loop_phi(loop_invariant_map_, v->values_, v);
+            process_with_non_loop_phi(
+                    v.remove_const()->values_, v, cur_loop_vars_);
         }
+    }
+};
+
+struct licm_hoist_prepare_viewer_t : public ssa_viewer_t {
+    using ssa_viewer_t::dispatch;
+    using ssa_viewer_t::view;
+    const stmt_base_t *current_ = nullptr;
+    //
+    std::vector<stmt_c> cur_if_scopes_;
+    std::vector<expr_c> cur_loop_vars_;
+    // currently we treat if_scope as a special stmt to judge
+    // how loop invariants interact with it
+    std::unordered_map<expr_c, stmt_c> if_scope_loop_map_;
+    // output map: loop var => vector of invariants, the invariants will
+    // be inserted just before their correspond loop vars.
+    std::unordered_map<expr_c, std::vector<stmt_c>> loop_invariant_map_;
+    std::unordered_set<stmt_c> stmt_to_remove_set_;
+    // input map: call and tensor info
+    std::unordered_map<expr_c, bool> &call_volatile_map_;
+    std::unordered_map<expr_c, std::unordered_set<expr_c>>
+            &tensor_volatile_map_;
+    //
+    licm_hoist_prepare_viewer_t(
+            std::unordered_map<expr_c, bool> &call_volatile_map,
+            std::unordered_map<expr_c, std::unordered_set<expr_c>>
+                    &tensor_volatile_map)
+        : call_volatile_map_(call_volatile_map)
+        , tensor_volatile_map_(tensor_volatile_map) {
+        // Create a dummy if_scope
+        cur_if_scopes_.emplace_back(
+                builder::make_if_else_unattached(false, {}, {}));
+    }
+    void register_loop_invariant_stmt() {
+        assert(current_ != nullptr);
+        // if stmts (need follow parent if or for), return
+        if (current_->node_type_ == sc_stmt_type::stmts) { return; }
+        // if the stmt is not in loop, return.
+        if (cur_loop_vars_.empty()) { return; }
+        auto &st_data = current_->temp_data().get<licm_analysis_data_t>();
+        if (st_data.volatile_) { return; }
+        // Find the loop to promote, from inner-most to out-most
+        auto it = cur_loop_vars_.rbegin();
+        for (; it != cur_loop_vars_.rend(); it++) {
+            // If any dep_tensors_ is defined or to be stored in the loop
+            // cannot promote
+            bool volatile_by_tensor = unordered_intersects(
+                    st_data.dep_tensors_, tensor_volatile_map_[*it]);
+            // If any dep_vars_ is the loop var, cannot promote
+            bool volatile_by_var = //
+                    st_data.dep_vars_.end()
+                    != std::find_if(st_data.dep_vars_.begin(),
+                            st_data.dep_vars_.end(),
+                            [&](const expr_c &v) { return v.ptr_same(*it); });
+            // If loop contains call node, cannot promote
+            bool volatile_by_call = call_volatile_map_[*it];
+            // If loop outside current if scope, cannot promote
+            bool outside_if_scope
+                    = !if_scope_loop_map_[*it].ptr_same(cur_if_scopes_.back());
+            // If depends not volatile, continue find the loop to promote
+            if (volatile_by_tensor || volatile_by_var || volatile_by_call
+                    || outside_if_scope) {
+                break;
+            }
+        }
+        if (it != cur_loop_vars_.rbegin()) {
+            stmt_c s = current_->node_ptr_from_this();
+            loop_invariant_map_[*(it - 1)].emplace_back(s);
+            stmt_to_remove_set_.insert(s);
+            return;
+        } else {
+            // current_ is volatile in its loop, cannot promote
+            return;
+        }
+    }
+    stmt_c dispatch(stmt_c s) override {
+        if (!stmt_can_hoist(s)) { return s; }
+        auto old = current_;
+        current_ = s.get();
+        auto ret = ssa_viewer_t::dispatch(std::move(s));
+        register_loop_invariant_stmt();
+        current_ = old;
+        return ret;
+    }
+    expr_c dispatch(expr_c s) override {
+        if (!expr_can_hoist(s) && current_ != nullptr
+                && !cur_loop_vars_.empty()) {
+            return s;
+        }
+        return ssa_viewer_t::dispatch(std::move(s));
+    }
+    void view(for_loop_c v) override {
+        if_scope_loop_map_[v->var_] = cur_if_scopes_.back();
+        cur_loop_vars_.emplace_back(v->var_);
+        ssa_viewer_t::view(v);
+        cur_loop_vars_.pop_back();
+    }
+    void view(if_else_c v) override {
+        cur_if_scopes_.emplace_back(v);
+        ssa_viewer_t::view(v);
+        // End of this if_scopes
+        cur_if_scopes_.pop_back();
     }
 };
 
@@ -678,14 +923,17 @@ func_c loop_invariant_code_motion_t::operator()(func_c f) {
     loop_analysis_viewer_t loop_analyzer;
     loop_analyzer.dispatch(f);
     // Mark loop-invariant code
-    licm_analysis_viewer_t analyzer(loop_analyzer.call_volatile_map_,
-            loop_analyzer.tensor_volatile_map_);
+    licm_analysis_viewer_t analyzer;
     analyzer.dispatch(f);
+    // use the mark information to prepare invariant map
+    licm_hoist_prepare_viewer_t hoist_prepared(loop_analyzer.call_volatile_map_,
+            loop_analyzer.tensor_volatile_map_);
+    hoist_prepared.dispatch(f);
     // Move code
-    filter_stmt_by_volatile(
-            analyzer.loop_invariant_map_, analyzer.stmt_to_remove_set_);
-    licm_hoister_t hoister(
-            analyzer.loop_invariant_map_, analyzer.stmt_to_remove_set_);
+    filter_stmt_by_volatile(hoist_prepared.loop_invariant_map_,
+            hoist_prepared.stmt_to_remove_set_);
+    licm_hoister_t hoister(hoist_prepared.loop_invariant_map_,
+            hoist_prepared.stmt_to_remove_set_);
     return hoister.top_level_dispatch(f);
 }
 

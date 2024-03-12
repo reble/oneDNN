@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -33,17 +33,23 @@ namespace jit_avx512_core_brgemm_conv_trans_kernel {
 jit_avx512_core_brgemm_conv_trans_kernel_t::
         jit_avx512_core_brgemm_conv_trans_kernel_t(
                 const jit_brgemm_conv_conf_t &ajcp, const char *name)
-    : jit_generator(name), jcp(ajcp) {
-    inp_dsz = jcp.src_dsz;
-    ic_block_sz = inp_dsz * jcp.inp_ic_block;
-    dst_w_block = dst_w(jcp, jcp.ow_block);
-    dst_stride = jcp.copy_block_only ? dst_w_block : jcp.iwp;
-    dst_w_offset = jcp.kh_sets * jcp.kw_sets * ic_block_sz;
+    : jit_generator(name)
+    , jcp(ajcp)
+    , inp_dsz(jcp.src_dsz)
+    , ic_block_sz(
+              jcp.is_reduced_rtus ? jcp.rtus_padded_ic_size : jcp.inp_ic_block)
+    , ic_block_offset(inp_dsz * ic_block_sz)
+    , iw_size(inp_dsz * jcp.ngroups * jcp.ic_without_padding)
+    , dst_w_block(dst_w(jcp, jcp.ow_block))
+    , dst_stride(jcp.copy_block_only ? dst_w_block : jcp.iwp)
+    , VL(cpu_isa_traits<avx512_core>::vlen)
+    , n_vec(ic_block_sz / jcp.simd_w)
+    , n_tail_vec((jcp.ic_without_padding % ic_block_sz) / jcp.simd_w) {
+
+    const auto kh_stride
+            = (jcp.relo_type == conv_brgemm_relo_type_t::whi) ? jcp.kh : 1;
+    dst_w_offset = kh_stride * ic_block_offset;
     dst_h_offset = dst_stride * dst_w_offset;
-    iw_size = inp_dsz * jcp.ngroups * jcp.ic_without_padding;
-    VL = cpu_isa_traits<avx512_core>::vlen;
-    n_vec = jcp.inp_ic_block / jcp.simd_w;
-    n_tail_vec = (jcp.ic_without_padding % jcp.inp_ic_block) / jcp.simd_w;
 }
 
 int get_inp_size(int dst_size, int ext_k, int stride, int dilate) {
@@ -66,10 +72,7 @@ int jit_avx512_core_brgemm_conv_trans_kernel_t::inp_w(int out_w) const {
 int jit_avx512_core_brgemm_conv_trans_kernel_t::dst_w(
         const jit_brgemm_conv_conf_t &ajcp, int out_w) {
     int res = 0;
-    if (ajcp.kw_sets > 1)
-        res = get_inp_size(out_w, 1, 1, ajcp.dilate_w);
-    else
-        res = get_inp_size(out_w, ajcp.ext_kw, ajcp.stride_w, ajcp.dilate_w);
+    res = get_inp_size(out_w, ajcp.ext_kw, ajcp.stride_w, ajcp.dilate_w);
     if (ajcp.is_os_blocking) res = rnd_up(res, ajcp.stride_w);
     return res;
 }
@@ -106,26 +109,29 @@ void jit_avx512_core_brgemm_conv_trans_kernel_t::store(
 void jit_avx512_core_brgemm_conv_trans_kernel_t::zero_ic_block(
         bool is_ic_tail, dim_t dst_off) {
     bool has_block_tail = (jcp.inp_ic_block % jcp.simd_w);
+    auto zmm = jcp.s8s8_compensation_required ? zmm_s8s8_shift : zmm_zero;
 
     // TODO: use Xmm or Ymm moves for better small ic efficiency
     auto nvec = is_ic_tail ? n_tail_vec : n_vec;
     for (int iv = 0; iv < nvec; iv++)
-        store(ptr[aux_dst_ptr + dst_off + iv * VL], zmm_zero);
+        store(ptr[aux_dst_ptr + dst_off + iv * VL], zmm);
     const auto last_dst_off = aux_dst_ptr + dst_off + nvec * VL;
     if (is_ic_tail) {
         if (has_block_tail)
-            store(ptr[last_dst_off] | kblock_tail_mask | T_z, zmm_zero);
+            store(ptr[last_dst_off] | kblock_tail_mask | T_z, zmm);
         else
-            store(ptr[last_dst_off], zmm_zero);
+            store(ptr[last_dst_off], zmm);
     } else if (has_block_tail)
-        store(ptr[last_dst_off] | kblock_tail_mask | T_z, zmm_zero);
+        store(ptr[last_dst_off] | kblock_tail_mask | T_z, zmm);
 }
 
-void jit_avx512_core_brgemm_conv_trans_kernel_t::copy_ic_block(bool is_ic_tail,
-        dim_t inp_off = 0, dim_t dst_off = 0, bool do_load = true) {
+void jit_avx512_core_brgemm_conv_trans_kernel_t::copy_ic_block(dim_t zidx,
+        bool is_ic_tail, dim_t inp_off = 0, dim_t dst_off = 0,
+        bool do_load = true) {
     bool has_block_tail = (jcp.inp_ic_block % jcp.simd_w);
 
     // TODO: use Xmm or Ymm moves for better small ic efficiency
+    Xbyak::Zmm zmm_tmp = get_zmm(zidx);
     auto nvec = is_ic_tail ? n_tail_vec : n_vec;
     for (int iv = 0; iv < nvec; iv++) {
         if (do_load) load(zmm_tmp, ptr[aux_inp_ptr + inp_off + iv * VL]);
@@ -175,35 +181,40 @@ void jit_avx512_core_brgemm_conv_trans_kernel_t::generate() {
         mov(reg_tmp, mask);
         kmovq(kblock_tail_mask, reg_tmp);
     }
+    if (jcp.s8s8_compensation_required) {
+        mov(reg_tmp, -128);
+        vpbroadcastb(zmm_s8s8_shift, reg_tmp.cvt8());
+    }
 
     auto icb_loop_body = [&](bool is_ic_tail) {
         Xbyak::Label kh_label, no_kh_label;
-        Xbyak::Label kh_tover_label, kh_bover_label;
-        Xbyak::Label no_kh_tover_label, no_kh_bover_label;
+        Xbyak::Label finish_label;
 
         mov(aux_inp_ptr, inp_ptr);
         mov(aux_dst_ptr, dst_ptr);
 
         cmp(reg_hc, 0);
-        jle(no_kh_bover_label, T_NEAR); // nothing to do
+        jle(finish_label, T_NEAR); // nothing to do
 
-        cmp(reg_t_pad, 0);
-        jle(no_kh_tover_label, T_NEAR);
+        if (jcp.t_pad > 0) {
+            Xbyak::Label kh_tover_label, no_kh_tover_label;
+            cmp(reg_t_pad, 0);
+            jle(no_kh_tover_label, T_NEAR);
 
-        mov(kh_over, reg_t_pad);
-        L(kh_tover_label);
-        {
-            // TODO: adjust step to improve zeroing efficiency for small ic
-            for_(dim_t iw = 0; iw < dst_w_block; iw++)
-            for (int kw = 0; kw < jcp.kw_sets; kw++)
-                zero_ic_block(is_ic_tail, iw * dst_w_offset + kw * ic_block_sz);
-            add(aux_dst_ptr, dst_h_offset);
+            mov(kh_over, reg_t_pad);
+            L(kh_tover_label);
+            {
+                // TODO: adjust step to improve zeroing efficiency for small ic
+                for (dim_t iw = 0; iw < dst_w_block; iw++)
+                    zero_ic_block(is_ic_tail, iw * dst_w_offset);
+                add(aux_dst_ptr, dst_h_offset);
 
-            dec(kh_over);
-            jnz(kh_tover_label, T_NEAR);
+                dec(kh_over);
+                jnz(kh_tover_label, T_NEAR);
+            }
+            sub(reg_hc, reg_t_pad);
+            L(no_kh_tover_label);
         }
-        sub(reg_hc, reg_t_pad);
-        L(no_kh_tover_label);
 
         cmp(reg_hc, reg_b_pad);
         jle(no_kh_label, T_NEAR);
@@ -222,24 +233,30 @@ void jit_avx512_core_brgemm_conv_trans_kernel_t::generate() {
         }
         L(no_kh_label);
 
-        cmp(reg_hc, 0);
-        jle(no_kh_bover_label, T_NEAR);
-
-        L(kh_bover_label);
         {
-            // TODO: adjust step to improve zeroing efficiency for small ic
-            for_(dim_t iw = 0; iw < dst_w_block; iw++)
-            for (int kw = 0; kw < jcp.kw_sets; kw++)
-                zero_ic_block(is_ic_tail, iw * dst_w_offset + kw * ic_block_sz);
-            add(aux_dst_ptr, dst_h_offset);
+            // even if jcp.b_pad == 0 it is possible that b_pad passed as
+            // parameter is not equal to 0 (e.g. for cases with tail by oh)
+            Xbyak::Label kh_bover_label, no_kh_bover_label;
+            cmp(reg_hc, 0);
+            jle(no_kh_bover_label, T_NEAR);
 
-            dec(reg_hc);
-            jnz(kh_bover_label, T_NEAR);
+            L(kh_bover_label);
+            {
+                // TODO: adjust step to improve zeroing efficiency for small ic
+                for (dim_t iw = 0; iw < dst_w_block; iw++)
+                    zero_ic_block(is_ic_tail, iw * dst_w_offset);
+                add(aux_dst_ptr, dst_h_offset);
+
+                dec(reg_hc);
+                jnz(kh_bover_label, T_NEAR);
+            }
+            L(no_kh_bover_label);
         }
-        L(no_kh_bover_label);
+
+        L(finish_label);
 
         // End IC Loop
-        auto inp_cb_offset = ic_block_sz;
+        auto inp_cb_offset = ic_block_offset;
         auto dst_cb_offset = jcp.ihp * dst_h_offset;
 
         add(inp_ptr, inp_cb_offset);
@@ -378,17 +395,15 @@ void jit_avx512_core_brgemm_conv_trans_kernel_t::copy_ow_block(
 void jit_avx512_core_brgemm_conv_trans_kernel_t::copy_ow_block_body(
         int lpad, int ow_len, int iw_len, bool is_ic_tail) {
     const auto dst_width = dst_w(jcp, ow_len);
-    const auto iw_stride = jcp.kw_sets > 1 ? jcp.stride_w : 1;
-    for_(int kw = 0; kw < jcp.kw_sets; kw++)
     for (dim_t ind_w = 0; ind_w < dst_width; ind_w++) {
-        auto iw_idx = ind_w * iw_stride - lpad + kw * (jcp.dilate_w + 1);
-        auto dst_off = ind_w * dst_w_offset + kw * ic_block_sz;
+        auto iw_idx = ind_w - lpad;
+        auto dst_off = ind_w * dst_w_offset;
         if (iw_idx < 0 || iw_idx >= iw_len) {
             // left or right padding
             zero_ic_block(is_ic_tail, dst_off);
         } else {
             auto inp_off = iw_idx * iw_size;
-            copy_ic_block(is_ic_tail, inp_off, dst_off, true);
+            copy_ic_block(ind_w, is_ic_tail, inp_off, dst_off, true);
         }
     }
 }
@@ -397,8 +412,7 @@ jit_avx512_core_brgemm_conv_rtus_kernel_t::
         jit_avx512_core_brgemm_conv_rtus_kernel_t(
                 const jit_brgemm_conv_conf_t &ajcp)
     : jit_avx512_core_brgemm_conv_trans_kernel_t(ajcp, jit_name()) {
-    ic_block_sz = inp_dsz * jcp.LDA; // output may or may not be zero padded
-    dst_h_offset = jcp.iwp * ic_block_sz;
+    dst_h_offset = jcp.iwp * ic_block_offset;
 }
 
 void jit_avx512_core_brgemm_conv_rtus_kernel_t::generate() {
@@ -440,10 +454,10 @@ void jit_avx512_core_brgemm_conv_rtus_kernel_t::generate() {
         jle(label_kwp_end, T_NEAR);
         L(label_kwp_begin);
         {
-            copy_ic_block(is_ic_tail);
+            copy_ic_block(0, is_ic_tail);
 
             auto inp_w_step = jcp.stride_w * iw_size;
-            auto out_w_step = ic_block_sz;
+            auto out_w_step = ic_block_offset;
             add(aux_inp_ptr, inp_w_step);
             add(aux_dst_ptr, out_w_step);
 
@@ -460,12 +474,12 @@ void jit_avx512_core_brgemm_conv_rtus_kernel_t::generate() {
         {
             for (int ow = 0; ow < jcp.ow; ow++) {
                 auto inp_w_off = ow * jcp.stride_w * iw_size;
-                auto out_w_off = ow * ic_block_sz;
-                copy_ic_block(is_ic_tail, inp_w_off, out_w_off);
+                auto out_w_off = ow * ic_block_offset;
+                copy_ic_block(0, is_ic_tail, inp_w_off, out_w_off);
             }
 
             auto inp_h_step = jcp.stride_h * jcp.iw * iw_size;
-            auto out_h_step = jcp.ow * ic_block_sz;
+            auto out_h_step = jcp.ow * ic_block_offset;
             add(aux_inp_ptr, inp_h_step);
             add(aux_dst_ptr, out_h_step);
 

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -57,6 +57,8 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
             = everyone_is(bf16, src_dt, wei_dt) && one_of(dst_dt, bf16, f32);
     const bool is_f16
             = everyone_is(f16, src_dt, wei_dt) && one_of(dst_dt, f16, f32);
+    const bool is_bf16_with_int_wei = src_dt == bf16 && one_of(wei_dt, s8, u8)
+            && one_of(dst_dt, bf16, f32);
 
     auto check_bias = [&]() -> bool {
         const auto bia_dt = weights_md(1)->data_type;
@@ -84,7 +86,8 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
 
     auto check_attr_zero_points
             = [&]() -> bool { return attr()->zero_points_.common(); };
-    const bool problem_dt_correct = is_int8 || is_bf16 || is_f32 || is_f16;
+    const bool problem_dt_correct = one_of(
+            true, is_int8, is_bf16, is_f32, is_f16, is_bf16_with_int_wei);
 
     auto src_d = memory_desc_wrapper(src_md_);
     auto weights_d = memory_desc_wrapper(weights_md_);
@@ -96,18 +99,19 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
                     && weights_d.is_sparse_packed_desc());
     VDISPATCH_MATMUL(is_sparse_ok, VERBOSE_UNSUPPORTED_SPARSE_CFG);
     VDISPATCH_MATMUL(mayiuse(isa), VERBOSE_UNSUPPORTED_ISA);
-    VDISPATCH_MATMUL(problem_dt_correct, VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_MATMUL(problem_dt_correct, VERBOSE_UNSUPPORTED_DT_CFG);
     VDISPATCH_MATMUL(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
     VDISPATCH_MATMUL(
             attr()->has_default_values(
                     primitive_attr_t::skip_mask_t::scales_runtime
                             | primitive_attr_t::skip_mask_t::zero_points_runtime
                             | primitive_attr_t::skip_mask_t::post_ops
-                            | primitive_attr_t::skip_mask_t::sum_dt,
+                            | primitive_attr_t::skip_mask_t::sum_dt
+                            | primitive_attr_t::skip_mask_t::fpmath_mode,
                     dst_dt),
             VERBOSE_UNSUPPORTED_ATTR);
     VDISPATCH_MATMUL(attr()->post_ops_.check_sum_consistency(dst_dt, is_int8),
-            VERBOSE_UNSUPPORTED_DT);
+            VERBOSE_UNSUPPORTED_POSTOP);
     VDISPATCH_MATMUL(check_attr_scales(), VERBOSE_UNSUPPORTED_SCALES_CFG);
     VDISPATCH_MATMUL(check_attr_zero_points(), VERBOSE_UNSUPPORTED_ZP_CFG);
     VDISPATCH_MATMUL(check_bias(), VERBOSE_UNSUPPORTED_BIAS_CFG);
@@ -178,7 +182,7 @@ status_t brgemm_matmul_t<isa>::pd_t::init(engine_t *engine) {
             brgattr.hint_expected_B_size = vN * vK * bs;
             brgattr.hint_expected_C_size = vM * vN * bs;
             brgattr.hint_innermost_loop = brgemm_innermost_undef;
-            brgattr.hint_prefetching = brgemm_kernel_prefetching_t::brgemm_prf1;
+            brgattr.hint_prefetching = brgemm_kernel_prefetching_t::brgemm_prf0;
         }
 
         CHECK(brgemm_desc_set_attr(&brg, brgattr));
@@ -237,6 +241,19 @@ status_t brgemm_matmul_t<isa>::init(engine_t *engine) {
         CHECK(sparse_decompress_kernel_->create_kernel());
     }
 
+    // JIT to precompute scales
+    const bool is_jit_supported = mayiuse(avx512_core);
+    const auto attr = pd()->attr();
+    if (is_jit_supported && req_copy_scales(attr)) {
+        const auto &attr_scales = attr->scales_;
+        int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
+        if (wei_scale_mask != 0) {
+            CHECK(safe_ptr_assign(jit_scale_precompute_,
+                    new jit_avx512_core_scale_precompute_t()));
+            CHECK(jit_scale_precompute_->create_kernel());
+        }
+    }
+
     return status::success;
 }
 
@@ -254,9 +271,9 @@ status_t brgemm_matmul_t<isa>::execute_body(const exec_ctx_t &ctx) const {
     const auto dst_d = ctx.memory_mdw(DNNL_ARG_DST, pd()->dst_md());
     matmul_helper_t helper(src_d, weights_d, dst_d);
 
-    auto &scratchpad = ctx.get_scratchpad_grantor();
-    const float *oscales = precompute_scales(
-            scratchpad, src_scales, wei_scales, pd()->N(), pd()->attr());
+    const float *oscales = scale_utils::precompute_scales(
+            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->N(),
+            pd()->attr(), jit_scale_precompute_.get());
 
     brg_matmul_exec_ctx_t brgmm_ctx(ctx, pd(), oscales, src_zero_point,
             wei_zero_point, dst_zero_point, dst_scales, helper);
@@ -542,8 +559,11 @@ void brgemm_matmul_t<isa>::maybe_reduce_partial_results_and_apply_postops(
             const bool n_chunk_tail = nc == N_chunks - 1 && N_chunk_tail > 0;
             auto nb_end = nb_start
                     + (n_chunk_tail ? N_chunk_tail : bgmmc.N_chunk_size);
-            const int curr_N_chunk_elems
-                    = n_chunk_tail ? N_chunk_tail_elems : bgmmc.N_chunk_elems;
+            const bool n_chunk_has_tail
+                    = nc == N_chunks - 1 && N_chunk_tail_elems > 0;
+            const int curr_N_chunk_elems = n_chunk_has_tail
+                    ? N_chunk_tail_elems
+                    : bgmmc.N_chunk_elems;
             for (int mb = mb_start; mb < mb_end; mb++) {
                 const int curr_M_blk = brgmm_ctx.get_M_kernel_size(mb);
                 const int m_ker_idx = brgmm_ctx.get_M_kernel_idx(mb);
@@ -764,11 +784,10 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
     brg_matmul_exec_ctx_t(const exec_ctx_t &ctx, const pd_t *pd,
             const float *oscales, int32_t src_zp, int32_t wei_zp,
             int32_t dst_zp, const float *dst_scales, matmul_helper_t &helper)
-        : bgmmc_(pd->get_brgemm_matmul_conf()) {
-
-        data_A_ptr_ = CTX_IN_MEM(const char *, DNNL_ARG_SRC);
-        data_B_ptr_ = CTX_IN_MEM(const char *, DNNL_ARG_WEIGHTS);
-        data_C_ptr_ = CTX_OUT_MEM(char *, DNNL_ARG_DST);
+        : bgmmc_(pd->get_brgemm_matmul_conf())
+        , data_A_ptr_(CTX_IN_MEM(const char *, DNNL_ARG_SRC))
+        , data_B_ptr_(CTX_IN_MEM(const char *, DNNL_ARG_WEIGHTS))
+        , data_C_ptr_(CTX_OUT_MEM(char *, DNNL_ARG_DST)) {
 
         const memory_desc_wrapper weights_d(pd->weights_md(0));
         if (bgmmc_.packed_sparse_weights) {
@@ -1007,7 +1026,6 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
 
         nthr_k_ = bgmmc.nthr_k > 0 && bgmmc.nthr_k <= nthr_ ? bgmmc.nthr_k : 1;
         nthr_bmn_ = nthr_ / nthr_k_;
-        num_threads_used_ = nthr_k_ * nthr_bmn_;
 
         // If parallel_work_amount_ == 1 and parallel reduction is not used, we
         // limit num threads to 1 as parallel(1, ...) does not create parallel
@@ -1017,6 +1035,14 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
         // layer.
         if (parallel_work_amount_ == 1 && !parallel_reduction_is_used())
             nthr_ = nthr_bmn_ = nthr_k_ = 1;
+
+        // For Eigen threadpool there is significant advantage to not spawn
+        // useless threads.
+        if (!dnnl_thr_syncable()) {
+            nthr_bmn_ = nstl::min(nthr_bmn_, parallel_work_amount_);
+        }
+
+        num_threads_used_ = nthr_k_ * nthr_bmn_;
 
         const bool need_to_calculate_compensation_for_a
                 = bgmmc.has_zero_point_b;
@@ -1154,9 +1180,7 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
         if (!bgmmc_.use_buffer_c) return nullptr;
 
         if (bgmmc_.nthr_k > 1) {
-            const int nthr_k = bgmmc_.nthr_k <= nthr_ ? bgmmc_.nthr_k : 1;
-            const int nthr_bmn = nthr_ / nthr_k;
-            const int ithr_k = ithr / nthr_bmn;
+            const int ithr_k = get_thread_idx_for_k(ithr);
             return get_buf_C_par_reduction_ptr(ithr_k, m_blk_idx, n_blk_idx);
         }
         char *buf_C_ptr_local
@@ -1208,11 +1232,15 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
     }
 
     // Auxiliary functions for getting offsets with pre-calculated memory
-    // strides for each tensor to get general sulution for all possible
+    // strides for each tensor to get general solution for all possible
     // dimension without significant overhead
     dim_t get_data_A_off(int b, int m, int k) const {
         using namespace format_tag;
-        if (bgmmc_.src_tag == acbd || bgmmc_.src_tag == adbc) {
+        if (one_of(bgmmc_.src_tag, acbd, adbc)
+                /* this is a special case when src can be represented
+                   by plain and transposed tags due to a batch dim equal to 1 */
+                || (one_of(bgmmc_.src_tag, abcd, abdc)
+                        && bgmmc_.A_ptr_shift_b != 0)) {
             dim_t b_off = 0;
             if (!bgmmc_.bcast_A_desc.bcast_mask) { // no broadcast
                 const dim_t batch_dim1 = bgmmc_.bcast_A_desc.batch_dims[1];
@@ -1229,7 +1257,11 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
 
     dim_t get_data_B_off(int b, int k, int n) const {
         using namespace format_tag;
-        if (bgmmc_.wei_tag == acbd || bgmmc_.wei_tag == adbc) {
+        if (one_of(bgmmc_.wei_tag, acbd, adbc)
+                /* this is a special case when weights can be represented
+                   by plain and transposed tags due to a batch dim equal to 1 */
+                || (one_of(bgmmc_.wei_tag, abcd, abdc)
+                        && bgmmc_.B_ptr_shift_b != 0)) {
             dim_t b_off = 0;
             if (!bgmmc_.bcast_B_desc.bcast_mask) { // no broadcast
                 const dim_t batch_dim1 = bgmmc_.bcast_B_desc.batch_dims[1];
@@ -1266,7 +1298,9 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
     dim_t get_data_C_off(int b, int m, int n) const {
         using namespace format_tag;
         assert(bgmmc_.dst_tag != adbc);
-        if (bgmmc_.dst_tag == acbd) {
+        if (bgmmc_.dst_tag == acbd
+                || (one_of(bgmmc_.dst_tag, abcd, abdc)
+                        && bgmmc_.C_ptr_shift_b != 0)) {
             const dim_t batch_dim1 = bgmmc_.bcast_A_desc.batch_dims[1];
             dim_t b_off = C_strides_[2] * (b % batch_dim1)
                     + (b / batch_dim1) * C_ptr_shift_b_;
@@ -1409,7 +1443,9 @@ struct brgemm_matmul_t<isa>::brg_matmul_exec_ctx_t {
         const int ithr_bmn = ithr % nthr_bmn_;
         return ithr_bmn < parallel_work_amount_ ? ithr_bmn : -1;
     }
-    int get_num_threads_for_parallelization() const { return nthr_; }
+    int get_num_threads_for_parallelization() const {
+        return num_threads_used_;
+    }
     dim_t get_M() const { return M_; }
     int get_M_chunks() const { return M_chunks_; }
     int get_M_chunk_size() const { return bgmmc_.M_chunk_size; }
@@ -1660,7 +1696,13 @@ private:
     int get_M_tail_block_idx(int m_block_idx) const {
         const int tail_idx = m_block_idx - M_tail_block_start_;
         if (!bgmmc_.is_runtime_M) return tail_idx;
-        return tail_idx < (int)m_tail_processing_.size() ? tail_idx : -1;
+        const bool is_index_within_range
+                = tail_idx < (int)m_tail_processing_.size();
+        if (!is_index_within_range) {
+            assert(!"Error in M_tail_block index, not within range.");
+            return 0;
+        }
+        return tail_idx;
     }
     bool is_M_tail_processing(int m_block_idx) const {
         return get_M_tail_block_idx(m_block_idx) >= 0;
@@ -1680,7 +1722,13 @@ private:
     int get_N_tail_block_idx(int n_block_idx) const {
         const int tail_idx = n_block_idx - N_tail_block_start_;
         if (!bgmmc_.is_runtime_N) return tail_idx;
-        return tail_idx < (int)n_tail_processing_.size() ? tail_idx : -1;
+        const bool is_index_within_range
+                = tail_idx < (int)n_tail_processing_.size();
+        if (!is_index_within_range) {
+            assert(!"Error in N_tail_block index, not within range.");
+            return 0;
+        }
+        return tail_idx;
     }
     bool is_N_tail_processing(int n_block_idx) const {
         return get_N_tail_block_idx(n_block_idx) >= 0;

@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -97,7 +97,9 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphFuseOpPass) {
 }
 
 TEST(GCCore_CPU_graph_mixed_partition_cpp, TestFuseOpBreakAndNoFuse) {
-    auto get_test_graph = [](const char *fuse_type = nullptr) {
+    auto ctx = get_test_ctx();
+
+    auto get_test_graph = [&ctx](const char *fuse_type = nullptr) {
         int M = 32, K = 64, N = 32;
         sc_graph_t mgr;
         auto in_a = mgr.make_input(
@@ -127,19 +129,19 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestFuseOpBreakAndNoFuse) {
                         {"channel_axis", 0}});
 
         mgr.make_output(quan->get_outputs());
+
+        graph_inline(mgr);
+        quantize::quantize_inline(mgr);
+        elemwise_dimension_alignment(mgr);
+        layout_propagation(mgr);
+        mixed_partition(mgr, ctx);
         return mgr;
     };
-
-    auto ctx = get_test_ctx();
 
     // full fusion version
     {
         sc_graph_t graph = get_test_graph();
-        graph_inline(graph);
-        quantize::quantize_inline(graph);
-        elemwise_dimension_alignment(graph);
-        layout_propagation(graph);
-        mixed_partition(graph, ctx);
+
         std::stringstream ss;
         print_graph(graph, ss, true);
         std::string expected_str
@@ -156,11 +158,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestFuseOpBreakAndNoFuse) {
     // break pre fusion version
     {
         sc_graph_t graph = get_test_graph(op_attr_key::break_pre_fuse);
-        graph_inline(graph);
-        quantize::quantize_inline(graph);
-        elemwise_dimension_alignment(graph);
-        layout_propagation(graph);
-        mixed_partition(graph, ctx);
+
         std::stringstream ss;
         print_graph(graph, ss, true);
         std::string expected_str
@@ -178,11 +176,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestFuseOpBreakAndNoFuse) {
     // break post fusion version
     {
         sc_graph_t graph = get_test_graph(op_attr_key::break_post_fuse);
-        graph_inline(graph);
-        quantize::quantize_inline(graph);
-        elemwise_dimension_alignment(graph);
-        layout_propagation(graph);
-        mixed_partition(graph, ctx);
 
         std::stringstream ss;
         print_graph(graph, ss, true);
@@ -201,11 +194,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestFuseOpBreakAndNoFuse) {
     // no fuse fusion version
     {
         sc_graph_t graph = get_test_graph(op_attr_key::no_fuse);
-        graph_inline(graph);
-        quantize::quantize_inline(graph);
-        elemwise_dimension_alignment(graph);
-        layout_propagation(graph);
-        mixed_partition(graph, ctx);
 
         std::stringstream ss;
         print_graph(graph, ss, true);
@@ -430,7 +418,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphLastDimPaddedReorder) {
     EXPECT_EQ(ss.str(), expected_str);
 }
 
-TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphFuseBRGemmPreOpFusion) {
+TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphFuseBRGemmPreOpFusion1) {
     sc_graph_t graph;
     auto run_threads = runtime_config_t::get().get_num_threads();
     int BS = run_threads, C = 64, H = 56, W = 56, K = 64;
@@ -463,6 +451,40 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphFuseBRGemmPreOpFusion) {
     EXPECT_EQ(fused_op->parti_list_[0]->get_outer_loops().size(), (size_t)4);
 }
 
+TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphFuseBRGemmPreOpFusion2) {
+    SET_THREADS_OR_SKIP(56);
+    sc_graph_t graph;
+    int BS = 56, C = 64, H = 56, W = 56, K = 64;
+    auto input0 = graph.make_input({graph_tensor::make({BS, C, H, W})});
+    auto weight0 = graph.make_input({graph_tensor::make({K, C, 1, 1})});
+    auto input1 = graph.make_input({graph_tensor::make({BS, C, H, W})});
+    auto input2 = graph.make("constant", {}, {graph_tensor::make({1})},
+            {{"values",
+                     std::make_shared<static_data_t>(
+                             std::vector<float> {1.0f})},
+                    {"dtype", datatypes::f32}, {"plain_dims", sc_dims {1}}});
+
+    auto cast0 = graph.make("cast", {input1->get_outputs()[0]}, {},
+            {{"dtype", datatypes::s32}});
+    auto relu0 = graph.make("relu", {cast0->get_outputs()[0]}, {}, {});
+    graph.make_output(relu0->get_outputs());
+    auto add0 = graph.make(
+            "add", {cast0->get_outputs()[0], input2->get_outputs()[0]}, {}, {});
+    auto relu1 = graph.make("relu", {cast0->get_outputs()[0]}, {}, {});
+    graph.make_output(relu1->get_outputs());
+    auto conv0 = graph.make("conv_fwd_core",
+            {input0->get_outputs()[0], weight0->get_outputs()[0]}, {},
+            {{"strides", sc_dims {1, 1}}, {"paddings", sc_dims {0, 0}}});
+    auto add1 = graph.make(
+            "add", {conv0->get_outputs()[0], add0->get_outputs()[0]}, {}, {});
+    graph.make_output(add1->get_outputs());
+
+    auto ctx = get_test_ctx();
+    mixed_partition(graph, ctx);
+    mixed_fuse_op_t *fused_op = get_mixed_op_from_graph(graph);
+    ASSERT_TRUE(fused_op && fused_op->parti_list_.size() == 1);
+}
+
 TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphFuseOptimizedReduce2) {
     sc_graph_t graph;
 
@@ -476,7 +498,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphFuseOptimizedReduce2) {
     graph.make_output(reduce0->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
+
     graph_driver_before_fusion(graph, ctx);
     bool found = false;
     for (auto &op : graph.ops_) {
@@ -525,7 +547,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphPartitionRingRiskCheck1) {
     ret = graph.make_output(ret->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     graph_inline(graph, ctx);
     ops::managed_matmul_core_config_t cfg = {1, 1, 1, 1, 2, 0};
     for (auto &op : graph.ops_) {
@@ -617,8 +638,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphBreakOpPreFusion2) {
     graph.make_output(add0->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
-    ctx->flags_.use_cost_model_ = false;
     mixed_partition(graph, ctx);
     std::stringstream ss;
     print_graph(graph, ss, true);
@@ -656,7 +675,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestaxisBinding1) {
     graph.make_output(add1->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     graph_driver(graph, ctx);
     std::stringstream ss;
     print_graph(graph, ss, true);
@@ -710,7 +728,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestaxisBinding2) {
     graph.make_output(mmm1->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     graph_driver(graph, ctx);
     std::stringstream ss;
     print_graph(graph, ss, true);
@@ -754,7 +771,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, SplitAndMergeInners_Accuracy0) {
     auto out1 = graph.make_output(relu1->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
 
     auto f1 = lower_graph(ctx, graph, {input0, weight0, input1, out0, out1});
     auto fptr1 = jit_engine_t::make(ctx)->get_entry_func(f1);
@@ -835,7 +851,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, SplitAndMergeInners_Accuracy1) {
     }
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
 
     auto f1 = lower_graph(ctx, graph, {input0, weight0, weight1, out0, out1});
     auto fptr1 = jit_engine_t::make(ctx)->get_entry_func(f1);
@@ -923,14 +938,12 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, SplitAndMergeInners_Accuracy2) {
     std::vector<float> pass_output1_data(M * K3);
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = false;
     sc_graph_t graph1;
     auto f1 = get_two_consective_mmm(M, K1, K2, K3, ctx, graph1);
     auto fptr1 = jit_engine_t::make(ctx)->get_entry_func(f1);
     fptr1->call_default(&input0_data[0], &weight0_data[0], &weight1_data[0],
             &ori_output0_data[0], &ori_output1_data[0]);
 
-    ctx->flags_.mixed_fusion_ = true;
     sc_graph_t graph2;
     auto f2 = get_two_consective_mmm(M, K1, K2, K3, ctx, graph2);
     std::stringstream ss;
@@ -1055,7 +1068,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, SplitAndMergeInners_Accuracy3) {
     ref_relu(ori_output2_data.data(), ori_output2_data.data(),
             ori_output2_data.size());
 
-    ctx->flags_.mixed_fusion_ = true;
     sc_graph_t graph;
     auto f = get_three_consective_mmm(M, K1, K2, K3, K4, ctx, graph);
 
@@ -1092,7 +1104,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, SplitOuterMostLoopWithTensorShrink) {
     auto out0 = graph.make_output(mmm1->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
+    graph_driver_before_fusion(graph, ctx);
     // split outmost and merge inners
     mixed_partition(graph, ctx);
     auto mixed_op = get_mixed_op_from_graph(graph);
@@ -1143,7 +1155,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp,
     }
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
 
     auto f1 = lower_graph(ctx, graph, {input, weight, out});
     auto fptr1 = jit_engine_t::make(ctx)->get_entry_func(f1);
@@ -1165,6 +1176,66 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp,
     fptr2->call_default(&input_data[0], &weight_data[0], &pass_output_data[0]);
 
     test_utils::compare_data(ori_output_data, pass_output_data, 1e-4f, 1e-5f);
+}
+
+TEST(GCCore_CPU_graph_mixed_partition_cpp, SyncTensorViewShrinkInfo) {
+    SET_THREADS_OR_SKIP(56);
+    auto ctx = std::make_shared<context_t>(*get_test_ctx());
+    bool is_special_fm = ctx->machine_.cpu_flags_.is_spr_like();
+    if (!is_special_fm) {
+        // managed matmul core will have different config under such machine.
+        GTEST_SKIP();
+    }
+
+    sc_dims A_dims {32, 32, 1024}, B_dims {1024, 1024}, bias {1024},
+            out {32, 32, 1024};
+    auto ins0 = graph_tensor::make(A_dims, sc_data_format_t(format_kinds::ABC));
+    auto ins1 = graph_tensor::make(B_dims);
+    auto ins2 = graph_tensor::make(bias);
+    auto outs0 = graph_tensor::make(out, sc_data_format_t(format_kinds::ABC));
+    any_map_t attrs({{"transpose_a", false}, {"transpose_b", false}});
+    sc_graph_t graph;
+    auto in = graph.make_input({ins0, ins1, ins2});
+    auto matmul = graph.make("matmul", in->get_outputs(), {outs0}, attrs);
+    graph.make_output(matmul->get_outputs());
+
+    graph_inline(graph, ctx);
+    std::stringstream ss;
+    print_graph(graph, ss, true);
+    // check graph
+    std::string expected_str
+            = R"(graph(v0: f32[32, 32, 1024], v1: f32[1024, 1024], v2: f32[1024]) -> [v3: f32[32, 32, 1024]] {
+  [v4: f32[1024, 1024]] = tensor_view(v0)
+  [v5: f32[1024, 1024]] = managed_matmul_core(v4, v1)
+  [v6: f32[32, 32, 1024]] = tensor_view(v5)
+  [v3: f32[32, 32, 1024]] = add(v6, v2)
+}
+)";
+    EXPECT_EQ(ss.str(), expected_str);
+    // set config
+    ops::managed_matmul_core_config_t cfg = {14, 4, 1, 1, 2, 0};
+    for (auto &op : graph.ops_) {
+        if (op->op_name_ == "managed_matmul_core") {
+            auto matmul_op = op->dyn_cast<ops::managed_matmul_core_op_t>();
+            matmul_op->set_config(reflection::general_object_t::make(cfg));
+        }
+    }
+    mixed_partition(graph, ctx);
+    auto mixed_op = get_mixed_op_from_graph(graph);
+    ASSERT_TRUE(mixed_op && mixed_op->parti_list_.size() == 1);
+    auto body = mixed_op->parti_list_[0]
+                        ->get_outer_loops()
+                        .back()
+                        ->body_.checked_as<stmts>()
+                        ->seq_;
+    EXPECT_TRUE(body.size() > 2 && body[2].isa<define>());
+    // check tensor attr
+    auto matmul_out = body[2].static_as<define>()->var_;
+    EXPECT_TRUE(matmul_out.isa<tensor>()
+            && utils::string_startswith(matmul_out.static_as<tensor>()->name_,
+                    "managed_matmul_core"));
+    EXPECT_TRUE(
+            matmul_out->attr().has_key(tensor_shrinker_attrs::should_shrink));
 }
 
 TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphMarkInplaceHint1) {
@@ -1430,6 +1501,41 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphMarkInplaceHint8) {
     EXPECT_EQ(inplace_map.size(), (size_t)0);
 }
 
+TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphMarkInplaceHint9) {
+    int run_threads = 28;
+    SET_THREADS_OR_SKIP(run_threads);
+
+    sc_graph_t graph;
+    auto input_shape = sc_dims {1, 16, 56, 56};
+
+    auto in1 = graph.make_input({std::make_shared<graph_tensor>(
+            nullptr, sc_data_format_t::NCHW(), input_shape, datatypes::f32)});
+    auto in2 = graph.make_input({std::make_shared<graph_tensor>(
+            nullptr, sc_data_format_t::NCHW(), input_shape, datatypes::f32)});
+    auto cat = graph.make("concat",
+            {in1->get_outputs()[0], in2->get_outputs()[0]}, {}, {{"axis", 1}});
+    auto pool = graph.make("pooling_max", cat->get_outputs(), {},
+            {{pooling_attr_key::strides, sc_dims {1, 1}},
+                    {pooling_attr_key::pads_begin, sc_dims {1, 1}},
+                    {pooling_attr_key::pads_end, sc_dims {1, 1}},
+                    {pooling_attr_key::kernel, sc_dims {3, 3}},
+                    {pooling_attr_key::rounding_type, "floor"},
+                    {pooling_attr_key::auto_pad, "None"},
+                    {pooling_attr_key::data_format, "NCX"}});
+    auto output0 = graph.make_output(pool->get_outputs());
+
+    auto ctx = get_test_ctx();
+    mixed_partition(graph, ctx);
+
+    mixed_fuse_op_t *fused_op = get_mixed_op_from_graph(graph);
+    ASSERT_TRUE(fused_op && fused_op->parti_list_.size() == 1);
+    // get inplace map
+    auto inplace_map = fused_op->parti_list_[0]->buf_alloc_.inplace_map_;
+    // there is expected nothing in inplace map, due to `pooling_max_4_outs_0`
+    // cannot be inplaced by `concat_2_outs_0`
+    EXPECT_EQ(inplace_map.size(), (size_t)0);
+}
+
 TEST(GCCore_CPU_graph_mixed_partition_cpp, TestUserDefinedShrintTensor) {
     REQUIRE_AVX2();
     sc_graph_t graph;
@@ -1455,7 +1561,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestUserDefinedShrintTensor) {
 TEST(GCCore_CPU_graph_mixed_partition_cpp, TestInputFusionAnchor1) {
     sc_graph_t graph;
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
+
     auto input = graph.make_input(
             {graph_tensor::make({128, 32}, sc_data_format_t::MK())});
     auto weight = graph.make_input(
@@ -1491,7 +1597,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestInputFusionAnchor1) {
 TEST(GCCore_CPU_graph_mixed_partition_cpp, TestInputFusionAnchor2) {
     sc_graph_t graph;
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
+
     auto input = graph.make_input(
             {graph_tensor::make({128, 16}, sc_data_format_t::MK())});
     auto weight = graph.make_input(
@@ -1530,7 +1636,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestInputFusionAnchor2) {
 TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically1) {
     sc_graph_t graph;
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
+
     auto input0 = graph.make_input(
             {graph_tensor::make({4, 4096}, sc_data_format_t::MK())});
     auto weight0 = graph.make_input(
@@ -1578,7 +1684,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically1) {
 TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically2) {
     sc_graph_t graph;
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
+
     auto input0 = graph.make_input(
             {graph_tensor::make({4, 4096}, sc_data_format_t::MK())});
     auto weight0 = graph.make_input(
@@ -1592,7 +1698,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically2) {
             {input0->get_outputs()[0], weight0->get_outputs()[0]}, {}, {});
     auto sig = graph.make("sigmoid", {gemm0->get_outputs()[0]}, {}, {});
     auto reo0 = graph.make("reorder", {sig->get_outputs()[0]}, {},
-            {{"out_format", sc_data_format_t::MKmk(4, 16)},
+            {{"out_format", sc_data_format_t::MKmk(4, 64)},
                     {"internal", true}});
     auto gemm1 = graph.make("managed_matmul_core",
             {input1->get_outputs()[0], weight1->get_outputs()[0]}, {}, {});
@@ -1666,7 +1772,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically3) {
     graph.make_output(mm1->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
     graph_driver(graph, ctx);
     std::stringstream ss;
@@ -1705,7 +1810,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically4) {
     graph.make_output(bmm0->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
+
     ctx->flags_.use_cost_model_ = true;
     graph_driver(graph, ctx);
     std::vector<sc_op_ptr> lower_args(graph.get_output_ops());
@@ -1737,7 +1842,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically5) {
     auto mmm0 = graph.make("managed_matmul_core",
             {input0->get_outputs()[0], weight0->get_outputs()[0]}, {}, {});
     {
-        ops::managed_matmul_core_config_t cfg = {1, 16, 1, 16, 4, 0};
+        ops::managed_matmul_core_config_t cfg = {1, 16, 1, 8, 4, 0};
         mmm0->dyn_cast<op_traits::configurable_t>()->set_config(
                 reflection::general_object_t::make(cfg));
     }
@@ -1746,7 +1851,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically5) {
     auto mmm1 = graph.make("managed_matmul_core",
             {input0->get_outputs()[0], weight1->get_outputs()[0]}, {}, {});
     {
-        ops::managed_matmul_core_config_t cfg = {1, 16, 1, 16, 4, 0};
+        ops::managed_matmul_core_config_t cfg = {1, 16, 1, 8, 4, 0};
         mmm1->dyn_cast<op_traits::configurable_t>()->set_config(
                 reflection::general_object_t::make(cfg));
     }
@@ -1758,19 +1863,56 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically5) {
     auto out0 = graph.make_output(add0->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
-    ctx->flags_.opt_level_ = sc_opt_level::lv2;
+    // skip parallel merge
+    ctx->flags_.fusion_level_ = fusion_opt_level::lv2;
     graph_driver(graph, ctx);
     std::stringstream ss;
     print_graph(graph, ss, true);
-    // Actually, mmm0 and mmm1 would still be merged during later parallel merge
     std::string expected_str
             = R"(graph(v0: f32[4, 4096], v1: f32[4096, 11008], v2: f32[4096, 11008]) -> [v3: f32[4, 11008]] {
-  [v4: f32[4, 11008]] = outerloop_1X16X1X1X16_partition_managed_matmul_core_relu(v0, v2)
-  [v3: f32[4, 11008]] = outerloop_1X16X1X1X16_partition_managed_matmul_core_relu_add(v0, v1, v4)
+  [v4: f32[4, 11008]] = outerloop_1X16X1X1X8_partition_managed_matmul_core_relu(v0, v2)
+  [v3: f32[4, 11008]] = outerloop_1X16X1X1X8_partition_managed_matmul_core_relu_add(v0, v1, v4)
 }
 )";
     EXPECT_EQ(ss.str(), expected_str);
+}
+
+TEST(GCCore_CPU_graph_mixed_partition_cpp, TestMergeMixedPartiVertically6) {
+    sc_graph_t graph;
+
+    int BS = 28, C = 64, H = 56, W = 56, K = 64;
+    SET_THREADS_OR_SKIP(BS);
+
+    auto input0 = graph.make_input({graph_tensor::make({BS, C, H, W})});
+    auto weight0 = graph.make_input({graph_tensor::make({K, C, 1, 1})});
+    weight0->attrs_.set("constant", const_kind::local_const);
+
+    auto relu0 = graph.make("relu", input0->get_outputs(), {}, {});
+    auto radd0 = graph.make("reduce", relu0->get_outputs(), {},
+            {{"rd_axis", std::vector<int> {3}}, {"rd_op", 0}});
+    auto relu1 = graph.make("relu", radd0->get_outputs(), {}, {});
+    // Based on current tunable template implement, conv_fwd does not belong to
+    // any fusion anchor
+    auto conv0 = graph.make("conv_fwd_core",
+            {input0->get_outputs()[0], weight0->get_outputs()[0]}, {},
+            {{"strides", sc_dims {1, 1}}, {"paddings", sc_dims {0, 0}}});
+    auto add0 = graph.make(
+            "add", {relu1->get_outputs()[0], conv0->get_outputs()[0]}, {}, {});
+
+    graph.make_output(add0->get_outputs());
+
+    auto ctx = std::make_shared<context_t>(*get_test_ctx());
+    ctx->flags_.use_cost_model_ = true;
+    // disable partition optimization
+    ctx->flags_.opt_level_ = sc_opt_level::lv0;
+
+    mixed_partition(graph, ctx);
+    auto mixed_op = get_mixed_op_from_graph(graph);
+    ASSERT_TRUE(mixed_op && mixed_op->parti_list_.size() == 1);
+    auto &parti = mixed_op->parti_list_[0];
+    // tunable op conv0 should be found in op_anchor_map
+    EXPECT_TRUE(parti->op_anchor_map_.find(conv0.get())
+            != parti->op_anchor_map_.end());
 }
 
 class test_prefetchable_op : public tunable_op_t,
@@ -1784,8 +1926,10 @@ public:
         : tunable_op_t(op_name, producer_lt, {producer_lt[0]->copy()}, attrs) {}
 
     body_generator_ptr create_generator() override { return nullptr; }
-    void infer_slice_ranges(
-            fslice_map &fsmap, infer_status_map_t &stat_map) override {}
+    infer_status_code infer_slice_ranges(
+            const context_ptr &ctx, fslice_map &fsmap) override {
+        throw std::runtime_error("Not implemented");
+    }
 
     std::vector<int> query_prefetch(const context_ptr &ctx, bool is_global,
             const std::vector<tensor_slice> &ins) override {
@@ -1881,57 +2025,107 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, TestPrefetchSelected) {
     EXPECT_TRUE(found);
 }
 
-TEST(GCCore_CPU_graph_mixed_partition_cpp, ParallelMergeAndNoBarrier) {
+// loop finder
+class loop_finder_t : public ir_viewer_t {
+public:
+    using ir_viewer_t::dispatch;
+    using ir_viewer_t::view;
+    void operator()(stmt_c v) { ir_viewer_t::dispatch(std::move(v)); }
+    bool has_illegal_var() const { return illegal_loop_var_; }
+    bool has_dummy_range() const { return dummy_loop_range_; }
+    bool has_no_barrier_attr() const { return no_barrier_attr_; }
+    void view(for_loop_c f) override {
+        // check `var_` if var type
+        if (!f->var_.isa<var>()) { illegal_loop_var_ = true; }
+        // check loop range if dummy
+        if (f->iter_begin_.isa<constant>() && f->iter_end_.isa<constant>()
+                && get_expr_as_int(f->iter_begin_) == 0
+                && get_expr_as_int(f->iter_end_) == 1) {
+            dummy_loop_range_ = true;
+        }
+        if (f->attr_
+                && f->attr_->get_or_else(
+                        stmt_attr_key::no_post_barrier, false)) {
+            no_barrier_attr_ = true;
+        }
+        ir_viewer_t::view(f);
+    }
+
+private:
+    bool illegal_loop_var_ = false;
+    bool dummy_loop_range_ = false;
+    bool no_barrier_attr_ = false;
+};
+
+TEST(GCCore_CPU_graph_mixed_partition_cpp, ParallelMergeAndBarrier) {
     SET_THREADS_OR_SKIP(16);
-    int M = 256, K1 = 2048, N = 1024;
 
-    sc_graph_t graph;
-    auto input0 = graph.make_input(
-            {graph_tensor::make({M, K1}, sc_data_format_t(format_kinds::MK))});
-    auto weight0 = graph.make_input(
-            {graph_tensor::make({K1, N}, sc_data_format_t(format_kinds::KN))});
-    auto weight1 = graph.make_input(
-            {graph_tensor::make({K1, N}, sc_data_format_t(format_kinds::KN))});
-
-    // mmm0
-    auto mmm0 = graph.make("managed_matmul_core",
-            {input0->get_outputs()[0], weight0->get_outputs()[0]}, {}, {});
-    {
-        ops::managed_matmul_core_config_t cfg = {2, 8, 1, 1, 1, 0};
+    auto make_parallel_mmm_graph = [](bool barrier) {
+        int M = 256, K1 = 2048, N = 1024;
+        sc_graph_t graph;
+        auto input0 = graph.make_input({graph_tensor::make(
+                {M, K1}, sc_data_format_t(format_kinds::MK))});
+        auto weight0 = graph.make_input({graph_tensor::make(
+                {K1, N}, sc_data_format_t(format_kinds::KN))});
+        auto weight1 = graph.make_input({graph_tensor::make(
+                {K1, N}, sc_data_format_t(format_kinds::KN))});
+        ops::managed_matmul_core_config_t cfg0 = {2, 8, 1, 1, 1, 0},
+                                          cfg1 = {2, 4, 1, 1, 1, 0};
+        // mmm0
+        auto mmm0 = graph.make("managed_matmul_core",
+                {input0->get_outputs()[0], weight0->get_outputs()[0]}, {}, {});
         mmm0->dyn_cast<op_traits::configurable_t>()->set_config(
-                reflection::general_object_t::make(cfg));
-    }
-    // mmm1
-    auto mmm1 = graph.make("managed_matmul_core",
-            {input0->get_outputs()[0], weight1->get_outputs()[0]}, {}, {});
-    {
-        ops::managed_matmul_core_config_t cfg = {2, 4, 1, 1, 1, 0};
+                reflection::general_object_t::make(barrier ? cfg1 : cfg0));
+        // mmm1
+        auto mmm1 = graph.make("managed_matmul_core",
+                {input0->get_outputs()[0], weight1->get_outputs()[0]}, {}, {});
         mmm1->dyn_cast<op_traits::configurable_t>()->set_config(
-                reflection::general_object_t::make(cfg));
-    }
-    auto out0 = graph.make_output({mmm0->get_outputs()[0]});
-    graph.make_output({mmm1->get_outputs()[0]});
+                reflection::general_object_t::make(cfg1));
+        graph.make_output({mmm0->get_outputs()[0]});
+        graph.make_output({mmm1->get_outputs()[0]});
+        return graph;
+    };
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
-    // split outmost and merge inners
-    mixed_partition(graph, ctx);
-    auto mixed_op = get_mixed_op_from_graph(graph);
-    ASSERT_TRUE(mixed_op && mixed_op->parti_list_.size() == 1);
-    auto &body = mixed_op->parti_list_[0]->func_->body_;
-    auto inner_loop = body.cast<stmts>()
-                              .map([](const stmts &v) {
-                                  return v->seq_.at(0).as<for_loop>();
-                              })
-                              .map([](const for_loop &v) {
-                                  return v->body_.as<stmts>()
-                                          ->seq_.at(0)
-                                          .as<for_loop>();
-                              })
-                              .get_or_else(for_loop());
-    ASSERT_TRUE(inner_loop.defined());
-    ASSERT_TRUE(inner_loop->attr().get_or_else(
-            stmt_attr_key::no_post_barrier, false));
+    bool barrier;
+    {
+        /* Case 0: need barrier */
+        barrier = true;
+        auto graph = make_parallel_mmm_graph(barrier);
+        mixed_partition(graph, ctx);
+        auto mixed_op = get_mixed_op_from_graph(graph);
+        ASSERT_TRUE(mixed_op && mixed_op->parti_list_.size() == 1);
+        auto &inner_body
+                = mixed_op->parti_list_[0]->get_outer_loops().back()->body_;
+        // loop attr finder
+        loop_finder_t la_finder;
+        la_finder(inner_body);
+        // `no_post_barrier attr` is not expected
+        ASSERT_FALSE(la_finder.has_no_barrier_attr());
+    }
+    {
+        /* Case 1: remove barrier */
+        barrier = false;
+        auto graph = make_parallel_mmm_graph(barrier);
+        mixed_partition(graph, ctx);
+        auto mixed_op = get_mixed_op_from_graph(graph);
+        ASSERT_TRUE(mixed_op && mixed_op->parti_list_.size() == 1);
+        auto &body = mixed_op->parti_list_[0]->func_->body_;
+        auto inner_loop = body.cast<stmts>()
+                                  .map([](const stmts &v) {
+                                      return v->seq_.at(0).as<for_loop>();
+                                  })
+                                  .map([](const for_loop &v) {
+                                      return v->body_.as<stmts>()
+                                              ->seq_.at(0)
+                                              .as<for_loop>();
+                                  })
+                                  .get_or_else(for_loop());
+        ASSERT_TRUE(inner_loop.defined());
+        // `no_post_barrier` attr is expected
+        ASSERT_TRUE(inner_loop->attr().get_or_else(
+                stmt_attr_key::no_post_barrier, false));
+    }
 }
 
 TEST(GCCore_CPU_graph_mixed_partition_cpp, ParallelMergeNotAppendInputAnchor) {
@@ -1963,7 +2157,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, ParallelMergeNotAppendInputAnchor) {
     graph.make_output({mmm1->get_outputs()[0]});
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     graph_driver(graph, ctx);
     auto mixed_op = get_mixed_op_from_graph(graph);
     // mmm0 and mmm1 both have input anchor, which is under outer loop when
@@ -2012,7 +2205,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp,
     };
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
 
     // Case 1
@@ -2085,7 +2277,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, CommitPaddingToContentOfAnchor) {
     graph.make_output(addd0->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
 
     graph_driver_before_fusion(graph, ctx);
@@ -2123,7 +2314,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, CleanFusibleInnerLoop1) {
     graph.make_output({reo0->get_outputs()[0]});
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
     mixed_partition(graph, ctx);
 
@@ -2132,7 +2322,7 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, CleanFusibleInnerLoop1) {
     auto func = mixed_op->parti_list_[0]->func_;
     ASSERT_TRUE(func && func->body_.isa<stmts>());
     auto body = func->body_.static_as<stmts>();
-    ASSERT_TRUE(body->seq_.size() == 1 && body->seq_[0].isa<for_loop>());
+    ASSERT_TRUE(body->seq_.size() == 2 && body->seq_[0].isa<for_loop>());
     auto outer_loop = body->seq_[0].static_as<for_loop>();
     ASSERT_TRUE(outer_loop->body_.isa<stmts>());
     auto loop_body = outer_loop->body_.static_as<stmts>();
@@ -2149,31 +2339,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, CleanFusibleInnerLoop1) {
                     stmt_attr_key::merge_loop, false));
 }
 
-// loop finder
-class loop_finder_t : public ir_viewer_t {
-public:
-    using ir_viewer_t::dispatch;
-    using ir_viewer_t::view;
-    void operator()(stmt_c v) { ir_viewer_t::dispatch(std::move(v)); }
-    bool has_illegal_var() const { return illegal_loop_var_; }
-    bool has_dummy_range() const { return dummy_loop_range_; }
-    void view(for_loop_c f) override {
-        // check `var_` if var type
-        if (!f->var_.isa<var>()) { illegal_loop_var_ = true; }
-        // check loop range if dummy
-        if (f->iter_begin_.isa<constant>() && f->iter_end_.isa<constant>()
-                && get_expr_as_int(f->iter_begin_) == 0
-                && get_expr_as_int(f->iter_end_) == 1) {
-            dummy_loop_range_ = true;
-        }
-        ir_viewer_t::view(f);
-    }
-
-private:
-    bool illegal_loop_var_ = false;
-    bool dummy_loop_range_ = false;
-};
-
 TEST(GCCore_CPU_graph_mixed_partition_cpp, CleanFusibleInnerLoop2) {
     SET_THREADS_OR_SKIP(1);
     int BS = 1, H = 8, W = 8, C = 64;
@@ -2189,13 +2354,13 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, CleanFusibleInnerLoop2) {
     graph.make_output(radd0->get_outputs());
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
     mixed_partition(graph, ctx);
 
     auto mixed_op = get_mixed_op_from_graph(graph);
     ASSERT_TRUE(mixed_op && mixed_op->parti_list_.size() == 1);
     auto &func = mixed_op->parti_list_[0]->func_;
+    // loop var finder
     loop_finder_t lv_finder;
     lv_finder(func->body_);
     // All loop var should be `var` type. `for 0 in (0, 1, 1)` is not expected.
@@ -2223,17 +2388,17 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, CleanFusibleInnerLoop3) {
     graph.make_output({relu0->get_outputs()[0]});
 
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
     mixed_partition(graph, ctx);
 
     auto mixed_op = get_mixed_op_from_graph(graph);
     ASSERT_TRUE(mixed_op && mixed_op->parti_list_.size() == 1);
     auto &func = mixed_op->parti_list_[0]->func_;
-    loop_finder_t lv_finder;
-    lv_finder(func->body_);
+    // loop range finder
+    loop_finder_t lr_finder;
+    lr_finder(func->body_);
     // All loop range should not be dummp like (0, 1, 1)
-    EXPECT_FALSE(lv_finder.has_dummy_range());
+    EXPECT_FALSE(lr_finder.has_dummy_range());
 }
 
 TEST(GCCore_CPU_graph_mixed_partition_cpp, PoolingLoopReSchedule) {
@@ -2257,8 +2422,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, PoolingLoopReSchedule) {
     // relu
     auto relu0 = graph.make("relu", pooling_out->get_outputs(), {}, {});
     graph.make_output({relu0->get_outputs()[0]});
-
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
     layout_propagation(graph, ctx);
     mixed_partition(graph, ctx);
@@ -2297,7 +2460,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp, ComplexTensorViewInferSlice) {
     auto relu2 = graph.make("relu", {radd0->get_outputs()[0]}, {}, {});
     graph.make_output({relu2->get_outputs()[0]});
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
 
     graph_driver_before_fusion(graph, ctx);
@@ -2337,7 +2499,6 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp,
     auto relu1 = graph.make("relu", {radd0->get_outputs()[0]}, {}, {});
     graph.make_output({relu1->get_outputs()[0]});
     auto ctx = std::make_shared<context_t>(*get_test_ctx());
-    ctx->flags_.mixed_fusion_ = true;
     ctx->flags_.use_cost_model_ = true;
 
     graph_driver_before_fusion(graph, ctx);
@@ -2348,6 +2509,196 @@ TEST(GCCore_CPU_graph_mixed_partition_cpp,
     std::string expected_str
             = R"(graph(v0: f32[224, 256], v1: f32[256, 256]) -> [v2: f32[224, 1]] {
   [v2: f32[224, 1]] = outerloop_4_partition_managed_matmul_core_relu_reduce_relu(v0, v1)
+}
+)";
+    EXPECT_EQ(ss.str(), expected_str);
+}
+
+TEST(GCCore_CPU_graph_mixed_partition_cpp,
+        TransposeSemanticTensorViewBindAxis) {
+    SET_THREADS_OR_SKIP(64);
+    REQUIRE_AMX();
+
+    auto ctx = std::make_shared<context_t>(*get_test_ctx());
+    ctx->flags_.use_cost_model_ = true;
+
+    sc_graph_t mlp_graph;
+    auto sigmoid_backprop_in0 = mlp_graph.make_input(
+            {graph_tensor::make({128, 1}, sc_data_format_t())});
+    auto sigmoid_backprop_in1 = mlp_graph.make_input(
+            {graph_tensor::make({128, 1}, sc_data_format_t())});
+    auto transpose_in0 = mlp_graph.make_input(
+            {graph_tensor::make({256, 1}, sc_data_format_t())});
+    auto relu_backprop_in0 = mlp_graph.make_input(
+            {graph_tensor::make({128, 256}, sc_data_format_t())});
+    auto transpose_in1 = mlp_graph.make_input(
+            {graph_tensor::make({512, 256}, sc_data_format_t())});
+    auto transpose_in2 = mlp_graph.make_input(
+            {graph_tensor::make({1024, 512}, sc_data_format_t())});
+    auto relu_backprop_in2 = mlp_graph.make_input(
+            {graph_tensor::make({128, 512}, sc_data_format_t())});
+    auto matmul_in1 = mlp_graph.make_input(
+            {graph_tensor::make({1024, 1024}, sc_data_format_t())});
+    auto matmul_in2 = mlp_graph.make_input(
+            {graph_tensor::make({128, 1024}, sc_data_format_t())});
+
+    auto sigmoid_backprop = mlp_graph.make("sigmoid_backprop",
+            {sigmoid_backprop_in0->get_outputs()[0],
+                    sigmoid_backprop_in1->get_outputs()[0]},
+            {}, {{"use_dst", true}});
+    auto static_transpose0
+            = mlp_graph.make("transpose", {transpose_in0->get_outputs()[0]}, {},
+                    {{"order", std::vector<int> {1, 0}}});
+    auto matmul0 = mlp_graph.make("matmul",
+            {sigmoid_backprop->get_outputs()[0],
+                    static_transpose0->get_outputs()[0]},
+            {}, {});
+    auto static_transpose0_0
+            = mlp_graph.make("transpose", {matmul0->get_outputs()[0]}, {},
+                    {{"order", std::vector<int> {1, 0}}});
+    auto matmul0_0 = mlp_graph.make("matmul",
+            {static_transpose0_0->get_outputs()[0],
+                    relu_backprop_in0->get_outputs()[0]},
+            {}, {});
+    auto relu_backprop1 = mlp_graph.make("relu_backprop",
+            {relu_backprop_in0->get_outputs()[0], matmul0->get_outputs()[0]},
+            {}, {{"use_dst", true}});
+    auto static_transpose1
+            = mlp_graph.make("transpose", {transpose_in1->get_outputs()[0]}, {},
+                    {{"order", std::vector<int> {1, 0}}});
+    auto static_transpose2
+            = mlp_graph.make("transpose", {relu_backprop1->get_outputs()[0]},
+                    {}, {{"order", std::vector<int> {1, 0}}});
+    auto matmul1 = mlp_graph.make("matmul",
+            {relu_backprop1->get_outputs()[0],
+                    static_transpose1->get_outputs()[0]},
+            {}, {});
+    auto matmul2 = mlp_graph.make("matmul",
+            {static_transpose2->get_outputs()[0],
+                    relu_backprop_in2->get_outputs()[0]},
+            {}, {});
+    auto relu_backprop2 = mlp_graph.make("relu_backprop",
+            {relu_backprop_in2->get_outputs()[0], matmul1->get_outputs()[0]},
+            {}, {{"use_dst", true}});
+    auto static_transpose3
+            = mlp_graph.make("transpose", {transpose_in2->get_outputs()[0]}, {},
+                    {{"order", std::vector<int> {1, 0}}});
+    auto static_transpose4
+            = mlp_graph.make("transpose", {relu_backprop2->get_outputs()[0]},
+                    {}, {{"order", std::vector<int> {1, 0}}});
+    auto matmul3 = mlp_graph.make("matmul",
+            {relu_backprop2->get_outputs()[0],
+                    static_transpose3->get_outputs()[0]},
+            {}, {});
+    auto matmul4 = mlp_graph.make("matmul",
+            {static_transpose4->get_outputs()[0], matmul_in2->get_outputs()[0]},
+            {}, {});
+    auto matmul5 = mlp_graph.make("matmul",
+            {matmul3->get_outputs()[0], matmul_in1->get_outputs()[0]}, {}, {});
+    auto static_transpose5
+            = mlp_graph.make("transpose", {matmul3->get_outputs()[0]}, {},
+                    {{"order", std::vector<int> {1, 0}}});
+    auto matmul6 = mlp_graph.make("matmul",
+            {static_transpose5->get_outputs()[0], matmul_in2->get_outputs()[0]},
+            {}, {});
+    auto matmul7 = mlp_graph.make("matmul",
+            {matmul5->get_outputs()[0], matmul_in2->get_outputs()[0]}, {}, {});
+
+    mlp_graph.make_output({matmul0_0->get_outputs()[0]});
+    mlp_graph.make_output({matmul2->get_outputs()[0]});
+    mlp_graph.make_output({matmul4->get_outputs()[0]});
+    mlp_graph.make_output({matmul6->get_outputs()[0]});
+    mlp_graph.make_output({matmul7->get_outputs()[0]});
+
+    graph_driver(mlp_graph, ctx);
+    std::stringstream ss;
+    print_graph(mlp_graph, ss, true);
+    // The reduce op could not be split
+    std::string expected_str_spr
+            = R"(graph(v0: f32[128, 1], v1: f32[128, 1], v2: f32[256, 1], v3: f32[128, 256], v4: f32[512, 256], v5: f32[1024, 512], v6: f32[128, 512], v7: f32[1024, 1024], v8: f32[128, 1024]) -> [v9: f32[256, 256], v10: f32[256, 512], v11: f32[512, 1024], v12: f32[1024, 1024], v13: f32[128, 1024]] {
+  [v14: f32[32, 32, 4, 16]] = outerloop_32X32X4_partition_reorder_select_one(v6)
+  [v15: f32[1024, 512]] = tensor_view(v5)
+  [v16: f32[512, 1024]] = reorder(v15)
+  [v17: f32[512, 256]] = tensor_view(v4)
+  [v18: f32[256, 512]] = reorder(v17)
+  [v19: f32[32, 16, 4, 16]] = outerloop_32X16X4_partition_reorder_select_one(v3)
+  [v20: f32[1, 256]] = tensor_view(v2)
+  [v21: f32[128, 1]] = outerloop_128_partition_mul_sub_mul(v0, v1)
+  [v22: f32[64, 8, 4, 16], v23: f32[64, 8, 4, 16], v24: f32[32, 32, 4, 16], v25: f32[32, 8, 16, 16]] = outerloop_32_partition_managed_matmul_core_tensor_view_reorder_mul_tensor_view_reorder_managed_matmul_core_mul_tensor_view_reorder(v21, v20, v19, v18, v14)
+  [v26: f32[64, 8, 16, 16], v13: f32[128, 1024]] = outerloop_8_partition_reorder_managed_matmul_core_tensor_view_reorder_managed_matmul_core_managed_matmul_core_reorder(v24, v16, v7, v8)
+  [v11: f32[512, 1024], v12: f32[1024, 1024]] = outerloop_32X2X1X1_partition_managed_matmul_core_reorder_managed_matmul_core_reorder(v25, v8, v26)
+  [v10: f32[256, 512]] = outerloop_64X1X1X1X1_partition_managed_matmul_core_reorder(v23, v6)
+  [v9: f32[256, 256]] = outerloop_64X1X1X1X1_partition_managed_matmul_core_reorder(v22, v3)
+}
+)";
+    EXPECT_EQ(ss.str(), expected_str_spr);
+}
+
+TEST(GCCore_CPU_graph_mixed_partition_cpp, InferSliceForBMMWithBroadcast) {
+    SET_THREADS_OR_SKIP(8);
+
+    sc_graph_t graph;
+    auto input0 = graph.make_input({graph_tensor::make(
+            {8, 16, 64, 128}, sc_data_format_t(), sc_data_type_t::u8())});
+    // explicit broadcast semantic on weight side
+    auto weight0 = graph.make_input({graph_tensor::make(
+            {8, 1, 128, 64}, sc_data_format_t(), sc_data_type_t::s8())});
+
+    any_map_t attrs({{"transpose_a", false}, {"transpose_b", false},
+            {"use_mmm", false}});
+    // bmm
+    auto bmm = graph.make("matmul_core",
+            {input0->get_outputs()[0], weight0->get_outputs()[0]}, {}, attrs);
+    ops::matmul_core_config_t cfg = {32, 32, 32};
+    bmm->dyn_cast<ops::matmul_core_op_t>()->set_config(
+            reflection::general_object_t::make(cfg));
+    graph.make_output({bmm->get_outputs()[0]});
+    auto ctx = std::make_shared<context_t>(*get_test_ctx());
+    ctx->flags_.use_cost_model_ = true;
+
+    graph_driver_before_fusion(graph, ctx);
+    mixed_partition(graph, ctx);
+    std::stringstream ss;
+    print_graph(graph, ss, true);
+    // The matmul op could not be fused into reorder op along weight side
+    std::string expected_str
+            = R"(graph(v0: u8[8, 16, 64, 128], v1: s8[8, 1, 128, 64]) -> [v2: s32[8, 16, 64, 64]] {
+  [v3: s8[8, 1, 2, 4, 8, 32, 4]] = reorder(v1)
+  [v2: s32[8, 16, 64, 64]] = matmul_core(v0, v3)
+}
+)";
+    EXPECT_EQ(ss.str(), expected_str);
+}
+
+TEST(GCCore_CPU_graph_mixed_partition_cpp, TestGraphFilterInputPartition) {
+    sc_graph_t graph;
+
+    SET_THREADS_OR_SKIP(10);
+    /** Build following graph
+     *      relu0
+     *      /   \
+     *     |    relu1 ("break_post_fues":true)
+     *      \   /
+     *      add0
+     */
+    auto input = graph.make_input({graph_tensor::make({10, 20, 30})});
+    auto relu0 = graph.make("relu", input->get_outputs(), {}, {});
+    // relu1 is marked as `break_post_fuse`
+    auto relu1 = graph.make(
+            "relu", relu0->get_outputs(), {}, {{"break_post_fuse", true}});
+    // Although `add0` can still be fused with `relu0`, it could not be fused
+    // with input partition including `relu1`
+    auto add0 = graph.make(
+            "add", {relu0->get_outputs()[0], relu1->get_outputs()[0]}, {}, {});
+    graph.make_output(add0->get_outputs());
+
+    mixed_partition(graph, get_test_ctx());
+    std::stringstream ss;
+    print_graph(graph, ss, true);
+    std::string expected_str
+            = R"(graph(v0: f32[10, 20, 30]) -> [v1: f32[10, 20, 30]] {
+  [v2: f32[10, 20, 30], v3: f32[10, 20, 30]] = outerloop_10X20_partition_relu_relu(v0)
+  [v1: f32[10, 20, 30]] = add(v2, v3)
 }
 )";
     EXPECT_EQ(ss.str(), expected_str);

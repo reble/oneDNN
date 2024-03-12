@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,6 +37,7 @@
 #include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
+#include "utils/cold_cache.hpp"
 #include "utils/dnnl_query.hpp"
 #include "utils/parallel.hpp"
 
@@ -93,7 +94,8 @@ dnn_mem_t::dnn_mem_t(const dnn_mem_t &rhs, dnnl_data_type_t dt,
     if (active_) {
         int status = reorder(rhs);
         if (status != OK) {
-            BENCHDNN_PRINT(0, "%s\n", "Reorder in memory constructor failed.");
+            BENCHDNN_PRINT(
+                    0, "%s\n", "Error: reorder in memory constructor failed.");
         }
     }
 }
@@ -116,18 +118,11 @@ int execute_reorder(const dnn_mem_t &src, dnn_mem_t &dst,
     // succeeded, then create CPU memory object wrapping mapped pointers of
     // source and destination and execute CPU reorder. If CPU reorder can't be
     // create, then just execute a regular GPU reorder.
-    //
-    // This optimization is skipped when testing reorder, sum and concat
-    // primitives because they are used specifically to test GPU reorders.
 #if ((DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL) \
         || (DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL)) \
         && DNNL_CPU_RUNTIME != DNNL_RUNTIME_NONE
-    bool is_reorder_related_driver = (driver_name == "reorder"
-            || driver_name == "sum" || driver_name == "concat");
     const auto &cpu_engine = get_cpu_engine();
-    if (!is_reorder_related_driver
-            && (src.engine_kind() == dnnl_gpu
-                    || dst.engine_kind() == dnnl_gpu)) {
+    if (src.engine_kind() == dnnl_gpu || dst.engine_kind() == dnnl_gpu) {
 
         dnnl_status_t status = dnnl_reorder_primitive_desc_create(
                 &r_pd_, src.md_, cpu_engine, dst.md_, cpu_engine, attr);
@@ -163,9 +158,28 @@ int execute_reorder(const dnn_mem_t &src, dnn_mem_t &dst,
 
     return execute_and_wait(prim, args);
 }
-int dnn_mem_t::reorder(const dnn_mem_t &rhs, const_dnnl_primitive_attr_t attr) {
+
+// `swap_dt` changes `this` data type which may be needed for
+// different sum data type or fpmath mode specified.
+int dnn_mem_t::reorder(const dnn_mem_t &rhs, const_dnnl_primitive_attr_t attr,
+        dnnl_data_type_t swap_dt) {
     if (this == &rhs) return OK;
-    return execute_reorder(rhs, *this, attr);
+
+    // When `rhs` object is empty, it's illigal to execute a reorder over it.
+    // Do nothing, return a good status. Keep here to avoid guarding externally.
+    if (query_md_ndims(rhs.md_) == 0) return OK;
+
+    // Assumption is `no_host_memory` assigned values at construction, and no
+    // actual reorder needed. This check is to avoid extra code outside of
+    // reorder interface.
+    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+
+    const bool do_swap_dt = swap_dt != dnnl_data_type_undef;
+    dnnl_data_type_t orig_dt = this->dt();
+    if (do_swap_dt) this->set_dt(swap_dt);
+    auto status = execute_reorder(rhs, *this, attr);
+    if (do_swap_dt) this->set_dt(orig_dt);
+    return status;
 }
 
 size_t dnn_mem_t::size() const {
@@ -192,6 +206,26 @@ float dnn_mem_t::get_elem(int64_t idx, int buffer_index) const {
         case dnnl_bf16:
             elem = static_cast<dnnl::impl::bfloat16_t *>(data)[idx];
             break;
+        case dnnl_f8_e5m2:
+            elem = static_cast<dnnl::impl::float8_e5m2_t *>(data)[idx];
+            break;
+        case dnnl_f8_e4m3:
+            elem = static_cast<dnnl::impl::float8_e4m3_t *>(data)[idx];
+            break;
+        case dnnl_s4: {
+            auto half = idx % 2 ? dnnl::impl::int4_extract_t::high_half
+                                : dnnl::impl::int4_extract_t::low_half;
+            elem = static_cast<float>(dnnl::impl::int4_t::extract(
+                    static_cast<uint8_t *>(data)[idx / 2], half));
+            break;
+        }
+        case dnnl_u4: {
+            auto half = idx % 2 ? dnnl::impl::int4_extract_t::high_half
+                                : dnnl::impl::int4_extract_t::low_half;
+            elem = static_cast<float>(dnnl::impl::uint4_t::extract(
+                    static_cast<uint8_t *>(data)[idx / 2], half));
+            break;
+        }
         default: assert(!"bad data type");
     }
     return elem;
@@ -208,6 +242,28 @@ void dnn_mem_t::set_elem(int64_t idx, float value, int buffer_index) const {
         case dnnl_f64: ((double *)data)[idx] = value; break;
         case dnnl_f16: ((dnnl::impl::float16_t *)data)[idx] = value; break;
         case dnnl_bf16: ((dnnl::impl::bfloat16_t *)data)[idx] = value; break;
+        case dnnl_f8_e5m2:
+            ((dnnl::impl::float8_e5m2_t *)data)[idx] = value;
+            break;
+        case dnnl_f8_e4m3:
+            ((dnnl::impl::float8_e4m3_t *)data)[idx] = value;
+            break;
+        case dnnl_s4: {
+            using type = dnnl::impl::int4_t;
+            auto half = idx % 2 ? dnnl::impl::int4_extract_t::high_half
+                                : dnnl::impl::int4_extract_t::low_half;
+            uint8_t dst_val = ((uint8_t *)data)[idx / 2];
+            ((type *)data)[idx / 2] = type(value).insert(dst_val, half);
+            break;
+        }
+        case dnnl_u4: {
+            using type = dnnl::impl::uint4_t;
+            auto half = idx % 2 ? dnnl::impl::int4_extract_t::high_half
+                                : dnnl::impl::int4_extract_t::low_half;
+            uint8_t dst_val = ((uint8_t *)data)[idx / 2];
+            ((type *)data)[idx / 2] = type(value).insert(dst_val, half);
+            break;
+        }
         default: assert(!"bad data type");
     }
 }
@@ -652,7 +708,11 @@ int dnn_mem_t::initialize(
             // Do not fill a memory if its size is zero. Moreover, memset
             // expects defined pointer, nullptr is not allowed.
             if (sz != 0) {
-                if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) {
+                // Avoid costy data reorders for cold cache mode when
+                // initializing cold cache buffers.
+                // TODO: consider enabling broadly for perf mode.
+                if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)
+                        || cold_cache_mode != default_cold_cache_mode) {
                     // Fill memory directly with 0x3F3F3F3F (0.747059f) number.
                     this->memset(dnnl_mem_default_perf_test_value, sz);
                 } else {
@@ -868,6 +928,8 @@ int check_zero_padding(
         case dnnl_data_type_undef:
             return OK;
 
+            CASE(dnnl_f8_e5m2, dnnl::impl::float8_e5m2_t);
+            CASE(dnnl_f8_e4m3, dnnl::impl::float8_e4m3_t);
             CASE(dnnl_bf16, dnnl::impl::bfloat16_t);
             CASE(dnnl_f16, dnnl::impl::float16_t);
             CASE(dnnl_f32, float);
@@ -875,7 +937,8 @@ int check_zero_padding(
             CASE(dnnl_s32, int32_t);
             CASE(dnnl_s8, int8_t);
             CASE(dnnl_u8, uint8_t);
-
+            CASE(dnnl_s4, int8_t);
+            CASE(dnnl_u4, uint8_t);
         default: assert(!"bad data_type");
     };
 #undef CASE
