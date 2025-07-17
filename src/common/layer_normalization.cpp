@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,7 +51,8 @@ status_t lnorm_desc_init(layer_normalization_desc_t *lnorm_desc,
     VCHECK_LNORM((flags
                          & ~(normalization_flags::use_global_stats
                                  | normalization_flags::use_scale
-                                 | normalization_flags::use_shift))
+                                 | normalization_flags::use_shift
+                                 | normalization_flags::rms_norm))
                     == 0,
             VERBOSE_BAD_FLAGS);
 
@@ -153,23 +154,40 @@ status_t layer_normalization_attr_check(const layer_normalization_desc_t &desc,
         const data_type_t src_dt = desc.src_desc.data_type;
         const data_type_t dst_dt = desc.dst_desc.data_type;
 
-        auto fwd_attr_mask = smask_t::none;
+        auto fwd_attr_mask = smask_t::post_ops;
 
         const bool is_int8 = utils::one_of(src_dt, data_type::s8, data_type::u8)
                 || utils::one_of(dst_dt, data_type::s8, data_type::u8);
-        if (is_int8) fwd_attr_mask |= smask_t::scales_runtime;
+        if (is_int8) fwd_attr_mask |= smask_t::scales;
 
         VCHECK_LNORM_UNIMPL(attr->has_default_values(fwd_attr_mask, dst_dt),
                 VERBOSE_UNSUPPORTED_ATTR);
 
         // Check scales
         if (!attr->scales_.has_default_values()) {
-            const auto &sc = attr->scales_;
-            const int mask_src = sc.get(DNNL_ARG_SRC).mask_;
-            const int mask_dst = sc.get(DNNL_ARG_DST).mask_;
-
-            VCHECK_LNORM_UNIMPL(utils::everyone_is(0, mask_src, mask_dst),
+            static const std::vector<int> supported_args {
+                    DNNL_ARG_SRC, DNNL_ARG_DST};
+            VCHECK_LNORM_UNIMPL(
+                    attr->scales_.has_default_values(supported_args),
                     VERBOSE_UNSUPPORTED_SCALES_CFG);
+
+            for (int arg : supported_args) {
+                if (attr->scales_.has_default_values(arg)) continue;
+
+                const int mask = attr->scales_.get_mask(arg);
+                VCHECK_LNORM_UNIMPL(mask == 0, VERBOSE_UNSUPPORTED_SCALES_CFG);
+            }
+        }
+
+        // Check post-ops
+        if (!attr->post_ops_.has_default_values()) {
+            const auto &po = attr->post_ops_;
+            using namespace primitive_kind;
+            VCHECK_LNORM_UNIMPL(po.has_default_values({binary, eltwise, sum}),
+                    VERBOSE_UNSUPPORTED_POSTOP);
+
+            // Note: verbose support is inside the call.
+            CHECK(po.validate_binary(engine->kind(), &desc.dst_desc));
         }
     } else {
         VCHECK_LNORM_UNIMPL(false, VERBOSE_UNSUPPORTED_ATTR);

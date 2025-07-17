@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,17 +17,20 @@
 #ifndef GRAPH_BACKEND_DNNL_KERNELS_KERNELS_HPP
 #define GRAPH_BACKEND_DNNL_KERNELS_KERNELS_HPP
 
-#include "graph/backend/dnnl/kernels/batchnorm.hpp"
+#include "graph/backend/dnnl/kernels/batch_norm.hpp"
 #include "graph/backend/dnnl/kernels/binary.hpp"
 #include "graph/backend/dnnl/kernels/concat.hpp"
 #include "graph/backend/dnnl/kernels/conv.hpp"
-#include "graph/backend/dnnl/kernels/convtranspose.hpp"
+#include "graph/backend/dnnl/kernels/conv_transpose.hpp"
 #include "graph/backend/dnnl/kernels/dummy.hpp"
 #include "graph/backend/dnnl/kernels/eltwise.hpp"
+#include "graph/backend/dnnl/kernels/gen_index.hpp"
+#include "graph/backend/dnnl/kernels/group_norm.hpp"
 #include "graph/backend/dnnl/kernels/large_partition.hpp"
-#include "graph/backend/dnnl/kernels/layernorm.hpp"
-#include "graph/backend/dnnl/kernels/logsoftmax.hpp"
+#include "graph/backend/dnnl/kernels/layer_norm.hpp"
+#include "graph/backend/dnnl/kernels/log_softmax.hpp"
 #include "graph/backend/dnnl/kernels/matmul.hpp"
+#include "graph/backend/dnnl/kernels/mqa.hpp"
 #include "graph/backend/dnnl/kernels/pool.hpp"
 #include "graph/backend/dnnl/kernels/prelu.hpp"
 #include "graph/backend/dnnl/kernels/quantize.hpp"
@@ -35,7 +38,6 @@
 #include "graph/backend/dnnl/kernels/reorder.hpp"
 #include "graph/backend/dnnl/kernels/resampling.hpp"
 #include "graph/backend/dnnl/kernels/sdp.hpp"
-#include "graph/backend/dnnl/kernels/sdp_base.hpp"
 #include "graph/backend/dnnl/kernels/shuffle.hpp"
 #include "graph/backend/dnnl/kernels/softmax.hpp"
 #include "graph/backend/dnnl/kernels/sum.hpp"

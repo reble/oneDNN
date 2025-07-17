@@ -22,7 +22,7 @@
 
 #include "cpu/aarch64/jit_sve_512_core_x8s8s32x_deconvolution.hpp"
 
-#define GET_OFF(field) offsetof(jit_deconv_call_s, field)
+#define GET_OFF(field) offsetof(jit_deconv_args_t, field)
 #define LD_MUL_VL(mn, op, mask, addr, off, size) \
     { \
         const int mul_vl_len = (cpu_sveLen / 4) * size; \
@@ -114,10 +114,11 @@ status_t _jit_sve_512_core_x8s8s32x_deconv_fwd_kernel::init_conf(
     if (jcp.is_depthwise && (!jcp.signed_input || is_3d))
         return status::unimplemented;
 
-    if (!zero_points_valid(&attr)) return status::unimplemented;
+    VDISPATCH_DECONVOLUTION_IC(
+            zero_points_valid(&attr), VERBOSE_UNSUPPORTED_ZP_CFG);
     jcp.src_zero_point = !attr.zero_points_.has_default_values(DNNL_ARG_SRC);
     jcp.dst_zero_point = !attr.zero_points_.has_default_values(DNNL_ARG_DST);
-    jcp.zp_src_is_common = attr.zero_points_.common(DNNL_ARG_SRC);
+    jcp.zp_src_is_common = attr.zero_points_.get_mask(DNNL_ARG_SRC) == 0;
 
     format_tag_t dat_tag = utils::pick(
             ndims - 3, format_tag::nwc, format_tag::nhwc, format_tag::ndhwc);
@@ -274,12 +275,8 @@ status_t _jit_sve_512_core_x8s8s32x_deconv_fwd_kernel::init_conf(
     //save post_ops desc for further usage
     jcp.post_ops = p;
 
-    const auto &oscales = attr.output_scales_;
-    jcp.is_oc_scale = oscales.mask_ == 1 << 1;
-
-    // only common and per-oc-channel scales are supported
-    const bool oscales_ok = one_of(oscales.mask_, 0, 1 << 1);
-    if (!oscales_ok) return status::unimplemented;
+    // TODO: add proper scaling support.
+    jcp.is_oc_scale = false;
 
     jcp.dst_dt = dst_d.data_type();
     jcp.bia_dt = jcp.with_bias ? bias_d.data_type() : data_type::undef;
@@ -1416,7 +1413,8 @@ status_t jit_sve_512_core_x8s8s32x_deconvolution_fwd_t::execute_forward_1d(
     const int oc_chunks = jcp.nb_oc / jcp.nb_oc_blocking;
     const int nb_groups = jcp.nb_ch;
 
-    DEFINE_SCALES_BUFFER(oscales);
+    // TODO: add support for scaling based on latest programming model.
+    DEFINE_ARG_SCALES_BUFFER(oscales, DNNL_ARG_WEIGHTS);
     const size_t offset = weights_d.size() - weights_d.additional_buffer_size();
     auto w = const_cast<int8_t *>(weights);
     int32_t *compensation = (!jcp.signed_input)
@@ -1432,7 +1430,7 @@ status_t jit_sve_512_core_x8s8s32x_deconvolution_fwd_t::execute_forward_1d(
         int work_amount = jcp.mb * nb_groups * oc_chunks;
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_deconv_call_s();
+        auto p = jit_deconv_args_t();
 
         int n {0}, g {0}, occ {0};
         if (jcp.loop_order == loop_ngc)
@@ -1514,7 +1512,8 @@ status_t jit_sve_512_core_x8s8s32x_deconvolution_fwd_t::execute_forward_2d(
     size_t dst_h_stride = dst_d.blk_off(0, 0, 1);
     size_t wht_kh_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
 
-    DEFINE_SCALES_BUFFER(oscales);
+    // TODO: add support for scaling based on latest programming model.
+    DEFINE_ARG_SCALES_BUFFER(oscales, DNNL_ARG_WEIGHTS);
     const size_t offset = weights_d.size() - weights_d.additional_buffer_size();
     auto w = const_cast<int8_t *>(weights);
     int32_t *compensation = (!jcp.signed_input)
@@ -1530,7 +1529,7 @@ status_t jit_sve_512_core_x8s8s32x_deconvolution_fwd_t::execute_forward_2d(
         int work_amount = jcp.mb * nb_groups * oc_chunks * jcp.oh;
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_deconv_call_s();
+        auto p = jit_deconv_args_t();
 
         /*loop order = cgn*/
         int n {0}, g {0}, occ {0}, oh_s {0};
@@ -1675,7 +1674,8 @@ status_t jit_sve_512_core_x8s8s32x_deconvolution_fwd_t::execute_forward_3d(
     size_t wht_kd_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
     size_t wht_kh_stride = wht_blk_off(weights_d, 0, 0, 0, 0, 1);
 
-    DEFINE_SCALES_BUFFER(oscales);
+    // TODO: add support for scaling based on latest programming model.
+    DEFINE_ARG_SCALES_BUFFER(oscales, DNNL_ARG_WEIGHTS);
     size_t offset = weights_d.size() - weights_d.additional_buffer_size();
     auto w = const_cast<int8_t *>(weights);
     int32_t *compensation = (!jcp.signed_input)
@@ -1691,7 +1691,7 @@ status_t jit_sve_512_core_x8s8s32x_deconvolution_fwd_t::execute_forward_3d(
         int work_amount = jcp.mb * nb_groups * oc_chunks * jcp.od * jcp.oh;
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_deconv_call_s();
+        auto p = jit_deconv_args_t();
 
         /*loop order = cgn*/
         int n {0}, g {0}, occ {0}, od_s {0}, oh_s {0};

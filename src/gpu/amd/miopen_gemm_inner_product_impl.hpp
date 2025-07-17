@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,10 +22,10 @@
 #include <rocblas/rocblas.h>
 
 #include "common/type_helpers.hpp"
+#include "gpu/amd/engine.hpp"
 #include "gpu/amd/miopen_inner_product_impl.hpp"
-#include "gpu/amd/sycl_hip_engine.hpp"
+#include "gpu/amd/stream.hpp"
 #include "gpu/amd/sycl_hip_scoped_context.hpp"
-#include "gpu/amd/sycl_hip_stream.hpp"
 #include "gpu/amd/sycl_hip_utils.hpp"
 
 namespace dnnl {
@@ -59,9 +59,11 @@ protected:
             case miopenInt8:
                 blas_dt = rocblas_datatype_i8_r;
                 return status::success;
+#if defined(MIOPEN_HAS_INT8X4)
             case miopenInt8x4:
                 blas_dt = rocblas_datatype_i8_r;
                 return status::success;
+#endif
             case miopenInt32:
                 blas_dt = rocblas_datatype_i32_r;
                 return status::success;
@@ -199,8 +201,9 @@ struct miopen_gemm_inner_product_fwd_impl_t
         return need_reorder_;
     }
 
-    virtual status_t init(engine_t *, inner_product_pd_t *pd, bool with_relu,
-            bool with_eltwise, bool with_sum, bool need_reorder) override {
+    virtual status_t init(impl::engine_t *, inner_product_pd_t *pd,
+            bool with_relu, bool with_eltwise, bool with_sum,
+            bool need_reorder) override {
         need_reorder_ = need_reorder;
 
         int ic = pd->IC_total_padded();
@@ -247,9 +250,9 @@ struct miopen_gemm_inner_product_fwd_impl_t
         with_eltwise_ = with_eltwise || with_relu;
         with_relu_ = with_eltwise;
 
-        output_scales_ = 1.0f;
-        alpha_s32 = output_scales_;
-        alpha_f32 = output_scales_;
+        alpha_ = 1.0f;
+        alpha_s32 = alpha_;
+        alpha_f32 = alpha_;
 
         with_sum_ = with_sum;
         sum_scale_ = sum_scale(pd);
@@ -323,9 +326,8 @@ struct miopen_gemm_inner_product_fwd_impl_t
 
         if (with_bias_) {
             MIOPEN_EXECUTE_FUNC(miopenOpTensor, miopen_handle,
-                    miopenTensorOpAdd, &alpha_, y_acc_desc_, y_dst,
-                    &output_scales_, tensor_descs_[io::bia], b, &alpha2,
-                    y_acc_desc_, y_dst);
+                    miopenTensorOpAdd, &alpha_, y_acc_desc_, y_dst, &alpha_,
+                    tensor_descs_[io::bia], b, &alpha2, y_acc_desc_, y_dst);
         }
 
         if (with_eltwise_) {
@@ -381,7 +383,7 @@ struct miopen_gemm_inner_product_bwd_data_impl_t
         return need_reorder_;
     }
 
-    virtual status_t init(engine_t *, inner_product_pd_t *pd,
+    virtual status_t init(impl::engine_t *, inner_product_pd_t *pd,
             bool /*with_relu*/, bool /*with_eltwise*/, bool /*with_sum */,
             bool need_reorder) override {
         need_reorder_ = need_reorder;
@@ -493,7 +495,7 @@ struct miopen_gemm_inner_product_bwd_weights_impl_t
                 MIOPEN_32BIT_INDICES);
         return status::success;
     }
-    virtual status_t init(engine_t *engine, inner_product_pd_t *pd,
+    virtual status_t init(impl::engine_t *engine, inner_product_pd_t *pd,
             bool /*with_relu*/, bool /*with_eltwise*/, bool /*with_sum */,
             bool need_reorder) override {
         need_reorder_ = need_reorder;
@@ -566,12 +568,11 @@ struct miopen_gemm_inner_product_bwd_weights_impl_t
                     strides_[io::bia]));
             CHECK(create_and_set_reduce_descriptor());
 
-            auto &sycl_engine = *utils::downcast<sycl_hip_engine_t *>(engine);
-            stream_t *service_stream;
+            auto &sycl_engine = *utils::downcast<amd::engine_t *>(engine);
+            impl::stream_t *service_stream;
             CHECK(sycl_engine.get_service_stream(service_stream));
 
-            auto hip_stream
-                    = utils::downcast<sycl_hip_stream_t *>(service_stream);
+            auto hip_stream = utils::downcast<stream_t *>(service_stream);
             auto handle = hip_stream->get_miopen_handle();
 
             // get the required workspace size

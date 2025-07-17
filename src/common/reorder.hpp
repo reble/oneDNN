@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021 Intel Corporation
+* Copyright 2021-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 #ifndef COMMON_REORDER_HPP
 #define COMMON_REORDER_HPP
 
+#include <memory>
+
 #include "c_types_map.hpp"
 
 namespace dnnl {
@@ -27,6 +29,10 @@ status_t reorder_primitive_desc_create(std::shared_ptr<primitive_desc_t> &pd,
         engine_t *engine, const memory_desc_t *src_md,
         const memory_desc_t *dst_md, const primitive_attr_t *attr = nullptr);
 
+status_t reorder_primitive_desc_create(std::shared_ptr<primitive_desc_t> &pd,
+        engine_t *engine, const memory_desc_t *src_md, engine_t *src_engine,
+        const memory_desc_t *dst_md, engine_t *dst_engine,
+        const primitive_attr_t *attr = nullptr);
 } // namespace impl
 } // namespace dnnl
 

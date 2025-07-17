@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,9 +27,11 @@
 
 #include "oneapi/dnnl/dnnl_graph.h"
 
+#include "common/engine.hpp"
 #include "common/engine_id.hpp"
 
 #include "graph/interface/c_types_map.hpp"
+#include "graph/interface/graph_attr.hpp"
 #include "graph/interface/logical_tensor.hpp"
 #include "graph/interface/op.hpp"
 
@@ -52,10 +54,11 @@ inline std::vector<op_t *> get_raw_ptrs(
 } // namespace
 
 struct key_t {
-    key_t(size_t partition_id, const impl::engine_t *engine,
+    key_t(const impl::engine_t *engine,
             const std::vector<std::shared_ptr<op_t>> &ops,
             const std::vector<const logical_tensor_t *> &ins,
-            const std::vector<const logical_tensor_t *> &outs);
+            const std::vector<const logical_tensor_t *> &outs,
+            const impl::graph::fpmath_t &fpmath);
     key_t(const partition_t *partition, const impl::engine_t *engine,
             const std::vector<const logical_tensor_t *> &ins,
             const std::vector<const logical_tensor_t *> &outs);
@@ -63,16 +66,16 @@ struct key_t {
     bool operator==(const key_t &other) const;
     const std::thread::id &thread_id() const { return thread_id_; }
     bool has_runtime_dependencies() const {
-        return !(engine_id_.kind() == engine_kind::cpu
-                && impl::is_native_runtime(engine_id_.runtime_kind()));
+        return !(engine_->kind() == engine_kind::cpu
+                && impl::is_native_runtime(engine_->runtime_kind()));
     }
 
-    mutable size_t partition_id_;
     mutable std::vector<op_t *> ops_;
     mutable std::vector<logical_tensor_t> ins_;
     mutable std::vector<logical_tensor_t> outs_;
     int nthread_;
-    impl::engine_id_t engine_id_;
+    const impl::engine_t *engine_;
+    const impl::graph::fpmath_t fpmath_;
 
 private:
     // Thread ID is not used as part of the key, it's only used to get
@@ -80,8 +83,6 @@ private:
     // primitive to handle some multithread scenarios.
     std::thread::id thread_id_;
 };
-
-size_t get_op_hash(const op_t &op);
 
 template <typename T>
 size_t get_array_hash(size_t seed, const T *v, size_t size) {
@@ -108,11 +109,11 @@ inline size_t get_array_hash<logical_tensor_t>(
     return seed;
 }
 
-template <>
-inline size_t get_array_hash<op_t>(size_t seed, const op_t *v, size_t size) {
-    for (size_t i = 0; i < size; i++) {
-        seed = hash_combine(seed, get_op_hash(v[i]));
-    }
+size_t get_op_hash(const op_t &op);
+
+inline size_t get_array_hash(size_t seed, std::vector<op_t *> &ops) {
+    for (const auto *op : ops)
+        seed = hash_combine(seed, get_op_hash(*op));
     return seed;
 }
 
@@ -149,17 +150,23 @@ struct hash<dnnl::impl::graph::partition_hashing::key_t> {
         using namespace dnnl::impl::graph::partition_hashing;
 
         size_t seed = 0;
-        // Compute hash for partition_id_, nthread_, engine_kind_
-        seed = dnnl::impl::hash_combine(seed, key.partition_id_);
+        // Compute hash for nthread_, engine_kind_
         seed = dnnl::impl::hash_combine(seed, key.nthread_);
-        seed = dnnl::impl::hash_combine(seed, key.engine_id_.hash());
+        seed = dnnl::impl::hash_combine(
+                seed, reinterpret_cast<uintptr_t>(key.engine_));
 
         // Combine hash for op_kinds & attributes with the computed hash
-        seed = get_array_hash(seed, key.ops_.data(), key.ops_.size());
+        seed = get_array_hash(seed, key.ops_);
 
         // Combine hash for input and output ports with the computed hash
         seed = get_array_hash(seed, key.ins_.data(), key.ins_.size());
         seed = get_array_hash(seed, key.outs_.data(), key.outs_.size());
+
+        // Combine hash for fpmath_t
+        seed = dnnl::impl::hash_combine(
+                seed, static_cast<size_t>(key.fpmath_.mode_));
+        seed = dnnl::impl::hash_combine(
+                seed, static_cast<size_t>(key.fpmath_.apply_to_int_));
 
         return seed;
     }

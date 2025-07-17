@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -32,12 +32,7 @@ namespace eltwise {
 using alg_t = attr_t::post_ops_t::kind_t;
 
 struct settings_t : public base_settings_t {
-    settings_t() = default;
-
-    // ctor to save certain fields from resetting
-    settings_t(const char *perf_template) : settings_t() {
-        this->perf_template = perf_template;
-    }
+    using base_settings_t::base_settings_t;
 
     prb_dims_t prb_dims;
 
@@ -65,17 +60,16 @@ struct prb_t : public prb_dims_t {
     // A ctor with common interface across all drivers.
     prb_t(const settings_t &s)
         : prb_t(s.prb_dims, s.dir[0], s.dt[0], s.tag[0], s.alg[0], s.alpha[0],
-                s.beta[0], s.inplace[0],
-                settings_t::get_attr(s.scales[0], s.zero_points[0],
-                        s.post_ops[0], s.scratchpad_mode[0], s.fpmath_mode[0]),
-                s.ctx_init[0], s.ctx_exe[0], s.mb[0]) {
+                s.beta[0], s.mb[0], s.inplace[0], s.attributes.front(),
+                s.ctx_init[0], s.ctx_exe[0], s.impl_filter) {
         SAFE_V(s.has_single_setup() ? OK : FAIL);
     }
 
     prb_t(const prb_dims_t &prb_dims, dir_t dir, dnnl_data_type_t dt,
             const std::string &tag, alg_t alg, float alpha, float beta,
-            bool inplace, const attr_t &attr, const thr_ctx_t &ctx_init,
-            const thr_ctx_t &ctx_exe, int64_t mb = 0)
+            int64_t mb, bool inplace, const attr_t &attr,
+            const thr_ctx_t &ctx_init, const thr_ctx_t &ctx_exe,
+            const impl_filter_t &impl_filter)
         : prb_dims_t(prb_dims)
         , dir(dir)
         , dt(dt)
@@ -83,11 +77,12 @@ struct prb_t : public prb_dims_t {
         , alg(alg)
         , alpha(alpha)
         , beta(beta)
+        , user_mb(mb)
         , inplace(inplace)
         , attr(attr)
         , ctx_init(ctx_init)
         , ctx_exe(ctx_exe)
-        , user_mb(mb) {
+        , impl_filter(impl_filter) {
         if (mb) dims[0] = mb;
         repro = set_repro_line(); // must be last in ctor to collect right info
     }
@@ -97,10 +92,11 @@ struct prb_t : public prb_dims_t {
     std::string tag;
     alg_t alg;
     float alpha, beta;
+    int64_t user_mb;
     bool inplace;
     attr_t attr;
-    const thr_ctx_t ctx_init, ctx_exe;
-    int64_t user_mb;
+    thr_ctx_t ctx_init, ctx_exe;
+    impl_filter_t impl_filter;
 
     bool use_dst() const {
         return alg == alg_t::RELU_DST || alg == alg_t::TANH_DST
@@ -166,13 +162,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
 void skip_unimplemented_prb(const prb_t *prb, res_t *res);
 void skip_invalid_prb(const prb_t *prb, res_t *res);
-void compute_ref(const prb_t *prb, const args_t &args,
+void compute_ref(const prb_t *prb, dir_t dir, const args_t &args,
         dnnl_primitive_t prim_ref = nullptr);
 
 int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);

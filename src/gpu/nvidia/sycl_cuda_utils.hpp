@@ -1,6 +1,6 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
-* Copyright 2020 Codeplay Software Limited
+* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2024 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,14 +23,14 @@
 #include <stdexcept>
 #include <cublas_v2.h>
 
-#include "dnnl_sycl.hpp"
+#include "dnnl_sycl.h"
 
 #include "common/c_types_map.hpp"
 #include "common/engine.hpp"
 #include "common/primitive_attr.hpp"
 #include "common/z_magic.hpp"
 
-#include "sycl/sycl_utils.hpp"
+#include "xpu/sycl/utils.hpp"
 
 #include "gpu/nvidia/sycl_cuda_compat.hpp"
 
@@ -40,25 +40,28 @@ namespace gpu {
 namespace nvidia {
 
 #define CTX_OUT_ACCESSOR(arg) \
-    utils::downcast<sycl::sycl_buffer_memory_storage_t *>( \
+    utils::downcast<xpu::sycl::buffer_memory_storage_t *>( \
             &CTX_OUT_STORAGE(arg)) \
             ->buffer() \
             .get_access<::sycl::access::mode::write>(cgh)
 
 #define CTX_IN_ACCESSOR(arg) \
-    utils::downcast<sycl::sycl_buffer_memory_storage_t *>( \
+    utils::downcast<xpu::sycl::buffer_memory_storage_t *>( \
             &CTX_IN_STORAGE(arg)) \
             ->buffer() \
             .get_access<::sycl::access::mode::read>(cgh)
 
 #define CTX_SCRATCH_ACCESSOR(arg) \
-    utils::downcast<sycl::sycl_buffer_memory_storage_t *>( \
+    utils::downcast<xpu::sycl::buffer_memory_storage_t *>( \
             ctx.get_scratchpad_grantor().get_memory_storage(arg).get()) \
             ->buffer() \
             .get_access<::sycl::access::mode::read_write>(cgh)
 
 bool compare_cuda_devices(const ::sycl::device &lhs, const ::sycl::device &rhs);
+cudaDeviceProp query_device_properties(const ::sycl::device &dev);
 bool has_bf16_support(const ::sycl::device &dev);
+bool has_imma_ampere_layout_support(const ::sycl::device &dev);
+bool has_imma_dst_int8_support();
 
 // Check if the device type matches the passed engine kind
 inline status_t check_device(dnnl::impl::engine_kind_t eng_kind) {
@@ -67,9 +70,15 @@ inline status_t check_device(dnnl::impl::engine_kind_t eng_kind) {
                     : status::invalid_arguments);
 }
 
+static void sync_device() {
+#ifndef SYCL_EXT_ONEAPI_ENQUEUE_NATIVE_COMMAND
+    cudaDeviceSynchronize();
+#endif
+}
+
 static void convert_dnnl_dims_array(
         const dnnl_dim_t *dims, int *new_dims, int n_dims) {
-    for (size_t i = 0; i < n_dims; i++) {
+    for (int i = 0; i < n_dims; i++) {
         new_dims[i] = static_cast<int>(dims[i]);
     }
 }
@@ -77,7 +86,7 @@ static void convert_dnnl_dims_array(
 static void convert_dims(const dnnl_dim_t *dims, int *new_dims, int n_dims,
         int adjustment_size = 4, int adjustment_value = 1) {
     convert_dnnl_dims_array(dims, new_dims, n_dims);
-    for (size_t i = n_dims; i < adjustment_size; i++) {
+    for (int i = n_dims; i < adjustment_size; i++) {
         new_dims[i] = adjustment_value;
     }
 }
@@ -126,7 +135,7 @@ static bool adjust_stride_for_dnn(
 
 // Check if the dimensions contain any zeros, returns true if they do.
 static bool has_zero_dims(const dnnl_dim_t *dims, int n_dims) {
-    for (size_t i = 0; i < n_dims; i++) {
+    for (int i = 0; i < n_dims; i++) {
         if (dims[i] == 0) { return true; }
     }
     return false;
@@ -182,9 +191,54 @@ static status_t convert_data_type(const memory_desc_t *mem_desc,
                                     ? cudnnDataType_t::CUDNN_DATA_INT8x4
                                     : cudnnDataType_t::CUDNN_DATA_INT8);
             break;
+        case dnnl_data_type_t::dnnl_s32:
+            *cudnn_data_type = cudnnDataType_t::CUDNN_DATA_INT32;
+            break;
         default: return status::unimplemented;
     }
     return status::success;
+}
+
+static status_t get_cublas_data_type(
+        dnnl_data_type_t data_type, cudaDataType_t &blas_dt) {
+    switch (data_type) {
+        case dnnl_data_type_t::dnnl_f32:
+            blas_dt = CUDA_R_32F;
+            return status::success;
+        case dnnl_data_type_t::dnnl_f16:
+            blas_dt = CUDA_R_16F;
+            return status::success;
+        case dnnl_data_type_t::dnnl_bf16:
+            blas_dt = CUDA_R_16BF;
+            return status::success;
+        case dnnl_data_type_t::dnnl_s8:
+            blas_dt = CUDA_R_8I;
+            return status::success;
+        case dnnl_data_type_t::dnnl_s32:
+            blas_dt = CUDA_R_32I;
+            return status::success;
+        default: return status::unimplemented;
+    }
+    return status::unimplemented;
+}
+
+inline bool is_md_col32(const memory_desc_wrapper &md) {
+    const bool is_batched = md.ndims() > 2;
+    // cublas operates in col-major so this function checks if the rows are blocked in 32.
+    if (md.is_blocking_desc()) {
+        if (md.blocking_desc().inner_nblks == 1
+                && md.blocking_desc().inner_idxs[0] == (is_batched ? 1 : 0)
+                && md.blocking_desc().inner_blks[0] == 32) {
+            return true;
+        }
+    }
+    return false;
+}
+
+template <typename T,
+        typename = typename std::enable_if<std::is_integral_v<T>>::type>
+T ceildiv(T n, T d) {
+    return (n + d - 1) / d;
 }
 
 class cublas_error : virtual public std::runtime_error {
@@ -325,7 +379,7 @@ template <typename T>
     auto event = q.submit([&, src](::sycl::handler &cgh) {
         // Retrieve a  write accessor to a global buffer
         auto acc = dst.template get_access<::sycl::access::mode::write,
-                impl::sycl::compat::target_device>(cgh);
+                xpu::sycl::compat::target_device>(cgh);
         // Copy from the input pointer into the buffer associated with the
         // accessor
         cgh.copy(src, acc);
@@ -339,7 +393,7 @@ template <typename T>
     auto event = q.submit([&, dst](::sycl::handler &cgh) {
         // Retrieve a read accessor to a global buffer
         auto acc = src.template get_access<::sycl::access::mode::read,
-                impl::sycl::compat::target_device>(cgh);
+                xpu::sycl::compat::target_device>(cgh);
         // Copy from the buffer associated with the accessor into the output
         // pointer
         cgh.copy(acc, dst);

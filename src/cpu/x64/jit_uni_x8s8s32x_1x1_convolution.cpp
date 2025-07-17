@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -73,16 +73,18 @@ status_t jit_uni_x8s8s32x_1x1_convolution_fwd_t<isa>::execute_forward(
 
     auto local_scales
             = scratchpad.template get<float>(key_conv_adjusted_scales);
+    const bool has_wei_scales
+            = !pd()->attr()->scales_.has_default_values(DNNL_ARG_WEIGHTS);
+    const int wei_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float factor = (pd()->jcp_.signed_input && (!pd()->jcp_.has_vnni))
             ? 1.f / pd()->jcp_.wei_adj_scale
-            : 1.0f;
-    int wei_mask = pd()->attr()->scales_.get(DNNL_ARG_WEIGHTS).mask_;
-    if (wei_mask == 0) {
-        utils::array_set(
-                local_scales, src_scales[0] * wei_scales[0] * factor, 8);
-    } else {
+            : 1.f;
+    if (has_wei_scales && wei_mask > 0) {
         for (dim_t c = 0; c < pd()->OC(); c++)
             local_scales[c] = src_scales[0] * wei_scales[c] * factor;
+    } else {
+        utils::array_set(
+                local_scales, src_scales[0] * wei_scales[0] * factor, 8);
     }
 
     const float *dw_oscales = nullptr;
@@ -94,7 +96,7 @@ status_t jit_uni_x8s8s32x_1x1_convolution_fwd_t<isa>::execute_forward(
 
         auto dw_local_scales
                 = dw_scratchpad.template get<float>(key_conv_adjusted_scales);
-        int wei_mask = attr_dw->scales_.get(DNNL_ARG_WEIGHTS).mask_;
+        int wei_mask = attr_dw->scales_.get_mask(DNNL_ARG_WEIGHTS);
         float factor = 1.f / jcp_dw->wei_adj_scale;
         if (wei_mask == 0) {
             utils::array_set(dw_local_scales,
@@ -161,7 +163,7 @@ void jit_uni_x8s8s32x_1x1_convolution_fwd_t<isa>::execute_forward_thr(
                     + (jcp.signed_input ? jcp.ngroups * jcp.oc : 0)
             : nullptr;
 
-    auto p = jit_1x1_conv_call_s();
+    auto p = jit_1x1_conv_args_t();
 
     auto rp = typename rtus_driver_t<isa>::call_params_t();
     const int nb_oc = jcp.nb_load;
@@ -380,7 +382,7 @@ void jit_uni_x8s8s32x_1x1_convolution_fwd_t<isa>::execute_forward_thr(
 
         const auto ocb_end = ocb_start + load_step;
         const size_t src_ch_stride = jcp_dw->nb_ch_blocking * jcp_dw->ch_block;
-        auto par_conv_dw = jit_conv_call_s();
+        auto par_conv_dw = jit_conv_args_t();
 
         par_conv_dw.t_overflow = nstl::min(jcp_dw->kh, nstl::max(0, -oh_1x1));
         par_conv_dw.b_overflow = nstl::min(

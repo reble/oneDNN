@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef CPU_X64_LRN_JIT_LRN_AVX512_NHWC_EXECUTOR_HPP
-#define CPU_X64_LRN_JIT_LRN_AVX512_NHWC_EXECUTOR_HPP
+#ifndef CPU_X64_LRN_LRN_AVX512_NHWC_EXECUTOR_HPP
+#define CPU_X64_LRN_LRN_AVX512_NHWC_EXECUTOR_HPP
 
 #include "cpu/x64/lrn/jit_avx512_common_lrn_bwd_nhwc.hpp"
 #include "cpu/x64/lrn/jit_avx512_common_lrn_fwd_nhwc.hpp"
@@ -42,7 +42,7 @@ public:
         , H_(pd->H())
         , W_(pd->W()) {}
 
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t create_kernel() override { return ker_->create_kernel(); }
 
@@ -73,7 +73,7 @@ public:
         return status::success;
     }
 
-    virtual ~lrn_avx512_nhwc_executor_fwd_t() = default;
+    ~lrn_avx512_nhwc_executor_fwd_t() override = default;
 
 private:
     std::unique_ptr<jit_avx512_common_lrn_kernel_fwd_nhwc_t<d_type>> ker_;
@@ -94,7 +94,7 @@ public:
         , C_(pd->C())
         , H_(pd->H())
         , W_(pd->W()) {}
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t create_kernel() override { return ker_->create_kernel(); }
 
@@ -126,7 +126,7 @@ public:
         return status::success;
     }
 
-    virtual ~lrn_avx512_nhwc_executor_bwd_t() = default;
+    ~lrn_avx512_nhwc_executor_bwd_t() override = default;
 
 private:
     std::unique_ptr<jit_avx512_common_lrn_kernel_bwd_nhwc_t<d_type>> ker_;

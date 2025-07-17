@@ -115,17 +115,37 @@ would lead to the following operation:
 
 \f[
     \dst(\overline{x}) =
-            scale_{src} \cdot \src(\overline{x} - shift_{src}) +
+            scale_{src} \cdot (\src(\overline{x}) - shift_{src}) +
             \beta  \cdot \dst(\overline{x}) + shift_{dst}
 \f]
 
 @note
     * The intermediate operations are being done using single precision
       floating point data type.
-    * \f$scale_{src}\f$ and \f$scale_{dst}\f$ must be passed during execution runtime
-      as a separate memory argument. Using \f$scale_{src}\f$ argument will lead to
+    * \f$scale_{src}\f$, \f$shift_{src}\f$, \f$scale_{dst}\f$, and
+      \f$shift_{dst}\f$ must be passed during execution runtime as a separate
+      memory arguments. Using \f$scale_{src}\f$ argument will lead to
       multiplication of tensor values by a scale value. Using \f$scale_{dst}\f$
       argument will lead to division of tensor values by a scale value.
+
+### Sparsity
+
+Currently, there is only one reorder for packing a dense tensor, i.e. converting
+a dense tensor that is in `ab` format to a sparse tensor that is encoded with
+the `PACKED` encoding.
+
+In general, it is expected that all reorder-related functionality
+(e.g. scales, zero-points, etc) that is supported for the dense
+destination tensor should also work for the sparse one.
+
+ Common Limitations
+* The interoperability API to get/set data handles is not supported. Use the
+runtime agnostic API to do that.
+* Sparse memory and memory descriptor can only be used with the Matrix
+Multiplication and Reorder primitives.
+
+Refer to [Sparsity Advanced Topic](@ref dev_guide_sparsity) page for more
+information on sparse encding.
 
 ## Implementation Limitations
 

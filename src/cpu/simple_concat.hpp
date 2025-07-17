@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -62,10 +62,10 @@ struct simple_concat_t : public primitive_t {
                         VERBOSE_UNSUPPORTED_TAG);
                 VDISPATCH_CONCAT(types::blocking_desc_is_equal(
                                          *i_d.md_, *o_d.md_, ignore_strides),
-                        VERBOSE_BLOCKING_FAIL);
+                        VERBOSE_BLOCKING_FAIL, "blocking descriptor mismatch");
                 VDISPATCH_CONCAT(types::blocking_desc_is_equal(
                                          *i_d.md_, *dst_d.md_, ignore_strides),
-                        VERBOSE_BLOCKING_FAIL);
+                        VERBOSE_BLOCKING_FAIL, "blocking descriptor mismatch");
                 VDISPATCH_CONCAT(!i_d.is_additional_buffer(),
                         "memory format does not have additional buffer");
             }
@@ -168,7 +168,7 @@ struct simple_concat_t : public primitive_t {
 
     status_t execute(const exec_ctx_t &ctx) const override;
 
-    typedef typename prec_traits<data_type>::type data_t;
+    using data_t = typename prec_traits_t<data_type>::type;
 
 private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@
 namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 
-TEST(test_compiled_partition_compiled_partition, Relu) {
+TEST(test_compiled_partition, Relu) {
     graph::engine_t *eng = get_engine();
 
     graph::op_t relu_op(graph::op_kind::ReLU, "relu");
@@ -82,7 +82,7 @@ TEST(test_compiled_partition_compiled_partition, Relu) {
         data_in[i] = static_cast<float>(i) - static_cast<float>(ele_num_in / 2);
     }
 
-    test_tensor t_in(lt_in, eng, data_in), t_out(query_out_lt, eng, data_out);
+    test_tensor_t t_in(lt_in, eng, data_in), t_out(query_out_lt, eng, data_out);
 
     std::vector<graph::tensor_t> t_inputs, t_outputs;
     t_inputs.emplace_back(t_in.get());
@@ -104,7 +104,7 @@ TEST(test_compiled_partition_compiled_partition, Relu) {
     }
 }
 
-TEST(test_compiled_partition_compiled_partition, SearchRequiredInputsOutputs) {
+TEST(test_compiled_partition, SearchRequiredInputsOutputs) {
     graph::engine_t *eng = get_engine();
 
     graph::op_t relu_op(graph::op_kind::ReLU, "relu");
@@ -185,24 +185,24 @@ TEST(test_compiled_partition_compiled_partition, SearchRequiredInputsOutputs) {
         data_in[i] = static_cast<float>(i) - static_cast<float>(ele_num_in / 2);
     }
 
-    test_tensor t_in(lt_in, eng, data_in), t_out(query_lt_out, eng, data_out);
-    test_tensor t_in_additional1(lt_in_additional1, eng),
+    test_tensor_t t_in(lt_in, eng, data_in), t_out(query_lt_out, eng, data_out);
+    test_tensor_t t_in_additional1(lt_in_additional1, eng),
             t_in_additional2(lt_in_additional2, eng);
 
-    test_tensor t_out_additional1(lt_out_additional1, eng),
+    test_tensor_t t_out_additional1(lt_out_additional1, eng),
             t_out_additional2(lt_out_additional2, eng);
 
     // when submit, in/outputs tensor's order must be same as compile
     // funcstion's in/outputs logical tensor
-    std::vector<test_tensor> t_inputs_correct {
+    std::vector<test_tensor_t> t_inputs_correct {
             t_in_additional1, t_in, t_in_additional2};
-    std::vector<test_tensor> t_outputs_correct {
+    std::vector<test_tensor_t> t_outputs_correct {
             t_out_additional1, t_out_additional2, t_out};
 
     graph::stream_t *strm = get_stream();
     EXPECT_SUCCESS(
-            cp.execute(strm, test_tensor::to_graph_tensor(t_inputs_correct),
-                    test_tensor::to_graph_tensor(t_outputs_correct)));
+            cp.execute(strm, test_tensor_t::to_graph_tensor(t_inputs_correct),
+                    test_tensor_t::to_graph_tensor(t_outputs_correct)));
     strm->wait();
 
     std::vector<float> ref_out(ele_num_in);
@@ -218,7 +218,7 @@ TEST(test_compiled_partition_compiled_partition, SearchRequiredInputsOutputs) {
     }
 }
 
-TEST(test_compiled_partition_compiled_partition, AllowRepeatedInputs) {
+TEST(test_compiled_partition, AllowRepeatedInputs) {
     graph::engine_t *eng = get_engine();
 
     graph::op_t n(graph::op_kind::Multiply);
@@ -271,16 +271,16 @@ TEST(test_compiled_partition_compiled_partition, AllowRepeatedInputs) {
     std::vector<float> ref_out {
             1.0f, 4.0f, 9.0f, 16.0f, 25.0f, 36.0f, 49.0f, 64.0f, 81.0f};
 
-    test_tensor t_in1(lt_in1, eng, data_in);
-    test_tensor t_out(query_lt_out, eng, data_out);
+    test_tensor_t t_in1(lt_in1, eng, data_in);
+    test_tensor_t t_out(query_lt_out, eng, data_out);
 
     // only one input
-    std::vector<test_tensor> t_ins {t_in1};
-    std::vector<test_tensor> t_outs {t_out};
+    std::vector<test_tensor_t> t_ins {t_in1};
+    std::vector<test_tensor_t> t_outs {t_out};
 
     graph::stream_t *strm = get_stream();
-    EXPECT_SUCCESS(cp.execute(strm, test_tensor::to_graph_tensor(t_ins),
-            test_tensor::to_graph_tensor(t_outs)));
+    EXPECT_SUCCESS(cp.execute(strm, test_tensor_t::to_graph_tensor(t_ins),
+            test_tensor_t::to_graph_tensor(t_outs)));
     strm->wait();
     data_out = t_out.as_vec_type<float>();
     for (size_t i = 0; i < ref_out.size(); i++) {
@@ -288,7 +288,7 @@ TEST(test_compiled_partition_compiled_partition, AllowRepeatedInputs) {
     }
 }
 
-TEST(test_compiled_partition_compiled_partition, GetAndInfoMethod) {
+TEST(test_compiled_partition, GetAndInfoMethod) {
     using ltw = graph::logical_tensor_wrapper_t;
 
     graph::engine_t &engine = *get_engine();
@@ -309,9 +309,9 @@ TEST(test_compiled_partition_compiled_partition, GetAndInfoMethod) {
             graph::dnnl_impl::dnnl_compiled_partition_impl_t>(
             engine, inputs, outputs, kernel);
     graph::partition_t par;
+    const graph::fpmath_t fpm {graph::fpmath_mode::strict, false};
     auto par_impl = std::make_shared<graph::dnnl_impl::dnnl_partition_impl_t>(
-            engine.kind(), graph::fpmath_mode::strict,
-            graph::partition_kind_t::undef);
+            engine.kind(), fpm, graph::partition_kind_t::undef);
     par.init(par_impl);
     graph::compiled_partition_t cp(par);
     cp.init(cp_impl);
@@ -330,7 +330,7 @@ TEST(test_compiled_partition_compiled_partition, GetAndInfoMethod) {
     ASSERT_EQ(std::string(cp.info()), std::string(info.c_str()));
 }
 
-TEST(test_compiled_partition_compiled_partition, GetInputsAndOutputs) {
+TEST(test_compiled_partition, GetInputsAndOutputs) {
     using ltw = graph::logical_tensor_wrapper_t;
     graph::engine_t &engine = *get_engine();
     size_t id = 0;

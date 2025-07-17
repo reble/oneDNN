@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -29,13 +29,13 @@ using namespace prop_kind;
 
 namespace jit_uni_brgemm_conv_comp_pad_kernel {
 
-#define GET_OFF(field) offsetof(jit_brgemm_conv_comp_pad_call_s, field)
+#define GET_OFF(field) offsetof(jit_brgemm_conv_comp_pad_args_t, field)
 
 template <typename Vmm>
 jit_uni_brgemm_conv_comp_pad_kernel_t<Vmm>::
         jit_uni_brgemm_conv_comp_pad_kernel_t(
                 const jit_brgemm_conv_conf_t &ajcp)
-    : jit_generator(jit_name())
+    : jit_generator_t(jit_name())
     , jcp_(ajcp)
     , inp_dsz_(jcp_.wei_dsz)
     , out_dsz_(jcp_.acc_dsz)
@@ -203,10 +203,7 @@ void jit_uni_brgemm_conv_comp_pad_kernel_t<Vmm>::compute(const int ic_step,
                     ? EVEX_compress_addr(reg_aux_in, oc_offset)
                     : ptr[reg_aux_in + oc_offset];
             if (jcp_.has_int8_vnni) {
-                vpdpbusd(vmm, vmm_one_bytes, addr,
-                        is_superset(jcp_.isa, avx512_core)
-                                ? Xbyak::EvexEncoding
-                                : Xbyak::VexEncoding);
+                vpdpbusd(vmm, vmm_one_bytes, addr, get_encoding());
             } else {
                 vpmaddubsw(zmm_int8_temp, vmm_one_bytes, addr);
                 vpmaddwd(zmm_int8_temp, zmm_int8_temp, zmm_one_words);
@@ -698,7 +695,7 @@ template <typename Vmm>
 jit_uni_brgemm_conv_relo_comp_pad_kernel_t<Vmm>::
         jit_uni_brgemm_conv_relo_comp_pad_kernel_t(
                 const jit_brgemm_conv_conf_t &ajcp)
-    : jit_generator(jit_name())
+    : jit_generator_t(jit_name())
     , jcp_(ajcp)
     , inp_dsz_(jcp_.wei_dsz)
     , out_dsz_(jcp_.acc_dsz)

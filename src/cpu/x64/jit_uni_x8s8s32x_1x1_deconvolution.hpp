@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,15 +39,11 @@ namespace x64 {
 template <cpu_isa_t isa>
 struct jit_uni_x8s8s32x_1x1_deconvolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_deconvolution_fwd_pd_t {
-        pd_t(const deconvolution_desc_t *adesc, const primitive_attr_t *attr,
-                const deconvolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_deconvolution_fwd_pd_t(adesc, attr, hint_fwd_pd) {}
+        using cpu_deconvolution_fwd_pd_t::cpu_deconvolution_fwd_pd_t;
 
         pd_t(const pd_t &other)
             : cpu_deconvolution_fwd_pd_t(other)
             , conv_pd_(other.conv_pd_->clone()) {}
-
-        ~pd_t() = default;
 
         DECLARE_COMMON_PD_T(
                 name_.c_str(), jit_uni_x8s8s32x_1x1_deconvolution_fwd_t);
@@ -101,9 +97,8 @@ struct jit_uni_x8s8s32x_1x1_deconvolution_fwd_t : public primitive_t {
             VDISPATCH_DECONVOLUTION(
                     desc()->accum_data_type == s32, VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_DECONVOLUTION(
-                    attr()->has_default_values(skip_mask_t::scales_runtime
-                            | skip_mask_t::post_ops
-                            | skip_mask_t::zero_points_runtime),
+                    attr()->has_default_values(skip_mask_t::scales
+                            | skip_mask_t::post_ops | skip_mask_t::zero_points),
                     VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_DECONVOLUTION(
                     zero_points_valid(attr(), true /*per_oc_bcast_accepted*/),
@@ -134,9 +129,10 @@ struct jit_uni_x8s8s32x_1x1_deconvolution_fwd_t : public primitive_t {
         std::shared_ptr<primitive_desc_t> conv_pd_;
 
     private:
-        std::string name_ = JIT_IMPL_NAME_HELPER("jit_deconvolution:", isa, "");
+        std::string name_;
 
         void init_name() {
+            name_ = JIT_IMPL_NAME_HELPER("jit_deconvolution:", isa, "");
             name_.append("+");
             name_.append(conv_pd_->name());
         }

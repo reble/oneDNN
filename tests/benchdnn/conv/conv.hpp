@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,10 +25,8 @@
 #include <stdint.h>
 
 #include "common.hpp"
-#include "dnn_types.hpp"
 #include "dnnl_common.hpp"
 #include "utils/cfg.hpp"
-#include "utils/compare.hpp"
 #include "utils/perf_report.hpp"
 #include "utils/settings.hpp"
 
@@ -75,7 +73,7 @@ struct desc_t {
     dims_t wei_dims() const;
     dims_t bia_dims() const;
     dims_t dst_dims() const;
-    dims_t strides() const;
+    dims_t kstrides() const;
     dims_t dilations() const;
     dims_t padding() const;
     dims_t padding_r() const;
@@ -91,18 +89,15 @@ int str2desc(desc_t *desc, const char *str);
 std::ostream &operator<<(std::ostream &s, const desc_t &d);
 
 struct settings_t : public base_settings_t {
-    settings_t() = default;
-
-    // ctor to save certain fields from resetting
-    settings_t(const char *perf_template) : settings_t() {
-        this->perf_template = perf_template;
-    }
+    using base_settings_t::base_settings_t;
 
     desc_t desc {};
 
     std::vector<dir_t> dir {FWD_B};
     std::vector<std::vector<dnnl_data_type_t>> dt {{dnnl_f32}};
+    std::vector<dnnl_data_type_t> bia_dt {dnnl_data_type_undef};
     std::vector<std::string> stag {tag::any}, wtag {tag::any}, dtag {tag::any};
+    std::vector<vdims_t> strides {vdims_t(STRIDES_SIZE)};
     std::vector<alg_t> alg {DIRECT};
 
     const char *perf_template_csv() const {
@@ -114,8 +109,9 @@ struct settings_t : public base_settings_t {
     void reset() { *this = settings_t(perf_template); }
 
     bool has_single_setup() const override {
-        return dir.size() == 1 && dt.size() == 1 && stag.size() == 1
-                && wtag.size() == 1 && dtag.size() == 1 && alg.size() == 1
+        return dir.size() == 1 && dt.size() == 1 && bia_dt.size() == 1
+                && stag.size() == 1 && wtag.size() == 1 && dtag.size() == 1
+                && strides.size() == 1 && alg.size() == 1
                 && base_settings_t::has_single_setup();
     }
 };
@@ -123,32 +119,34 @@ struct settings_t : public base_settings_t {
 struct prb_t : public desc_t {
     // A ctor with common interface across all drivers.
     prb_t(const settings_t &s)
-        : prb_t(s.desc, s.dir[0], s.dt[0], s.stag[0], s.wtag[0], s.dtag[0],
-                s.alg[0],
-                settings_t::get_attr(s.scales[0], s.zero_points[0],
-                        s.post_ops[0], s.scratchpad_mode[0], s.fpmath_mode[0],
-                        s.acc_mode[0]),
-                s.ctx_init[0], s.ctx_exe[0], s.mb[0]) {
+        : prb_t(s.desc, s.dir[0], s.dt[0], s.bia_dt[0], s.stag[0], s.wtag[0],
+                s.dtag[0], s.strides[0], s.alg[0], s.mb[0],
+                s.attributes.front(), s.ctx_init[0], s.ctx_exe[0],
+                s.impl_filter) {
         SAFE_V(s.has_single_setup() ? OK : FAIL);
     }
 
     prb_t(const desc_t &desc, dir_t dir,
-            const std::vector<dnnl_data_type_t> &dt, const std::string &stag,
-            const std::string &wtag, const std::string &dtag, alg_t alg,
-            const attr_t &attr, const thr_ctx_t &ctx_init,
-            const thr_ctx_t &ctx_exe, int64_t mb = 0)
+            const std::vector<dnnl_data_type_t> &dt, dnnl_data_type_t bia_dt,
+            const std::string &stag, const std::string &wtag,
+            const std::string &dtag, const vdims_t &strides, alg_t alg,
+            int64_t mb, const attr_t &attr, const thr_ctx_t &ctx_init,
+            const thr_ctx_t &ctx_exe, const impl_filter_t &impl_filter)
         : desc_t(desc)
         , dir(dir)
         , dt(dt)
+        , bia_dt_(bia_dt)
         , stag(stag)
         , wtag(wtag)
         , dtag(dtag)
+        , strides(strides)
         , alg(alg)
-        , attr(attr)
         , user_mb(mb)
         , ops(0)
+        , attr(attr)
         , ctx_init(ctx_init)
-        , ctx_exe(ctx_exe) {
+        , ctx_exe(ctx_exe)
+        , impl_filter(impl_filter) {
         if (mb) this->mb = mb;
 
         // Broadcast data types if needed
@@ -163,14 +161,16 @@ struct prb_t : public desc_t {
 
     dir_t dir;
     std::vector<dnnl_data_type_t> dt;
+    dnnl_data_type_t bia_dt_; // `_` to avoid conflicting name with bia_dt().
     std::string stag, wtag, dtag;
+    vdims_t strides;
     mutable alg_t alg; // `mutable` because of `AUTO`.
+    int64_t user_mb;
+    double ops;
     bool inplace = false; // Lacks placement, always considered `false`.
     attr_t attr;
-    int64_t user_mb;
-
-    double ops;
     thr_ctx_t ctx_init, ctx_exe;
+    impl_filter_t impl_filter;
 
     void count_ops();
     int64_t count_n_acc() const {
@@ -181,9 +181,7 @@ struct prb_t : public desc_t {
 
     dnnl_data_type_t src_dt() const { return dt[0]; }
     dnnl_data_type_t wei_dt() const { return dt[1]; }
-    dnnl_data_type_t bia_dt() const {
-        return is_integral_dt(wei_dt()) ? dnnl_f32 : wei_dt();
-    } // TODO: customize
+    dnnl_data_type_t bia_dt() const { return bia_dt_; }
     dnnl_data_type_t dst_dt() const { return dt[2]; }
     dnnl_data_type_t get_dt(data_kind_t data_kind) const;
 
@@ -304,13 +302,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
 void skip_unimplemented_prb(const prb_t *prb, res_t *res);
 void skip_invalid_prb(const prb_t *prb, res_t *res);
-void compute_ref(const prb_t *prb, const args_t &args,
+void compute_ref(const prb_t *prb, dir_t dir, const args_t &args,
         dnnl_primitive_t prim_ref = nullptr);
 
 int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -182,17 +182,16 @@ protected:
     convolution_desc_t desc_;
     const convolution_fwd_pd_t *hint_fwd_pd_;
 
-    convolution_pd_t(const convolution_desc_t *adesc,
-            const primitive_attr_t *attr,
+    convolution_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const convolution_fwd_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<convolution_desc_t>(adesc))
         , hint_fwd_pd_(hint_fwd_pd) {}
 
     bool set_default_formats_common_template(memory_desc_t &src_md,
             format_tag_t src_tag, memory_desc_t &wei_md, format_tag_t wei_tag,
             memory_desc_t &dst_md, format_tag_t dst_tag,
-            memory_desc_t &bia_md) {
+            memory_desc_t &bia_md) const {
         using namespace format_tag;
 
 #define IS_OK(f) \
@@ -239,29 +238,99 @@ protected:
         return ok;
     }
 
-    bool attr_scales_ok(const std::vector<int> &supported_args
-            = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST}) const {
-        bool ok = attr()->scales_.has_default_values(supported_args);
-        for (int arg : supported_args) {
-            const auto &mask = attr()->scales_.get(arg).mask_;
-            if (arg == DNNL_ARG_WEIGHTS)
-                ok = ok && (mask == 0 || mask == (with_groups() ? 3 : 1));
-            else
-                ok = ok && (mask == 0);
+    // `supported_args_map` contains supported arguments and associated
+    // supported masks with those supported arguments. This function has default
+    // values to cover the widest possible case. In case the support range is
+    // shorter, the implementation should pass its own supported map.
+    //
+    // Note: `DNNL_ARG_WEIGHTS` expects masks without groups. It will be handled
+    // in this function through the `x * 2 + 1` equation. Like, `per_oc` or `1`
+    // will be checked as `1 * 2 + 1 = 3`.
+    status_t attr_scales_ok(
+            const std::unordered_map<int, std::vector<int>> &supported_args_map)
+            const {
+        std::vector<int> supported_args;
+        supported_args.reserve(supported_args_map.size());
+        for (const auto &e : supported_args_map) {
+            const int arg = e.first;
+            supported_args.push_back(arg);
+
+            if (attr()->scales_.has_default_values(arg)) continue;
+
+            const auto &mask = attr()->scales_.get_mask(arg);
+            const auto &supported_masks = e.second;
+            const bool arg_is_wei = utils::one_of(arg, DNNL_ARG_WEIGHTS,
+                    DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
+            bool mask_supported = false;
+            for (const int supported_mask : supported_masks) {
+                if (mask == supported_mask) {
+                    mask_supported = true;
+                    break;
+                }
+                // Handle a case with groups.
+                if (arg_is_wei && with_groups() && supported_mask > 0
+                        && mask == (supported_mask * 2 + 1)) {
+                    mask_supported = true;
+                    break;
+                }
+            }
+            VDISPATCH_CONV_IC(mask_supported,
+                    "scale_mask:%d for arg:%d is unsupported", mask, arg);
         }
-        return ok;
+
+        VDISPATCH_CONV_IC(attr()->scales_.has_default_values(supported_args),
+                VERBOSE_UNSUPPORTED_SCALES_CFG);
+
+        return status::success;
+    }
+
+    // `supported_args_map` contains supported arguments and associated
+    // supported masks with those supported arguments. This function has default
+    // values to cover the widest possible case. In case the support range is
+    // shorter, the implementation should pass its own supported map.
+    status_t attr_zero_points_ok(
+            const std::unordered_map<int, std::vector<int>> &supported_args_map)
+            const {
+        std::vector<int> supported_args;
+        supported_args.reserve(supported_args_map.size());
+        for (const auto &e : supported_args_map) {
+            const int arg = e.first;
+            supported_args.push_back(arg);
+
+            if (attr()->zero_points_.has_default_values(arg)) continue;
+
+            const auto &mask = attr()->zero_points_.get_mask(arg);
+            const auto &supported_masks = e.second;
+            bool mask_supported = false;
+            for (const int supported_mask : supported_masks) {
+                if (mask == supported_mask) {
+                    mask_supported = true;
+                    break;
+                }
+            }
+            VDISPATCH_CONV_IC(mask_supported,
+                    "zero_point_mask:%d for arg:%d is unsupported", mask, arg);
+        }
+
+        VDISPATCH_CONV_IC(
+                attr()->zero_points_.has_default_values(supported_args),
+                VERBOSE_UNSUPPORTED_ZP_CFG);
+
+        return status::success;
     }
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct convolution_fwd_pd_t : public convolution_pd_t {
-    typedef convolution_fwd_pd_t base_class;
-    typedef convolution_fwd_pd_t hint_class;
+    using base_class = convolution_fwd_pd_t;
+    using hint_class = convolution_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_WEIGHTS))
             return arg_usage_t::input;
 
-        if (arg == DNNL_ARG_BIAS && with_bias()) return arg_usage_t::input;
+        if (arg == DNNL_ARG_BIAS)
+            return with_bias() ? arg_usage_t::input : arg_usage_t::unused;
 
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
 
@@ -310,8 +379,7 @@ protected:
     memory_desc_t bias_md_;
     memory_desc_t dst_md_;
 
-    convolution_fwd_pd_t(const convolution_desc_t *adesc,
-            const primitive_attr_t *attr,
+    convolution_fwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const convolution_fwd_pd_t *hint_fwd_pd)
         : convolution_pd_t(adesc, attr, hint_fwd_pd)
         , src_md_(desc_.src_desc)
@@ -333,10 +401,12 @@ protected:
                                                                           : 2;
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct convolution_bwd_data_pd_t : public convolution_pd_t {
-    typedef convolution_bwd_data_pd_t base_class;
-    typedef convolution_fwd_pd_t hint_class;
+    using base_class = convolution_bwd_data_pd_t;
+    using hint_class = convolution_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_WEIGHTS, DNNL_ARG_DIFF_DST))
@@ -389,7 +459,7 @@ protected:
     memory_desc_t bias_md_;
     memory_desc_t diff_dst_md_;
 
-    convolution_bwd_data_pd_t(const convolution_desc_t *adesc,
+    convolution_bwd_data_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const convolution_fwd_pd_t *hint_fwd_pd)
         : convolution_pd_t(adesc, attr, hint_fwd_pd)
@@ -404,12 +474,14 @@ protected:
                 weights_md_, wei_tag, diff_dst_md_, diff_dst_tag, bias_md_);
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct convolution_bwd_weights_pd_t : public convolution_pd_t {
-    typedef convolution_bwd_weights_pd_t base_class;
-    typedef convolution_fwd_pd_t hint_class;
+    using base_class = convolution_bwd_weights_pd_t;
+    using hint_class = convolution_fwd_pd_t;
 
-    convolution_bwd_weights_pd_t(const convolution_desc_t *adesc,
+    convolution_bwd_weights_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const convolution_fwd_pd_t *hint_fwd_pd)
         : convolution_pd_t(adesc, attr, hint_fwd_pd)
@@ -424,8 +496,8 @@ struct convolution_bwd_weights_pd_t : public convolution_pd_t {
 
         if (arg == DNNL_ARG_DIFF_WEIGHTS) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_DIFF_BIAS && with_bias())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_DIFF_BIAS)
+            return with_bias() ? arg_usage_t::output : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -477,6 +549,7 @@ protected:
                 diff_bias_md_);
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

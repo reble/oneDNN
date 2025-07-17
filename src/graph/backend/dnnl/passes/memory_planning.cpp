@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -33,12 +33,15 @@
 
 #include "oneapi/dnnl/dnnl.hpp"
 
+#define VCHECK_MEMORY_PLANNING(cond, status, msg, ...) \
+    VCONDCHECK(graph, create, check, memory_planning, (cond), status, msg, \
+            ##__VA_ARGS__);
+
 namespace dnnl {
 namespace impl {
 namespace graph {
 namespace dnnl_impl {
 using op_t = op_t;
-using op_ptr = std::shared_ptr<op_t>;
 using ltw = logical_tensor_wrapper_t;
 
 struct op_inplace_pair_t {
@@ -143,6 +146,9 @@ std::vector<op_inplace_pair_t> get_op_inplace_pairs(
         const bool can_inplace = make_dnnl_memory_desc(diff_dst)
                 == make_dnnl_memory_desc(diff_src);
         if (can_inplace) { pairs.emplace_back(1, 0); }
+    } else if (op.get_kind() == op_kind::dnnl_transpose
+            || op.get_kind() == op_kind::dnnl_reshape) {
+        pairs.emplace_back(0, 0);
     } else {
         // Do nothing
     }
@@ -156,8 +162,30 @@ std::shared_ptr<execution_args_set_t> execution_args_set_t::clone() const {
     // clone
     ret->value_mem_map_.reserve(value_mem_map_.size());
     for (auto &val_mem : value_mem_map_) {
-        memory cloned_mem(val_mem.second.get_desc(),
-                val_mem.second.get_engine(), nullptr);
+        memory cloned_mem;
+        if (val_mem.second.get_engine().get_kind() == dnnl::engine::kind::gpu) {
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+            dnnl::ocl_interop::memory_kind m_kind
+                    = dnnl::ocl_interop::get_memory_kind(val_mem.second);
+            if (m_kind == dnnl::ocl_interop::memory_kind::usm) {
+                cloned_mem = dnnl::ocl_interop::make_memory(
+                        val_mem.second.get_desc(), val_mem.second.get_engine(),
+                        dnnl::ocl_interop::memory_kind::usm, nullptr);
+            } else {
+                cloned_mem = dnnl::ocl_interop::make_memory(
+                        val_mem.second.get_desc(), val_mem.second.get_engine(),
+                        nullptr);
+            }
+
+#else
+            cloned_mem = memory(val_mem.second.get_desc(),
+                    val_mem.second.get_engine(), nullptr);
+#endif
+
+        } else {
+            cloned_mem = memory(val_mem.second.get_desc(),
+                    val_mem.second.get_engine(), nullptr);
+        }
         ret->value_mem_map_.insert({val_mem.first, cloned_mem});
     }
 
@@ -215,6 +243,11 @@ std::shared_ptr<execution_args_set_t> execution_args_set_t::clone() const {
         ret->topo_ordered_exec_args_.emplace_back(new_args);
     }
 
+    ret->host_scalar_infos_.reserve(host_scalar_infos_.size());
+    for (const auto &info : host_scalar_infos_) {
+        ret->host_scalar_infos_.emplace_back(info);
+    }
+
     return ret;
 }
 
@@ -225,6 +258,7 @@ void execution_args_set_t::clear() {
     mems_use_internal_persistent_.clear();
     value_mem_map_.clear();
     topo_ordered_exec_args_.clear();
+    host_scalar_infos_.clear();
 }
 
 void alias_analyzer_t::clear() {
@@ -319,7 +353,8 @@ status_t memory_planner_t::assign_external_inputs_buffer(
                 // assign alias
                 auto aliases = alias_analyzer_.get_all_aliases(val);
                 for (auto &alias : aliases) {
-                    assertm(!buffer_assignments_.count(alias),
+                    VCHECK_MEMORY_PLANNING(!buffer_assignments_.count(alias),
+                            status::runtime_error,
                             "alias of input has been assigned buffer");
                     buffer_assignments_.insert(std::make_pair(alias, info));
                 }
@@ -357,38 +392,51 @@ status_t memory_planner_t::assign_external_inputs_buffer(
 status_t memory_planner_t::assign_external_outputs_buffer(
         std::shared_ptr<subgraph_t> &sg,
         const std::vector<logical_tensor_t> &outputs, fusion_info_mgr_t &mgr) {
-    for (auto &val : sg->get_output_values()) {
-        for (size_t i = 0; i < outputs.size(); i++) {
-            if (val->get_logical_tensor().id == outputs[i].id) {
-                assign_info_t orig_info = buffer_assignments_.at(val);
-                assign_info_t updated_info(external_output, i);
-                std::queue<const value_t *> q;
-                std::set<const value_t *> visited;
-                q.push(val);
-                while (!q.empty()) {
-                    auto cur_val = q.front();
-                    q.pop();
-                    if (visited.count(cur_val)) continue;
+    for (const auto &op : sg->get_ops()) {
+        for (const auto &val : op->get_output_values()) {
+            for (size_t i = 0; i < outputs.size(); i++) {
+                if (val->get_logical_tensor().id == outputs[i].id) {
+                    assign_info_t orig_info = buffer_assignments_.at(val.get());
+                    assign_info_t updated_info(external_output, i);
+                    std::queue<const value_t *> q;
+                    std::set<const value_t *> visited;
+                    q.push(val.get());
+                    while (!q.empty()) {
+                        auto cur_val = q.front();
+                        q.pop();
+                        if (visited.count(cur_val)) continue;
 
-                    // update the assigned buffer to external buffer
-                    buffer_assignments_[cur_val] = updated_info;
-                    visited.insert(cur_val);
+                        // update the assigned buffer to external buffer
+                        buffer_assignments_[cur_val] = updated_info;
+                        visited.insert(cur_val);
 
-                    // push the alias to queue for next visit
-                    auto aliases = alias_analyzer_.get_all_aliases(cur_val);
-                    for (const value_t *alias : aliases) {
-                        q.push(alias);
-                    }
+                        // push the alias to queue for next visit
+                        auto aliases = alias_analyzer_.get_all_aliases(cur_val);
+                        for (const value_t *alias : aliases) {
+                            if (buffer_assignments_[alias].kind_
+                                    == external_input)
+                                continue;
+                            q.push(alias);
+                        }
 
-                    // push the inplaced input to queue for next visit
-                    auto &producer = cur_val->get_producer();
-                    auto op_inplace_pairs = get_op_inplace_pairs(producer, mgr);
-                    for (auto &pair : op_inplace_pairs) {
-                        if (pair.out_idx_ != cur_val->get_offset()) continue;
-                        auto in_val = producer.get_input_value(pair.in_idx_);
-                        if (buffer_assignments_.at(in_val.get()) != orig_info)
-                            continue;
-                        q.push(in_val.get());
+                        // push the inplaced input to queue for next visit
+                        if (!cur_val->has_producer()) continue;
+                        auto &producer = cur_val->get_producer();
+                        auto op_inplace_pairs
+                                = get_op_inplace_pairs(producer, mgr);
+                        for (auto &pair : op_inplace_pairs) {
+                            if (pair.out_idx_ != cur_val->get_offset())
+                                continue;
+                            auto in_val
+                                    = producer.get_input_value(pair.in_idx_);
+                            if (buffer_assignments_.at(in_val.get())
+                                            != orig_info
+                                    || buffer_assignments_.at(in_val.get())
+                                                    .kind_
+                                            == external_input)
+                                continue;
+                            q.push(in_val.get());
+                        }
                     }
                 }
             }
@@ -531,7 +579,7 @@ status_t memory_planner_t::assign_internal_temporary_buffer(
             assign_info_t info = buffer_assignments_.at(out.get());
             if (info.kind_ != internal_temporary) continue;
 
-            auto consumers = out->get_consumers();
+            const auto &consumers = out->get_consumers();
             if (consumers.empty()) {
                 --temporary_buffer_ref_count[info.index_];
                 if (enable_standard_sharing) {
@@ -687,7 +735,11 @@ status_t memory_planner_t::book_buffers(std::shared_ptr<subgraph_t> &sg) {
                 persistent_registrar.book(info.index_,
                         persistent_buffer_assigner_.query_size(info.index_));
                 break;
-            default: return status::unimplemented;
+            default:
+                VCHECK_MEMORY_PLANNING(false, status::unimplemented,
+                        "booking memory failed for unimplemented buffer kind "
+                        "%d",
+                        info.kind_);
         }
     }
     return status::success;
@@ -722,13 +774,22 @@ status_t memory_planner_t::prepare_execution_args_set(
     // create memory object for each value, and classify the memory objects into
     // different categories
     std::unordered_set<value_t *> prepared;
+    std::unordered_map<value_t *, dnnl::memory::desc> host_scalar_mds;
     ret = topo_order_visit(sg->get_output_ops(), [&](op_t *op) {
         for (auto &in : op->get_input_values()) {
             if (prepared.count(in.get())) continue;
-            auto md = make_dnnl_memory_desc(in->get_logical_tensor());
-            auto mem = make_dnnl_memory(md, p_engine, nullptr);
-            exec_args_set_.add_value_mem_map({in.get(), mem});
-            classify_mem(mem, in.get());
+            const logical_tensor_t in_lt = in->get_logical_tensor();
+            auto md = make_dnnl_memory_desc(in_lt);
+            bool is_host_scalar
+                    = ltw(in_lt).property_type() == property_type::host_scalar;
+            if (is_host_scalar) {
+                // store md, leave memory allocation to execution time
+                host_scalar_mds.insert({in.get(), md});
+            } else {
+                auto mem = make_dnnl_memory(md, p_engine, nullptr);
+                exec_args_set_.add_value_mem_map({in.get(), mem});
+                classify_mem(mem, in.get());
+            }
             prepared.insert(in.get());
         }
 
@@ -741,21 +802,20 @@ status_t memory_planner_t::prepare_execution_args_set(
         }
         return status::success;
     });
-    if (ret != status::success) return ret;
+    VCHECK_MEMORY_PLANNING(
+            ret == status::success, ret, "prepare memory failed");
 
     // construct the dnnl execution args for each op
     ret = topo_order_visit(sg->get_output_ops(), [&](op_t *op) {
         const op_schema_t *opm
                 = op_schema_registry_t::get_op_schema(op->get_kind());
-        if (!opm) {
-            assertm(false, "no schema for current op");
-            return status::invalid_graph_op;
-        }
+        VCHECK_MEMORY_PLANNING(opm != nullptr, status::invalid_graph_op,
+                "no schema for current op: %s", op->get_name().c_str());
 
-        if (!opm->has_additional_item("arg_indices_getter")) {
-            assertm(false, "no arg indices getter in this op schema");
-            return status::invalid_graph_op;
-        }
+        VCHECK_MEMORY_PLANNING(opm->has_additional_item("arg_indices_getter"),
+                status::invalid_graph_op,
+                "no arg indices getter in the schema of op: %s",
+                op->get_name().c_str());
 
         auto getter = opm->get_additional_item<arg_indices_getter_func>(
                 "arg_indices_getter");
@@ -775,11 +835,17 @@ status_t memory_planner_t::prepare_execution_args_set(
 
             // find the corresponding memory object
             dnnl::memory mem;
-            if (!exec_args_set_.find_value_mem_map(val, mem)) {
-                return status::invalid_arguments;
+            if (host_scalar_mds.find(val) != host_scalar_mds.end()) {
+                size_t input_idx = buffer_assignments_.at(val).index_;
+                exec_args_set_.add_host_scalar_arg(
+                        input_idx, host_scalar_mds[val], dnnl_arg);
+            } else if (!exec_args_set_.find_value_mem_map(val, mem)) {
+                VCHECK_MEMORY_PLANNING(false, status::invalid_arguments,
+                        "can't find memory for value id: %zu",
+                        val->get_logical_tensor().id);
+            } else {
+                dnnl_exec_args.insert({dnnl_arg, mem});
             }
-
-            dnnl_exec_args.insert({dnnl_arg, mem});
         }
 
         exec_args_set_.add_exec_args(dnnl_exec_args);
@@ -800,8 +866,6 @@ status_t memory_planner_t::prepare_execution_args_set(
 // - Assign internal allocated persistent buffer to corresponding edges.
 // - Prepare the memory objects which will be used in execution.
 status_t memory_planner_t::run(std::shared_ptr<subgraph_t> &sg) {
-    status_t ret;
-
     auto &mgr = sg->fusion_info_mgr_;
     const auto &p_engine = *(sg->p_engine_);
     const auto &inputs = sg->ins_;
@@ -837,21 +901,17 @@ status_t memory_planner_t::run(std::shared_ptr<subgraph_t> &sg) {
     }
 
     // Assign external_input buffers to subgraph's inputs and their alias
-    ret = assign_external_inputs_buffer(sg, inputs);
-    if (ret != status::success) return ret;
+    CHECK(assign_external_inputs_buffer(sg, inputs));
 
     // Assign internal temporary buffer for all other edges
-    ret = assign_internal_temporary_buffer(sg, edge_ref_count, mgr, false);
-    if (ret != status::success) return ret;
+    CHECK(assign_internal_temporary_buffer(sg, edge_ref_count, mgr, false));
 
     // Replace some internal temporary buffers to user given external output
     // buffer
-    ret = assign_external_outputs_buffer(sg, outputs, mgr);
-    if (ret != status::success) return ret;
+    CHECK(assign_external_outputs_buffer(sg, outputs, mgr));
 
     // Replace some internal temporary buffers to cached persistent buffer
-    ret = assign_internal_persistent_buffer(sg, mgr);
-    if (ret != status::success) return ret;
+    CHECK(assign_internal_persistent_buffer(sg, mgr));
 
     // Reset the unreplaced internal temporary buffer
     temporary_buffer_assigner_.clear();
@@ -866,20 +926,13 @@ status_t memory_planner_t::run(std::shared_ptr<subgraph_t> &sg) {
 
     // Re-assign internal temporary buffer for reset ones (will re-do memory
     // sharing between temporary buffers)
-    ret = assign_internal_temporary_buffer(sg, edge_ref_count, mgr, true);
-    if (ret != status::success) return ret;
-
+    CHECK(assign_internal_temporary_buffer(sg, edge_ref_count, mgr, true));
     // Check which input/output pair of the subgraph can be inplaced
-    ret = prepare_subgraph_inplace_pairs(sg, false);
-    if (ret != status::success) return ret;
+    CHECK(prepare_subgraph_inplace_pairs(sg, false));
 
-    ret = book_buffers(sg);
-    if (ret != status::success) return ret;
-
+    CHECK(book_buffers(sg));
     // Bind memory object to each value
-    ret = prepare_execution_args_set(sg, p_engine, mgr);
-    if (ret != status::success) return ret;
-
+    CHECK(prepare_execution_args_set(sg, p_engine, mgr));
     return status::success;
 }
 

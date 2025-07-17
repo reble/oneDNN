@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2016-2024 Intel Corporation
+# Copyright 2016-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ if(WIN32 AND DNNL_WITH_SYCL)
     add_definitions(-DGTEST_HAS_SEH=0)
 endif()
 
-add_subdirectory (gtest)
+add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/gtest gtest)
 
 set(APP_NAME "gtest")
 set(MAIN_SRC_GTEST ${CMAKE_CURRENT_SOURCE_DIR}/main.cpp)
@@ -37,8 +37,7 @@ endif()
 include_directories_with_host_compiler(${CMAKE_CURRENT_SOURCE_DIR}
                                        ${CMAKE_CURRENT_SOURCE_DIR}/gtest
                                        ${CMAKE_CURRENT_SOURCE_DIR}/in
-                                       ${CMAKE_CURRENT_SOURCE_DIR}/../../src/common
-                                       ${CMAKE_CURRENT_SOURCE_DIR}/../../src/cpu
+                                       ${CMAKE_CURRENT_SOURCE_DIR}/../../src
 )
 
 if(WIN32)
@@ -62,6 +61,7 @@ file(GLOB PRIM_TEST_CASES_SRC
                               test_iface_attr_quantization.cpp
                               test_iface_weights_format.cpp
                               test_iface_wino_convolution.cpp
+                              test_iface_sparse.cpp
                               test_memory.cpp
                               test_sum.cpp
                               test_reorder.cpp
@@ -95,10 +95,6 @@ file(GLOB PRIM_TEST_CASES_SRC
                               test_prelu.cpp
                               test_group_normalization.cpp
                               )
-
-if(DNNL_EXPERIMENTAL_SPARSE)
-    list(APPEND PRIM_TEST_CASES_SRC test_iface_sparse.cpp)
-endif()
 
 if(DNNL_CPU_RUNTIME STREQUAL "NONE")
     list(APPEND PRIM_TEST_CASES_SRC test_iface_gpu_only.cpp)
@@ -269,9 +265,6 @@ if(NOT DNNL_ENABLE_STACK_CHECKER)
     endif()
 
     if(ONEDNN_BUILD_GRAPH)
-        if(ONEDNN_EXPERIMENTAL_GRAPH_COMPILER_BACKEND)
-            add_definitions_with_host_compiler(-DDNNL_ENABLE_COMPILER_BACKEND)
-        endif()
         add_subdirectory(graph)
     endif()
 endif()

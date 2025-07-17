@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 #include "interface/c_types_map.hpp"
 
-#include "utils/allocator.hpp"
+#include "utils/alloc.hpp"
 
 #include "gtest/gtest.h"
 
@@ -28,7 +28,7 @@
 
 namespace graph = dnnl::impl::graph;
 
-TEST(test_utils_alloctor, SyclAlloctorMallocAndFree) {
+TEST(test_utils_allocator, SyclAlloctorMallocAndFree) {
     graph::engine_t &engine = *get_engine();
     if (engine.kind() == graph::engine_kind::cpu) {
 #ifdef DNNL_GRAPH_CPU_SYCL

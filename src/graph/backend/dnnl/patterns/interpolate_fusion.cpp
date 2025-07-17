@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -33,14 +33,19 @@ using FCreatePattern = graph::pass::FCreatePattern;
 
 namespace {
 bool check_attributes(op_t *op) {
-    return op->get_attr<std::string>(op_attr::coordinate_transformation_mode)
+    bool result
+            = op->get_attr<std::string>(op_attr::coordinate_transformation_mode)
             == std::string("half_pixel");
+    VCHECK_PATTERN_UTILS(result, result,
+            "interpolate primitive doesn't support "
+            "other coordinate_transformation_mode except half_pixel");
+    return result;
 }
 } // namespace
 
 DNNL_BACKEND_REGISTER_PATTERN_DEF_BEGIN(interpolate_fusion)
 
-DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, interpolate_post_ops_fusion)
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, fp_interpolate_post_ops)
         .set_priority(8.4f)
         .set_kind(partition_kind_t::interpolate_post_ops)
         .set_attr<FCreatePattern>("FCreatePattern",
@@ -62,7 +67,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, interpolate_post_ops_fusion)
                             in_edges_t {in_edge(0, interpolate, 0)});
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<float_resampling_fwd>();
+            return std::make_shared<resampling_fwd_t>();
         });
 
 DNNL_BACKEND_REGISTER_PATTERN_DEF_END

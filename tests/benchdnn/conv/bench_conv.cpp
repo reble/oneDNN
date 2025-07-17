@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,55 +27,54 @@
 
 namespace conv {
 
-using create_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t *,
-        res_t *)>;
-using check_cache_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t *,
-        res_t *)>;
-using do_func_t = std::function<int(
-        const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &,
-        const prb_t *, res_t *)>;
-using driver_task_executor_t = task_executor_t<prb_t, perf_report_t,
-        create_func_t, check_cache_func_t, do_func_t>;
+TASK_EXECUTOR_DECL_TYPES;
 
 void check_correctness(
         const settings_t &s, driver_task_executor_t &task_executor) {
     for_(const auto &i_dir : s.dir)
     for_(const auto &i_dt : s.dt)
+    for_(const auto &i_bia_dt_ : s.bia_dt)
     for_(const auto &i_stag : s.stag)
     for_(const auto &i_wtag : s.wtag)
     for_(const auto &i_dtag : s.dtag)
+    for_(const auto &i_strides : s.strides)
     for_(const auto &i_alg : s.alg)
-    for_(const auto &i_scales : s.scales)
-    for_(const auto &i_zero_points : s.zero_points)
-    for_(const auto &i_post_ops : s.post_ops)
-    for_(const auto &i_scratchpad_mode : s.scratchpad_mode)
-    for_(const auto &i_fpmath_mode : s.fpmath_mode)
-    for_(const auto &i_acc_mode : s.acc_mode)
-    for_(const auto &i_deterministic : s.deterministic)
+    for_(const auto &i_attr : s.attributes)
     for_(const auto &i_ctx_init : s.ctx_init)
     for_(const auto &i_ctx_exe : s.ctx_exe)
     for (const auto &i_mb : s.mb) {
-        auto attr = settings_t::get_attr(i_scales, i_zero_points, i_post_ops,
-                i_scratchpad_mode, i_fpmath_mode, i_acc_mode, i_deterministic);
-
-        const prb_t prb(s.desc, i_dir, i_dt, i_stag, i_wtag, i_dtag, i_alg,
-                attr, i_ctx_init, i_ctx_exe, i_mb);
+        auto i_bia_dt = i_bia_dt_;
+        if (i_dir & FLAG_BIA) {
+            if (i_bia_dt != dnnl_data_type_undef) {
+                BENCHDNN_PRINT(0, "%s\n",
+                        "Warning: `--dir=FWD_B,BWD_WB` options are "
+                        "incompatible with `--bia-dt` option. To specify a "
+                        "bias data type, use `--dir=FWD_D,FWD_I,BWD_W` values "
+                        "intead.");
+            }
+            // The f32/f64 data type should be used as the default for bias with
+            // directions that include a bias.
+            const bool is_f64 = (i_dt.size() == 1 && i_dt[0] == dnnl_f64)
+                    || (i_dt.size() > 1 && i_dt[1] == dnnl_f64);
+            i_bia_dt = is_f64 ? dnnl_f64 : dnnl_f32;
+        }
+        const prb_t prb(s.desc, i_dir, i_dt, i_bia_dt, i_stag, i_wtag, i_dtag,
+                i_strides, i_alg, i_mb, i_attr, i_ctx_init, i_ctx_exe,
+                s.impl_filter);
         if (s.pattern && !match_regex(prb.str(), s.pattern)) return;
 
-        bool has_dw_po = attr.post_ops.convolution_index() >= 0;
+        bool has_dw_po = i_attr.post_ops.convolution_index() >= 0;
         auto &conv_createit
                 = has_dw_po ? conv_dw_fusion::createit : conv::createit;
-        auto &conv_check_cacheit = has_dw_po ? conv_dw_fusion::check_cacheit
-                                             : conv::check_cacheit;
+        auto &conv_checkit
+                = has_dw_po ? conv_dw_fusion::checkit : conv::checkit;
         auto &conv_doit = has_dw_po ? conv_dw_fusion::doit : conv::doit;
-        task_executor.submit(prb, s.perf_template, conv_createit,
-                conv_check_cacheit, conv_doit);
+        task_executor.submit(
+                prb, s.perf_template, conv_createit, conv_checkit, conv_doit);
     }
 }
 
-int verify_input(const settings_t &s) {
+int verify_input(const settings_t &s, const settings_t &def) {
     static constexpr int n_inputs = 3;
     for (const auto &i_dt : s.dt) {
         if (i_dt.size() != 1 && i_dt.size() != n_inputs) {
@@ -84,6 +83,41 @@ int verify_input(const settings_t &s) {
                     "inputs in SRC, WEI, DST order. Current size is: ",
                     static_cast<int>(i_dt.size()));
             return FAIL;
+        }
+    }
+
+    for (const auto &i_strides : s.strides) {
+        if (i_strides.size() != n_inputs) {
+            BENCHDNN_PRINT(0, "%s\n",
+                    "ERROR: `strides` option expects three inputs in format "
+                    "`[SRC]:[WEI]:[DST]` (two colons must present).");
+            return FAIL;
+        }
+    }
+
+    for (const auto &i_strides : s.strides) {
+        const bool strided_input = !i_strides[STRIDES_SRC].empty()
+                || !i_strides[STRIDES_WEI].empty()
+                || !i_strides[STRIDES_DST].empty();
+        if (!strided_input) continue;
+
+        for_(const auto &i_stag : s.stag)
+        for_(const auto &i_wtag : s.wtag)
+        for (const auto &i_dtag : s.dtag) {
+            const bool no_stride_with_tag
+                    = IMPLICATION(i_stag != def.stag[0],
+                              i_strides[STRIDES_SRC].empty())
+                    && IMPLICATION(i_wtag != def.wtag[0],
+                            i_strides[STRIDES_WEI].empty())
+                    && IMPLICATION(i_dtag != def.dtag[0],
+                            i_strides[STRIDES_DST].empty());
+
+            if (!no_stride_with_tag) {
+                BENCHDNN_PRINT(0, "%s\n",
+                        "ERROR: both `strides` and `tag` knobs can not be used "
+                        "with either of `src`, `wei`, and `dst` tensors.\n");
+                return FAIL;
+            }
         }
     }
 
@@ -101,33 +135,21 @@ int bench(int argc, char **argv) {
                 || parse_batch(bench, argv[0])
                 || parse_dir(s.dir, def.dir, argv[0])
                 || parse_multi_dt(s.dt, def.dt, argv[0], "dt")
+                || parse_dt(s.bia_dt, def.bia_dt, argv[0], "bia-dt")
                 || parse_tag(s.stag, def.stag, argv[0], "stag")
                 || parse_tag(s.wtag, def.wtag, argv[0], "wtag")
                 || parse_tag(s.dtag, def.dtag, argv[0], "dtag")
+                || parse_strides(s.strides, def.strides, argv[0], "strides")
                 || parse_alg(s.alg, def.alg, str2alg, argv[0])
                 || parse_mb(s.mb, def.mb, argv[0])
-                || parse_attr_scales(s.scales, argv[0])
-                || parse_attr_zero_points(s.zero_points, argv[0])
-                || parse_attr_post_ops(s.post_ops, argv[0])
-                || parse_attr_scratchpad_mode(
-                        s.scratchpad_mode, def.scratchpad_mode, argv[0])
-                || parse_attr_fpmath_mode(
-                        s.fpmath_mode, def.fpmath_mode, argv[0])
-                || parse_attr_acc_mode(s.acc_mode, def.acc_mode, argv[0])
-                || parse_attr_deterministic(
-                        s.deterministic, def.deterministic, argv[0])
-                || parse_ctx_init(s.ctx_init, def.ctx_init, argv[0])
-                || parse_ctx_exe(s.ctx_exe, def.ctx_exe, argv[0])
-                || parse_test_pattern_match(s.pattern, argv[0])
-                || parse_perf_template(s.perf_template, s.perf_template_def,
-                        s.perf_template_csv(), argv[0])
-                || parse_reset(s, argv[0]) || parse_help(argv[0]);
+                || parse_driver_shared_settings(s, def, argv[0]);
         if (!parsed_options) {
             catch_unknown_options(argv[0]);
 
             SAFE(str2desc(&s.desc, argv[0]), CRIT);
 
-            SAFE(verify_input(s), WARN);
+            SAFE(verify_input(s, def), WARN);
+            s.finalize();
             check_correctness(s, task_executor);
         }
     }

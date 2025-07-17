@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2022 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,38 +14,36 @@
 * limitations under the License.
 *******************************************************************************/
 
-#include "common/impl_list_item.hpp"
-
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/ocl/gen9_concat.hpp"
-#include "gpu/ocl/multi_concat.hpp"
-#include "gpu/ocl/ref_concat.hpp"
-#include "gpu/ocl/simple_concat.hpp"
+#include "gpu/generic/ref_concat.hpp"
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/multi_concat.hpp"
+#include "gpu/intel/reusable_simple_concat.hpp"
+#include "gpu/intel/xe_concat.hpp"
+#endif
 
 namespace dnnl {
 namespace impl {
 namespace gpu {
 
 namespace {
-#define CONCAT_INSTANCE(...) \
-    impl_list_item_t(impl_list_item_t::concat_type_deduction_helper_t< \
-            __VA_ARGS__::pd_t>()),
 
 // clang-format off
-constexpr impl_list_item_t concat_impl_list[] = REG_CONCAT_P({
-        CONCAT_INSTANCE(ocl::simple_concat_t)
-        CONCAT_INSTANCE(ocl::gen9_concat_t)
-        CONCAT_INSTANCE(ocl::multi_concat_t)
-        CONCAT_INSTANCE(ocl::ref_concat_t)
+constexpr impl_list_item_t impl_list[] = REG_CONCAT_P({
+        GPU_CONCAT_INSTANCE_INTEL(intel::reusable_simple_concat_t)
+        GPU_CONCAT_INSTANCE_INTEL(intel::xe_concat_t)
+        GPU_CONCAT_INSTANCE_INTEL(intel::multi_concat_t)
+        GPU_CONCAT_INSTANCE_GENERIC(generic::ref_concat_t)
         nullptr,
 });
 // clang-format on
-#undef INSTANCE
+
 } // namespace
 
-const impl_list_item_t *gpu_impl_list_t::get_concat_implementation_list() {
-    return concat_impl_list;
+const impl_list_item_t *get_concat_impl_list() {
+    return impl_list;
 }
 
 } // namespace gpu

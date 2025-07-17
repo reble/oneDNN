@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -76,6 +76,12 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_mul_scales, 1,
                 .set_attr(
                         op_attr::qtype, false, attribute_kind::s, "per_tensor")
                 .set_attr(op_attr::axis, false, attribute_kind::i, int64_t(1))
+                .set_attr(op_attr::group_shape, false, attribute_kind::is,
+                        std::vector<int64_t>())
+                .set_attr(op_attr::group_mask, false, attribute_kind::i,
+                        int64_t(0))
+                .set_attr(op_attr::data_type, false, attribute_kind::i,
+                        int64_t(0))
                 .set_attr(op_attr::scales, false, attribute_kind::fs,
                         std::vector<float>())
                 .set_attr(op_attr::with_runtime_scales, false,
@@ -86,6 +92,20 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_mul_scales, 1,
                 .SET_EXECUTABLE_CREATOR(
                         executable_creator<reorder_executable_t>)
                 .SET_ARG_INDICES_GETTER(reorder_executable_t))
+
+DNNL_GRAPH_OP_SCHEMA(dnnl_host_scalar, 1,
+        op_schema_t()
+                .set_num_inputs(1)
+                .set_num_outputs(1)
+                .set_input(0, "scalar")
+                .set_output(0, "output")
+                .SET_ATTR_IS_CONSTANT // used for constant prop and cache
+                .set_shape_inference_function(
+                        infer_dnnl_host_scalar_output_shape)
+                .SET_LAYOUT_PROPAGATOR(layout_propagator_for_host_scalar)
+                .SET_EXECUTABLE_CREATOR(
+                        executable_creator<host_scalar_executable_t>)
+                .SET_ARG_INDICES_GETTER(host_scalar_executable_t))
 
 DNNL_GRAPH_OP_SCHEMA(dnnl_constant_scales, 1,
         op_schema_t()
@@ -116,6 +136,12 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_add_zps, 1,
                         std::vector<int64_t>())
                 .set_attr(op_attr::with_runtime_zps, false, attribute_kind::b,
                         false)
+                .set_attr(op_attr::group_shape, false, attribute_kind::is,
+                        std::vector<int64_t>())
+                .set_attr(op_attr::group_mask, false, attribute_kind::i,
+                        int64_t(0))
+                .set_attr(op_attr::data_type, false, attribute_kind::i,
+                        int64_t(0))
                 .set_shape_inference_function(infer_identity_output_shape)
                 .SET_LAYOUT_PROPAGATOR(layout_propagator_for_add_zps)
                 .SET_EXECUTABLE_CREATOR(dummy_executable_creator)
@@ -137,6 +163,12 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_sub_zps, 1,
                         std::vector<int64_t>())
                 .set_attr(op_attr::with_runtime_zps, false, attribute_kind::b,
                         false)
+                .set_attr(op_attr::group_shape, false, attribute_kind::is,
+                        std::vector<int64_t>())
+                .set_attr(op_attr::group_mask, false, attribute_kind::i,
+                        int64_t(0))
+                .set_attr(op_attr::data_type, false, attribute_kind::i,
+                        int64_t(0))
                 .set_shape_inference_function(infer_identity_output_shape)
                 .SET_LAYOUT_PROPAGATOR(layout_propagator_for_sub_zps)
                 .SET_EXECUTABLE_CREATOR(dummy_executable_creator)
@@ -683,6 +715,7 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_binary, 1,
                 .set_num_outputs(2)
                 .set_input(0, "a")
                 .set_input(1, "b")
+                .set_input(2, "cond")
                 .set_output(0, "output")
                 .set_output(1, "scratchpad")
                 // Attributes inherited from front binary ops (Add, Multiply,
@@ -755,6 +788,22 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_eltwise_bwd, 1,
                 .SET_EXECUTABLE_CREATOR(
                         executable_creator<eltwise_bwd_executable_t>)
                 .SET_ARG_INDICES_GETTER(eltwise_bwd_executable_t))
+
+DNNL_GRAPH_OP_SCHEMA(dnnl_gen_index, 1,
+        op_schema_t()
+                .set_num_inputs(1)
+                .set_num_outputs(1)
+                .set_input(0, "input")
+                .set_output(0, "output")
+                // Attributes inherited from front GenIndex ops
+                .set_attr(op_attr::axis, true, attribute_kind::i)
+                .SET_ATTR_IS_CONSTANT // used for constant prop and cache
+                // Analysis rules
+                .set_shape_inference_function(infer_identity_output_shape)
+                .SET_LAYOUT_PROPAGATOR(layout_propagator_for_gen_index)
+                .SET_EXECUTABLE_CREATOR(
+                        executable_creator<genindex_executable_t>)
+                .SET_ARG_INDICES_GETTER(genindex_executable_t))
 
 DNNL_GRAPH_OP_SCHEMA(dnnl_shuffle, 1,
         op_schema_t()
@@ -923,7 +972,7 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_matmul, 1,
                 .set_num_outputs(2)
                 .set_input(0, "src0")
                 .set_input(1, "src1")
-                .set_input(2, "bias")
+                .set_input(2, "bias") // optional
                 .set_output(0, "output")
                 .set_output(1, "scratchpad")
                 // Attributes inherited from MatMul.
@@ -945,14 +994,16 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_matmul, 1,
 
 DNNL_GRAPH_OP_SCHEMA(dnnl_softmax, 1,
         op_schema_t()
-                .set_inputs_option(op_schema_t::param_num_option::optional)
-                .set_num_inputs(std::set<size_t>({1, 2}))
+                .set_inputs_option(op_schema_t::param_num_option::variadic)
+                .set_num_inputs(std::set<size_t>({1, 32}))
                 .set_num_outputs(2)
                 .set_input(0, "input")
                 .set_output(0, "output")
                 .set_output(1, "scratchpad")
                 // Attributes inherited from SoftMax
                 .set_attr(op_attr::axis, false, attribute_kind::i, (int64_t)1)
+                .set_attr(op_attr::mode, false, attribute_kind::s, "none",
+                        {"none", "inf_as_zero"})
                 // New added attributes
                 .SET_ATTR_IS_CONSTANT // used for constant prop and cache
                 .set_attr(op_attr::fusion_info_key, false, attribute_kind::i,
@@ -984,8 +1035,8 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_logsoftmax, 1,
 
 DNNL_GRAPH_OP_SCHEMA(dnnl_layernorm, 1,
         op_schema_t()
-                .set_inputs_option(op_schema_t::param_num_option::optional)
-                .set_num_inputs(std::set<size_t>({1, 2, 3, 4}))
+                .set_inputs_option(op_schema_t::param_num_option::variadic)
+                .set_num_inputs(std::set<size_t>({1, 32}))
                 .set_outputs_option(op_schema_t::param_num_option::optional)
                 .set_num_outputs(std::set<size_t>({2, 4}))
                 .set_input(0, "input")
@@ -1033,6 +1084,9 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_reorder, 1,
                 .set_attr(op_attr::scales, false, attribute_kind::fs)
                 .set_attr(op_attr::src_zps, false, attribute_kind::is)
                 .set_attr(op_attr::dst_zps, false, attribute_kind::is)
+                .set_attr(op_attr::group_shape, false, attribute_kind::is)
+                .set_attr(op_attr::group_mask, false, attribute_kind::i,
+                        int64_t(0))
                 .set_attr(op_attr::with_runtime_scales, false,
                         attribute_kind::b, false)
                 .set_attr(op_attr::with_runtime_src_zps, false,
@@ -1047,6 +1101,87 @@ DNNL_GRAPH_OP_SCHEMA(dnnl_reorder, 1,
                 .SET_EXECUTABLE_CREATOR(
                         executable_creator<reorder_executable_t>)
                 .SET_ARG_INDICES_GETTER(reorder_executable_t))
+
+DNNL_GRAPH_OP_SCHEMA(dnnl_groupnorm, 1,
+        op_schema_t()
+                .set_inputs_option(op_schema_t::param_num_option::variadic)
+                .set_num_inputs(std::set<size_t>({1, 32}))
+                .set_outputs_option(op_schema_t::param_num_option::optional)
+                .set_num_outputs(std::set<size_t>({2, 4}))
+                .set_input(0, "input")
+                .set_input(1, "gamma")
+                .set_input(2, "beta")
+                .set_output(0, "output")
+                .set_output(1, "mean")
+                .set_output(2, "variance")
+                .set_output(3, "scratchpad")
+                // Attributes inherited from GroupNorm
+                .set_attr(op_attr::keep_stats, false, attribute_kind::b, true)
+                .set_attr(op_attr::groups, true, attribute_kind::i)
+                .set_attr(op_attr::use_affine, false, attribute_kind::b, true)
+                .set_attr(op_attr::epsilon, false, attribute_kind::f, 1e-5f)
+                .set_attr(op_attr::data_format, false, attribute_kind::s, "NXC",
+                        {"NCX", "NXC"})
+                .set_attr(op_attr::fusion_info_key, false, attribute_kind::i,
+                        (int64_t)-1)
+                // New added attributes
+                .SET_ATTR_IS_CONSTANT // used for constant prop and cache
+                // Analysis rules
+                .set_shape_inference_function(infer_groupnorm_output_shape)
+                .SET_LAYOUT_PROPAGATOR(layout_propagator_for_groupnorm)
+                .SET_EXECUTABLE_CREATOR(
+                        executable_creator<groupnorm_executable_t>)
+                .SET_ARG_INDICES_GETTER(groupnorm_executable_t))
+
+DNNL_GRAPH_OP_SCHEMA(dnnl_mask, 1,
+        op_schema_t()
+                .set_inputs_option(op_schema_t::param_num_option::optional)
+                .set_num_inputs(std::set<size_t>({2, 4}))
+                .set_num_outputs(1)
+                .set_input(0, "input")
+                .set_input(1, "-inf")
+                .set_input(2, "s_kv")
+                .set_input(3, "s_q")
+                .set_output(0, "output")
+                // Attributes inherited from front gen_index ops
+                .set_attr(op_attr::axis_row, true, attribute_kind::i)
+                .set_attr(op_attr::axis_col, true, attribute_kind::i)
+                // mask_type attribute indicates existence of explicit mask,
+                // top-left implicit causal mask or bottm-right implicit causal mask
+                .set_attr(op_attr::mask_type, true, attribute_kind::i)
+                .SET_ATTR_IS_CONSTANT // used for constant prop and cache
+                // Analysis rules
+                .set_shape_inference_function(infer_identity_output_shape)
+                .SET_LAYOUT_PROPAGATOR(layout_propagator_for_mask)
+                .SET_EXECUTABLE_CREATOR(executable_creator<memory_reparser_t>)
+                .SET_ARG_INDICES_GETTER(memory_reparser_t))
+
+// The data types of query/key/value/mask/output must be consistent, and only
+// f16/bf16 are supported. The data type of scale must be consistent with other
+// input and output data types or fp32.
+DNNL_GRAPH_OP_SCHEMA(dnnl_sdpa, 1,
+        op_schema_t()
+                .set_inputs_option(op_schema_t::param_num_option::variadic)
+                .set_num_inputs(std::set<size_t>({3, 32}))
+                .set_num_outputs(2)
+                .set_input(0, "query")
+                .set_input(1, "key")
+                .set_input(2, "value")
+                .set_input(3, "scale") // optional
+                .set_input(4, "mask") // optional
+                .set_output(0, "output")
+                .set_output(1, "scratchpad")
+                .set_attr(op_attr::with_scale, true, attribute_kind::b)
+                .set_attr(op_attr::is_invert_scale, false, attribute_kind::b,
+                        false)
+                // mask_type attribute indicates existence of explicit mask,
+                // top-left implicit causal mask or bottm-right implicit causal mask
+                .set_attr(op_attr::mask_type, true, attribute_kind::i)
+                .set_attr(op_attr::mode, true, attribute_kind::s)
+                .set_shape_inference_function(infer_dnnl_sdpa_output_shape)
+                .SET_LAYOUT_PROPAGATOR(layout_propagator_for_sdpa)
+                .SET_EXECUTABLE_CREATOR(executable_creator<sdpa_executable_t>)
+                .SET_ARG_INDICES_GETTER(sdpa_executable_t))
 
 } // namespace dnnl_impl
 } // namespace graph

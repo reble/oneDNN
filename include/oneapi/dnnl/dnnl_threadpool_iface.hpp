@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,9 +14,14 @@
 * limitations under the License.
 *******************************************************************************/
 
+/// @file
+/// Threadpool Interoperability C++ Types
+
 #ifndef ONEAPI_DNNL_DNNL_THREADPOOL_IFACE_HPP
 #define ONEAPI_DNNL_DNNL_THREADPOOL_IFACE_HPP
+// NOLINTBEGIN(readability-identifier-naming)
 
+#include <cstdint>
 #include <functional>
 
 /// @addtogroup dnnl_api
@@ -56,7 +61,7 @@ struct threadpool_iface {
     /// waiting for the submitted closures to finish execution on its own.
     static constexpr uint64_t ASYNCHRONOUS = 1;
 
-    virtual ~threadpool_iface() {}
+    virtual ~threadpool_iface() = default;
 };
 
 } // namespace threadpool_interop
@@ -69,4 +74,5 @@ struct threadpool_iface {
 
 /// @} dnnl_api
 
-#endif
+// NOLINTEND(readability-identifier-naming)
+#endif /* ONEAPI_DNNL_DNNL_THREADPOOL_IFACE_HPP */

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@
 #include <unordered_set>
 
 #include "graph/interface/c_types_map.hpp"
+#include "graph/interface/graph_attr.hpp"
 #include "graph/interface/logical_tensor.hpp"
 #include "graph/interface/op.hpp"
 #include "graph/interface/partition_impl.hpp"
@@ -35,6 +36,10 @@
 #include "graph/utils/id.hpp"
 #include "graph/utils/utils.hpp"
 #include "graph/utils/verbose.hpp"
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include <CL/cl.h>
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -82,7 +87,7 @@ public:
         return pimpl_->get_engine_kind();
     }
 
-    graph::fpmath_mode_t get_fpmath_mode() const {
+    const graph::fpmath_t &get_fpmath_mode() const {
         return pimpl_->get_fpmath_mode();
     }
 
@@ -122,7 +127,8 @@ public:
             const graph::engine_t *e = nullptr) const;
 
     graph::status_t compile(
-            std::pair<graph::compiled_partition_t *, bool> &compiled_partition,
+            std::pair<graph::compiled_partition_t *, dnnl::impl::cache_state_t>
+                    &compiled_partition,
             std::vector<const graph::logical_tensor_t *> &inputs,
             std::vector<const graph::logical_tensor_t *> &outputs,
             const graph::engine_t *aengine) const;
@@ -180,6 +186,13 @@ public:
             const std::vector<graph::tensor_t> &outputs,
             const std::vector<::sycl::event> &sycl_deps,
             ::sycl::event *sycl_event) const;
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    graph::status_t execute_ocl(const graph::stream_t *astream,
+            const std::vector<graph::tensor_t> &inputs,
+            const std::vector<graph::tensor_t> &outputs,
+            const std::vector<cl_event> &sycl_deps, cl_event *sycl_event) const;
 #endif
 
     graph::status_t query_logical_tensor(

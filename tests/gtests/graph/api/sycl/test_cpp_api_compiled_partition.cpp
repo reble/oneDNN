@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,27 +28,20 @@
 using namespace dnnl::graph;
 
 #ifdef DNNL_WITH_SYCL
-TEST(ApiExecute, ConvReLU) {
+
+inline void construct_conv_relu(graph &g, size_t seed) {
     using data_type = logical_tensor::data_type;
     using layout_type = logical_tensor::layout_type;
 
     std::vector<int64_t> conv0_input_dims {1, 3, 227, 227};
     std::vector<int64_t> conv0_weight_dims {16, 3, 11, 11};
-
-    dnnl::engine::kind ekind
-            = static_cast<dnnl::engine::kind>(api_test_engine_kind);
-#if DNNL_CPU_RUNTIME != DNNL_RUNTIME_SYCL
-    SKIP_IF(api_test_engine_kind == dnnl_cpu,
-            "skip sycl api test for native cpu runtime.");
-#endif
-    graph g(ekind);
     logical_tensor conv0_src_desc {
             0, data_type::f32, conv0_input_dims, layout_type::strided};
     logical_tensor conv0_weight_desc {
             1, data_type::f32, conv0_weight_dims, layout_type::strided};
     logical_tensor conv0_dst_desc {2, data_type::f32, 4, layout_type::strided};
-    op conv0(0, op::kind::Convolution, {conv0_src_desc, conv0_weight_desc},
-            {conv0_dst_desc}, "conv0");
+    op conv0(0 + seed, op::kind::Convolution,
+            {conv0_src_desc, conv0_weight_desc}, {conv0_dst_desc}, "conv0");
     conv0.set_attr<std::vector<int64_t>>(op::attr::strides, {4, 4});
     conv0.set_attr<std::vector<int64_t>>(op::attr::pads_begin, {0, 0});
     conv0.set_attr<std::vector<int64_t>>(op::attr::pads_end, {0, 0});
@@ -57,10 +50,23 @@ TEST(ApiExecute, ConvReLU) {
     conv0.set_attr<std::string>(op::attr::data_format, "NCX");
     conv0.set_attr<std::string>(op::attr::weights_format, "OIX");
     logical_tensor relu0_dst_desc {3, data_type::f32, 4, layout_type::strided};
-    op relu0(1, op::kind::ReLU, {conv0_dst_desc}, {relu0_dst_desc}, "relu0");
+    op relu0(1 + seed, op::kind::ReLU, {conv0_dst_desc}, {relu0_dst_desc},
+            "relu0");
     g.add_op(conv0);
     g.add_op(relu0);
     g.finalize();
+}
+
+TEST(SYCLApi, CompiledPartitionExecute) {
+
+    dnnl::engine::kind ekind
+            = static_cast<dnnl::engine::kind>(api_test_engine_kind);
+#if DNNL_CPU_RUNTIME != DNNL_RUNTIME_SYCL
+    SKIP_IF(api_test_engine_kind == dnnl_cpu,
+            "skip sycl api test for native cpu runtime.");
+#endif
+    graph g(ekind);
+    construct_conv_relu(g, 100);
     auto partition = g.get_partitions()[0];
 
     allocator alloc = sycl_interop::make_allocator(
@@ -68,9 +74,9 @@ TEST(ApiExecute, ConvReLU) {
             dnnl::graph::testing::sycl_free_wrapper);
 
     sycl::queue q = (ekind == dnnl::engine::kind::gpu)
-            ? sycl::queue(dnnl::impl::sycl::compat::gpu_selector_v,
+            ? sycl::queue(dnnl::impl::xpu::sycl::compat::gpu_selector_v,
                     sycl::property::queue::in_order {})
-            : sycl::queue(dnnl::impl::sycl::compat::cpu_selector_v,
+            : sycl::queue(dnnl::impl::xpu::sycl::compat::cpu_selector_v,
                     sycl::property::queue::in_order {});
 
     dnnl::engine eng = sycl_interop::make_engine_with_allocator(
@@ -95,33 +101,27 @@ TEST(ApiExecute, ConvReLU) {
     outputs_ts.reserve(outputs.size());
     for (const auto &in : inputs) {
         size_t mem_size = in.get_mem_size();
-        data_buffers.push_back({});
+        data_buffers.emplace_back();
         data_buffers.back().reset(::sycl::malloc_shared(mem_size,
                                           q.get_device(), q.get_context()),
-                sycl_deletor {q.get_context()});
-        inputs_ts.push_back(tensor {in, eng, data_buffers.back().get()});
+                sycl_deletor_t {q.get_context()});
+        inputs_ts.emplace_back(in, eng, data_buffers.back().get());
     }
 
     for (const auto &out : outputs) {
         size_t mem_size = out.get_mem_size();
-        data_buffers.push_back({});
+        data_buffers.emplace_back();
         data_buffers.back().reset(::sycl::malloc_device(mem_size,
                                           q.get_device(), q.get_context()),
-                sycl_deletor {q.get_context()});
-        outputs_ts.push_back(tensor {out, eng, data_buffers.back().get()});
+                sycl_deletor_t {q.get_context()});
+        outputs_ts.emplace_back(out, eng, data_buffers.back().get());
     }
 
     cp.execute(strm, inputs_ts, outputs_ts);
     strm.wait();
 }
 
-TEST(SyclApiExecute, ConvReLU) {
-    using data_type = logical_tensor::data_type;
-    using layout_type = logical_tensor::layout_type;
-
-    std::vector<int64_t> conv0_input_dims {1, 3, 227, 227};
-    std::vector<int64_t> conv0_weight_dims {16, 3, 11, 11};
-
+TEST(SYCLApi, CompiledPartitionInteropExecute) {
     dnnl::engine::kind ekind
             = static_cast<dnnl::engine::kind>(api_test_engine_kind);
 #if DNNL_CPU_RUNTIME != DNNL_RUNTIME_SYCL
@@ -129,25 +129,7 @@ TEST(SyclApiExecute, ConvReLU) {
             "skip sycl api test for native cpu runtime.");
 #endif
     graph g(ekind);
-    logical_tensor conv0_src_desc {
-            0, data_type::f32, conv0_input_dims, layout_type::strided};
-    logical_tensor conv0_weight_desc {
-            1, data_type::f32, conv0_weight_dims, layout_type::strided};
-    logical_tensor conv0_dst_desc {2, data_type::f32, 4, layout_type::strided};
-    op conv0(0, op::kind::Convolution, {conv0_src_desc, conv0_weight_desc},
-            {conv0_dst_desc}, "conv0");
-    conv0.set_attr<std::vector<int64_t>>(op::attr::strides, {4, 4});
-    conv0.set_attr<std::vector<int64_t>>(op::attr::pads_begin, {0, 0});
-    conv0.set_attr<std::vector<int64_t>>(op::attr::pads_end, {0, 0});
-    conv0.set_attr<std::vector<int64_t>>(op::attr::dilations, {1, 1});
-    conv0.set_attr<int64_t>(op::attr::groups, 1);
-    conv0.set_attr<std::string>(op::attr::data_format, "NCX");
-    conv0.set_attr<std::string>(op::attr::weights_format, "OIX");
-    logical_tensor relu0_dst_desc {3, data_type::f32, 4, layout_type::strided};
-    op relu0(1, op::kind::ReLU, {conv0_dst_desc}, {relu0_dst_desc}, "relu0");
-    g.add_op(conv0);
-    g.add_op(relu0);
-    g.finalize();
+    construct_conv_relu(g, 200);
     auto partition = g.get_partitions()[0];
 
     allocator alloc = sycl_interop::make_allocator(
@@ -155,9 +137,9 @@ TEST(SyclApiExecute, ConvReLU) {
             dnnl::graph::testing::sycl_free_wrapper);
 
     sycl::queue q = (ekind == dnnl::engine::kind::gpu)
-            ? sycl::queue(dnnl::impl::sycl::compat::gpu_selector_v,
+            ? sycl::queue(dnnl::impl::xpu::sycl::compat::gpu_selector_v,
                     sycl::property::queue::in_order {})
-            : sycl::queue(dnnl::impl::sycl::compat::cpu_selector_v,
+            : sycl::queue(dnnl::impl::xpu::sycl::compat::cpu_selector_v,
                     sycl::property::queue::in_order {});
 
     dnnl::engine eng = sycl_interop::make_engine_with_allocator(
@@ -182,20 +164,20 @@ TEST(SyclApiExecute, ConvReLU) {
     outputs_ts.reserve(outputs.size());
     for (const auto &in : inputs) {
         size_t mem_size = in.get_mem_size();
-        data_buffers.push_back({});
+        data_buffers.emplace_back();
         data_buffers.back().reset(::sycl::malloc_shared(mem_size,
                                           q.get_device(), q.get_context()),
-                sycl_deletor {q.get_context()});
-        inputs_ts.push_back(tensor {in, eng, data_buffers.back().get()});
+                sycl_deletor_t {q.get_context()});
+        inputs_ts.emplace_back(in, eng, data_buffers.back().get());
     }
 
     for (const auto &out : outputs) {
         size_t mem_size = out.get_mem_size();
-        data_buffers.push_back({});
+        data_buffers.emplace_back();
         data_buffers.back().reset(::sycl::malloc_device(mem_size,
                                           q.get_device(), q.get_context()),
-                sycl_deletor {q.get_context()});
-        outputs_ts.push_back(tensor {out, eng, data_buffers.back().get()});
+                sycl_deletor_t {q.get_context()});
+        outputs_ts.emplace_back(out, eng, data_buffers.back().get());
     }
 
     sycl_interop::execute(cp, strm, inputs_ts, outputs_ts);

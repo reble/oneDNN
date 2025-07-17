@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 
 #include "utils/parallel.hpp"
 
@@ -31,19 +32,39 @@
 namespace compare {
 
 namespace {
-void dump_point_values(const_dnnl_memory_desc_t md, const std::string &kind_str,
-        int64_t l_offset, float exp_f32, float exp, float got, float diff,
-        float rel_diff) {
-    std::stringstream ss;
-    dims_t l_dims = md2dims(md);
-    dims_t dims_idx = off2dims_idx(l_dims, l_offset);
+struct dump_point_ctx_t {
+    dump_point_ctx_t(const_dnnl_memory_desc_t md, int64_t l_offset,
+            float exp_f32, float exp, float got, float diff, float rel_diff)
+        : md(md)
+        , l_offset(l_offset)
+        , exp_f32(exp_f32)
+        , exp(exp)
+        , got(got)
+        , diff(diff)
+        , rel_diff(rel_diff) {}
+
+    const_dnnl_memory_desc_t md;
+    int64_t l_offset;
+    float exp_f32;
+    float exp;
+    float got;
+    float diff;
+    float rel_diff;
+};
+
+void dump_point_values(
+        const std::string &kind_str, const dump_point_ctx_t &ctx) {
+    dnnl::impl::stringstream_t ss;
+    dims_t l_dims = md2dims(ctx.md);
+    dims_t dims_idx = off2dims_idx(l_dims, ctx.l_offset);
     ss << dims_idx;
     std::string ind_str = ss.str();
 
     BENCHDNN_PRINT(0,
-            "[%4ld]%s[%s] exp_f32:%12g exp:%12g got:%12g diff:%8g rdiff:%8g\n",
-            (long)l_offset, kind_str.c_str(), ind_str.c_str(), exp_f32, exp,
-            got, diff, rel_diff);
+            "[%4" PRId64
+            "]%s[%s] exp_f32:%12g exp:%12g got:%12g diff:%8g rdiff:%8g\n",
+            ctx.l_offset, kind_str.c_str(), ind_str.c_str(), ctx.exp_f32,
+            ctx.exp, ctx.got, ctx.diff, ctx.rel_diff);
 }
 
 void dump_norm_values(
@@ -139,9 +160,9 @@ compare_t::driver_check_func_args_t::driver_check_func_args_t(
         const dnnl_data_type_t data_type, const float trh)
     : dt(data_type)
     , idx(i)
-    , exp_f32(exp_mem.get_elem(idx))
+    , exp_f32(exp_mem.get_f32_elem(idx))
     , exp(round_to_nearest_representable(dt, exp_f32))
-    , got(got_f32.get_elem(idx))
+    , got(got_f32.get_f32_elem(idx))
     , diff(fabsf(exp - got))
     , rel_diff(diff / (fabsf(exp) > FLT_MIN ? fabsf(exp) : 1))
     , trh(trh) {}
@@ -177,10 +198,9 @@ int compare_t::compare_norm(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
         static thread_local diff_norm_t diff_norm_ithr;
         driver_check_func_args_t args(exp_mem, got_f32, i, dt, trh_);
 
-        if ((std::isnan(args.exp_f32) && is_integral_dt(dt))
-                || std::isinf(args.exp)) {
-            // Don't include integer max values or inf values into norm as they
-            // make it irrelevant for validation.
+        if ((std::isnan(args.exp_f32)) || std::isinf(args.exp)) {
+            // Don't include nan inf values into norm as they make it
+            // irrelevant for validation.
             ;
         } else if (is_cpu() && dt == dnnl_s32 && args.exp == max_dt(dnnl_s32)
                 && args.got >= BENCHDNN_S32_TO_F32_SAT_CONST
@@ -211,8 +231,9 @@ int compare_t::compare_norm(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     if (need_dump) {
         for (int64_t i = 0; i < nelems; ++i) {
             driver_check_func_args_t args(exp_mem, got_f32, i, dt, trh_);
-            dump_point_values(got_mem.md_, get_kind_str(), i, args.exp_f32,
-                    args.exp, args.got, args.diff, args.rel_diff);
+            dump_point_values(get_kind_str(),
+                    {got_mem.md_, i, args.exp_f32, args.exp, args.got,
+                            args.diff, args.rel_diff});
         }
     }
 
@@ -223,6 +244,12 @@ int compare_t::compare_norm(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     if (dump) dump_norm_values(diff_norm, get_kind_str());
 
     if (res->errors) res->state = FAILED;
+
+    // Status may be propagated from previous tensor. Use stats from cur tensor.
+    BENCHDNN_PRINT((res->errors ? 0 : 6),
+            "[COMPARE_STATS]%s: trh=%g (compare against [L2] rel_diff)\n",
+            get_kind_str().c_str(), trh_);
+
     if (res->state == EXECUTED) res->state = PASSED;
 
     return res->state == FAILED ? FAIL : OK;
@@ -240,8 +267,11 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
 
     dnn_mem_t got_f32(got_mem, dnnl_f32, tag::abx, get_cpu_engine());
     dnn_mem_t exp_f32_plain;
-    if (has_prim_ref_
-            && !check_md_consistency_with_tag(exp_mem.md_, tag::abx)) {
+    const bool is_prim_ref_dst_mem_f32_abx
+            = query_md_data_type(exp_mem.md_) == dnnl_f32
+            && IMPLICATION(has_prim_ref_,
+                    check_md_consistency_with_tag(exp_mem.md_, tag::abx));
+    if (!is_prim_ref_dst_mem_f32_abx) {
         exp_f32_plain
                 = dnn_mem_t(exp_mem, dnnl_f32, tag::abx, get_cpu_engine());
     }
@@ -250,10 +280,12 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     const auto dt = got_mem.dt();
     const bool has_eltwise
             = attr.post_ops.eltwise_index() != -1 || has_eltwise_post_op_;
+    const std::vector<dnnl_data_type_t> dt_with_nan {
+            dnnl_f16, dnnl_e8m0, dnnl_f8_e5m2, dnnl_f8_e4m3};
     const bool output_has_nans = op_output_has_nans_
             || eltwise::eltwise_alg_returns_nan_or_inf(attr)
-            || got_mem.dt() == dnnl_f16 || got_mem.dt() == dnnl_f8_e5m2
-            || got_mem.dt() == dnnl_f8_e4m3;
+            || std::any_of(dt_with_nan.begin(), dt_with_nan.end(),
+                    [&](dnnl_data_type_t dt) { return got_mem.dt() == dt; });
     const bool has_exp_eltwise
             = attr.post_ops.find(attr_t::post_ops_t::kind_t::EXP) >= 0;
     const bool has_dst_scale = !attr.scales.get(DNNL_ARG_DST).is_def();
@@ -267,7 +299,6 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     const auto nelems_pad = nelems_per_thread * nthreads;
 
     // These global metrics are updated at the synchronization point.
-    bool global_ok = true;
     int64_t zeros = 0;
     // "all_" stuff is across the whole tensor. "err_" stuff is just for points
     // that didn't pass any criteria.
@@ -275,32 +306,71 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     float all_max_diff = 0.f;
     float err_max_rdiff = 0.f;
     float err_max_diff = 0.f;
-    int64_t n_errors = 0;
-    volatile bool from_parallel = true;
     const bool need_dump = verbose >= 99;
+
+    // Make thread_data static so that acquiring the thread data can be
+    // performed in a static thread_local variable to minimize locking
+    static struct {
+        struct data_t {
+            int64_t n_errors;
+            std::vector<dump_point_ctx_t> dumps;
+        };
+
+        data_t &get() {
+            std::lock_guard<std::mutex> guard(m);
+            return data[std::this_thread::get_id()];
+        }
+        void reset() {
+            for (auto &d : data) {
+                d.second.n_errors = 0;
+                d.second.dumps.clear();
+            }
+        }
+
+        std::unordered_map<std::thread::id, data_t> data;
+        std::mutex m;
+    } thread_data;
+
+    // Clear data from previous runs for the static variable
+    thread_data.reset();
 
     const auto compare_point_values = [&](int64_t i) {
         // Skip padded (non-existent) elements.
         if (i >= nelems) return;
 
         // Stats for all validated points per one thread.
-        static thread_local bool ithr_ok = true;
         static thread_local int64_t ithr_zeros = 0;
         static thread_local float ithr_all_max_rdiff = 0.f;
         static thread_local float ithr_all_max_diff = 0.f;
         static thread_local float ithr_err_max_rdiff = 0.f;
         static thread_local float ithr_err_max_diff = 0.f;
 
-        driver_check_func_args_t args(exp_f32, got_f32, i, dt, trh_);
+        // This is valid because references to data are only invalidated by
+        // erasing that element, but it does require that thread_data is a
+        // static variable and the corresponding element isn't erased between
+        // calls to this function.
+        static thread_local auto &out_data = thread_data.get();
 
-        bool ok = args.diff == 0.f;
-        if (std::isnan(args.exp_f32) && is_integral_dt(dt)) {
-            // Relax output requirements for this case, since different backends
-            // may implement NaN fp32 -> int32 conversion in a different manner.
-            ok = true;
-        }
+        const auto got_val = got_f32.get_f32_elem(i);
+        bool ok = exp_f32.get_f32_elem(i) == got_val;
 
-        for (int z = 0; !ok && z < 1; z++) {
+        static thread_local driver_check_func_args_t args;
+        for (int z = ok; z < 1; z++) {
+            args = driver_check_func_args_t(exp_f32, got_f32, i, dt, trh_);
+
+            if (std::isnan(args.exp_f32) && is_integral_dt(dt)) {
+                // Relax output requirements for this case, since different
+                // backends may implement NaN fp32 -> int32 conversion in a
+                // different manner.
+                ok = true;
+                break;
+            }
+
+            // Discard tiny values very close to each other. It's impossible to
+            // compare them reliably and fit into any criterion.
+            ok = fabsf(args.exp) <= 1e-5f && args.diff < epsilon_dt(dnnl_f32);
+            if (ok) break;
+
             // Standard check for relative diff is under set threshold.
             ok = (fabsf(args.exp) > 1e-5f ? args.rel_diff : args.diff) <= trh_;
             if (ok) break;
@@ -308,13 +378,13 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
             // When NaNs or infinity are allowed for the driver, check
             // that both exp and got are NaNs or infinity with same sign.
             ok = output_has_nans
-                    && compare::compare_extreme_values(args.exp, args.got);
+                    && compare::compare_extreme_values(args.exp, got_val);
             if (ok) break;
 
             // Use hack to check not fully correct s32 saturation on CPU.
             ok = is_cpu() && dt == dnnl_s32 && args.exp == max_dt(dnnl_s32)
-                    && args.got >= BENCHDNN_S32_TO_F32_SAT_CONST
-                    && args.got < max_dt(dnnl_s32);
+                    && got_val >= BENCHDNN_S32_TO_F32_SAT_CONST
+                    && got_val < max_dt(dnnl_s32);
             if (ok) break;
 
             // Check driver's additional checks, if set.
@@ -328,9 +398,19 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
             // function). We rely on validation of pure eltwise and let some
             // big rdiff errors slip away hoping that absolute error is good
             // enough.
-            const float experimental_eltwise_trh
+            // Note: two scenarios covered:
+            // * When rdiff is bigger due to small output values but diff is
+            //   small due to single point computation or short acc chain.
+            // * When diff is no longer small due to longer acc chain, but rdiff
+            //   is still small but greater than 0.
+            const float experimental_eltwise_trh_diff
                     = std::max(epsilon_dt(dt), 2e-5f);
-            ok = has_eltwise && args.diff <= experimental_eltwise_trh;
+            const float experimental_eltwise_trh_rel_diff
+                    = std::max(epsilon_dt(dt), 8e-6f);
+            ok = has_eltwise
+                    && (args.diff <= experimental_eltwise_trh_diff
+                            || args.rel_diff
+                                    <= experimental_eltwise_trh_rel_diff);
             if (ok) break;
 
             // For eltwise it also may happen that threshold is really small,
@@ -367,12 +447,16 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
             //
             // Note: use specific dt and correspondent values not to mess with
             // broad set of supported data types.
-            float binary_comp_po_trh = 0.f;
-            if (args.dt == dnnl_f16)
-                binary_comp_po_trh = 5.f * epsilon_dt(args.dt); // == 5e-3;
-            if (args.dt == dnnl_f32)
-                binary_comp_po_trh = 20.f * epsilon_dt(args.dt); // == 2e-6f;
-            ok = has_binary_compute_po(attr) && args.diff <= binary_comp_po_trh;
+            float binary_comp_po_diff_trh = 0.f;
+            float binary_comp_po_rdiff_trh = 0.f;
+            if (args.dt == dnnl_f16) binary_comp_po_diff_trh = 5e-3f;
+            if (args.dt == dnnl_f32) {
+                binary_comp_po_diff_trh = 4e-6f;
+                binary_comp_po_rdiff_trh = 1e-5f;
+            }
+            ok = has_binary_compute_po(attr)
+                    && (args.diff <= binary_comp_po_diff_trh
+                            || args.rel_diff <= binary_comp_po_rdiff_trh);
             if (ok) break;
 
             // Some drivers (like pooling or resampling) on integer data types
@@ -384,7 +468,7 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
             // reference when transcendental operation present in the chain. In
             // such cases, there's no way to test original output as both
             // outputs would be rounded to integer number.
-            const auto is_int8_round_good = [args]() -> bool {
+            const auto is_int8_round_good = [&]() -> bool {
                 // Check that original value is close to x.5f.
                 static constexpr float small_eps = 9e-6f;
                 const float floor_val = floorf(args.exp_f32);
@@ -394,15 +478,15 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
 
                 // If it is, check exp and got values are on opposite sides.
                 if (args.exp == floor_val) {
-                    return args.got == ceil_val;
+                    return got_val == ceil_val;
                 } else if (args.exp == ceil_val) {
-                    return args.got == floor_val;
+                    return got_val == floor_val;
                 }
                 return false;
             };
             const auto is_int8_prim_ref_and_transcedental = [&]() -> bool {
                 if (!has_prim_ref_) return false;
-                if (fabsf(args.exp_f32 - args.got) != 1) return false;
+                if (fabsf(args.exp_f32 - got_val) != 1) return false;
                 // TODO: update with transcendental eltwise ops only.
                 return has_eltwise;
             };
@@ -422,39 +506,40 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
         }
 
         // Update compare stats.
-        if (from_parallel) {
-            if (fabsf(args.got) == 0) ithr_zeros++;
+        if (fabsf(got_val) == 0) ithr_zeros++;
+        if (args.rel_diff > 0)
             ithr_all_max_rdiff = MAX2(ithr_all_max_rdiff, args.rel_diff);
+        if (args.diff > 0)
             ithr_all_max_diff = MAX2(ithr_all_max_diff, args.diff);
-            if (!ok)
-                ithr_err_max_rdiff = MAX2(ithr_err_max_rdiff, args.rel_diff);
-            if (!ok) ithr_err_max_diff = MAX2(ithr_err_max_diff, args.diff);
+        if (!ok) ithr_err_max_rdiff = MAX2(ithr_err_max_rdiff, args.rel_diff);
+        if (!ok) ithr_err_max_diff = MAX2(ithr_err_max_diff, args.diff);
+
+        if (!ok) out_data.n_errors++;
+
+        const bool dump = need_dump
+                || (!ok && (out_data.n_errors <= 10 || verbose >= 10));
+        if (dump) {
+            // Need to initialize `args` in case they weren't.
+            if (args.dt == dnnl_data_type_undef)
+                args = driver_check_func_args_t(exp_f32, got_f32, i, dt, trh_);
+
+            out_data.dumps.emplace_back(got_mem.md_, i, args.exp_f32, args.exp,
+                    got_val, args.diff, args.rel_diff);
         }
 
-        if (!ok && ithr_ok) ithr_ok = false;
-        if (!ok && !from_parallel) n_errors++;
-
-        const bool dump
-                = need_dump || (!ok && (n_errors <= 10 || verbose >= 10));
-        if (!from_parallel && dump)
-            dump_point_values(got_mem.md_, get_kind_str(), i, args.exp_f32,
-                    args.exp, args.got, args.diff, args.rel_diff);
+        // Reset args for the next point if they were initialized.
+        if (args.dt != dnnl_data_type_undef) args = driver_check_func_args_t();
 
         // Synchronization point, update global stats from thread stats.
         if (((i + 1) % nelems_per_thread == 0) || (i == nelems - 1)) {
             static std::mutex m;
             std::lock_guard<std::mutex> guard(m);
 
-            if (global_ok && !ithr_ok) global_ok = false;
-            ithr_ok = true;
-
-            if (from_parallel) {
-                zeros += ithr_zeros;
-                all_max_rdiff = MAX2(all_max_rdiff, ithr_all_max_rdiff);
-                all_max_diff = MAX2(all_max_diff, ithr_all_max_diff);
-                err_max_rdiff = MAX2(err_max_rdiff, ithr_err_max_rdiff);
-                err_max_diff = MAX2(err_max_diff, ithr_err_max_diff);
-            }
+            zeros += ithr_zeros;
+            all_max_rdiff = MAX2(all_max_rdiff, ithr_all_max_rdiff);
+            all_max_diff = MAX2(all_max_diff, ithr_all_max_diff);
+            err_max_rdiff = MAX2(err_max_rdiff, ithr_err_max_rdiff);
+            err_max_diff = MAX2(err_max_diff, ithr_err_max_diff);
             ithr_zeros = 0;
             ithr_all_max_rdiff = 0.f;
             ithr_all_max_diff = 0.f;
@@ -469,11 +554,26 @@ int compare_t::compare_p2p(const dnn_mem_t &exp_mem, const dnn_mem_t &got_mem,
     // With this logic, the block of code below won't be needed.
     benchdnn_parallel_nd(nelems_pad, compare_point_values);
 
+    int64_t n_errors = 0;
+    for (auto &d : thread_data.data) {
+        n_errors += d.second.n_errors;
+    }
     // serial comparison with enabled dumping when needed for nicer output.
-    if (!global_ok || need_dump) {
-        from_parallel = false;
-        for (int64_t i = 0; i < nelems; ++i)
-            compare_point_values(i);
+    if (n_errors > 0 || need_dump) {
+        std::vector<dump_point_ctx_t> dumps;
+        for (auto &d : thread_data.data) {
+            dumps.insert(
+                    dumps.end(), d.second.dumps.begin(), d.second.dumps.end());
+        }
+        std::sort(dumps.begin(), dumps.end(),
+                [](const dump_point_ctx_t &a, const dump_point_ctx_t &b) {
+                    return a.l_offset < b.l_offset;
+                });
+        size_t max_dump_size
+                = (verbose >= 10 || dumps.size() < 10) ? dumps.size() : 10;
+        for (size_t i = 0; i < max_dump_size; i++) {
+            dump_point_values(get_kind_str(), dumps[i]);
+        }
     }
 
     // Set state to FAILED in case of any errors.

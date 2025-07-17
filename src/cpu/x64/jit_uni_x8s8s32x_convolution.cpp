@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -44,15 +44,17 @@ const float *jit_uni_x8s8s32x_convolution_fwd_t<isa>::adjust_oscales(
         const memory_tracking::grantor_t &scratchpad, const float *src_scales,
         const float *wei_scales) const {
     auto loc_scales = scratchpad.template get<float>(key_conv_adjusted_scales);
-    int wei_mask = pd()->attr()->scales_.get(DNNL_ARG_WEIGHTS).mask_;
+    const bool has_wei_scales
+            = !pd()->attr()->scales_.has_default_values(DNNL_ARG_WEIGHTS);
+    const int wei_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     float factor = (pd()->jcp_.signed_input && (!pd()->jcp_.has_vnni))
             ? 1.f / pd()->jcp_.wei_adj_scale
-            : 1.0f;
-    if (wei_mask == 0) {
-        utils::array_set(loc_scales, src_scales[0] * wei_scales[0] * factor, 8);
-    } else {
+            : 1.f;
+    if (has_wei_scales && wei_mask > 0) {
         for (dim_t c = 0; c < pd()->OC(); c++)
             loc_scales[c] = src_scales[0] * wei_scales[c] * factor;
+    } else {
+        utils::array_set(loc_scales, src_scales[0] * wei_scales[0] * factor, 8);
     }
     return loc_scales;
 }
@@ -109,7 +111,7 @@ status_t jit_uni_x8s8s32x_convolution_fwd_t<isa>::execute_forward_2d(
         int start {0}, end {0};
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
 
         size_t src_h_stride = src_d.blk_off(0, 0, 1);
         size_t dst_h_stride = dst_d.blk_off(0, 0, 1);
@@ -280,7 +282,7 @@ status_t jit_uni_x8s8s32x_convolution_fwd_t<isa>::execute_forward_1d(
         int start {0}, end {0};
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
 
         int n {0}, gg {0}, occ {0}, owb {0};
         switch (jcp.loop_order) {
@@ -410,7 +412,7 @@ status_t jit_uni_x8s8s32x_convolution_fwd_t<isa>::execute_forward_2d_dw(
 
     parallel_nd(jcp.mb, jcp.oh, jcp.nb_ow, nb_groups,
             [&](dim_t n, dim_t oh_s, dim_t owb, dim_t gg) {
-                auto p = jit_conv_call_s();
+                auto p = jit_conv_args_t();
 
                 size_t src_h_stride = src_d.blk_off(0, 0, 1);
                 size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
@@ -529,7 +531,7 @@ status_t jit_uni_x8s8s32x_convolution_fwd_t<isa>::execute_forward_3d(
         int start {0}, end {0};
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
 
         size_t src_d_stride = src_d.blk_off(0, 0, 1);
         size_t src_h_stride = src_d.blk_off(0, 0, 0, 1);

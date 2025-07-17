@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2024 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,25 +39,41 @@ enum {
     undefined,
 };
 
-impl::data_type_t get_accum_datatype(brgemm_t *brg) {
+impl::data_type_t get_accum_datatype(brgemm_desc_t *brg) {
     // this assert should check if 'init_kernel_datatype()' was previously
     // called.
-    assert(brg->is_int8 || brg->is_bf16 || brg->is_f32 || brg->is_f16);
+    assert(brg->is_int8 || brg->is_bf16 || brg->is_f32 || brg->is_f16
+            || brg->is_fp8);
     return brg->is_int8 ? data_type::s32 : data_type::f32;
 }
 
-void init_kernel_datatype(
-        brgemm_t *brg, impl::data_type_t dt_a, impl::data_type_t dt_b) {
-    assert(dt_a != data_type::undef && dt_b != data_type::undef);
+status_t init_kernel_datatype(
+        brgemm_desc_t *brg, impl::data_type_t dt_a, impl::data_type_t dt_b) {
+    if (utils::one_of(data_type::undef, dt_a, dt_b)) {
+        assert(!"Unsupported data type");
+        return status::unimplemented;
+    }
+
     brg->is_int8 = utils::one_of(dt_a, data_type::u8, data_type::s8)
             && utils::one_of(dt_b, data_type::u8, data_type::s8);
     brg->is_bf16 = (dt_a == data_type::bf16) && (dt_b == data_type::bf16);
-    brg->is_f32 = (dt_a == data_type::f32) && (dt_b == data_type::f32);
-    brg->is_f16 = utils::one_of(data_type::f16, dt_a, dt_b);
-    assert(brg->is_int8 || brg->is_bf16 || brg->is_f32 || brg->is_f16);
+    // Note: f32:bf16 is treated as f32 case while f32:f16 has already been
+    // treated as f16. Probably, need a common ground here.
+    brg->is_f32 = (dt_a == data_type::f32)
+            && utils::one_of(
+                    dt_b, data_type::f32, data_type::bf16, data_type::f16);
+    brg->is_f16 = utils::one_of(data_type::f16, dt_a, dt_b) && !brg->is_f32;
+    brg->is_fp8 = one_of(dt_a, data_type::f8_e5m2, data_type::f8_e4m3)
+            && one_of(dt_b, data_type::f8_e5m2, data_type::f8_e4m3);
+    if (utils::everyone_is(false, brg->is_int8, brg->is_bf16, brg->is_f32,
+                brg->is_f16, brg->is_fp8)) {
+        assert(!"Unsupported data type");
+        return status::unimplemented;
+    }
+    return status::success;
 }
 
-void init_common_conf(brgemm_t *brg, brgemm_batch_kind_t type, float alpha,
+void init_common_conf(brgemm_desc_t *brg, brgemm_batch_kind_t type, float alpha,
         float beta, const brgemm_strides_t *strides) {
     brg->beta = beta;
     brg->alpha = alpha;
@@ -80,7 +96,7 @@ void init_common_conf(brgemm_t *brg, brgemm_batch_kind_t type, float alpha,
 
 namespace brgemm_utils {
 
-bool can_dispatch_uker(const brgemm_t *brg) {
+bool can_dispatch_uker(const brgemm_desc_t *brg) {
     return brg->is_tmm
             && one_of(brg->type, brgemm_addr, brgemm_offs, brgemm_static_offs)
             && brg->brgattr.use_uker
@@ -88,7 +104,7 @@ bool can_dispatch_uker(const brgemm_t *brg) {
                     brg->is_runtime_ldc, brg->is_runtime_ldd);
 }
 
-void maybe_try_bf32(brgemm_t *brg) {
+void maybe_try_bf32(brgemm_desc_t *brg) {
     const bool try_bf32 = brg->is_f32
             && one_of(brg->brgattr.fpmath_mode, fpmath_mode::bf16,
                     fpmath_mode::any)
@@ -107,7 +123,7 @@ void maybe_try_bf32(brgemm_t *brg) {
     }
 }
 
-void set_isa_impl(brgemm_t *brg) {
+void set_isa_impl(brgemm_desc_t *brg) {
     auto is_isa_ok = [&](cpu_isa_t isa) {
         return mayiuse(isa) &&
                 // maybe IMPLICATION(brg->isa_user != isa_undef,
@@ -115,7 +131,9 @@ void set_isa_impl(brgemm_t *brg) {
                 one_of(brg->isa_user, isa_undef, isa);
     };
 
-    if (brg->is_bf32) {
+    if (brg->is_tf32) {
+        brg->isa_impl = avx10_2_512_amx_2;
+    } else if (brg->is_bf32) {
         brg->isa_impl = avx512_core_amx;
     } else if (brg->is_f32) {
         brg->isa_impl = utils::map(true, isa_undef,
@@ -127,37 +145,65 @@ void set_isa_impl(brgemm_t *brg) {
                 is_isa_ok(avx512_core_fp16), avx512_core_fp16, is_isa_ok(avx2),
                 avx2);
     } else if (brg->is_bf16) {
-        brg->isa_impl = utils::map(true, isa_undef, is_isa_ok(avx512_core_amx),
-                avx512_core_amx, is_isa_ok(avx512_core_bf16), avx512_core_bf16,
-                is_isa_ok(avx2_vnni_2), avx2_vnni_2);
+        if (brg->dt_a == data_type::f32 && brg->dt_b == data_type::bf16) {
+            // Distinguish f32:bf16 case upconversion for bf16 on AVX512_CORE
+            // and AVX2.
+            brg->isa_impl = utils::map(true, isa_undef,
+                    is_isa_ok(avx512_core_amx), avx512_core_amx,
+                    is_isa_ok(avx512_core_bf16), avx512_core_bf16,
+                    is_isa_ok(avx512_core), avx512_core, is_isa_ok(avx2_vnni_2),
+                    avx2_vnni_2, is_isa_ok(avx2), avx2);
+        } else {
+            brg->isa_impl = utils::map(true, isa_undef,
+                    is_isa_ok(avx512_core_amx), avx512_core_amx,
+                    is_isa_ok(avx512_core_bf16), avx512_core_bf16,
+                    is_isa_ok(avx2_vnni_2), avx2_vnni_2);
+        }
     } else if (brg->is_f16) {
         if (everyone_is(data_type::f16, brg->dt_a, brg->dt_b)) {
+            brg->isa_impl = utils::map(true, isa_undef, is_isa_ok(avx10_2_512),
+                    avx10_2_512, is_isa_ok(avx512_core_amx_fp16),
+                    avx512_core_amx_fp16, is_isa_ok(avx512_core_fp16),
+                    avx512_core_fp16, is_isa_ok(avx2_vnni_2), avx2_vnni_2);
+        } else if (brg->dt_a == data_type::f32 && brg->dt_b == data_type::f16) {
+            // Distinguish f32:f16 case upconversion for f16 on AVX512_CORE and
+            // AVX2.
             brg->isa_impl = utils::map(true, isa_undef,
-                    is_isa_ok(avx512_core_amx_fp16), avx512_core_amx_fp16,
                     is_isa_ok(avx512_core_fp16), avx512_core_fp16,
-                    is_isa_ok(avx2_vnni_2), avx2_vnni_2);
+                    is_isa_ok(avx512_core), avx512_core, is_isa_ok(avx2), avx2);
         } else {
             brg->isa_impl = utils::map(true, isa_undef,
                     is_isa_ok(avx512_core_fp16), avx512_core_fp16);
         }
     } else if (brg->is_int8) {
-        brg->isa_impl = utils::map(true, isa_undef, is_isa_ok(avx512_core_amx),
-                avx512_core_amx, is_isa_ok(avx512_core_vnni), avx512_core_vnni,
-                is_isa_ok(avx512_core), avx512_core, is_isa_ok(avx2_vnni_2),
-                avx2_vnni_2, is_isa_ok(avx2_vnni), avx2_vnni);
+        brg->isa_impl
+                = utils::map(true, isa_undef, is_isa_ok(avx10_2_512_amx_2),
+                        avx10_2_512_amx_2, is_isa_ok(avx512_core_amx_fp16),
+                        avx512_core_amx_fp16, is_isa_ok(avx512_core_amx),
+                        avx512_core_amx, is_isa_ok(avx10_2_512), avx10_2_512,
+                        is_isa_ok(avx512_core_fp16), avx512_core_fp16,
+                        is_isa_ok(avx512_core_vnni), avx512_core_vnni,
+                        is_isa_ok(avx512_core), avx512_core,
+                        is_isa_ok(avx2_vnni_2), avx2_vnni_2,
+                        is_isa_ok(avx2_vnni), avx2_vnni, is_isa_ok(avx2), avx2);
+    } else if (brg->is_fp8) {
+        brg->isa_impl = utils::map(true, isa_undef,
+                is_isa_ok(avx10_2_512_amx_2), avx10_2_512_amx_2,
+                is_isa_ok(avx10_1_512_amx_fp16), avx10_1_512_amx_fp16,
+                is_isa_ok(avx10_2_512), avx10_2_512);
     }
 }
 
-void set_brg_vmm(brgemm_t *brg) {
+void set_brg_vmm(brgemm_desc_t *brg) {
     brg->is_tmm = brg->is_int8_tmm || brg->is_bf16_tmm || brg->is_f16_tmm
-            || brg->is_bf32;
+            || brg->is_bf32 || brg->is_fp8_tmm || brg->is_tf32;
     brg->is_zmm = !brg->is_tmm && mayiuse(avx512_core)
             && is_superset(brg->isa_impl, avx512_core);
     brg->is_ymm
             = !brg->is_zmm && mayiuse(avx2) && is_superset(brg->isa_impl, avx2);
 }
 
-int calculate_ldb_params(brgemm_t *brg, const int try_ld_block2) {
+int calculate_ldb_params(brgemm_desc_t *brg, const int try_ld_block2) {
     brg->ld_block2 = try_ld_block2;
     brg->ldb2 = brg->ldb / brg->ld_block2;
     brg->ldb2_tail = brg->ldb % brg->ld_block2;
@@ -173,271 +219,243 @@ int calculate_ldb_params(brgemm_t *brg, const int try_ld_block2) {
     return nstl::max(1, adj_ld_block2);
 }
 
-int calculate_max_bcast_block(brgemm_t *brg, const int adj_ld_block2) {
+int calculate_max_bcast_block(brgemm_desc_t *brg, const int adj_ld_block2) {
 
-    constexpr int max_bcst_regs = 1;
-    const bool req_compensation = brg->req_s8s8_compensation
-            || brg->zp_type_a != brgemm_broadcast_t::none;
+    // TODO: Calculating the number of available registers should be re-factored
+    // to use one code here and in brgemm kernel generator on
+    // "max_effective_vregs" calculation
+    int max_isa_regs = isa_num_vregs(brg->isa_impl);
+    const int max_bcst_regs = brg->n_bcast_1_load ? 0 : 1;
+    const int load_regs = brg->n_bcast_1_load ? 1 : adj_ld_block2;
     const bool req_zp_a_comp_pads
             = (brg->req_cal_comp_pads || brg->brgattr.max_top_vpad > 0
                       || brg->brgattr.max_bottom_vpad > 0)
             && brg->zp_type_a != brgemm_broadcast_t::none;
+
+    // --------------  whole kernel --------------
+    // To support the f16 vnni B matrix on non-AMX we need to use two Vmm
+    // registers for permutation in brgemm kernel:
+    // see f16_perm_even_vreg_ and f16_perm_odd_vreg_ in brgemm kernel
+    const int b_vnni_regs = brg->is_f16_b_non_amx_vnni() ? 2 : 0;
+
+    // non-VNNI INT8 dot product required 2 temp vectors:
+    // see int8_ones_words() and int8_dot_product_temp() in brgemm kernel
+    const int non_int8_vnni_regs
+            = (brg->is_int8 && !brg->has_int8_vnni) ? 2 : 0;
+
+    // non-AMX fp8 via conversion requires five registers
+    // to convert fp8 to f16 vnni before dot product
+    // see vmm_fp8_emu_aux* in brgemm kernel
+    const int fp8_emu_regs = brg->is_fp8_via_convert_non_amx() ? 5 : 0;
+
+    max_isa_regs -= b_vnni_regs + non_int8_vnni_regs + fp8_emu_regs;
+
+    // --------------- microkernel ---------------
+    // see vmm_inp_shift() in brgemm kernel
+    const int compensation_regs = brg->req_s8s8_compensation
+                    || brg->zp_type_a != brgemm_broadcast_t::none
+            ? 1
+            : 0;
+
+    // see vmm_zp_a_shift(), vmm_one_bytes() in brgemm kernel
+    const int zp_a_comp_pads_regs = req_zp_a_comp_pads ? 2 : 0;
+
+    const int microkernel_regs = zp_a_comp_pads_regs + compensation_regs;
+
+    const auto microkernel_max_reg_count
+            = max_isa_regs - microkernel_regs - load_regs - max_bcst_regs;
+
+    auto microkernel_max_bcast_block
+            = microkernel_max_reg_count / (adj_ld_block2 + brg->n_bcast_1_load);
+
+    // ----- post-ops and store accumulators -----
     const int beta_regs = !one_of(brg->beta, 1.f, 0.f);
 
-    const int max_isa_regs = isa_num_vregs(brg->isa_impl);
-    // note: the 'adj_ld_block2' already removes the necessary registers
-    // for 'embd_bcst'
-    auto max_reg_count = max_isa_regs - max_bcst_regs - beta_regs
-            - req_compensation - req_zp_a_comp_pads;
-    if (req_zp_a_comp_pads)
-        max_reg_count
-                = nstl::min(max_reg_count, max_isa_regs - max_bcst_regs - 5);
+    const int postops_regs = brg->attr()
+            ? injector::aux_vec_count(
+                    brg->attr()->post_ops_, brg->isa_impl, true)
+            : 0;
 
-    int max_bcast_block = max_reg_count - adj_ld_block2;
+    // Emulators: fp8 emulation are supported for amx only
+    // In theory, vmm bf16_emu register indices overlap with other vmm
+    // registers related to 'max_bcast_block'
+    assert(IMPLICATION(
+            brg->is_bf16_emu, is_superset(brg->isa_impl, avx512_core)));
+    const int bf16_emu_regs = brg->is_bf16_emu ? 4 : 0;
 
-    if (brg->is_bf16_emu) {
-        // in theory, vmm bf16_emu register indices overlap with other vmm
-        // registers related to 'max_bcast_block'
-        assert(is_superset(brg->isa_impl, avx512_core));
-        constexpr int bf16_emu_reg_count = 28;
-        max_bcast_block = nstl::min(max_bcast_block, bf16_emu_reg_count);
-    }
+    const auto store_regs = nstl::max(beta_regs,
+            nstl::max(
+                    postops_regs, nstl::max(compensation_regs, bf16_emu_regs)));
 
-    // non-VNNI INT8 dot product required 2 temp vectors
-    if (brg->is_int8 && !brg->has_int8_vnni) max_bcast_block -= 2;
+    const auto store_max_reg_count = max_isa_regs - store_regs;
 
-    max_bcast_block /= adj_ld_block2;
+    auto store_max_bcast_block = store_max_reg_count / adj_ld_block2;
+
+    // ------------ final calculation ------------
+    const auto max_bcast_block
+            = nstl::min(microkernel_max_bcast_block, store_max_bcast_block);
 
     return max_bcast_block;
 }
 
-status_t brgemm_blocking(brgemm_t *brg) {
+status_t brgemm_blocking_tmm(brgemm_desc_t *brg) {
+    const auto L1 = platform::get_per_core_cache_size(1);
 
-    set_isa_impl(brg);
-    if (brg->isa_impl == isa_undef) return status::unimplemented;
-    assert(!brg->is_dgmm); // should not be called from brdgmm
-    if (brg->is_dgmm) return status::unimplemented;
-    set_brg_vmm(brg);
-    if (!(brg->is_tmm || brg->is_zmm || brg->is_ymm))
-        return status::unimplemented;
+    // Blocking configuration for AMX
+    const auto BD = brg->bcast_dim;
+    const auto BD_R16 = rnd_up(BD, 16);
+    const auto LD = brg->load_dim;
+    const auto LD_R16 = rnd_up(LD, 16);
 
-    if (!brg->is_tmm) {
-        const int simd_w = is_superset(brg->isa_impl, avx512_core) ? 16 : 8;
-        brg->ld_block = simd_w;
-        brg->ldb = brg->load_dim / brg->ld_block;
-        brg->ldb_tail = brg->load_dim % brg->ld_block;
+    const int max_width = 16, min_width = 1;
+    brg->ld_block = 16;
+    brg->ldb = LD / brg->ld_block;
+    brg->ldb_tail = LD % brg->ld_block;
 
-        int adj_ld_block2 = calculate_ldb_params(brg, 4);
-        int max_bcast_block = calculate_max_bcast_block(brg, adj_ld_block2);
-
-        // reduce 'ld_block2' to allow a larger 'bd_block'
-        const int max_vpad = nstl::max(
-                brg->brgattr.max_top_vpad, brg->brgattr.max_bottom_vpad);
-        if (is_superset(brg->isa_impl, avx2) && max_bcast_block < max_vpad) {
-            adj_ld_block2 = calculate_ldb_params(brg, 2);
-            max_bcast_block = calculate_max_bcast_block(brg, adj_ld_block2);
+    auto find_bdb_bd_mask = [&](int bd_block, int &bdb, int &bdb_tail) {
+        if (brg->brgattr.bd_mask_level != 2 || BD == 0) {
+            bdb = div_up(BD, bd_block);
+            bdb_tail = BD % bd_block;
+            return;
         }
 
-        const int min_block = 1;
-        float best_bd_block_eff = 0.f;
-        brg->bd_block = 1;
-        for (int bd_block = max_bcast_block; bd_block >= min_block;
-                bd_block--) {
-            const auto bd_block_disb = static_cast<float>(brg->bcast_dim)
-                    / rnd_up(brg->bcast_dim, bd_block);
-            const auto brgemm_microkernel_eff
-                    = (static_cast<float>(adj_ld_block2) * bd_block)
-                    / (((adj_ld_block2) + bd_block) * max_bcast_block);
-            const auto bd_block_eff = bd_block_disb * brgemm_microkernel_eff;
-
-            float block_foot_print = static_cast<float>(brg->typesize_A)
-                    * (bd_block * brg->reduce_dim);
-            if (block_foot_print <= static_cast<float>(
-                        platform::get_per_core_cache_size(1))
-                    && (bd_block_eff > best_bd_block_eff)) {
-                brg->bd_block = bd_block;
-                best_bd_block_eff = bd_block_eff;
-            }
-        }
-        brg->bdb = brg->bcast_dim / brg->bd_block;
-        brg->bdb_tail = brg->bcast_dim % brg->bd_block;
-
-        const int rd_unroll = 4;
-        const int vnni_granularity
-                = (brg->is_f16 && brg->isa_impl == avx512_core_fp16)
-                ? 1
-                : data_type_vnni_granularity(brg->dt_a);
-        brg->rd_block = rd_unroll * vnni_granularity;
-        brg->rdb = brg->reduce_dim / brg->rd_block;
-        brg->rdb_tail = brg->reduce_dim % brg->rd_block;
-
-        brg->is_M_tail = false;
-    } else {
-        // Blocking configuration for AMX
-        const int max_width = 16, min_width = 1;
-        brg->ld_block = 16;
-        brg->ldb = brg->load_dim / brg->ld_block;
-        brg->ldb_tail = brg->load_dim % brg->ld_block;
-
-        auto find_bdb_bd_mask = [&](int bd_block, int &bdb, int &bdb_tail) {
-            if (brg->brgattr.bd_mask_level != 2 || brg->bcast_dim == 0) {
-                bdb = div_up(brg->bcast_dim, bd_block);
-                bdb_tail = brg->bcast_dim % bd_block;
-                return;
-            }
-
-            bdb = 0;
-            bdb_tail = 0;
-            for (int i = 0; i < brg->bcast_dim;) {
-                if (brg->brgattr.bd_mask_level == 2
-                        && brg->brgattr.bd_mask[i] == 0) {
-                    i++;
-                } else {
-                    i += bd_block;
-                    if (i > brg->bcast_dim) {
-                        bdb_tail = brg->bcast_dim - i + bd_block;
-                        if (brg->brgattr.use_uker) bdb++;
-                    } else
-                        bdb++;
-                }
-            }
-        };
-
-        auto find_bd_block_for_bd_mask = [&]() {
-            if (brg->brgattr.bd_mask_level != 2 || brg->bcast_dim == 0)
-                return false;
-
-            auto min_bdb = INT_MAX;
-            const auto start_bd_block = nstl::min(max_width, brg->bcast_dim);
-            auto best_bd_block = start_bd_block;
-            for (auto bd_block = start_bd_block; bd_block > 0; bd_block--) {
-                int bdb = 0;
-                int bdb_tail = 0;
-                find_bdb_bd_mask(bd_block, bdb, bdb_tail);
-                // bcast_dim should be divided by bd_block
-                if (bdb < min_bdb && bdb_tail == 0) {
-                    min_bdb = bdb;
-                    best_bd_block = bd_block;
-                }
-            }
-            brg->bd_block = best_bd_block;
-            brg->bdb_tail = 0;
-            brg->bdb = min_bdb;
-            return true;
-        };
-
-        auto set_decomposition_by_ld = [&]() {
-            if (brg->bd_block2 == 1 && brg->ldb > 0 && brg->ldb_tail == 0) {
-                if (brg->ldb % 3 == 0)
-                    brg->ld_block2 = 3;
-                else if (brg->ldb % 2 == 0)
-                    brg->ld_block2 = 2;
-                else
-                    brg->ld_block2 = 1;
+        bdb = 0;
+        bdb_tail = 0;
+        for (int i = 0; i < BD;) {
+            if (brg->brgattr.bd_mask_level == 2
+                    && brg->brgattr.bd_mask[i] == 0) {
+                i++;
             } else {
-                brg->ld_block2
-                        = (brg->ldb > 0 && brg->ldb % 2 == 0
-                                  && brg->ldb_tail == 0 && brg->bd_block2 < 3)
-                        ? 2
-                        : 1;
+                i += bd_block;
+                if (i > BD) {
+                    bdb_tail = BD - i + bd_block;
+                    if (brg->brgattr.use_uker) bdb++;
+                } else
+                    bdb++;
             }
-            brg->ldb2 = brg->ldb / brg->ld_block2;
-            brg->ldb2_tail = brg->ldb % brg->ld_block2;
+        }
+    };
 
-            // Re-adjust the bd_block2 if possible
-            if (brg->ld_block2 == 1 && !brg->is_M_tail && brg->ldb_tail == 0) {
-                brg->bd_block2 = (brg->bdb >= 3) ? 3 : (brg->bdb >= 2) ? 2 : 1;
-                brg->bdb2 = brg->bdb / brg->bd_block2;
-                brg->bdb2_tail = (brg->bd_block2 == 1)
-                        ? brg->bdb
-                        : brg->bdb % brg->bd_block2;
+    auto find_bd_block_for_bd_mask = [&]() {
+        if (brg->brgattr.bd_mask_level != 2 || BD == 0) return false;
+
+        auto min_bdb = INT_MAX;
+        const auto start_bd_block = nstl::min(max_width, BD);
+        auto best_bd_block = start_bd_block;
+        for (auto bd_block = start_bd_block; bd_block > 0; bd_block--) {
+            int bdb = 0;
+            int bdb_tail = 0;
+            find_bdb_bd_mask(bd_block, bdb, bdb_tail);
+            // bcast_dim should be divided by bd_block
+            if (bdb < min_bdb && bdb_tail == 0) {
+                min_bdb = bdb;
+                best_bd_block = bd_block;
             }
-        };
+        }
+        brg->bd_block = best_bd_block;
+        brg->bdb_tail = 0;
+        brg->bdb = min_bdb;
+        return true;
+    };
 
-        auto try_3x1_decomposition = [&](int width_step) {
-            brg->is_M_tail = false;
-            if (brg->bcast_dim > (width_step - 1) * max_width
-                    && brg->bcast_dim < width_step * max_width
-                    && brg->ldb_tail == 0) {
-                if (!find_bd_block_for_bd_mask()) {
-                    brg->bd_block = max_width;
-                    brg->bdb = div_up(brg->bcast_dim, brg->bd_block);
-                    brg->bdb_tail = brg->bcast_dim % brg->bd_block;
-                    brg->is_M_tail = true;
-                }
-                brg->bd_block2 = width_step;
-                brg->bdb2 = brg->bdb / brg->bd_block2;
-                brg->bdb2_tail = brg->bdb % brg->bd_block2;
-                set_decomposition_by_ld();
-                return true;
-            }
-            return false;
-        };
+    auto set_decomposition_by_ld = [&]() {
+        if (brg->bd_block2 == 1 && brg->ldb > 0 && brg->ldb_tail == 0) {
+            if (brg->ldb % 3 == 0)
+                brg->ld_block2 = 3;
+            else if (brg->ldb % 2 == 0)
+                brg->ld_block2 = 2;
+            else
+                brg->ld_block2 = 1;
+        } else {
+            brg->ld_block2
+                    = (brg->ldb > 0 && brg->ldb % 2 == 0 && brg->ldb_tail == 0
+                              && brg->bd_block2 < 3)
+                    ? 2
+                    : 1;
+        }
+        brg->ldb2 = brg->ldb / brg->ld_block2;
+        brg->ldb2_tail = brg->ldb % brg->ld_block2;
 
-        auto try_2x2_decomposition = [&]() {
-            if (!find_bd_block_for_bd_mask()) {
-                for (int m_block = max_width; m_block >= min_width; m_block--) {
-                    if (brg->bcast_dim % m_block == 0) {
-                        brg->bd_block = m_block;
-                        break;
-                    }
-                }
-                if (brg->bd_block == 1) {
-                    brg->bd_block = nstl::min(max_width, brg->bcast_dim);
-                    brg->bdb_tail = brg->bcast_dim % max_width;
-                    for (int i = max_width; i >= min_width; i--) {
-                        const auto i_tail = brg->bcast_dim % i;
-                        if (i_tail > brg->bdb_tail || i_tail == 0) {
-                            brg->bd_block = i;
-                            brg->bdb_tail = i_tail;
-                            if (i_tail == 0) break;
-                        }
-                    }
-                }
-                brg->bdb = brg->bcast_dim / brg->bd_block;
-                brg->bdb_tail = brg->bcast_dim % brg->bd_block;
-            }
-
-            brg->bd_block2 = (brg->bdb >= 2) ? 2 : 1;
+        // Re-adjust the bd_block2 if possible
+        if (brg->ld_block2 == 1 && !brg->is_M_tail && brg->ldb_tail == 0) {
+            brg->bd_block2 = (brg->bdb >= 3) ? 3 : (brg->bdb >= 2) ? 2 : 1;
             brg->bdb2 = brg->bdb / brg->bd_block2;
             brg->bdb2_tail = (brg->bd_block2 == 1) ? brg->bdb
                                                    : brg->bdb % brg->bd_block2;
-
-            brg->is_M_tail = false;
-
-            set_decomposition_by_ld();
-
-            return !(brg->ld_block2 == 1 || brg->bd_block2 == 1
-                    || brg->bd_block < 8);
-        };
-
-        bool is_decomposition_defined = false;
-        for (int i = decomposition_2x2; i != undefined; i++) {
-            switch (i) {
-                case decomposition_2x2:
-                    is_decomposition_defined = try_2x2_decomposition();
-                    break;
-                case decomposition_3x1_3:
-                    is_decomposition_defined = try_3x1_decomposition(3);
-                    break;
-                case decomposition_3x1_2:
-                    is_decomposition_defined = try_3x1_decomposition(2);
-                    break;
-                default: assert(!"invalid value"); break;
-            };
-            if (is_decomposition_defined) break;
         }
-        if (!is_decomposition_defined) try_2x2_decomposition();
+    };
 
-        auto recalc_bd_block = [&](int new_bd_block) {
-            if (new_bd_block == 0) return;
+    auto try_3x1_decomposition = [&](int width_step) {
+        brg->is_M_tail = false;
+        if (BD > (width_step - 1) * max_width && BD < width_step * max_width
+                && brg->ldb_tail == 0) {
+            if (!find_bd_block_for_bd_mask()) {
+                brg->bd_block = max_width;
+                brg->bdb = div_up(BD, brg->bd_block);
+                brg->bdb_tail = BD % brg->bd_block;
+                brg->is_M_tail = true;
+            }
+            brg->bd_block2 = width_step;
+            brg->bdb2 = brg->bdb / brg->bd_block2;
+            brg->bdb2_tail = brg->bdb % brg->bd_block2;
+            set_decomposition_by_ld();
+            return true;
+        }
+        return false;
+    };
+
+    auto try_2x2_decomposition = [&]() {
+        if (!find_bd_block_for_bd_mask()) {
+            for (int m_block = max_width; m_block >= min_width; m_block--) {
+                if (BD % m_block == 0) {
+                    brg->bd_block = m_block;
+                    break;
+                }
+            }
+            if (brg->bd_block == 1) {
+                brg->bd_block = nstl::min(max_width, BD);
+                brg->bdb_tail = BD % max_width;
+                for (int i = max_width; i >= min_width; i--) {
+                    const auto i_tail = BD % i;
+                    if (i_tail > brg->bdb_tail || i_tail == 0) {
+                        brg->bd_block = i;
+                        brg->bdb_tail = i_tail;
+                        if (i_tail == 0) break;
+                    }
+                }
+            }
+            brg->bdb = BD / brg->bd_block;
+            brg->bdb_tail = BD % brg->bd_block;
+        }
+
+        brg->bd_block2 = (brg->bdb >= 2) ? 2 : 1;
+        brg->bdb2 = brg->bdb / brg->bd_block2;
+        brg->bdb2_tail
+                = (brg->bd_block2 == 1) ? brg->bdb : brg->bdb % brg->bd_block2;
+
+        brg->is_M_tail = false;
+
+        set_decomposition_by_ld();
+
+        return !(brg->ld_block2 == 1 || brg->bd_block2 == 1
+                || brg->bd_block < 8);
+    };
+
+    auto recalc_blocking = [&](int new_bd_block, int new_ld_block,
+                                   int new_bd_block2, int new_ld_block2) {
+        if (new_bd_block != 0) {
             brg->bd_block = new_bd_block;
             find_bdb_bd_mask(brg->bd_block, brg->bdb, brg->bdb_tail);
             brg->is_M_tail = (brg->bdb_tail != 0);
-        };
+        }
 
-        auto recalc_bd_block2 = [&](int new_bd_block2) {
-            if (new_bd_block2 == 0) return;
+        if (new_ld_block != 0) {
+            brg->ld_block = new_ld_block;
+            brg->ldb = div_up(LD, brg->ld_block);
+            brg->ldb_tail = LD % brg->ld_block;
+        }
+
+        if (new_bd_block2 != 0) {
             brg->bd_block2 = new_bd_block2;
             if (can_dispatch_uker(brg)) {
                 brg->bdb2 = div_up(brg->bdb, brg->bd_block2);
@@ -448,17 +466,9 @@ status_t brgemm_blocking(brgemm_t *brg) {
                 brg->bdb2 = full_bd_blocks / brg->bd_block2;
                 brg->bdb2_tail = full_bd_blocks % brg->bd_block2;
             }
-        };
+        }
 
-        auto recalc_ld_block = [&](int new_ld_block) {
-            if (new_ld_block == 0) return;
-            brg->ld_block = new_ld_block;
-            brg->ldb = div_up(brg->load_dim, brg->ld_block);
-            brg->ldb_tail = brg->load_dim % brg->ld_block;
-        };
-
-        auto recalc_ld_block2 = [&](int new_ld_block2) {
-            if (new_ld_block2 == 0) return;
+        if (new_ld_block2 != 0) {
             brg->ld_block2 = new_ld_block2;
             if (can_dispatch_uker(brg)) {
                 brg->ldb2 = div_up(brg->ldb, brg->ld_block2);
@@ -469,218 +479,184 @@ status_t brgemm_blocking(brgemm_t *brg) {
                 brg->ldb2 = full_ld_blocks / brg->ld_block2;
                 brg->ldb2_tail = full_ld_blocks % brg->ld_block2;
             }
+        }
+    };
+
+    auto recalc_blocking_ext
+            = [&](int new_bd_block, int new_ld_block, int new_bd_block2,
+                      int new_ld_block2, bool load_nt_A, bool load_nt_B,
+                      brgemm_kernel_innermost_loop_t innermost_loop) {
+                  recalc_blocking(new_bd_block, new_ld_block, new_bd_block2,
+                          new_ld_block2);
+                  brg->load_nt_A = load_nt_A;
+                  brg->load_nt_B = load_nt_B;
+                  brg->innermost_loop = innermost_loop;
+              };
+
+    bool is_decomposition_defined = false;
+    for (int i = decomposition_2x2; i != undefined; i++) {
+        switch (i) {
+            case decomposition_2x2:
+                is_decomposition_defined = try_2x2_decomposition();
+                break;
+            case decomposition_3x1_3:
+                is_decomposition_defined = try_3x1_decomposition(3);
+                break;
+            case decomposition_3x1_2:
+                is_decomposition_defined = try_3x1_decomposition(2);
+                break;
+            default: assert(!"invalid value"); break;
         };
+        if (is_decomposition_defined) break;
+    }
+    if (!is_decomposition_defined) try_2x2_decomposition();
 
-        const bool try_load_nt_A
-                = (brg->innermost_loop == brgemm_bd_loop_innermost);
-        const bool try_load_nt_B
-                = (brg->innermost_loop == brgemm_ld_loop_innermost);
-        const bool try_load_nt
-                = (static_cast<size_t>(brg->typesize_A)
-                                  * brg->brgattr.hint_expected_A_size
-                          + static_cast<size_t>(brg->typesize_B)
-                                  * brg->brgattr.hint_expected_B_size
-                          + static_cast<size_t>(brg->typesize_C)
-                                  * brg->brgattr.hint_expected_C_size)
-                >= platform::get_per_core_cache_size(1);
-        brg->load_nt_A = try_load_nt_A && try_load_nt;
-        brg->load_nt_B = try_load_nt_B && try_load_nt;
+    const bool try_load_nt_A
+            = (brg->innermost_loop == brgemm_bd_loop_innermost);
+    const bool try_load_nt_B
+            = (brg->innermost_loop == brgemm_ld_loop_innermost);
+    const bool try_load_nt
+            = (static_cast<size_t>(brg->typesize_A)
+                              * brg->brgattr.hint_expected_A_size
+                      + static_cast<size_t>(brg->typesize_B)
+                              * brg->brgattr.hint_expected_B_size
+                      + static_cast<size_t>(brg->typesize_C)
+                              * brg->brgattr.hint_expected_C_size)
+            >= L1;
+    brg->load_nt_A = try_load_nt_A && try_load_nt;
+    brg->load_nt_B = try_load_nt_B && try_load_nt;
 
-        recalc_bd_block(brg->bd_block);
-        recalc_bd_block2(brg->bd_block2);
-        recalc_ld_block(brg->ld_block);
-        recalc_ld_block2(brg->ld_block2);
+    recalc_blocking(
+            brg->bd_block, brg->ld_block, brg->bd_block2, brg->ld_block2);
 
-        if (can_dispatch_uker(brg)) {
-            // Blocking heuristics for some shapes
-            // TODO: Review these criterias
-            size_t eff_K
-                    = brg->reduce_dim * brg->typesize_A * brg->brgattr.K_koef;
-            auto L1 = platform::get_per_core_cache_size(1);
-            auto low_K = (L1 - 4 * 1024) / (6 * 16);
+    if (can_dispatch_uker(brg)) {
+        // Blocking heuristics for some shapes
+        // TODO: Review these criteria
+        const size_t eff_K
+                = brg->reduce_dim * brg->typesize_A * brg->brgattr.K_koef;
+        const auto low_K = (L1 - 4 * 1024) / (6 * 16);
 
-            // TODO: if rdb_tail != 0 then we should limit
-            // blocking because we need extra tiles for A and B to load rdb_tail
-            // if bd_mask_level != 0 it means it aligned to 16
+        // TODO: if rdb_tail != 0 then we should limit
+        // blocking because we need extra tiles for A and B to load rdb_tail
+        // if bd_mask_level != 0 it means it aligned to 16
 
-            bool bdb_block_tail = !(brg->bd_block > 12
-                    && (brg->bcast_dim % brg->bd_block == 0
-                            && brg->brgattr.bd_mask_level == 0));
-            bool ldb_tail_16 = (brg->load_dim % 16 != 0);
-            if (everyone_is(false, bdb_block_tail, ldb_tail_16)) {
-                // try to use 1x(4|5) or (4|5)x1 decomposition for specific
-                // range of K
-                auto upper_K5 = (L1 - 5 * 1024) / (5 * 16);
-                auto upper_K4 = (L1 - 4 * 1024) / (4 * 16);
-                bool K5_fit_L1 = (low_K <= eff_K && eff_K < upper_K5);
-                bool K4_fit_L1 = (low_K <= eff_K && eff_K < upper_K4);
-                bool bd_big = (brg->bcast_dim > 32);
-                bool ld_big = (brg->load_dim > 32);
-                if (brg->load_dim % 80 == 0 && K5_fit_L1 && bd_big) {
+        const bool bdb_block_tail = !(brg->bd_block > 12
+                && (BD % brg->bd_block == 0
+                        && brg->brgattr.bd_mask_level == 0));
+        const bool ldb_tail_16 = (LD % 16 != 0);
+        if (everyone_is(false, bdb_block_tail, ldb_tail_16)) {
+            // try to use 1x(4|5) or (4|5)x1 decomposition for specific
+            // range of K
+            const auto upper_K5 = (L1 - 5 * 1024) / (5 * 16);
+            const auto upper_K4 = (L1 - 4 * 1024) / (4 * 16);
+            const bool K5_fit_L1 = (low_K <= eff_K && eff_K < upper_K5);
+            const bool K4_fit_L1 = (low_K <= eff_K && eff_K < upper_K4);
+            const bool bd_big = (BD > 32);
+            const bool ld_big = (LD > 32);
+            const bool aligned_bd_mask
+                    = brg->brgattr.bd_mask_level != 0 && brg->bdb % 4 == 0;
+            if (LD % 80 == 0 && K5_fit_L1 && bd_big) {
+                recalc_blocking_ext(
+                        0, 16, 1, 5, true, false, brgemm_bd_loop_innermost);
+            } else if (LD % 64 == 0 && K4_fit_L1 && bd_big) {
+                recalc_blocking_ext(
+                        0, 16, 1, 4, true, false, brgemm_bd_loop_innermost);
+            } else if ((BD % 80 == 0 || aligned_bd_mask) && K5_fit_L1
+                    && ld_big) {
 
-                    recalc_ld_block(16);
-                    recalc_bd_block2(1);
-                    recalc_ld_block2(5);
-                    brg->load_nt_A = true;
-                    brg->load_nt_B = false;
-                    brg->innermost_loop = brgemm_bd_loop_innermost;
-                } else if (brg->load_dim % 64 == 0 && K4_fit_L1 && bd_big) {
-
-                    recalc_ld_block(16);
-                    recalc_bd_block2(1);
-                    recalc_ld_block2(4);
-                    brg->load_nt_A = true;
-                    brg->load_nt_B = false;
-                    brg->innermost_loop = brgemm_bd_loop_innermost;
-                } else if ((brg->bcast_dim % 80 == 0
-                                   || (brg->brgattr.bd_mask_level != 0
-                                           && brg->bdb % 4 == 0))
-                        && K5_fit_L1 && ld_big) {
-
-                    recalc_ld_block(16);
-                    recalc_bd_block2(5);
-                    recalc_ld_block2(1);
-                    brg->load_nt_A = false;
-                    brg->load_nt_B = true;
-                    brg->innermost_loop = brgemm_ld_loop_innermost;
-                } else if ((brg->bcast_dim % 64 == 0
-                                   || (brg->brgattr.bd_mask_level != 0
-                                           && brg->bdb % 4 == 0))
-                        && K4_fit_L1 && ld_big) {
-
-                    recalc_bd_block(16);
-                    recalc_ld_block(16);
-                    recalc_bd_block2(4);
-                    recalc_ld_block2(1);
-                    brg->load_nt_A = false;
-                    brg->load_nt_B = true;
-                    brg->innermost_loop = brgemm_ld_loop_innermost;
-                }
-            }
-            // Tile decomposition for shapes with small dimensions
-            // or dimensions with tails
-            if (ldb_tail_16 && !bdb_block_tail && brg->load_dim > 64
-                    && brg->ld_block < 8) {
-                recalc_ld_block(16);
-                recalc_bd_block2(2);
-                recalc_ld_block2(1);
-            } else if (ldb_tail_16 && !bdb_block_tail
-                    && rnd_up(brg->load_dim, 16) == 64
-                    && (brg->ld_block < 8 || brg->ldb_tail > 0)) {
-                recalc_ld_block(16);
-                recalc_bd_block2(1);
-                recalc_ld_block2(4);
-            } else if (ldb_tail_16 && !bdb_block_tail
-                    && rnd_up(brg->load_dim, 16) == 48
-                    && (brg->ld_block < 8 || brg->ldb_tail > 0)) {
-                recalc_ld_block(16);
-                recalc_bd_block2(1);
-                recalc_ld_block2(3);
-            } else if (ldb_tail_16 && !bdb_block_tail
-                    && rnd_up(brg->load_dim, 16) == 32
-                    && (brg->ld_block < 8 || brg->ldb_tail > 0)) {
-                recalc_ld_block(16);
-                recalc_bd_block2(2);
-                recalc_ld_block2(2);
-            } else if (brg->bcast_dim <= 16) {
-                recalc_bd_block(brg->bcast_dim);
-                recalc_ld_block(16);
-                recalc_bd_block2(1);
-                recalc_ld_block2(
-                        nstl::min(ldb_tail_16 ? ((brg->ldb > 4) ? 3 : 4) : 5,
-                                div_up(brg->load_dim, 16)));
-            } else if (bdb_block_tail && !ldb_tail_16 && brg->bcast_dim > 64
-                    && (brg->bd_block < 8 || brg->bdb_tail > 0)) {
-
-                recalc_bd_block(16);
-                recalc_ld_block(16);
-                recalc_bd_block2(1);
-                recalc_ld_block2(2);
-            } else if (bdb_block_tail && !ldb_tail_16
-                    && rnd_up(brg->bcast_dim, 16) == 64
-                    && (brg->bd_block < 8 || brg->bdb_tail > 0)) {
-                recalc_bd_block(16);
-                recalc_ld_block(16);
-                recalc_bd_block2(4);
-                recalc_ld_block2(1);
-            } else if (bdb_block_tail && !ldb_tail_16
-                    && rnd_up(brg->bcast_dim, 16) == 48
-                    && (brg->bd_block < 8 || brg->bdb_tail > 0)) {
-                recalc_bd_block(16);
-                recalc_ld_block(16);
-                recalc_bd_block2(3);
-                recalc_ld_block2(1);
-            } else if (bdb_block_tail && !ldb_tail_16
-                    && rnd_up(brg->bcast_dim, 16) == 32
-                    && (brg->bd_block < 8 || brg->bdb_tail > 0)
-                    && (brg->load_dim % 32 == 0)) {
-
-                recalc_bd_block(16);
-                recalc_ld_block(16);
-                recalc_bd_block2(2);
-                recalc_ld_block2(2);
-            } else if (brg->load_dim <= 16) {
-                recalc_bd_block(16);
-                recalc_ld_block(16); // we can't use ld_block other than 16
-                recalc_bd_block2(
-                        nstl::min(brg->bdb_tail ? (brg->bdb > 4 ? 3 : 4) : 5,
-                                div_up(brg->bcast_dim, 16)));
-                recalc_ld_block2(1);
-            } else if (bdb_block_tail && ldb_tail_16
-                    && rnd_up(brg->bcast_dim, 16) == 32
-                    && rnd_up(brg->load_dim, 16) == 32
-                    && (brg->ld_block < 8 || brg->ldb_tail > 0
-                            || brg->bd_block < 8 || brg->bdb_tail > 0)) {
-                recalc_bd_block(16);
-                recalc_ld_block(16);
-                recalc_bd_block2(2);
-                recalc_ld_block2(2);
-            }
-            // if interleave stores and small number of iterations then
-            // try to increase them
-            auto n_iterations = brg->bdb2 * brg->bdb2;
-            if (false && brg->brgattr.use_interleave_stores
-                    && n_iterations < 4) {
-                int k_it = div_up(4, n_iterations);
-                if (brg->bdb2 > brg->ldb2)
-                    recalc_bd_block2(div_up(brg->bdb2, k_it));
-                else
-                    recalc_ld_block2(div_up(brg->ldb2, k_it));
+                recalc_blocking_ext(
+                        0, 16, 5, 1, false, true, brgemm_ld_loop_innermost);
+            } else if ((BD % 64 == 0 || aligned_bd_mask) && K4_fit_L1
+                    && ld_big) {
+                recalc_blocking_ext(
+                        16, 16, 4, 1, false, true, brgemm_ld_loop_innermost);
             }
         }
-
-        if (brg->get_num_A_tiles() + brg->get_num_B_tiles()
-                        + brg->get_num_C_tiles()
-                > brgemm_t::AMX_TILES_NUM) {
-            assert(!"brgemm internal error: invalid blocking");
-            return status::runtime_error;
+        // Tile decomposition for shapes with small dimensions
+        // or dimensions with tails
+        const bool weak_ldb = brg->ld_block < 8 || brg->ldb_tail > 0;
+        const bool weak_bdb = brg->bd_block < 8 || brg->bdb_tail > 0;
+        const bool ldb_tail_only = ldb_tail_16 && !bdb_block_tail;
+        const bool bdb_tail_only = bdb_block_tail && !ldb_tail_16;
+        if (ldb_tail_only && LD > 64 && brg->ld_block < 8) {
+            recalc_blocking(0, 16, 2, 1);
+        } else if (ldb_tail_only && weak_ldb && LD_R16 == 64) {
+            recalc_blocking(0, 16, 1, 4);
+        } else if (ldb_tail_only && weak_ldb && LD_R16 == 48) {
+            recalc_blocking(0, 16, 1, 3);
+        } else if (ldb_tail_only && weak_ldb && LD_R16 == 32) {
+            recalc_blocking(0, 16, 2, 2);
+        } else if (BD <= 16) {
+            // Have to call recalc_blocking twice to calculate ldb
+            recalc_blocking(BD, 16, 0, 0);
+            const auto ld_block2 = nstl::min(
+                    ldb_tail_16 ? ((brg->ldb > 4) ? 3 : 4) : 5, div_up(LD, 16));
+            recalc_blocking(0, 0, 1, ld_block2);
+        } else if (bdb_tail_only && weak_bdb && BD > 64) {
+            recalc_blocking(16, 16, 1, 2);
+        } else if (bdb_tail_only && weak_bdb && BD_R16 == 64) {
+            recalc_blocking(16, 16, 4, 1);
+        } else if (bdb_tail_only && weak_bdb && BD_R16 == 48) {
+            recalc_blocking(16, 16, 3, 1);
+        } else if (bdb_tail_only && weak_bdb && BD_R16 == 32
+                && (LD % 32 == 0)) {
+            recalc_blocking(16, 16, 2, 2);
+        } else if (LD <= 16) {
+            // Have to call recalc_blocking twice to calculate bdb
+            // we can't use ld_block other than 16
+            recalc_blocking(16, 16, 0, 0);
+            const auto bd_block2 = nstl::min(
+                    brg->bdb_tail ? (brg->bdb > 4 ? 3 : 4) : 5, div_up(BD, 16));
+            recalc_blocking(0, 0, bd_block2, 1);
+        } else if (bdb_block_tail && ldb_tail_16 && BD_R16 == 32 && LD_R16 == 32
+                && (weak_ldb || weak_bdb)) {
+            recalc_blocking(16, 16, 2, 2);
         }
 
-        // check hints for blocking parameters
-        recalc_bd_block(brg->brgattr.hint_bd_block);
-        recalc_bd_block2(brg->brgattr.hint_bd_block2
-                        ? brg->brgattr.hint_bd_block2
-                        : brg->bd_block2);
-        recalc_ld_block(brg->brgattr.hint_ld_block);
-        recalc_ld_block2(brg->brgattr.hint_ld_block2
-                        ? brg->brgattr.hint_ld_block2
-                        : brg->ld_block2);
+        // The code below is a draft for the future optimization of interleave
+        // stores and small number of iterations.
+        // TODO: review and enable if needed
+#if 0
+        // if interleave stores and small number of iterations then
+        // try to increase them
+        const auto n_iterations = brg->bdb2 * brg->bdb2;
+        if (brg->brgattr.use_interleave_stores && n_iterations < 4) {
+            int k_it = div_up(4, n_iterations);
+            if (brg->bdb2 > brg->ldb2)
+                recalc_blocking(0, 0, div_up(brg->bdb2, k_it), 0);
+            else
+                recalc_blocking(0, 0, 0, div_up(brg->ldb2, k_it));
+        }
+#endif
+    }
 
-        if (brg->brgattr.hint_load_nt_A != brgemm_hint_nt_undef)
-            brg->load_nt_A
-                    = (brg->brgattr.hint_load_nt_A == brgemm_hint_nt_true);
-        if (brg->brgattr.hint_load_nt_B != brgemm_hint_nt_undef)
-            brg->load_nt_B
-                    = (brg->brgattr.hint_load_nt_B == brgemm_hint_nt_true);
+    if (brg->get_num_A_tiles() + brg->get_num_B_tiles() + brg->get_num_C_tiles()
+            > brgemm_desc_t::AMX_TILES_NUM) {
+        assert(!"brgemm internal error: invalid blocking");
+        return status::runtime_error;
+    }
 
-        const auto max_rd_block
-                = (brg->is_bf16_tmm || brg->is_f16_tmm || brg->is_bf32) ? 32
-                                                                        : 64;
-        const auto rd_block_step
-                = (brg->is_bf16_tmm || brg->is_f16_tmm || brg->is_bf32) ? 2 : 4;
-        // TODO: if rd_block calculated is very small then maybe it makes
-        // sense to use 1x2 or 2x1 blocking with supporting rd_block
-        // and rdb_tail
+    // check hints for blocking parameters
+    recalc_blocking(brg->brgattr.hint_bd_block, brg->brgattr.hint_ld_block,
+            brg->brgattr.hint_bd_block2 ? brg->brgattr.hint_bd_block2
+                                        : brg->bd_block2,
+            brg->brgattr.hint_ld_block2 ? brg->brgattr.hint_ld_block2
+                                        : brg->ld_block2);
+
+    if (brg->brgattr.hint_load_nt_A != brgemm_hint_nt_undef)
+        brg->load_nt_A = (brg->brgattr.hint_load_nt_A == brgemm_hint_nt_true);
+    if (brg->brgattr.hint_load_nt_B != brgemm_hint_nt_undef)
+        brg->load_nt_B = (brg->brgattr.hint_load_nt_B == brgemm_hint_nt_true);
+
+    // TODO: if rd_block calculated is very small then maybe it makes
+    // sense to use 1x2 or 2x1 blocking with supporting rd_block
+    // and rdb_tail
+    const auto rd_block_step = brg->rd_block_step();
+    const auto max_rd_block = brg->max_rd_block();
+    if (brg->amx_may_extend_k()) {
+        brg->rd_block = nstl::min(
+                rnd_up(brg->reduce_dim, brg->rd_step), max_rd_block);
+    } else {
         brg->rd_block = rd_block_step;
         for (int i = max_rd_block; i > 0; i -= rd_block_step) {
             if (brg->reduce_dim % i == 0) {
@@ -688,36 +664,155 @@ status_t brgemm_blocking(brgemm_t *brg) {
                 break;
             }
         }
-        brg->rdb = brg->reduce_dim / brg->rd_block;
-        brg->rdb_tail = brg->reduce_dim % brg->rd_block;
-
-        // Remove these guards in the future (add tail processing by reduction
-        // dimension)
-        if (!IMPLICATION(brg->rdb > 0 && brg->rdb_tail, brg->is_bf32))
-            return status::unimplemented;
-        if (!IMPLICATION(
-                    (brg->rdb_tail
-                            % ((brg->is_bf16_tmm || brg->is_f16_tmm) ? 2 : 4))
-                            != 0,
-                    brg->is_bf32))
-            return status::unimplemented;
-
-        //TODO: check this condition
-        brg->interleave_tilestores_ = brg->beta == 0
-                        && (brg->brgattr.use_interleave_stores
-                                && (brg->bd_block2 * brg->ld_block2 == 4)
-                                && !brg->brgattr.var_bs)
-                ? true
-                : false;
     }
+
+    brg->rdb = brg->reduce_dim / brg->rd_block;
+    brg->rdb_tail = brg->reduce_dim % brg->rd_block;
+
+    // Remove these guards in the future (add tail processing by reduction
+    // dimension)
+    // TODO: these checks do not work for fp8-f16 and f16-fp8 cfgs
+    if (!IMPLICATION(brg->rdb > 0 && brg->rdb_tail,
+                brg->is_tf32 || brg->is_input_convert()
+                        || brg->amx_wary_k_tail())) {
+        return status::unimplemented;
+    }
+
+    if (!IMPLICATION((brg->rdb_tail
+                             % ((brg->is_bf16_tmm || brg->is_f16_tmm) ? 2 : 4))
+                        != 0,
+                brg->is_tf32 || brg->is_input_convert()
+                        || brg->amx_wary_k_tail())) {
+        return status::unimplemented;
+    }
+
+    //TODO: check this condition
+    brg->interleave_tilestores_ = brg->beta == 0
+                    && (brg->brgattr.use_interleave_stores
+                            && (brg->bd_block2 * brg->ld_block2 == 4)
+                            && !brg->brgattr.var_bs)
+            ? true
+            : false;
+    return status::success;
+}
+
+status_t brgemm_blocking_vmm(brgemm_desc_t *brg) {
+    const auto L1 = platform::get_per_core_cache_size(1);
+
+    const int simd_w = is_superset(brg->isa_impl, avx512_core) ? 16 : 8;
+    brg->ld_block = simd_w;
+    brg->ldb = brg->load_dim / brg->ld_block;
+    brg->ldb_tail = brg->load_dim % brg->ld_block;
+
+    const int max_vpad = nstl::max(
+            brg->brgattr.max_top_vpad, brg->brgattr.max_bottom_vpad);
+
+    // iterate ld_block2 starting from 4 to allow bd_block larger than
+    // virtual padding
+    int max_bcast_block {0}, min_bcast_block {0}, adj_ld_block2 {0};
+    bool few_regs = utils::one_of(brg->isa_impl, avx2, avx2_vnni, avx2_vnni_2);
+    bool hint_n_bcast_1_load
+            = brg->brgattr.hint_loop_order == brgemm_lo_bl_1load;
+    for (int try_ld_block2 = 4; try_ld_block2 > 0; --try_ld_block2) {
+        adj_ld_block2 = calculate_ldb_params(brg, try_ld_block2);
+        brg->n_bcast_1_load
+                = (few_regs && adj_ld_block2 == 4) || hint_n_bcast_1_load;
+        max_bcast_block = calculate_max_bcast_block(brg, adj_ld_block2);
+        const auto bdb_tail = brg->bcast_dim % max_bcast_block;
+        min_bcast_block = bdb_tail > 0 ? bdb_tail : max_bcast_block;
+        if (min_bcast_block >= max_vpad) break;
+    }
+    // bcast block in brgemm kernel should be greater than virtual
+    // padding to avoid possible functional issues
+    if (min_bcast_block < max_vpad) return status::unimplemented;
+
+    const int min_block = nstl::max(1, max_vpad);
+
+    float best_bd_block_eff = 0.f;
+    brg->bd_block = max_bcast_block;
+    for (int bd_block = max_bcast_block; bd_block >= min_block; bd_block--) {
+        const auto bd_block_disb = static_cast<float>(brg->bcast_dim)
+                / rnd_up(brg->bcast_dim, bd_block);
+        const auto brgemm_microkernel_eff
+                = (static_cast<float>(adj_ld_block2) * bd_block)
+                / (((adj_ld_block2) + bd_block) * max_bcast_block);
+        const auto bd_block_eff = bd_block_disb * brgemm_microkernel_eff;
+
+        float block_foot_print = static_cast<float>(brg->typesize_A) * bd_block
+                * brg->reduce_dim;
+        if (block_foot_print <= static_cast<float>(L1)
+                && (bd_block_eff > best_bd_block_eff)) {
+            brg->bd_block = bd_block;
+            best_bd_block_eff = bd_block_eff;
+        }
+    }
+    brg->bdb = brg->bcast_dim / brg->bd_block;
+    brg->bdb_tail = brg->bcast_dim % brg->bd_block;
+
+    const int rd_unroll = 4;
+    const data_type_t rd_block_dt = get_mac_emu_data_type(
+            brg->dt_a, brg->isa_impl, brg->isa_impl != avx2_vnni_2);
+    if (rd_block_dt == dnnl_data_type_undef) return status::unimplemented;
+    const int vnni_granularity = data_type_vnni_granularity(rd_block_dt);
+    brg->rd_block = rd_unroll * vnni_granularity;
+    brg->rdb = brg->reduce_dim / brg->rd_block;
+    brg->rdb_tail = brg->reduce_dim % brg->rd_block;
+
+    brg->is_M_tail = false;
+    // avx2_vnni_2 kernel with xf16 data type requires blocked weights.
+    if (brg->isa_impl == avx2_vnni_2 && brg->is_xf16()
+            && brg->LDB % brg->ld_block > 0)
+        return status::unimplemented;
 
     return status::success;
 }
 
-status_t brdgmm_blocking(brgemm_t *brg) {
+status_t brgemm_blocking(brgemm_desc_t *brg) {
+    const data_type_t ld_step_compute_dt = get_mac_emu_data_type(
+            brg->dt_b, brg->isa_impl, brg->isa_impl != avx2_vnni_2);
+    brg->ld_step = brg->is_f16_b_non_amx_vnni()
+            ? 2
+            : data_type_vnni_granularity(ld_step_compute_dt);
+    const data_type_t rd_step_compute_dt
+            = get_mac_emu_data_type(brg->dt_b, brg->isa_impl);
+    brg->rd_step = data_type_vnni_granularity(rd_step_compute_dt);
+
+    set_isa_impl(brg);
+    if (brg->isa_impl == isa_undef) return status::unimplemented;
+    assert(!brg->is_dgmm); // should not be called from brdgmm
+    if (brg->is_dgmm) return status::unimplemented;
+    set_brg_vmm(brg);
+    if (!(brg->is_tmm || brg->is_zmm || brg->is_ymm))
+        return status::unimplemented;
+
+    if (brg->is_tmm)
+        CHECK(brgemm_blocking_tmm(brg));
+    else
+        CHECK(brgemm_blocking_vmm(brg));
+
+    if (!IMPLICATION(brg->brgattr.LDB2 == 0, brg->load_dim <= brg->LDB))
+        return status::invalid_arguments;
+
+    brg->LDA2 = (brg->brgattr.LDA2 != 0) ? brg->brgattr.LDA2 : brg->LDA;
+    brg->LDB2 = (brg->brgattr.LDB2 != 0) ? brg->brgattr.LDB2 : brg->LDB;
+    brg->LDC2_M = (brg->brgattr.LDC2_M != 0) ? brg->brgattr.LDC2_M : brg->LDC;
+    brg->LDC2_N
+            = (brg->brgattr.LDC2_N != 0) ? brg->brgattr.LDC2_N : brg->ld_block;
+
+    brg->is_blocked = (brg->LDA2 != brg->LDA || brg->LDB2 != brg->LDB
+            || brg->LDC2_M != brg->LDC || brg->LDC2_N != brg->ld_block);
+
+    if (!IMPLICATION(brg->is_blocked, brg->layout == brgemm_row_major))
+        return status::invalid_arguments;
+
+    return status::success;
+}
+
+status_t brdgmm_blocking(brgemm_desc_t *brg) {
 
     if (brg->isa_impl == isa_undef) return status::unimplemented;
 
+    set_brg_vmm(brg); // Needed to dispatch into the right kernel later.
     const int max_vregs = isa_num_vregs(brg->isa_impl);
 
     const int simd_w = isa_max_vlen(brg->isa_impl) / brg->typesize_C;
@@ -754,25 +849,30 @@ status_t brdgmm_blocking(brgemm_t *brg) {
     const int max_n_block2 = max_n_block2_vmms / n_block1_num_steps;
     n_block2 = nstl::min(max_n_block2, nb_n_block1);
 
-    // Note: using avx512_core template, but calculation uses 'brg->isa_impl'
-    // which is dynamic i.e. uses values AVX2, AVX2_VNNI, etc. depending on the
-    // configuration.
-    const int aux_vregs = jit_brdgmm_kernel_base_t<avx512_core_vnni,
-            Xbyak::Zmm>::get_aux_vmm_count(*brg);
-    const int compute_vregs = jit_brdgmm_kernel_base_t<avx512_core_vnni,
-            Xbyak::Zmm>::get_compute_vmm_count(*brg);
+    const int aux_vregs
+            = jit_brdgmm_kernel_base_t<Xbyak::Zmm>::get_aux_vmm_count(*brg);
+    const int compute_vregs
+            = jit_brdgmm_kernel_base_t<Xbyak::Zmm>::get_compute_vmm_count(*brg);
     const int bf16_emu_vregs = brg->is_bf16_emu * 4;
-    const int max_acc_vmms
-            = max_vregs - nstl::max(compute_vregs + aux_vregs, bf16_emu_vregs);
+    const int postops_regs = brg->attr()
+            ? injector::aux_vec_count(
+                    brg->attr()->post_ops_, brg->isa_impl, true)
+            : 0;
 
-    const auto min_possible_m_block2 = brg->brgattr.bs_group > 1
-            ? (max_acc_vmms / (2 * n_block1_num_steps) - brg->brgattr.bs_group
-                      + 1)
-                    / 2
-            : 1;
-    if (min_possible_m_block2 < 1) brg->brgattr.bs_group = 1;
+    const int max_acc_vmms = max_vregs
+            - nstl::max(postops_regs,
+                    nstl::max(compute_vregs + aux_vregs, bf16_emu_vregs));
 
-    if (brg->brgattr.bs_group > 1) n_block2 = n_block2 % 2 == 0 ? 2 : 1;
+    if (brg->brgattr.hint_bs_group > 1) {
+        // Check if we can actually apply bs grouping
+        const auto min_possible_m_block2
+                = (max_acc_vmms / (2 * n_block1_num_steps)
+                          - brg->brgattr.hint_bs_group + 1)
+                / 2;
+        if (min_possible_m_block2 < 1) brg->bs_group = 1;
+    }
+
+    if (brg->bs_group > 1) n_block2 = n_block2 % 2 == 0 ? 2 : 1;
 
     nb_n_block2 = div_up(nb_n_block1, n_block2);
     n_block2_tail = nb_n_block1 % n_block2;
@@ -782,21 +882,22 @@ status_t brdgmm_blocking(brgemm_t *brg) {
     m_block1_tail = M % m_block1;
 
     m_block2 = nstl::min(nb_m_block1,
-            brg->brgattr.bs_group > 1
-                    ? (max_acc_vmms / (n_block2 * n_block1_num_steps)
-                              - brg->brgattr.bs_group + 1)
+            brg->bs_group > 1 ? (max_acc_vmms / (n_block2 * n_block1_num_steps)
+                                        - brg->bs_group + 1)
                             / 2
-                    : max_acc_vmms / (n_block2 * n_block1_num_steps));
+                              : max_acc_vmms / (n_block2 * n_block1_num_steps));
+    assert(m_block2 > 0);
     nb_m_block2 = div_up(nb_m_block1, m_block2);
     m_block2_tail = nb_m_block1 % m_block2;
 
     return status::success;
 }
 
-void init_brgemm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
-        impl::data_type_t dt_a, impl::data_type_t dt_b, brgemm_layout_t layout,
-        float alpha, float beta, dim_t LDA, dim_t LDB, dim_t LDC, dim_t M,
-        dim_t N, dim_t K, const brgemm_strides_t *strides, bool is_bf32) {
+status_t init_brgemm_conf(brgemm_desc_t *brg, cpu_isa_t isa,
+        brgemm_batch_kind_t type, impl::data_type_t dt_a,
+        impl::data_type_t dt_b, brgemm_layout_t layout, float alpha, float beta,
+        dim_t LDA, dim_t LDB, dim_t LDC, dim_t M, dim_t N, dim_t K,
+        const brgemm_strides_t *strides, bool is_bf32, bool is_tf32) {
 
     init_common_conf(brg, type, alpha, beta, strides);
 
@@ -804,7 +905,7 @@ void init_brgemm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
 
     brg->dt_a = brg->is_row_major() ? dt_a : dt_b;
     brg->dt_b = brg->is_row_major() ? dt_b : dt_a;
-    init_kernel_datatype(brg, brg->dt_a, brg->dt_b);
+    CHECK(init_kernel_datatype(brg, brg->dt_a, brg->dt_b));
 
     brg->dt_c = get_accum_datatype(brg);
     brg->dt_d = brg->dt_c;
@@ -816,13 +917,23 @@ void init_brgemm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
     brg->typesize_D = types::data_type_size(brg->dt_d);
 
     brg->isa_user = isa;
-    set_isa_impl(brg);
-    brg->is_int8_tmm = brg->is_int8 && brg->isa_impl == avx512_core_amx;
-    brg->is_bf16_tmm = brg->is_bf16 && brg->isa_impl == avx512_core_amx;
-    brg->is_f16_tmm = brg->is_f16 && brg->isa_impl == avx512_core_amx_fp16;
+
+    brg->is_tf32 = is_tf32
+            && utils::one_of(brg->isa_user, isa_undef, avx10_2_512_amx_2)
+            && mayiuse(avx10_2_512_amx_2);
     brg->is_bf32 = is_bf32
             && utils::one_of(brg->isa_user, isa_undef, avx512_core_amx)
             && mayiuse(avx512_core_amx);
+
+    set_isa_impl(brg);
+    brg->is_int8_tmm
+            = brg->is_int8 && is_superset(brg->isa_impl, avx512_core_amx);
+    brg->is_bf16_tmm
+            = brg->is_bf16 && is_superset(brg->isa_impl, avx512_core_amx);
+    brg->is_f16_tmm
+            = brg->is_f16 && is_superset(brg->isa_impl, avx512_core_amx_fp16);
+    brg->is_fp8_tmm
+            = brg->is_fp8 && is_superset(brg->isa_impl, avx512_core_amx_fp16);
 
     brg->has_int8_vnni = isa_has_int8_vnni(brg->isa_impl);
 
@@ -852,23 +963,13 @@ void init_brgemm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
     brg->bdb2 = 0;
     brg->bdb2_tail = 0;
 
-    const bool is_b_in_vnni_format = !(
-            brg->dt_b == data_type::f16 && brg->isa_impl == avx512_core_fp16);
-    brg->ld_step
-            = is_b_in_vnni_format ? data_type_vnni_granularity(brg->dt_b) : 1;
-
-    const bool has_no_vnni_compute_instruction
-            = (brg->is_f16
-                      && one_of(brg->isa_impl, avx2_vnni_2, avx512_core_fp16))
-            || (brg->is_bf16 && brg->isa_impl == avx2_vnni_2);
-    brg->rd_step = has_no_vnni_compute_instruction
-            ? 1
-            : data_type_vnni_granularity(brg->dt_b);
+    return status::success;
 }
 
-void init_brdgmm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
-        impl::data_type_t dt_a, impl::data_type_t dt_b, brgemm_layout_t layout,
-        float alpha, float beta, dim_t LDA, dim_t LDC, dim_t M, dim_t N,
+status_t init_brdgmm_conf(brgemm_desc_t *brg, cpu_isa_t isa,
+        brgemm_batch_kind_t type, impl::data_type_t dt_a,
+        impl::data_type_t dt_b, brgemm_layout_t layout, float alpha, float beta,
+        dim_t LDA, dim_t LDC, dim_t M, dim_t N,
         const brgemm_strides_t *strides) {
 
     init_common_conf(brg, type, alpha, beta, strides);
@@ -877,7 +978,7 @@ void init_brdgmm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
 
     brg->dt_a = dt_a;
     brg->dt_b = dt_b;
-    init_kernel_datatype(brg, brg->dt_a, brg->dt_b);
+    CHECK(init_kernel_datatype(brg, brg->dt_a, brg->dt_b));
 
     brg->dt_c = get_accum_datatype(brg);
     brg->dt_d = brg->dt_c;
@@ -901,17 +1002,18 @@ void init_brdgmm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
                 avx512_core_bf16, is_isa_ok(avx2_vnni_2), avx2_vnni_2);
     } else if (brg->is_f16) {
         brg->isa_impl = utils::map(true, isa_undef, is_isa_ok(avx512_core_fp16),
-                avx512_core_fp16, is_isa_ok(avx2_vnni_2), avx2_vnni_2);
+                avx512_core_fp16, is_isa_ok(avx2_vnni_2), avx2_vnni_2,
+                is_isa_ok(avx10_2_512), avx10_2_512);
     } else if (brg->is_int8) {
-        brg->isa_impl = utils::map(true, isa_undef, is_isa_ok(avx512_core_vnni),
-                avx512_core_vnni, is_isa_ok(avx2_vnni_2), avx2_vnni_2,
-                is_isa_ok(avx2_vnni), avx2_vnni);
+        brg->isa_impl = utils::map(true, isa_undef, is_isa_ok(avx10_2_512),
+                avx10_2_512, is_isa_ok(avx512_core_vnni), avx512_core_vnni,
+                is_isa_ok(avx2_vnni_2), avx2_vnni_2, is_isa_ok(avx2_vnni),
+                avx2_vnni);
     }
 
     brg->req_s8s8_compensation = brg->is_int8 && brg->dt_a == data_type::s8
             && !isa_has_s8s8(brg->isa_impl);
 
-    brg->is_bf16_tmm = brg->is_bf16 && mayiuse(avx512_core_amx);
     brg->is_dgmm = true;
 
     brg->LDA = static_cast<int>(LDA);
@@ -920,6 +1022,8 @@ void init_brdgmm_conf(brgemm_t *brg, cpu_isa_t isa, brgemm_batch_kind_t type,
 
     brg->bcast_dim = M;
     brg->load_dim = N;
+
+    return status::success;
 }
 
 } // namespace brgemm_utils

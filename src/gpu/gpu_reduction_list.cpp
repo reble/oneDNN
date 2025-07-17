@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2024 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,10 +16,30 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/ocl/reduction/atomic_reduction.hpp"
-#include "gpu/ocl/reduction/combined_reduction.hpp"
-#include "gpu/ocl/reduction/ref_reduction.hpp"
-#include "gpu/ocl/reduction/reusable_ref_reduction.hpp"
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/reduction/atomic_reduction.hpp"
+#include "gpu/intel/reduction/combined_reduction.hpp"
+#include "gpu/intel/reduction/ref_reduction.hpp"
+#include "gpu/intel/reduction/reusable_ref_reduction.hpp"
+
+#ifdef DNNL_DEV_MODE
+#include "gpu/intel/jit/reduction.hpp"
+#endif
+
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+#include "gpu/nvidia/cudnn_reduction.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_AMD
+#include "gpu/amd/miopen_reduction.hpp"
+#endif
+
+#ifdef GENERIC_SYCL_KERNELS_ENABLED
+#include "gpu/generic/sycl/ref_reduction.hpp"
+#include "gpu/generic/sycl/simple_reduction.hpp"
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -29,13 +49,19 @@ namespace {
 
 // clang-format off
 constexpr impl_list_item_t impl_list[] = REG_REDUCTION_P({
-        INSTANCE(ocl::atomic_reduction_t)
-        INSTANCE(ocl::combined_reduction_t)
-        INSTANCE(ocl::ref_reduction_t)
-        INSTANCE(ocl::reusable_ref_reduction_t)
+        GPU_INSTANCE_INTEL_DEVMODE(intel::jit::reduction_t)
+        GPU_INSTANCE_INTEL(intel::atomic_reduction_t)
+        GPU_INSTANCE_INTEL(intel::combined_reduction_t)
+        GPU_INSTANCE_INTEL(intel::ref_reduction_t)
+        GPU_INSTANCE_INTEL(intel::reusable_ref_reduction_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_reduction_t)
+        GPU_INSTANCE_AMD(amd::miopen_reduction_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_reduction_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::simple_reduction_t)
         nullptr,
 });
 // clang-format on
+
 } // namespace
 
 const impl_list_item_t *get_reduction_impl_list(const reduction_desc_t *desc) {

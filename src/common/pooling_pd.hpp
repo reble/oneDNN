@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -146,12 +146,11 @@ protected:
 
     memory_desc_t ws_md_;
 
-    pooling_pd_t(const pooling_desc_t *adesc, const primitive_attr_t *attr,
+    pooling_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const pooling_fwd_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
-        , hint_fwd_pd_(hint_fwd_pd)
-        , ws_md_() {}
+        , desc_(*op_desc_t::to_desc<pooling_desc_t>(adesc))
+        , hint_fwd_pd_(hint_fwd_pd) {}
 
     void init_default_ws(data_type_t dt = data_type::undef) {
         ws_md_ = is_fwd() ? *dst_md() : *diff_dst_md();
@@ -161,7 +160,7 @@ protected:
     data_type_t indices_data_type() const {
         /* the simplest way to express 256... */
         const int u8_max = nstl::numeric_limits<
-                typename prec_traits<data_type::u8>::type>::max();
+                typename prec_traits_t<data_type::u8>::type>::max();
         return utils::array_product(desc()->kernel, spatial_ndims()) <= u8_max
                 ? data_type::u8
                 : data_type::s32;
@@ -176,17 +175,19 @@ private:
     }
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct pooling_fwd_pd_t : public pooling_pd_t {
-    typedef pooling_fwd_pd_t base_class;
-    typedef pooling_fwd_pd_t hint_class;
+    using base_class = pooling_fwd_pd_t;
+    using hint_class = pooling_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg == DNNL_ARG_SRC) return arg_usage_t::input;
 
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_WORKSPACE && (!types::is_zero_md(workspace_md())))
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return !types::is_zero_md(workspace_md()) ? arg_usage_t::output
+                                                      : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -229,7 +230,7 @@ protected:
     memory_desc_t src_md_;
     memory_desc_t dst_md_;
 
-    pooling_fwd_pd_t(const pooling_desc_t *adesc, const primitive_attr_t *attr,
+    pooling_fwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const pooling_fwd_pd_t *hint_fwd_pd)
         : pooling_pd_t(adesc, attr, hint_fwd_pd)
         , src_md_(desc_.src_desc)
@@ -245,18 +246,21 @@ protected:
                 dst_md_, src_md_.format_desc.blocking);
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct pooling_bwd_pd_t : public pooling_pd_t {
-    typedef pooling_bwd_pd_t base_class;
-    typedef pooling_fwd_pd_t hint_class;
+    using base_class = pooling_bwd_pd_t;
+    using hint_class = pooling_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg == DNNL_ARG_DIFF_DST) return arg_usage_t::input;
 
         if (arg == DNNL_ARG_DIFF_SRC) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_WORKSPACE && (!types::is_zero_md(workspace_md())))
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return !types::is_zero_md(workspace_md()) ? arg_usage_t::input
+                                                      : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -302,7 +306,7 @@ protected:
     memory_desc_t diff_src_md_;
     memory_desc_t diff_dst_md_;
 
-    pooling_bwd_pd_t(const pooling_desc_t *adesc, const primitive_attr_t *attr,
+    pooling_bwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const pooling_fwd_pd_t *hint_fwd_pd)
         : pooling_pd_t(adesc, attr, hint_fwd_pd)
         , diff_src_md_(desc_.diff_src_desc)
@@ -338,6 +342,7 @@ protected:
 private:
     std::vector<memory_desc_t> hint_mds_;
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

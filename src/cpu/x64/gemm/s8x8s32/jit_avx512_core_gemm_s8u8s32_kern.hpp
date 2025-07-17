@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2021 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,11 +24,11 @@ namespace impl {
 namespace cpu {
 namespace x64 {
 
-class jit_avx512_core_gemm_s8u8s32_kern : public jit_generator {
+class jit_avx512_core_gemm_s8u8s32_kern_t : public jit_generator_t {
 public:
-    jit_avx512_core_gemm_s8u8s32_kern(
+    jit_avx512_core_gemm_s8u8s32_kern_t(
             bool beta_zero, bool enable_offset_c, bool enable_offset_r);
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_gemm_s8u8s32_kern);
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_gemm_s8u8s32_kern_t);
 
 protected:
     bool beta_zero_;
@@ -50,7 +50,7 @@ protected:
     void innerloop(int unroll_m, int unroll_n);
     void outerloop(int unroll_x, int unroll_y, Xbyak::Label *&outerloop_label);
 
-    void generate() override ATTRIBUTE_OPTIMIZE;
+    void generate() override;
 
 private:
     static const int IGEMM_UNROLL_M_ = 48;

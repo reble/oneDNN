@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include "graph/unit/utils.hpp"
 
 #include "backend/dnnl/dnnl_constant_tensor_cache.hpp"
+#include "oneapi/dnnl/dnnl_graph.hpp"
 
 namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
@@ -76,10 +77,10 @@ TEST(test_matmul_execute, MatmulFp32) {
 
     p.compile(&cp, inputs, outputs, eng);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor bias_ts(bias, eng, bias_data);
-    test_tensor dst_ts(dst, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t bias_ts(bias, eng, bias_data);
+    test_tensor_t dst_ts(dst, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), bias_ts.get()},
@@ -98,10 +99,10 @@ TEST(test_matmul_execute, MatmulFp32) {
     std::vector<float> ref_dst_data2 {5};
     std::vector<float> dst_data2(ref_dst_data2.size(), 0.0);
 
-    test_tensor src_ts2(src, eng, src_data2);
-    test_tensor weight_ts2(weight, eng, weight_data2);
-    test_tensor bias_ts2(bias, eng, bias_data2);
-    test_tensor dst_ts2(dst, eng, dst_data2);
+    test_tensor_t src_ts2(src, eng, src_data2);
+    test_tensor_t weight_ts2(weight, eng, weight_data2);
+    test_tensor_t bias_ts2(bias, eng, bias_data2);
+    test_tensor_t dst_ts2(dst, eng, dst_data2);
 
     cp.execute(strm, {src_ts2.get(), weight_ts2.get(), bias_ts2.get()},
             {dst_ts2.get()});
@@ -112,7 +113,7 @@ TEST(test_matmul_execute, MatmulFp32) {
     }
 }
 
-TEST(test_matmul_execute, MatmulF16F16F16) {
+TEST(test_matmul_execute, MatmulF16F16F16_GPU) {
     graph::op_t matmul_op(graph::op_kind::MatMul);
 
     graph::engine_t *eng = get_engine();
@@ -161,9 +162,9 @@ TEST(test_matmul_execute, MatmulF16F16F16) {
 
     p.compile(&cp, inputs, outputs, eng);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor dst_ts(dst, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t dst_ts(dst, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get()}, {dst_ts.get()});
@@ -216,9 +217,9 @@ TEST(test_matmul_execute, MatmulBf16Bf16Bf16) {
 
     p.compile(&cp, inputs, outputs, eng);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor dst_ts(dst, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t dst_ts(dst, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get()}, {dst_ts.get()});
@@ -284,6 +285,7 @@ TEST(test_matmul_compile, MatmulMatmulBf16Bf16Bf16) {
 }
 
 TEST(test_matmul_compile, MatmulBlocked) {
+    SKIP_IF_NV_GPU("not supported on NVIDIA GPU");
     graph::op_t matmul_op(0, graph::op_kind::MatMul, "matmul");
 
     graph::engine_t *eng = get_engine();
@@ -303,7 +305,7 @@ TEST(test_matmul_compile, MatmulBlocked) {
     // simulate user given block src
     dnnl::memory::desc src_md({24576, 1024}, dnnl::memory::data_type::bf16,
             dnnl::memory::format_tag::AB48a16b);
-    auto &backend_ptr = graph::dnnl_impl::dnnl_backend::get_singleton();
+    auto &backend_ptr = graph::dnnl_impl::dnnl_backend_t::get_singleton();
     graph::utils::optional_t<size_t> layout_id
             = backend_ptr.set_mem_desc(src_md);
     src.layout.layout_id = graph::backend_registry_t::encode_layout_id(
@@ -336,6 +338,7 @@ TEST(test_matmul_compile, MatmulBlocked) {
 }
 
 TEST(test_matmul_execute, MatmulNdx1d) {
+    SKIP_IF_NV_GPU("not supported on NVIDIA GPU");
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
@@ -351,8 +354,8 @@ TEST(test_matmul_execute, MatmulNdx1d) {
 
     for (size_t w_idx = 0; w_idx < weight_shapes.size(); ++w_idx) {
         for (size_t idx = 0; idx < src_shapes.size(); idx++) {
-            auto src_shape = src_shapes[idx];
-            auto dst_shape = dst_shapes[idx + w_idx * src_shapes.size()];
+            const auto &src_shape = src_shapes[idx];
+            const auto &dst_shape = dst_shapes[idx + w_idx * src_shapes.size()];
 
             std::vector<float> src_data(product(src_shape));
             std::vector<float> weight_data(product(weight_shapes[w_idx]));
@@ -398,9 +401,9 @@ TEST(test_matmul_execute, MatmulNdx1d) {
             ASSERT_EQ(p.compile(&cp, inputs, outputs, engine),
                     graph::status::success);
 
-            test_tensor src_ts(src, engine, src_data);
-            test_tensor weight_ts(weight, engine, weight_data);
-            test_tensor dst_ts(dst, engine, dst_data);
+            test_tensor_t src_ts(src, engine, src_data);
+            test_tensor_t weight_ts(weight, engine, weight_data);
+            test_tensor_t dst_ts(dst, engine, dst_data);
 
             ASSERT_EQ(cp.execute(strm, {src_ts.get(), weight_ts.get()},
                               {dst_ts.get()}),
@@ -432,6 +435,7 @@ TEST(test_matmul_execute, MatmulNdx1d) {
 }
 
 TEST(test_matmul_execute, Matmul1dxNd) {
+    SKIP_IF_NV_GPU("not supported on NVIDIA GPU");
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
@@ -447,8 +451,9 @@ TEST(test_matmul_execute, Matmul1dxNd) {
 
     for (size_t idx = 0; idx < src_shapes.size(); ++idx) {
         for (size_t w_idx = 0; w_idx < weight_shapes.size(); w_idx++) {
-            auto src_shape = src_shapes[idx];
-            auto dst_shape = dst_shapes[w_idx + idx * weight_shapes.size()];
+            const auto &src_shape = src_shapes[idx];
+            const auto &dst_shape
+                    = dst_shapes[w_idx + idx * weight_shapes.size()];
 
             std::vector<float> src_data(product(src_shape));
             std::vector<float> weight_data(product(weight_shapes[w_idx]));
@@ -493,9 +498,9 @@ TEST(test_matmul_execute, Matmul1dxNd) {
 
             p.compile(&cp, inputs, outputs, engine);
 
-            test_tensor src_ts(src, engine, src_data);
-            test_tensor weight_ts(weight, engine, weight_data);
-            test_tensor dst_ts(dst, engine, dst_data);
+            test_tensor_t src_ts(src, engine, src_data);
+            test_tensor_t weight_ts(weight, engine, weight_data);
+            test_tensor_t dst_ts(dst, engine, dst_data);
 
             cp.execute(strm, {src_ts.get(), weight_ts.get()}, {dst_ts.get()});
             strm->wait();
@@ -563,9 +568,9 @@ TEST(test_matmul_execute, Matmul3dx3d) {
 
     p.compile(&cp, inputs, outputs, eng);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor dst_ts(dst, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t dst_ts(dst, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get()}, {dst_ts.get()});
@@ -630,10 +635,10 @@ TEST(test_matmul_execute, MatmulBiasAdd) {
     p.compile(&cp, inputs, outputs, engine);
     cp.query_logical_tensor(add_dst.id, &add_dst);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor post_src_ts(post_src, engine, post_src_data);
-    test_tensor dst_ts(add_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t post_src_ts(post_src, engine, post_src_data);
+    test_tensor_t dst_ts(add_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), post_src_ts.get()},
@@ -706,11 +711,11 @@ TEST(test_matmul_execute, MatmulBiasAddPerTensorBroadcast) {
 
         p.compile(&cp, inputs, outputs, engine);
 
-        test_tensor src_ts(src, engine, src_data);
-        test_tensor weight_ts(weight, engine, weight_data);
-        test_tensor bias_ts(bias, engine, bias_data);
-        test_tensor post_src_ts(post_src, engine, post_src_data);
-        test_tensor dst_ts(add_dst, engine, dst_data);
+        test_tensor_t src_ts(src, engine, src_data);
+        test_tensor_t weight_ts(weight, engine, weight_data);
+        test_tensor_t bias_ts(bias, engine, bias_data);
+        test_tensor_t post_src_ts(post_src, engine, post_src_data);
+        test_tensor_t dst_ts(add_dst, engine, dst_data);
 
         cp.execute(strm,
                 {src_ts.get(), weight_ts.get(), bias_ts.get(),
@@ -784,11 +789,11 @@ TEST(test_matmul_execute, MatmulBiasAddPerChannelBroadcast) {
 
         p.compile(&cp, inputs, outputs, engine);
 
-        test_tensor src_ts(src, engine, src_data);
-        test_tensor weight_ts(weight, engine, weight_data);
-        test_tensor bias_ts(bias, engine, bias_data);
-        test_tensor post_src_ts(post_src, engine, post_src_data);
-        test_tensor dst_ts(add_dst, engine, dst_data);
+        test_tensor_t src_ts(src, engine, src_data);
+        test_tensor_t weight_ts(weight, engine, weight_data);
+        test_tensor_t bias_ts(bias, engine, bias_data);
+        test_tensor_t post_src_ts(post_src, engine, post_src_data);
+        test_tensor_t dst_ts(add_dst, engine, dst_data);
 
         cp.execute(strm,
                 {src_ts.get(), weight_ts.get(), bias_ts.get(),
@@ -857,6 +862,104 @@ TEST(test_matmul_compile, MatmulBiasAddUnsupportedBroadcast) {
     }
 }
 
+TEST(test_matmul_compile, MatmulInt8WeightScaleSupport) {
+    graph::engine_t *engine = get_engine();
+
+    std::vector<int64_t> src_shape = {3, 3, 8, 4};
+    std::vector<int64_t> weight_shape = {3, 3, 4, 2};
+    std::vector<int64_t> bias_shape {2};
+    std::vector<int64_t> dst_shape = {3, 3, 8, 2};
+    size_t scales_wei_sizes = dst_shape.back();
+    std::vector<float> scale_wei(scales_wei_sizes, 1 / 127.f);
+    std::vector<int64_t> zp_wei(scales_wei_sizes, 0);
+
+    std::vector<size_t> axes = {0, 1, 2, 3};
+    for (auto &axis : axes) {
+        graph::op_t dqdata_op(1, graph::op_kind::Dequantize, "dqdata_op");
+        dqdata_op.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
+        dqdata_op.set_attr<std::vector<int64_t>>(graph::op_attr::zps, {0});
+        dqdata_op.set_attr<std::vector<float>>(graph::op_attr::scales, {1});
+        dqdata_op.set_attr<int64_t>(graph::op_attr::axis, 0);
+
+        graph::op_t dqweight_op(2, graph::op_kind::Dequantize, "dqweight_op");
+        dqweight_op.set_attr<std::string>(graph::op_attr::qtype, "per_channel");
+        dqweight_op.set_attr<std::vector<int64_t>>(graph::op_attr::zps, zp_wei);
+        dqweight_op.set_attr<std::vector<float>>(
+                graph::op_attr::scales, scale_wei);
+        dqweight_op.set_attr<int64_t>(graph::op_attr::axis, axis);
+
+        graph::op_t matmul_op(3, graph::op_kind::MatMul, "matmul_op");
+        matmul_op.set_attr<bool>(graph::op_attr::transpose_a, false);
+        matmul_op.set_attr<bool>(graph::op_attr::transpose_b, false);
+
+        graph::op_t qout_op(4, graph::op_kind::Quantize, "qout_op");
+        qout_op.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
+        qout_op.set_attr<std::vector<int64_t>>(graph::op_attr::zps, {0});
+        qout_op.set_attr<std::vector<float>>(graph::op_attr::scales, {1});
+        qout_op.set_attr<int64_t>(graph::op_attr::axis, 3);
+
+        // prepare logical tensor
+        graph::logical_tensor_t src_u8 = utils::logical_tensor_init(
+                1, src_shape, graph::data_type::u8);
+        graph::logical_tensor_t src_f32_dq = utils::logical_tensor_init(
+                2, src_shape, graph::data_type::f32);
+        graph::logical_tensor_t weight_s8 = utils::logical_tensor_init(
+                4, weight_shape, graph::data_type::s8);
+        graph::logical_tensor_t weight_f32_dq = utils::logical_tensor_init(
+                5, weight_shape, graph::data_type::f32);
+        graph::logical_tensor_t bias_f32 = utils::logical_tensor_init(
+                6, bias_shape, graph::data_type::f32);
+        graph::logical_tensor_t dst_f32 = utils::logical_tensor_init(
+                7, dst_shape, graph::data_type::f32);
+        graph::logical_tensor_t dst_s8 = utils::logical_tensor_init(
+                8, dst_shape, graph::data_type::s8);
+
+        dqdata_op.add_input(src_u8);
+        dqdata_op.add_output(src_f32_dq);
+
+        dqweight_op.add_input(weight_s8);
+        dqweight_op.add_output(weight_f32_dq);
+
+        matmul_op.add_input(src_f32_dq);
+        matmul_op.add_input(weight_f32_dq);
+        matmul_op.add_input(bias_f32);
+        matmul_op.add_output(dst_f32);
+
+        qout_op.add_input(dst_f32);
+        qout_op.add_output(dst_s8);
+
+        graph::graph_t g(engine->kind());
+        g.add_op(&dqdata_op);
+        g.add_op(&dqweight_op);
+        g.add_op(&matmul_op);
+        g.add_op(&qout_op);
+        g.finalize();
+
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
+        apass->run(g);
+        ASSERT_EQ(g.get_num_partitions(), 1U);
+        auto part = g.get_partitions()[0];
+
+        // compile
+        graph::partition_t p;
+        p.init(part);
+        graph::compiled_partition_t cp(p);
+
+        std::vector<const graph::logical_tensor_t *> lt_ins {
+                &src_u8, &weight_s8, &bias_f32};
+        std::vector<const graph::logical_tensor_t *> lt_outs {&dst_s8};
+        // Matmul only support applying scale per channel along the last
+        // dimension for DNNL_ARG_WEIGHTS.
+        if (axis == weight_shape.size() - 1) {
+            ASSERT_EQ(p.compile(&cp, lt_ins, lt_outs, engine),
+                    graph::status::success);
+        } else {
+            ASSERT_EQ(p.compile(&cp, lt_ins, lt_outs, engine),
+                    graph::status::unimplemented);
+        }
+    }
+}
+
 TEST(test_matmul_execute_subgraph_int8, MatmulNdx2d) {
     // compare results between:
     // case 1: [quantize] - [dequantize] - [fp32_matmul] - [quantize]
@@ -874,10 +977,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2d) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<int8_t> weight_data(product(weight_shape));
@@ -899,10 +1002,6 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2d) {
         float scale_src = 1 / 255.f; // map to 0~255
         float scale_out = 1;
         int64_t zp_src = 0;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
         size_t scales_wei_sizes = qtype == "per_tensor" ? 1 : dst_shape.back();
@@ -971,21 +1070,19 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2d) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
 
         // -------------------------case 1----------------------------------
         std::vector<int8_t> case1_out_data(product(dst_shape));
-        test_tensor dst_s8_ts(dst_s8, engine, case1_out_data);
+        test_tensor_t dst_s8_ts(dst_s8, engine, case1_out_data);
         ASSERT_EQ(run_graph(g, {src_u8_ts, weight_s8_ts, bias_f32_ts},
                           {dst_s8_ts}, *engine, *strm),
                 graph::status::success);
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
+
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -1004,7 +1101,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2d) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<int8_t> case2_out_data(product(dst_shape));
-        test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+        test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
         cp.execute(strm,
                 {src_u8_ts.get(), weight_s8_ts.get(), bias_f32_ts.get()},
                 {dst_s8_case2_ts.get()});
@@ -1028,8 +1125,6 @@ TEST(test_matmul_execute_subgraph_int8, MatmulU8U8) {
     // case 1: [quantize] - [dequantize] - [fp32_matmul] - [quantize]
     // case 2: [quantize] - [int8_matmul]
     graph::engine_t *engine = get_engine();
-    SKIP_IF(engine->kind() != graph::engine_kind::cpu,
-            "only cpu u8 to s8 for matmul");
     graph::stream_t *strm = get_stream();
 
     std::vector<std::string> qtypes {"per_tensor"};
@@ -1042,10 +1137,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulU8U8) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<uint8_t> weight_data(product(weight_shape));
@@ -1119,21 +1214,18 @@ TEST(test_matmul_execute_subgraph_int8, MatmulU8U8) {
         g.add_op(&matmul_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_u8_ts(weight_u8, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_u8_ts(weight_u8, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
 
         // -------------------------case 1----------------------------------
         std::vector<float> case1_out_data(product(dst_shape));
-        test_tensor dst_f32_ts(dst_f32, engine, case1_out_data);
+        test_tensor_t dst_f32_ts(dst_f32, engine, case1_out_data);
         ASSERT_EQ(run_graph(g, {src_u8_ts, weight_u8_ts, bias_f32_ts},
                           {dst_f32_ts}, *engine, *strm),
                 graph::status::success);
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -1152,7 +1244,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulU8U8) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<float> case2_out_data(product(dst_shape));
-        test_tensor dst_f32_case2_ts(dst_f32, engine, case2_out_data);
+        test_tensor_t dst_f32_case2_ts(dst_f32, engine, case2_out_data);
         cp.execute(strm,
                 {src_u8_ts.get(), weight_u8_ts.get(), bias_f32_ts.get()},
                 {dst_f32_case2_ts.get()});
@@ -1184,9 +1276,9 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx1d) {
     for (size_t i = 0; i < weight_shapes.size(); ++i) {
         for (size_t j = 0; j < src_shapes.size(); ++j) {
             // prepare fp32 data
-            std::vector<int64_t> src_shape = src_shapes[j];
-            std::vector<int64_t> weight_shape = weight_shapes[i];
-            std::vector<int64_t> dst_shape
+            const std::vector<int64_t> &src_shape = src_shapes[j];
+            const std::vector<int64_t> &weight_shape = weight_shapes[i];
+            const std::vector<int64_t> &dst_shape
                     = dst_shapes[j + i * src_shapes.size()];
 
             std::vector<uint8_t> src_data(product(src_shape));
@@ -1208,10 +1300,6 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx1d) {
             float scale_out = 1;
             int64_t zp_src = 0;
             int64_t zp_wei = 0;
-            // The following cmd will be skiped by benchdnn, since oneDNN didn't
-            // support reorder with zps on GPU: "./tests/benchdnn/benchdnn
-            // --reorder --engine=gpu --mode=C --sdt=f32 --ddt=s8
-            // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
             int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
             graph::op_t dqdata_op(1, graph::op_kind::Dequantize, "dqdata_op");
@@ -1279,20 +1367,18 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx1d) {
             g.add_op(&qout_op);
             g.finalize();
 
-            test_tensor src_u8_ts(src_u8, engine, src_data);
-            test_tensor weight_s8_ts(weight_s8, engine, weight_data);
+            test_tensor_t src_u8_ts(src_u8, engine, src_data);
+            test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
             // -------------------------case 1----------------------------------
             std::vector<int8_t> case1_out_data(product(dst_shape));
-            test_tensor dst_s8_case1_ts(dst_s8, engine, case1_out_data);
+            test_tensor_t dst_s8_case1_ts(dst_s8, engine, case1_out_data);
             ASSERT_EQ(run_graph(g, {src_u8_ts, weight_s8_ts}, {dst_s8_case1_ts},
                               *engine, *strm),
                     graph::status::success);
 
             // -------------------------case 2----------------------------------
             graph::pass::pass_base_ptr apass
-                    = get_pass(engine->kind() == graph::engine_kind::gpu
-                                    ? "x8s8x_matmul_post_ops_gpu"
-                                    : "x8x8x_matmul_post_ops_cpu");
+                    = get_pass("x8x8x_matmul_post_ops");
             apass->run(g);
             ASSERT_EQ(g.get_num_partitions(), 1U);
             auto part = g.get_partitions()[0];
@@ -1310,7 +1396,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx1d) {
             p.compile(&cp, lt_ins, lt_outs, engine);
 
             std::vector<int8_t> case2_out_data(product(dst_shape));
-            test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+            test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
             cp.execute(strm, {src_u8_ts.get(), weight_s8_ts.get()},
                     {dst_s8_case2_ts.get()});
             strm->wait();
@@ -1345,10 +1431,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2dWithTranspose) {
     for (size_t i = 0; i < src_shapes.size(); ++i) {
         for (size_t j = 0; j < weight_shapes.size(); ++j) {
             // prepare fp32 data
-            std::vector<int64_t> src_shape = src_shapes[i];
-            std::vector<int64_t> weight_shape = weight_shapes[j];
-            std::vector<int64_t> bias_shape {1};
-            std::vector<int64_t> dst_shape = dst_shapes[i];
+            const std::vector<int64_t> &src_shape = src_shapes[i];
+            const std::vector<int64_t> &weight_shape = weight_shapes[j];
+            const std::vector<int64_t> bias_shape {1};
+            const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
             std::vector<uint8_t> src_data(product(src_shape));
             std::vector<int8_t> weight_data(product(weight_shape));
@@ -1373,10 +1459,6 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2dWithTranspose) {
             float scale_out = 1;
             int64_t zp_src = 0;
             int64_t zp_wei = 0;
-            // The following cmd will be skiped by benchdnn, since oneDNN didn't
-            // support reorder with zps on GPU: "./tests/benchdnn/benchdnn
-            // --reorder --engine=gpu --mode=C --sdt=f32 --ddt=s8
-            // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
             int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
             // -------------------------case 1----------------------------------
@@ -1448,21 +1530,20 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2dWithTranspose) {
             g.add_op(&qout_op);
             g.finalize();
 
-            test_tensor src_u8_ts(src_u8, engine, src_data);
-            test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-            test_tensor bias_f32_ts = test_tensor(bias_f32, engine, bias_data);
+            test_tensor_t src_u8_ts(src_u8, engine, src_data);
+            test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+            test_tensor_t bias_f32_ts
+                    = test_tensor_t(bias_f32, engine, bias_data);
             // -------------------------case 1----------------------------------
             std::vector<int8_t> case1_out_data(product(dst_shape));
-            test_tensor dst_s8_ts(dst_s8, engine, case1_out_data);
+            test_tensor_t dst_s8_ts(dst_s8, engine, case1_out_data);
             ASSERT_EQ(run_graph(g, {src_u8_ts, weight_s8_ts, bias_f32_ts},
                               {dst_s8_ts}, *engine, *strm),
                     graph::status::success);
 
             // -------------------------case 2----------------------------------
             graph::pass::pass_base_ptr apass
-                    = get_pass(engine->kind() == graph::engine_kind::gpu
-                                    ? "x8s8x_matmul_post_ops_gpu"
-                                    : "x8x8x_matmul_post_ops_cpu");
+                    = get_pass("x8x8x_matmul_post_ops");
             apass->run(g);
             ASSERT_EQ(g.get_num_partitions(), 1U);
             auto part = g.get_partitions()[0];
@@ -1480,7 +1561,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2dWithTranspose) {
             p.compile(&cp, lt_ins, lt_outs, engine);
 
             std::vector<int8_t> case2_out_data(product(dst_shape));
-            test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+            test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
             cp.execute(strm,
                     {src_u8_ts.get(), weight_s8_ts.get(), bias_f32_ts.get()},
                     {dst_s8_case2_ts.get()});
@@ -1501,14 +1582,16 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2dWithTranspose) {
 }
 
 TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumNdx2d) {
-    // skip the test on AArch64 or some older machine without avx support
-    SKIP_IF(dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx,
-            "skip on machine without AVX");
     // compare results between:
     // case 1: [quantize] - [dequantize] - [fp32_matmul] - [quantize]
     // case 2: [quantize] - [int8_matmul]
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
+
+    // skip the test on AArch64 or some older machine without avx support
+    SKIP_IF(engine->kind() == graph::engine_kind::cpu
+                    && dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx,
+            "skip on machine without AVX");
 
     std::vector<std::string> qtypes {"per_tensor", "per_channel"};
     std::vector<std::string> other_qtypes = {"symmetric", "asymmetric"};
@@ -1522,10 +1605,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumNdx2d) {
     for_(const auto &other_qtype : other_qtypes)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<int8_t> weight_data(product(weight_shape));
@@ -1558,10 +1641,6 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumNdx2d) {
                         || engine->kind() == graph::engine_kind::gpu
                 ? 0
                 : 128;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
         size_t scales_wei_sizes = qtype == "per_tensor" ? 1 : dst_shape.back();
@@ -1655,13 +1734,13 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumNdx2d) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-        test_tensor other_s8_ts(other_s8, engine, other_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t other_s8_ts(other_s8, engine, other_data);
         // -------------------------case 1----------------------------------
         std::vector<int8_t> case1_out_data(product(dst_shape));
-        test_tensor dst_s8_ts(dst_s8, engine, case1_out_data);
+        test_tensor_t dst_s8_ts(dst_s8, engine, case1_out_data);
         ASSERT_EQ(run_graph(g,
                           {src_u8_ts, weight_s8_ts, bias_f32_ts, other_s8_ts},
                           {dst_s8_ts}, *engine, *strm),
@@ -1669,7 +1748,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumNdx2d) {
         // -------------------------case 2----------------------------------
         graph::pass::pass_base_ptr apass
                 = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x8_matmul_add_post_ops_gpu"
+                                ? "x8x8x8_matmul_add_post_ops_gpu"
                                 : "x8x8x8_matmul_add_post_ops_cpu");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
@@ -1689,7 +1768,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumNdx2d) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<int8_t> case2_out_data(product(dst_shape));
-        test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+        test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
         cp.execute(strm,
                 {src_u8_ts.get(), weight_s8_ts.get(), bias_f32_ts.get(),
                         other_s8_ts.get()},
@@ -1710,14 +1789,16 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumNdx2d) {
 }
 
 TEST(test_matmul_execute_subgraph_int8, MatmulBiasBinary) {
-    // skip the test on AArch64 or some older machine without avx support
-    SKIP_IF(dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx,
-            "skip on machine without AVX");
     // compare results between:
     // case 1: [quantize] - [dequantize] - [fp32_matmul] - [quantize]
     // case 2: [quantize] - [int8_matmul]
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
+
+    // skip the test on AArch64 or some older machine without avx support
+    SKIP_IF(engine->kind() == graph::engine_kind::cpu
+                    && dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx,
+            "skip on machine without AVX");
 
     std::vector<std::string> qtypes {"per_channel"};
     std::vector<graph::op_kind_t> binary_kinds {graph::op_kind::Multiply,
@@ -1731,10 +1812,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasBinary) {
     for_(size_t j = 0; j < weight_shapes.size(); ++j)
     for (const auto &binary_kind : binary_kinds) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<int8_t> weight_data(product(weight_shape));
@@ -1760,10 +1841,6 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasBinary) {
         float scale_src = 1 / 255.f; // map to 0~255
         float scale_out = 1;
         int64_t zp_src = 0;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
         size_t scales_wei_sizes = qtype == "per_tensor" ? 1 : dst_shape.back();
@@ -1843,22 +1920,19 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasBinary) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-        test_tensor other_f32_ts(other_f32, engine, other_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t other_f32_ts(other_f32, engine, other_data);
         // -------------------------case 1----------------------------------
         std::vector<int8_t> case1_out_data(product(dst_shape));
-        test_tensor dst_s8_ts(dst_s8, engine, case1_out_data);
+        test_tensor_t dst_s8_ts(dst_s8, engine, case1_out_data);
         ASSERT_EQ(run_graph(g,
                           {src_u8_ts, weight_s8_ts, bias_f32_ts, other_f32_ts},
                           {dst_s8_ts}, *engine, *strm),
                 graph::status::success);
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -1877,7 +1951,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasBinary) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<int8_t> case2_out_data(product(dst_shape));
-        test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+        test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
         cp.execute(strm,
                 {src_u8_ts.get(), weight_s8_ts.get(), bias_f32_ts.get(),
                         other_f32_ts.get()},
@@ -1898,11 +1972,13 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasBinary) {
 }
 
 TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddMul) {
-    // skip the test on AArch64 or some older machine without avx support
-    SKIP_IF(dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx,
-            "skip on machine without AVX");
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
+
+    // skip the test on AArch64 or some older machine without avx support
+    SKIP_IF(engine->kind() == graph::engine_kind::cpu
+                    && dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx,
+            "skip on machine without AVX");
 
     std::vector<std::string> qtypes {"per_tensor", "per_channel"};
     std::vector<std::string> other_qtypes = {"symmetric", "asymmetric"};
@@ -1923,10 +1999,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddMul) {
         if (engine->kind() == graph::engine_kind::gpu && qtype == "per_channel")
             continue;
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<int8_t> weight_data(product(weight_shape));
@@ -1962,10 +2038,6 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddMul) {
                         || engine->kind() == graph::engine_kind::gpu
                 ? 0
                 : 128;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
         size_t scales_wei_sizes = qtype == "per_tensor" ? 1 : dst_shape.back();
@@ -2070,14 +2142,14 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddMul) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-        test_tensor add_other_s8_ts(other_s8, engine, add_other_data);
-        test_tensor mul_other_f32_ts(mul_src_f32, engine, mul_other_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t add_other_s8_ts(other_s8, engine, add_other_data);
+        test_tensor_t mul_other_f32_ts(mul_src_f32, engine, mul_other_data);
         // -------------------------case 1----------------------------------
         std::vector<int8_t> case1_out_data(product(dst_shape));
-        test_tensor dst_s8_ts(dst_s8, engine, case1_out_data);
+        test_tensor_t dst_s8_ts(dst_s8, engine, case1_out_data);
         ASSERT_EQ(run_graph(g,
                           {src_u8_ts, weight_s8_ts, bias_f32_ts,
                                   add_other_s8_ts, mul_other_f32_ts},
@@ -2086,7 +2158,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddMul) {
         // -------------------------case 2----------------------------------
         graph::pass::pass_base_ptr apass
                 = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x8_matmul_add_post_ops_gpu"
+                                ? "x8x8x8_matmul_add_post_ops_gpu"
                                 : "x8x8x8_matmul_add_post_ops_cpu");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
@@ -2106,7 +2178,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddMul) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<int8_t> case2_out_data(product(dst_shape));
-        test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+        test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
         cp.execute(strm,
                 {src_u8_ts.get(), weight_s8_ts.get(), bias_f32_ts.get(),
                         add_other_s8_ts.get(), mul_other_f32_ts.get()},
@@ -2140,10 +2212,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasNdx2dX8s8f32) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<int8_t> weight_data(product(weight_shape));
@@ -2219,20 +2291,17 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasNdx2dX8s8f32) {
         g.add_op(&matmul_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
         // -------------------------case 1----------------------------------
         std::vector<float> case1_out_data(product(dst_shape));
-        test_tensor dst_f32_ts(dst_f32, engine, case1_out_data);
+        test_tensor_t dst_f32_ts(dst_f32, engine, case1_out_data);
         ASSERT_EQ(run_graph(g, {src_u8_ts, weight_s8_ts, bias_f32_ts},
                           {dst_f32_ts}, *engine, *strm),
                 graph::status::success);
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -2250,7 +2319,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasNdx2dX8s8f32) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<float> case2_out_data(product(dst_shape));
-        test_tensor dst_f32_case2_ts(dst_f32, engine, case2_out_data);
+        test_tensor_t dst_f32_case2_ts(dst_f32, engine, case2_out_data);
         cp.execute(strm,
                 {src_u8_ts.get(), weight_s8_ts.get(), bias_f32_ts.get()},
                 {dst_f32_case2_ts.get()});
@@ -2283,9 +2352,9 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2dX8s8f32) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<int8_t> weight_data(product(weight_shape));
@@ -2354,19 +2423,16 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2dX8s8f32) {
         g.add_op(&matmul_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
         // -------------------------case 1----------------------------------
         std::vector<float> case1_out_data(product(dst_shape));
-        test_tensor dst_f32_ts(dst_f32, engine, case1_out_data);
+        test_tensor_t dst_f32_ts(dst_f32, engine, case1_out_data);
         ASSERT_EQ(run_graph(g, {src_u8_ts, weight_s8_ts}, {dst_f32_ts}, *engine,
                           *strm),
                 graph::status::success);
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -2384,7 +2450,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulNdx2dX8s8f32) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<float> case2_out_data(product(dst_shape));
-        test_tensor dst_f32_case2_ts(dst_f32, engine, case2_out_data);
+        test_tensor_t dst_f32_case2_ts(dst_f32, engine, case2_out_data);
         cp.execute(strm, {src_u8_ts.get(), weight_s8_ts.get()},
                 {dst_f32_case2_ts.get()});
         strm->wait();
@@ -2416,10 +2482,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasGeluNdx2dX8s8f32) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<int8_t> weight_data(product(weight_shape));
@@ -2503,20 +2569,17 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasGeluNdx2dX8s8f32) {
         g.add_op(&gelu_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
         // -------------------------case 1----------------------------------
         std::vector<float> case1_out_data(product(dst_shape));
-        test_tensor dst_f32_ts(gelu_f32, engine, case1_out_data);
+        test_tensor_t dst_f32_ts(gelu_f32, engine, case1_out_data);
         ASSERT_EQ(run_graph(g, {src_u8_ts, weight_s8_ts, bias_f32_ts},
                           {dst_f32_ts}, *engine, *strm),
                 graph::status::success);
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -2534,7 +2597,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasGeluNdx2dX8s8f32) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<float> case2_out_data(product(dst_shape));
-        test_tensor dst_f32_case2_ts(gelu_f32, engine, case2_out_data);
+        test_tensor_t dst_f32_case2_ts(gelu_f32, engine, case2_out_data);
         cp.execute(strm,
                 {src_u8_ts.get(), weight_s8_ts.get(), bias_f32_ts.get()},
                 {dst_f32_case2_ts.get()});
@@ -2638,10 +2701,10 @@ TEST(test_matmul_execute_subgraph_int8, Matmul2dx3dWithTranspose) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {1};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {1};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<int8_t> weight_data(product(weight_shape));
@@ -2664,10 +2727,6 @@ TEST(test_matmul_execute_subgraph_int8, Matmul2dx3dWithTranspose) {
         float scale_out = 1;
         int64_t zp_src = 0;
         int64_t zp_wei = 0;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
         graph::op_t qdata_op(0, graph::op_kind::Quantize, "qdata_op");
@@ -2748,10 +2807,7 @@ TEST(test_matmul_execute_subgraph_int8, Matmul2dx3dWithTranspose) {
         g.add_op(&qout_op);
         g.finalize();
 
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -2768,11 +2824,11 @@ TEST(test_matmul_execute_subgraph_int8, Matmul2dx3dWithTranspose) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         // execute
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
         std::vector<int8_t> dst_data(product(dst_shape));
-        test_tensor dst_s8_ts(dst_s8, engine, dst_data);
+        test_tensor_t dst_s8_ts(dst_s8, engine, dst_data);
         cp.execute(strm,
                 {src_u8_ts.get(), weight_s8_ts.get(), bias_f32_ts.get()},
                 {dst_s8_ts.get()});
@@ -2780,13 +2836,13 @@ TEST(test_matmul_execute_subgraph_int8, Matmul2dx3dWithTranspose) {
     }
 }
 
-TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumGetInplacePair) {
-    // skip the test on AArch64 or some older machine without avx support
-    SKIP_IF(dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx,
-            "skip on machine without AVX");
+TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumGetInplacePair_CPU) {
     graph::engine_t *engine = get_engine();
     SKIP_IF(engine->kind() == graph::engine_kind::gpu,
             "Skip for GPU - no inplace for layout mismatch.");
+    // skip the test on AArch64 or some older machine without avx support
+    SKIP_IF(dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx,
+            "skip on machine without AVX");
 
     std::vector<std::string> qtypes {"per_tensor", "per_channel"};
     std::vector<std::string> other_qtypes = {"symmetric", "asymmetric"};
@@ -2800,20 +2856,16 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumGetInplacePair) {
     for_(const auto &other_qtype : other_qtypes)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         float scale_src = 1 / 255.f; // map to 0~255
         float scale_other = 1 / 127.f;
         float scale_out = 1;
         int64_t zp_src = 0;
         int64_t zp_other = other_qtype == "symmetric" ? 0 : 128;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
         size_t scales_wei_sizes = qtype == "per_tensor" ? 1 : dst_shape.back();
@@ -2963,8 +3015,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumGetInplacePair) {
 
         graph::pass::pass_base_ptr apass1
                 = get_pass("x8x8x8_matmul_add_post_ops_cpu");
-        graph::pass::pass_base_ptr apass2
-                = get_pass("x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass2 = get_pass("x8x8x_matmul_post_ops");
         apass1->run(g);
         apass2->run(g);
         ASSERT_EQ(g.get_num_partitions(), 2U);
@@ -3002,7 +3053,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasSumGetInplacePair) {
     }
 }
 
-TEST(test_matmul_execute_subgraph_int8, MatmulBiasU8s8bf16) {
+TEST(test_matmul_execute_subgraph_int8, MatmulBiasU8s8bf16_CPU) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
@@ -3100,10 +3151,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasU8s8bf16) {
     g.add_op(&tcweight_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::gpu
-                            ? "x8s8x_tc_matmul_post_ops_gpu"
-                            : "x8x8x_tc_matmul_post_ops_cpu");
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_tc_matmul_post_ops");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -3120,16 +3168,126 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasU8s8bf16) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-    test_tensor bias_bf16_ts(bias_bf16, engine, bias_data);
-    test_tensor dst_ts(dst_bf16, engine);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+    test_tensor_t bias_bf16_ts(bias_bf16, engine, bias_data);
+    test_tensor_t dst_ts(dst_bf16, engine);
     cp.execute(strm, {src_u8_ts.get(), weight_s8_ts.get(), bias_bf16_ts.get()},
             {dst_ts.get()});
     strm->wait();
 }
 
-TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddBF16U8s8bf16) {
+TEST(test_matmul_execute_subgraph_int8, MatmulU8U8bf16) {
+    graph::engine_t *engine = get_engine();
+    graph::stream_t *strm = get_stream();
+
+    std::string qtype = "per_channel";
+    std::vector<int64_t> src_shape = {1, 8, 16};
+    std::vector<int64_t> weight_shape = {8, 16};
+    std::vector<int64_t> dst_shape = {1, 8, 8};
+
+    std::vector<uint8_t> src_data(product(src_shape));
+    std::vector<int8_t> weight_data(product(weight_shape));
+
+    // random generate src, weight data
+    // random seed = 7
+    std::default_random_engine generator(7);
+    std::uniform_real_distribution<float> distribution(0.0f, 255.0f);
+    std::generate(src_data.begin(), src_data.end(),
+            [&]() { return distribution(generator); });
+    std::uniform_real_distribution<float> distribution2(-127.0f, 127.0f);
+    std::generate(weight_data.begin(), weight_data.end(),
+            [&]() { return distribution2(generator); });
+    float scale_src = 1 / 255.f; // map to 0~255
+    int64_t zp_src = 110;
+
+    size_t scales_wei_sizes = qtype == "per_tensor" ? 1 : dst_shape.back();
+    std::vector<float> scale_wei(scales_wei_sizes, 1 / 127.f);
+    std::vector<int64_t> zp_wei(scales_wei_sizes, 0);
+
+    graph::op_t dqdata_op(0, graph::op_kind::Dequantize, "dqdata_op");
+    dqdata_op.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
+    dqdata_op.set_attr<std::vector<int64_t>>(graph::op_attr::zps, {zp_src});
+    dqdata_op.set_attr<std::vector<float>>(graph::op_attr::scales, {scale_src});
+    dqdata_op.set_attr<int64_t>(graph::op_attr::axis, 0);
+
+    graph::op_t dqweight_op(1, graph::op_kind::Dequantize, "dqweight_op");
+    dqweight_op.set_attr<std::string>(graph::op_attr::qtype, qtype);
+    dqweight_op.set_attr<std::vector<int64_t>>(graph::op_attr::zps, zp_wei);
+    dqweight_op.set_attr<std::vector<float>>(graph::op_attr::scales, scale_wei);
+    dqweight_op.set_attr<int64_t>(graph::op_attr::axis, 0);
+
+    graph::op_t tcdata_op {2, graph::op_kind::TypeCast, "typecast_data"};
+    graph::op_t tcweight_op {3, graph::op_kind::TypeCast, "typecast_weight"};
+
+    graph::op_t matmul_op(4, graph::op_kind::MatMul, "matmul_op");
+    matmul_op.set_attr<bool>(graph::op_attr::transpose_a, false);
+    matmul_op.set_attr<bool>(graph::op_attr::transpose_b, true);
+
+    // prepare logical tensor
+    graph::logical_tensor_t src_u8
+            = utils::logical_tensor_init(0, src_shape, graph::data_type::u8);
+    graph::logical_tensor_t src_f32_dq
+            = utils::logical_tensor_init(1, src_shape, graph::data_type::f32);
+    graph::logical_tensor_t src_bf16
+            = utils::logical_tensor_init(2, src_shape, graph::data_type::bf16);
+    graph::logical_tensor_t weight_u8
+            = utils::logical_tensor_init(3, weight_shape, graph::data_type::u8);
+    graph::logical_tensor_t weight_f32_dq = utils::logical_tensor_init(
+            4, weight_shape, graph::data_type::f32);
+    graph::logical_tensor_t weight_bf16 = utils::logical_tensor_init(
+            5, weight_shape, graph::data_type::bf16);
+    graph::logical_tensor_t dst_bf16
+            = utils::logical_tensor_init(7, dst_shape, graph::data_type::bf16);
+
+    dqdata_op.add_input(src_u8);
+    dqdata_op.add_output(src_f32_dq);
+
+    dqweight_op.add_input(weight_u8);
+    dqweight_op.add_output(weight_f32_dq);
+
+    tcdata_op.add_input(src_f32_dq);
+    tcdata_op.add_output(src_bf16);
+
+    tcweight_op.add_input(weight_f32_dq);
+    tcweight_op.add_output(weight_bf16);
+
+    matmul_op.add_input(src_bf16);
+    matmul_op.add_input(weight_bf16);
+    matmul_op.add_output(dst_bf16);
+
+    graph::graph_t g(engine->kind());
+    g.add_op(&dqdata_op);
+    g.add_op(&dqweight_op);
+    g.add_op(&matmul_op);
+    g.add_op(&tcdata_op);
+    g.add_op(&tcweight_op);
+    g.finalize();
+
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_tc_matmul_post_ops");
+    apass->run(g);
+    ASSERT_EQ(g.get_num_partitions(), 1U);
+    auto part = g.get_partitions()[0];
+
+    // compile
+    graph::partition_t p;
+    p.init(part);
+
+    graph::compiled_partition_t cp(p);
+
+    std::vector<const graph::logical_tensor_t *> lt_ins {&src_u8, &weight_u8};
+    std::vector<const graph::logical_tensor_t *> lt_outs {&dst_bf16};
+
+    p.compile(&cp, lt_ins, lt_outs, engine);
+
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_s8_ts(weight_u8, engine, weight_data);
+    test_tensor_t dst_ts(dst_bf16, engine);
+    cp.execute(strm, {src_u8_ts.get(), weight_s8_ts.get()}, {dst_ts.get()});
+    strm->wait();
+}
+
+TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddBF16U8s8bf16_CPU) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
@@ -3241,10 +3399,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddBF16U8s8bf16) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::gpu
-                            ? "x8s8x_tc_matmul_post_ops_gpu"
-                            : "x8x8x_tc_matmul_post_ops_cpu");
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_tc_matmul_post_ops");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -3261,11 +3416,11 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddBF16U8s8bf16) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-    test_tensor bias_bf16_ts(bias_bf16, engine, bias_data);
-    test_tensor other_bf16_ts(other_bf16, engine, other_data);
-    test_tensor dst_ts(dst_bf16, engine);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+    test_tensor_t bias_bf16_ts(bias_bf16, engine, bias_data);
+    test_tensor_t other_bf16_ts(other_bf16, engine, other_data);
+    test_tensor_t dst_ts(dst_bf16, engine);
     cp.execute(strm,
             {src_u8_ts.get(), weight_s8_ts.get(), bias_bf16_ts.get(),
                     other_bf16_ts.get()},
@@ -3273,14 +3428,13 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasAddBF16U8s8bf16) {
     strm->wait();
 }
 
-TEST(test_matmul_execute_subgraph_int8, MatmulBiasaddAddBF16U8s8bf16) {
+TEST(test_matmul_execute_subgraph_int8, MatmulBiasaddAddBF16U8s8bf16_CPU) {
     graph::engine_t *engine = get_engine();
     graph::stream_t *strm = get_stream();
 
-    // gpu doesn't support mixed int8-bf16 matmul with runtime zero points
+    // gpu doesn't support mixed int8-bf16 matmul
     SKIP_IF(engine->kind() == graph::engine_kind::gpu,
-            "skip on gpu for unsupported mixed int8-bf16 matmul with runtime "
-            "zero points");
+            "skip on gpu for unsupported mixed int8-bf16 matmul with runtime ");
     std::string qtype = "per_channel";
     std::vector<int64_t> src_shape = {1, 8, 16};
     std::vector<int64_t> weight_shape = {8, 16};
@@ -3416,10 +3570,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasaddAddBF16U8s8bf16) {
     g.add_op(&add_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::gpu
-                            ? "x8s8x_tc_matmul_post_ops_gpu"
-                            : "x8x8x_tc_matmul_post_ops_cpu");
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_tc_matmul_post_ops");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -3436,11 +3587,11 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasaddAddBF16U8s8bf16) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-    test_tensor other_bf16_ts(other_bf16, engine, other_data);
-    test_tensor dst_ts(dst_bf16, engine);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t other_bf16_ts(other_bf16, engine, other_data);
+    test_tensor_t dst_ts(dst_bf16, engine);
     cp.execute(strm,
             {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get(),
                     other_bf16_ts.get()},
@@ -3563,10 +3714,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasU8s8u8MixBf16) {
     g.add_op(&qout_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::gpu
-                            ? "x8s8x_tc_matmul_post_ops_gpu"
-                            : "x8x8x_tc_matmul_post_ops_cpu");
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_tc_matmul_post_ops");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -3584,10 +3732,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasU8s8u8MixBf16) {
     p.compile(&cp, lt_ins, lt_outs, engine);
 
     std::vector<uint8_t> dst_data(product(dst_shape));
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-    test_tensor bias_bf16_ts(bias_bf16, engine, bias_data);
-    test_tensor dst_ts(dst_u8, engine, dst_data);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+    test_tensor_t bias_bf16_ts(bias_bf16, engine, bias_data);
+    test_tensor_t dst_ts(dst_u8, engine, dst_data);
     cp.execute(strm, {src_u8_ts.get(), weight_s8_ts.get(), bias_bf16_ts.get()},
             {dst_ts.get()});
     strm->wait();
@@ -3738,10 +3886,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasaddU8s8u8MixBf16) {
     g.add_op(&qout_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::gpu
-                            ? "x8s8x_tc_matmul_post_ops_gpu"
-                            : "x8x8x_tc_matmul_post_ops_cpu");
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_tc_matmul_post_ops");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -3759,10 +3904,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasaddU8s8u8MixBf16) {
     p.compile(&cp, lt_ins, lt_outs, engine);
 
     std::vector<uint8_t> dst_data(product(dst_shape));
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-    test_tensor dst_ts(dst_u8, engine, dst_data);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t dst_ts(dst_u8, engine, dst_data);
     cp.execute(strm, {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
             {dst_ts.get()});
     strm->wait();
@@ -3900,7 +4045,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasGeluU8s8u8MixBf16) {
     g.finalize();
 
     auto &backend_ptr
-            = dnnl::impl::graph::dnnl_impl::dnnl_backend::get_singleton();
+            = dnnl::impl::graph::dnnl_impl::dnnl_backend_t::get_singleton();
     auto pm = dnnl::impl::graph::pass::pass_manager_t(
             backend_ptr.get_pass_registry());
     pm.run_passes(g, "", graph::partition_policy::fusion);
@@ -3920,10 +4065,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasGeluU8s8u8MixBf16) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-    test_tensor bias_bf16_ts(bias_bf16, engine, bias_data);
-    test_tensor dst_ts(dst_u8, engine);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+    test_tensor_t bias_bf16_ts(bias_bf16, engine, bias_data);
+    test_tensor_t dst_ts(dst_u8, engine);
     cp.execute(strm, {src_u8_ts.get(), weight_s8_ts.get(), bias_bf16_ts.get()},
             {dst_ts.get()});
     strm->wait();
@@ -4081,10 +4226,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasaddGeluU8s8u8MixBf16) {
     g.add_op(&qout_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::gpu
-                            ? "x8s8x_tc_matmul_post_ops_gpu"
-                            : "x8x8x_tc_matmul_post_ops_cpu");
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_tc_matmul_post_ops");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -4101,10 +4243,10 @@ TEST(test_matmul_execute_subgraph_int8, MatmulBiasaddGeluU8s8u8MixBf16) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_bf32_ts(bias_f32, engine, bias_data);
-    test_tensor dst_ts(dst_u8, engine);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_bf32_ts(bias_f32, engine, bias_data);
+    test_tensor_t dst_ts(dst_u8, engine);
     cp.execute(strm, {src_u8_ts.get(), weight_f32_ts.get(), bias_bf32_ts.get()},
             {dst_ts.get()});
     strm->wait();
@@ -4190,9 +4332,9 @@ TEST(test_matmul_execute, MatmulTransposeReorder) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_f32_ts(src_f32, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor dst_ts(reorder_f32, engine);
+    test_tensor_t src_f32_ts(src_f32, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t dst_ts(reorder_f32, engine);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(
                 strm, {src_f32_ts.get(), weight_f32_ts.get()}, {dst_ts.get()});
@@ -4346,11 +4488,11 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasTransposeReorder) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
     std::vector<int8_t> dst_out_data(product(dst_shape));
-    test_tensor dst_ts(dst_s8, engine, dst_out_data);
+    test_tensor_t dst_ts(dst_s8, engine, dst_out_data);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(strm,
                 {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
@@ -4520,10 +4662,10 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMixBf16MatmulTransposeReorder) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
     std::vector<int8_t> dst_out_data(product(dst_shape));
-    test_tensor dst_ts(dst_s8, engine, dst_out_data);
+    test_tensor_t dst_ts(dst_s8, engine, dst_out_data);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(
                 strm, {src_u8_ts.get(), weight_f32_ts.get()}, {dst_ts.get()});
@@ -4579,9 +4721,9 @@ TEST(test_matmul_execute, MatmulScalarOutput) {
     ASSERT_EQ(scalar_lt.layout_type, graph::layout_type::strided);
     ASSERT_EQ(scalar_lt.ndims, 0);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor dst_ts(scalar_lt, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t dst_ts(scalar_lt, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get(), weight_ts.get()}, {dst_ts.get()}),
@@ -4616,10 +4758,10 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasSumNdx2d) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<float> weight_data(product(weight_shape));
@@ -4648,10 +4790,6 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasSumNdx2d) {
         // reorder with zps is not supported on GPU
         int64_t zp_src = engine->kind() == graph::engine_kind::gpu ? 0 : zp;
         int64_t zp_other = engine->kind() == graph::engine_kind::gpu ? 0 : zp;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : zp;
 
         auto generate_zps = [&]() {
@@ -4776,13 +4914,13 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasSumNdx2d) {
         // set bias to be constant
         bias_f32.property = graph::property_type::constant;
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-        test_tensor other_s8_ts(other_s8, engine, other_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+        test_tensor_t other_s8_ts(other_s8, engine, other_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
         // -------------------------case 1----------------------------------
         std::vector<int8_t> case1_out_data(product(dst_shape));
-        test_tensor dst_s8_ts(dst_s8, engine, case1_out_data);
+        test_tensor_t dst_s8_ts(dst_s8, engine, case1_out_data);
         ASSERT_EQ(run_graph(g,
                           {src_u8_ts, weight_f32_ts, bias_f32_ts, other_s8_ts},
                           {dst_s8_ts}, *engine, *strm),
@@ -4791,7 +4929,7 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasSumNdx2d) {
         // -------------------------case 2----------------------------------
         graph::pass::pass_base_ptr apass
                 = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x8_matmul_add_post_ops_gpu"
+                                ? "x8x8x8_matmul_add_post_ops_gpu"
                                 : "x8x8x8_matmul_add_post_ops_cpu");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
@@ -4810,7 +4948,7 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasSumNdx2d) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<int8_t> case2_out_data(product(dst_shape));
-        test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+        test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
         for (size_t iter = 0; iter < 5; iter++) {
             cp.execute(strm,
                     {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get(),
@@ -4844,9 +4982,9 @@ TEST(test_matmul_execute_subgraph_int8, U8S8U8MatmulAddF32) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<float> weight_data(product(weight_shape));
@@ -4956,21 +5094,18 @@ TEST(test_matmul_execute_subgraph_int8, U8S8U8MatmulAddF32) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-        test_tensor other_f32_ts(other_f32, engine, other_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+        test_tensor_t other_f32_ts(other_f32, engine, other_data);
         // -------------------------case 1----------------------------------
         std::vector<int8_t> case1_out_data(product(dst_shape));
-        test_tensor dst_u8_ts(dst_u8, engine, case1_out_data);
+        test_tensor_t dst_u8_ts(dst_u8, engine, case1_out_data);
         ASSERT_EQ(run_graph(g, {src_u8_ts, weight_f32_ts, other_f32_ts},
                           {dst_u8_ts}, *engine, *strm),
                 graph::status::success);
 
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -4988,7 +5123,7 @@ TEST(test_matmul_execute_subgraph_int8, U8S8U8MatmulAddF32) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<int8_t> case2_out_data(product(dst_shape));
-        test_tensor dst_u8_case2_ts(dst_u8, engine, case2_out_data);
+        test_tensor_t dst_u8_case2_ts(dst_u8, engine, case2_out_data);
         for (size_t iter = 0; iter < 5; iter++) {
             cp.execute(strm,
                     {src_u8_ts.get(), weight_f32_ts.get(), other_f32_ts.get()},
@@ -5024,10 +5159,10 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasNdx2dWithTranspose) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         std::vector<uint8_t> src_data(product(src_shape));
         std::vector<float> weight_data(product(weight_shape));
@@ -5053,10 +5188,6 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasNdx2dWithTranspose) {
         float scale_src = 1 / 255.f; // map to 0~255
         float scale_out = 1;
         int64_t zp_src = 0;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
         size_t scales_wei_sizes = qtype == "per_tensor" ? 1 : dst_shape.back();
@@ -5146,20 +5277,17 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasNdx2dWithTranspose) {
         // set bias to be constant
         bias_f32.property = graph::property_type::constant;
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-        test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+        test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
         // -------------------------case 1----------------------------------
         std::vector<int8_t> case1_out_data(product(dst_shape));
-        test_tensor dst_s8_ts(dst_s8, engine, case1_out_data);
+        test_tensor_t dst_s8_ts(dst_s8, engine, case1_out_data);
         ASSERT_EQ(run_graph(g, {src_u8_ts, weight_f32_ts, bias_f32_ts},
                           {dst_s8_ts}, *engine, *strm),
                 graph::status::success);
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -5177,7 +5305,7 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasNdx2dWithTranspose) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<int8_t> case2_out_data(product(dst_shape));
-        test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+        test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
         for (size_t iter = 0; iter < 1; iter++) {
             cp.execute(strm,
                     {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
@@ -5214,18 +5342,14 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasReluNdx2d) {
     for_(size_t i = 0; i < src_shapes.size(); ++i)
     for (size_t j = 0; j < weight_shapes.size(); ++j) {
         // prepare fp32 data
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> weight_shape = weight_shapes[j];
-        std::vector<int64_t> bias_shape {2};
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &weight_shape = weight_shapes[j];
+        const std::vector<int64_t> bias_shape {2};
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         float scale_src = 1 / 255.f; // map to 0~255
         float scale_out = 1;
         int64_t zp_src = 0;
-        // The following cmd will be skiped by benchdnn, since oneDNN didn't
-        // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-        // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-        // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
         int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
         size_t scales_wei_sizes = qtype == "per_tensor" ? 1 : dst_shape.back();
@@ -5316,23 +5440,20 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasReluNdx2d) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine);
+        test_tensor_t src_u8_ts(src_u8, engine);
         src_u8_ts.fill<uint8_t>(20, 5);
-        test_tensor weight_f32_ts(weight_f32, engine);
+        test_tensor_t weight_f32_ts(weight_f32, engine);
         weight_f32_ts.fill<float>();
-        test_tensor bias_f32_ts(bias_f32, engine);
+        test_tensor_t bias_f32_ts(bias_f32, engine);
         bias_f32_ts.fill<float>();
         // -------------------------case 1----------------------------------
-        test_tensor dst_s8_ts(dst_s8, engine);
+        test_tensor_t dst_s8_ts(dst_s8, engine);
         ASSERT_EQ(run_graph(g, {src_u8_ts, weight_f32_ts, bias_f32_ts},
                           {dst_s8_ts}, *engine, *strm),
                 graph::status::success);
 
         // -------------------------case 2----------------------------------
-        graph::pass::pass_base_ptr apass
-                = get_pass(engine->kind() == graph::engine_kind::gpu
-                                ? "x8s8x_matmul_post_ops_gpu"
-                                : "x8x8x_matmul_post_ops_cpu");
+        graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
         apass->run(g);
         ASSERT_EQ(g.get_num_partitions(), 1U);
         auto part = g.get_partitions()[0];
@@ -5350,7 +5471,7 @@ TEST(test_matmul_execute_subgraph_int8, QuantWeiMatmulBiasReluNdx2d) {
 
         p.compile(&cp, lt_ins, lt_outs, engine);
 
-        test_tensor dst_s8_case2_ts(dst_s8, engine);
+        test_tensor_t dst_s8_case2_ts(dst_s8, engine);
         for (size_t iter = 0; iter < 5; iter++) {
             if (with_bias) {
                 cp.execute(strm,
@@ -5425,9 +5546,9 @@ TEST(test_matmul_execute, MatmulReluFusion) {
 
     p.compile(&cp, inputs, outputs, eng);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor dst_ts(relu_dst, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t dst_ts(relu_dst, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get()}, {dst_ts.get()});
@@ -5484,10 +5605,10 @@ TEST(test_matmul_execute, MatmulBiasFusion) {
 
     p.compile(&cp, inputs, outputs, eng);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor bias_ts(bias, eng, bias_data);
-    test_tensor dst_ts(dst, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t bias_ts(bias, eng, bias_data);
+    test_tensor_t dst_ts(dst, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), bias_ts.get()},
@@ -5552,10 +5673,10 @@ TEST(test_matmul_execute, MatmulSumBroadcast1d) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor add_src1_ts(add_src1, engine, add_src1_data);
-    test_tensor dst_ts(add_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t add_src1_ts(add_src1, engine, add_src1_data);
+    test_tensor_t dst_ts(add_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), add_src1_ts.get()},
@@ -5620,10 +5741,10 @@ TEST(test_matmul_execute, MatmulSumFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor add_src1_ts(add_src1, engine, add_src1_data);
-    test_tensor dst_ts(add_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t add_src1_ts(add_src1, engine, add_src1_data);
+    test_tensor_t dst_ts(add_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), add_src1_ts.get()},
@@ -5693,10 +5814,10 @@ TEST(test_matmul_execute, MatmulSumGeluFusion) {
 
     p.compile(&cp, inputs, outputs, eng);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor other_ts(other, eng, other_data);
-    test_tensor dst_ts(gelu_dst, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t other_ts(other, eng, other_data);
+    test_tensor_t dst_ts(gelu_dst, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), other_ts.get()},
@@ -5766,10 +5887,10 @@ TEST(test_matmul_execute, MatmulSumReluFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor other_ts(other, engine, other_data);
-    test_tensor dst_ts(relu_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t other_ts(other, engine, other_data);
+    test_tensor_t dst_ts(relu_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), other_ts.get()},
@@ -5832,10 +5953,10 @@ TEST(test_matmul_execute, MatmulBiasReluFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor bias_ts(bias, engine, bias_data);
-    test_tensor dst_ts(relu_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t bias_ts(bias, engine, bias_data);
+    test_tensor_t dst_ts(relu_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), bias_ts.get()},
@@ -5898,10 +6019,10 @@ TEST(test_matmul_execute, MatmulBiasGeluFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor bias_ts(bias, engine, bias_data);
-    test_tensor dst_ts(gelu_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t bias_ts(bias, engine, bias_data);
+    test_tensor_t dst_ts(gelu_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), bias_ts.get()},
@@ -5967,10 +6088,10 @@ TEST(test_matmul_execute, MatmulBiasRelu6Fusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor bias_ts(bias, engine, bias_data);
-    test_tensor dst_ts(clamp_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t bias_ts(bias, engine, bias_data);
+    test_tensor_t dst_ts(clamp_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), bias_ts.get()},
@@ -6036,10 +6157,10 @@ TEST(test_matmul_execute, MatmulBiasClampFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor bias_ts(bias, engine, bias_data);
-    test_tensor dst_ts(clamp_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t bias_ts(bias, engine, bias_data);
+    test_tensor_t dst_ts(clamp_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), bias_ts.get()},
@@ -6104,10 +6225,10 @@ TEST(test_matmul_execute, MatmulBiasEluFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor bias_ts(bias, engine, bias_data);
-    test_tensor dst_ts(elu_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t bias_ts(bias, engine, bias_data);
+    test_tensor_t dst_ts(elu_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), bias_ts.get()},
@@ -6170,10 +6291,10 @@ TEST(test_matmul_execute, MatmulBiasSigmoidFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor bias_ts(bias, engine, bias_data);
-    test_tensor dst_ts(sigmoid_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t bias_ts(bias, engine, bias_data);
+    test_tensor_t dst_ts(sigmoid_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), bias_ts.get()},
@@ -6241,11 +6362,11 @@ TEST(test_matmul_execute, MatmulBiasAddFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor bias_ts(bias, engine, bias_data);
-    test_tensor post_src_ts(post_src, engine, post_src_data);
-    test_tensor dst_ts(add_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t bias_ts(bias, engine, bias_data);
+    test_tensor_t post_src_ts(post_src, engine, post_src_data);
+    test_tensor_t dst_ts(add_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm,
@@ -6312,10 +6433,10 @@ TEST(test_matmul_execute, MatmulDivFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor div_src1_ts(div_src1, engine, div_src1_data);
-    test_tensor dst_ts(div_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t div_src1_ts(div_src1, engine, div_src1_data);
+    test_tensor_t dst_ts(div_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), weight_ts.get(), div_src1_ts.get()},
@@ -6391,11 +6512,11 @@ TEST(test_matmul_execute, MatmulDivAddFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor div_src1_ts(div_src1, engine, div_src1_data);
-    test_tensor add_src1_ts(add_src1, engine, add_src1_data);
-    test_tensor dst_ts(add_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t div_src1_ts(div_src1, engine, div_src1_data);
+    test_tensor_t add_src1_ts(add_src1, engine, add_src1_data);
+    test_tensor_t dst_ts(add_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm,
@@ -6488,11 +6609,11 @@ TEST(test_matmul_execute, MatmulSwapBinaryMulAddFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor div_src1_ts(div_src1, engine, div_src1_data);
-    test_tensor add_src1_ts(add_src1, engine, add_src1_data);
-    test_tensor dst_ts(add_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t div_src1_ts(div_src1, engine, div_src1_data);
+    test_tensor_t add_src1_ts(add_src1, engine, add_src1_data);
+    test_tensor_t dst_ts(add_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm,
@@ -6530,10 +6651,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulReluFusion) {
     float scale_out = 1;
     int64_t zp_src = 0;
     int64_t zp_wei = 0;
-    // The following cmd will be skiped by benchdnn, since oneDNN didn't
-    // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-    // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-    // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
+
     int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
     // -------------------------case 1----------------------------------
@@ -6602,19 +6720,16 @@ TEST(test_matmul_execute_subgraph_int8, MatmulReluFusion) {
     g.add_op(&qout_op);
     g.finalize();
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_s8_ts(weight_s8, engine, weight_data);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
     // -------------------------case 1----------------------------------
     std::vector<int8_t> case1_out_data(product(dst_shape));
-    test_tensor dst_s8_ts(dst_s8, engine, case1_out_data);
+    test_tensor_t dst_s8_ts(dst_s8, engine, case1_out_data);
     ASSERT_EQ(run_graph(g, {src_u8_ts, weight_s8_ts}, {dst_s8_ts}, *engine,
                       *strm),
             graph::status::success);
     // -------------------------case 2----------------------------------
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::gpu
-                            ? "x8s8x_matmul_post_ops_gpu"
-                            : "x8x8x_matmul_post_ops_cpu");
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -6632,7 +6747,7 @@ TEST(test_matmul_execute_subgraph_int8, MatmulReluFusion) {
     p.compile(&cp, lt_ins, lt_outs, engine);
 
     std::vector<int8_t> case2_out_data(product(dst_shape));
-    test_tensor dst_s8_case2_ts(dst_s8, engine, case2_out_data);
+    test_tensor_t dst_s8_case2_ts(dst_s8, engine, case2_out_data);
     cp.execute(strm, {src_u8_ts.get(), weight_s8_ts.get()},
             {dst_s8_case2_ts.get()});
     strm->wait();
@@ -6794,10 +6909,10 @@ TEST(test_matmul_execute_subgraph_int8,
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-    test_tensor dst_s8_ts(dst_s8, engine);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t dst_s8_ts(dst_s8, engine);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(strm,
                 {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
@@ -6955,11 +7070,11 @@ TEST(test_matmul_execute_subgraph_int8,
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
     std::vector<int8_t> dst_out_data(product(dst_shape));
-    test_tensor dst_s8_ts(dst_s8, engine, dst_out_data);
+    test_tensor_t dst_s8_ts(dst_s8, engine, dst_out_data);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(strm,
                 {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
@@ -7157,10 +7272,10 @@ TEST(test_matmul_execute_subgraph_int8,
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-    test_tensor dst_s8_ts(dst_s8, engine);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t dst_s8_ts(dst_s8, engine);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(strm,
                 {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
@@ -7359,10 +7474,10 @@ TEST(test_matmul_execute_subgraph_int8,
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_u8_ts(src_u8, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-    test_tensor dst_s8_ts(dst_s8, engine);
+    test_tensor_t src_u8_ts(src_u8, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t dst_s8_ts(dst_s8, engine);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(strm,
                 {src_u8_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
@@ -7462,12 +7577,12 @@ TEST(test_matmul_execute, MatmulBiasReshapeTranspose) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_f32_ts(src_f32, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t src_f32_ts(src_f32, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
     graph::logical_tensor_t lt;
     cp.query_logical_tensor(transpose_f32.id, &lt);
-    test_tensor dst_f32_ts(lt, engine);
+    test_tensor_t dst_f32_ts(lt, engine);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(strm,
                 {src_f32_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
@@ -7568,10 +7683,10 @@ TEST(test_matmul_execute, MatmulBiasTransposeReshape) {
 
     p.compile(&cp, lt_ins, lt_outs, engine);
 
-    test_tensor src_f32_ts(src_f32, engine, src_data);
-    test_tensor weight_f32_ts(weight_f32, engine, weight_data);
-    test_tensor bias_f32_ts(bias_f32, engine, bias_data);
-    test_tensor dst_f32_ts(reshape_f32, engine);
+    test_tensor_t src_f32_ts(src_f32, engine, src_data);
+    test_tensor_t weight_f32_ts(weight_f32, engine, weight_data);
+    test_tensor_t bias_f32_ts(bias_f32, engine, bias_data);
+    test_tensor_t dst_f32_ts(reshape_f32, engine);
     for (size_t iter = 0; iter < 5; iter++) {
         cp.execute(strm,
                 {src_f32_ts.get(), weight_f32_ts.get(), bias_f32_ts.get()},
@@ -7628,9 +7743,9 @@ TEST(test_matmul_execute, MatmulStridedScalarOutput) {
     ASSERT_EQ(scalar_lt.layout_type, graph::layout_type::strided);
     ASSERT_EQ(scalar_lt.ndims, 0);
 
-    test_tensor src_ts(src, eng, src_data);
-    test_tensor weight_ts(weight, eng, weight_data);
-    test_tensor dst_ts(scalar_lt, eng, dst_data);
+    test_tensor_t src_ts(src, eng, src_data);
+    test_tensor_t weight_ts(weight, eng, weight_data);
+    test_tensor_t dst_ts(scalar_lt, eng, dst_data);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get(), weight_ts.get()}, {dst_ts.get()}),
@@ -7704,11 +7819,11 @@ TEST(test_matmul_execute, MatmulBiasAddReluFusion) {
 
     p.compile(&cp, inputs, outputs, engine);
 
-    test_tensor src_ts(src, engine, src_data);
-    test_tensor weight_ts(weight, engine, weight_data);
-    test_tensor bias_ts(bias, engine, bias_data);
-    test_tensor post_src_ts(post_src, engine, post_src_data);
-    test_tensor dst_ts(relu_dst, engine, dst_data);
+    test_tensor_t src_ts(src, engine, src_data);
+    test_tensor_t weight_ts(weight, engine, weight_data);
+    test_tensor_t bias_ts(bias, engine, bias_data);
+    test_tensor_t post_src_ts(post_src, engine, post_src_data);
+    test_tensor_t dst_ts(relu_dst, engine, dst_data);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm,
@@ -7767,9 +7882,9 @@ TEST(test_matmul_execute, MatmulEmptyInput) {
     cp.query_logical_tensor(weight.id, &weight);
     cp.query_logical_tensor(dst.id, &dst);
 
-    test_tensor src_ts(src, eng);
-    test_tensor weight_ts(weight, eng);
-    test_tensor dst_ts(dst, eng);
+    test_tensor_t src_ts(src, eng);
+    test_tensor_t weight_ts(weight, eng);
+    test_tensor_t dst_ts(dst, eng);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get(), weight_ts.get()}, {dst_ts.get()}),
@@ -7787,10 +7902,6 @@ TEST(test_matmul_execute_subgraph_int8, ShareCachedWeight) {
     float scale_src = 1 / 255.f; // map to 0~255
     float scale_out = 1;
     int64_t zp_src = 0;
-    // The following cmd will be skiped by benchdnn, since oneDNN didn't
-    // support reorder with zps on GPU: "./tests/benchdnn/benchdnn --reorder
-    // --engine=gpu --mode=C --sdt=f32 --ddt=s8
-    // --attr-zero-points=dst:common:78 --stag=aBc8b --dtag=abc 1x8x10"
     int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
 
     size_t scales_wei_sizes = weight_shape.back();
@@ -7850,10 +7961,7 @@ TEST(test_matmul_execute_subgraph_int8, ShareCachedWeight) {
     g.add_op(&qout_op);
     g.finalize();
 
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::gpu
-                            ? "x8s8x_matmul_post_ops_gpu"
-                            : "x8x8x_matmul_post_ops_cpu");
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
     apass->run(g);
     ASSERT_EQ(g.get_num_partitions(), 1U);
     auto part = g.get_partitions()[0];
@@ -7866,9 +7974,22 @@ TEST(test_matmul_execute_subgraph_int8, ShareCachedWeight) {
     std::vector<std::vector<int64_t>> dst_shapes {{4, 4096}, {32, 4096}};
     std::vector<std::shared_ptr<graph::compiled_partition_t>> cps;
     size_t prv_cache_size = 0;
+
+    // random generate src, weight and bias data random seed = 7.
+    // Weight tensor keeps same for different src.
+    std::default_random_engine generator(7);
+    std::uniform_real_distribution<float> s8_distribution(-127.0f, 128.0f);
+    std::vector<int8_t> weight_data(product(weight_shape));
+    std::generate(weight_data.begin(), weight_data.end(),
+            [&]() { return static_cast<int8_t>(s8_distribution(generator)); });
+    test_tensor_t weight_s8_ts(weight_s8, engine, weight_data);
+
+    // set constant tensor cache capacity as 1GB
+    dnnl::graph::set_constant_tensor_cache_capacity(
+            static_cast<engine::kind>(engine->kind()), 1024);
     for (size_t i = 0; i < src_shapes.size(); ++i) {
-        std::vector<int64_t> src_shape = src_shapes[i];
-        std::vector<int64_t> dst_shape = dst_shapes[i];
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
 
         src_u8 = utils::logical_tensor_init(1, src_shape, graph::data_type::u8);
         dst_s8 = utils::logical_tensor_init(8, dst_shape, graph::data_type::s8);
@@ -7886,22 +8007,14 @@ TEST(test_matmul_execute_subgraph_int8, ShareCachedWeight) {
         cp.query_logical_tensor(dst_s8.id, &compiled_output);
 
         std::vector<uint8_t> src_data(product(src_shape));
-        std::vector<int8_t> weight_data(product(weight_shape));
 
-        // random generate src, weight and bias data random seed = 7
-        std::default_random_engine generator(7);
         std::uniform_real_distribution<float> u8_distribution(0.0f, 255.0f);
-        std::uniform_real_distribution<float> s8_distribution(-127.0f, 128.0f);
         std::generate(src_data.begin(), src_data.end(), [&]() {
             return static_cast<uint8_t>(u8_distribution(generator));
         });
-        std::generate(weight_data.begin(), weight_data.end(), [&]() {
-            return static_cast<int8_t>(s8_distribution(generator));
-        });
 
-        test_tensor src_u8_ts(src_u8, engine, src_data);
-        test_tensor weight_s8_ts(weight_s8, engine, weight_data);
-        test_tensor dst_s8_ts(compiled_output, engine);
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t dst_s8_ts(compiled_output, engine);
         ASSERT_EQ(cp.execute(strm, {src_u8_ts.get(), weight_s8_ts.get()},
                           {dst_s8_ts.get()}),
                 graph::status::success);
@@ -7909,7 +8022,6 @@ TEST(test_matmul_execute_subgraph_int8, ShareCachedWeight) {
         size_t curr_cache_size = graph::get_constant_tensor_cache(
                 engine->kind(), engine->index())
                                          ->get_size();
-
         if (i != 0) {
             // cache size should not change since no new weight cached
             ASSERT_EQ(prv_cache_size, curr_cache_size);
@@ -7918,4 +8030,156 @@ TEST(test_matmul_execute_subgraph_int8, ShareCachedWeight) {
 
         strm->wait();
     }
+    // Reset constant tensor cache capacity as 0
+    dnnl::graph::set_constant_tensor_cache_capacity(
+            static_cast<engine::kind>(engine->kind()), 0);
+}
+
+TEST(test_matmul_execute_subgraph_int8, NoShareCachedWeight) {
+    graph::engine_t *engine = get_engine();
+    graph::stream_t *strm = get_stream();
+    std::string qtype = "per_channel";
+
+    std::vector<int64_t> weight_shape = {1024, 1024};
+
+    float scale_src = 1 / 255.f; // map to 0~255
+    float scale_out = 1;
+    int64_t zp_src = 0;
+    int64_t zp_out = engine->kind() == graph::engine_kind::gpu ? 0 : 78;
+
+    size_t scales_wei_sizes = weight_shape.back();
+    std::vector<float> scale_wei(scales_wei_sizes, 1 / 127.f);
+    std::vector<int64_t> zp_wei(scales_wei_sizes, 0);
+
+    graph::op_t dqdata_op(1, graph::op_kind::Dequantize, "dqdata_op");
+    dqdata_op.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
+    dqdata_op.set_attr<std::vector<int64_t>>(graph::op_attr::zps, {zp_src});
+    dqdata_op.set_attr<std::vector<float>>(graph::op_attr::scales, {scale_src});
+    dqdata_op.set_attr<int64_t>(graph::op_attr::axis, 0);
+
+    graph::op_t dqweight_op(2, graph::op_kind::Dequantize, "dqweight_op");
+    dqweight_op.set_attr<std::string>(graph::op_attr::qtype, "per_channel");
+    dqweight_op.set_attr<std::vector<int64_t>>(graph::op_attr::zps, zp_wei);
+    dqweight_op.set_attr<std::vector<float>>(graph::op_attr::scales, scale_wei);
+    dqweight_op.set_attr<int64_t>(graph::op_attr::axis, 1);
+
+    graph::op_t matmul_op(3, graph::op_kind::MatMul, "matmul_op");
+    matmul_op.set_attr<bool>(graph::op_attr::transpose_a, false);
+    matmul_op.set_attr<bool>(graph::op_attr::transpose_b, false);
+
+    graph::op_t qout_op(4, graph::op_kind::Quantize, "qout_op");
+    qout_op.set_attr<std::string>(graph::op_attr::qtype, "per_tensor");
+    qout_op.set_attr<std::vector<int64_t>>(graph::op_attr::zps, {zp_out});
+    qout_op.set_attr<std::vector<float>>(graph::op_attr::scales, {scale_out});
+    qout_op.set_attr<int64_t>(graph::op_attr::axis, 0);
+
+    // prepare logical tensor
+    auto src_u8 = utils::logical_tensor_init(1, graph::data_type::u8);
+    auto src_f32_dq = utils::logical_tensor_init(2, graph::data_type::f32);
+    auto weight_s8
+            = utils::logical_tensor_init(4, weight_shape, graph::data_type::s8);
+    weight_s8.property = graph::property_type::constant;
+    auto weight_f32_dq = utils::logical_tensor_init(
+            5, weight_shape, graph::data_type::f32);
+    auto dst_f32 = utils::logical_tensor_init(7, graph::data_type::f32);
+    auto dst_s8 = utils::logical_tensor_init(8, graph::data_type::s8);
+
+    dqdata_op.add_input(src_u8);
+    dqdata_op.add_output(src_f32_dq);
+
+    dqweight_op.add_input(weight_s8);
+    dqweight_op.add_output(weight_f32_dq);
+
+    matmul_op.add_input(src_f32_dq);
+    matmul_op.add_input(weight_f32_dq);
+    matmul_op.add_output(dst_f32);
+
+    qout_op.add_input(dst_f32);
+    qout_op.add_output(dst_s8);
+
+    graph::graph_t g(engine->kind());
+    g.add_op(&dqdata_op);
+    g.add_op(&dqweight_op);
+    g.add_op(&matmul_op);
+    g.add_op(&qout_op);
+    g.finalize();
+
+    graph::pass::pass_base_ptr apass = get_pass("x8x8x_matmul_post_ops");
+    apass->run(g);
+    ASSERT_EQ(g.get_num_partitions(), 1U);
+    auto part = g.get_partitions()[0];
+    ASSERT_EQ(part->get_ops().size(), 4U);
+
+    graph::partition_t p;
+    p.init(part);
+
+    std::vector<std::vector<int64_t>> src_shapes {{4, 1024}, {32, 1024}};
+    std::vector<std::vector<int64_t>> dst_shapes {{4, 1024}, {32, 1024}};
+    std::vector<std::shared_ptr<graph::compiled_partition_t>> cps;
+    size_t prv_cache_size = 0;
+
+    //set constant tensor cache capacity as 1GB
+    dnnl::graph::set_constant_tensor_cache_capacity(
+            static_cast<engine::kind>(engine->kind()), 1024);
+
+    std::default_random_engine generator(7);
+    std::uniform_real_distribution<float> s8_distribution(-127.0f, 128.0f);
+    std::vector<int8_t> weight_data(product(weight_shape));
+    // Construct different weight tensor obejct with different memory address.
+    std::vector<test_tensor_t> weight_s8_ts_vec;
+    for (size_t i = 0; i < src_shapes.size(); i++) {
+        std::generate(weight_data.begin(), weight_data.end(), [&]() {
+            return static_cast<int8_t>(s8_distribution(generator));
+        });
+        weight_s8_ts_vec.emplace_back(weight_s8, engine, weight_data);
+    }
+
+    for (size_t i = 0; i < src_shapes.size(); ++i) {
+        const std::vector<int64_t> &src_shape = src_shapes[i];
+        const std::vector<int64_t> &dst_shape = dst_shapes[i];
+
+        src_u8 = utils::logical_tensor_init(1, src_shape, graph::data_type::u8);
+        dst_s8 = utils::logical_tensor_init(8, dst_shape, graph::data_type::s8);
+        std::vector<const graph::logical_tensor_t *> lt_ins {
+                &src_u8, &weight_s8};
+        std::vector<const graph::logical_tensor_t *> lt_outs {&dst_s8};
+
+        cps.push_back(std::make_shared<graph::compiled_partition_t>(p));
+        auto &cp = *cps.back();
+
+        ASSERT_EQ(p.compile(&cp, lt_ins, lt_outs, engine),
+                graph::status::success);
+
+        graph::logical_tensor_t compiled_output;
+        cp.query_logical_tensor(dst_s8.id, &compiled_output);
+
+        std::vector<uint8_t> src_data(product(src_shape));
+        std::uniform_real_distribution<float> u8_distribution(0.0f, 255.0f);
+        std::generate(src_data.begin(), src_data.end(), [&]() {
+            return static_cast<uint8_t>(u8_distribution(generator));
+        });
+
+        test_tensor_t src_u8_ts(src_u8, engine, src_data);
+        test_tensor_t dst_s8_ts(compiled_output, engine);
+        ASSERT_EQ(cp.execute(strm, {src_u8_ts.get(), weight_s8_ts_vec[i].get()},
+                          {dst_s8_ts.get()}),
+                graph::status::success);
+
+        size_t curr_cache_size = graph::get_constant_tensor_cache(
+                engine->kind(), engine->index())
+                                         ->get_size();
+
+        if (i != 0) {
+            // cache size changes since new weight tensor with different address
+            // will be cached
+            ASSERT_NE(prv_cache_size, curr_cache_size);
+        }
+        prv_cache_size = curr_cache_size;
+
+        strm->wait();
+    }
+
+    // Reset constant tensor cache capacity as 0
+    dnnl::graph::set_constant_tensor_cache_capacity(
+            static_cast<engine::kind>(engine->kind()), 0);
 }

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -70,10 +70,10 @@ struct jit_uni_pooling_fwd_t : public primitive_t {
             if (desc()->alg_kind == alg_kind::pooling_max && is_training)
                 init_default_ws();
 
-            auto scratchpad = scratchpad_registry().registrar();
+            CHECK(jit_uni_pool_kernel_t<isa>::init_conf(jpp_, attr_, this));
 
-            CHECK(jit_uni_pool_kernel<isa>::init_conf(
-                    jpp_, scratchpad, attr_, this));
+            auto scratchpad = scratchpad_registry().registrar();
+            jit_uni_pool_kernel_t<isa>::init_scratchpad(jpp_, scratchpad);
 
             return status::success;
         }
@@ -84,9 +84,9 @@ struct jit_uni_pooling_fwd_t : public primitive_t {
     explicit jit_uni_pooling_fwd_t(const pd_t *apd);
     jit_uni_pooling_fwd_t(jit_uni_pooling_fwd_t &&) = default;
     jit_uni_pooling_fwd_t &operator=(jit_uni_pooling_fwd_t &&) = default;
-    ~jit_uni_pooling_fwd_t();
+    ~jit_uni_pooling_fwd_t() override;
 
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t init(engine_t *engine) override;
 
@@ -111,7 +111,7 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
     status_t init_ncsp_trans_ctx();
 
-    std::unique_ptr<jit_uni_pool_kernel<isa>> kernel_;
+    std::unique_ptr<jit_uni_pool_kernel_t<isa>> kernel_;
     std::unique_ptr<jit_uni_pooling_utils::trans_context_t> trans_ctx_;
     static constexpr data_type_t wsp_dt_ = data_type::f32;
 };
@@ -134,12 +134,6 @@ struct jit_uni_pooling_bwd_t : public primitive_t {
             VDISPATCH_POOLING(everyone_is(d_type, diff_src_md()->data_type,
                                       diff_dst_md()->data_type),
                     VERBOSE_UNSUPPORTED_DT);
-            // TODO: Current implementation uses diff_src_dt as
-            // accumulation, which can cause accuracy issues due to
-            // overflow or loss of precision for smaller data type.
-            // Hence, disabling reduced precision for now.
-            VDISPATCH_POOLING(diff_src_md()->data_type == data_type::f32,
-                    VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_POOLING(
                     attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_POOLING(!is_dilated(), VERBOSE_UNSUPPORTED_FEATURE,
@@ -152,10 +146,10 @@ struct jit_uni_pooling_bwd_t : public primitive_t {
                         compare_ws(hint_fwd_pd_), VERBOSE_WS_MISMATCH);
             }
 
-            auto scratchpad = scratchpad_registry().registrar();
+            CHECK(jit_uni_pool_kernel_t<isa>::init_conf(jpp_, attr_, this));
 
-            CHECK(jit_uni_pool_kernel<isa>::init_conf(
-                    jpp_, scratchpad, attr_, this));
+            auto scratchpad = scratchpad_registry().registrar();
+            jit_uni_pool_kernel_t<isa>::init_scratchpad(jpp_, scratchpad);
 
             return status::success;
         }
@@ -166,9 +160,9 @@ struct jit_uni_pooling_bwd_t : public primitive_t {
     explicit jit_uni_pooling_bwd_t(const pd_t *apd);
     jit_uni_pooling_bwd_t(jit_uni_pooling_bwd_t &&) = default;
     jit_uni_pooling_bwd_t &operator=(jit_uni_pooling_bwd_t &&) = default;
-    ~jit_uni_pooling_bwd_t();
+    ~jit_uni_pooling_bwd_t() override;
 
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t init(engine_t *engine) override;
 
@@ -193,7 +187,7 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
     status_t init_ncsp_trans_ctx();
 
-    std::unique_ptr<jit_uni_pool_kernel<isa>> kernel_;
+    std::unique_ptr<jit_uni_pool_kernel_t<isa>> kernel_;
     std::unique_ptr<jit_uni_pooling_utils::trans_context_t> trans_ctx_;
     static constexpr data_type_t wsp_dt_ = data_type::f32;
 };

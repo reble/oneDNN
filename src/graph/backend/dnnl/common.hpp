@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -44,7 +44,6 @@ using memory = dnnl::memory;
 using desc = memory::desc;
 using format_tag = memory::format_tag;
 using format_kind = memory::format_kind;
-using tag = memory::format_tag;
 using data_type = typename memory::data_type;
 using dims = typename memory::dims;
 using dim = memory::dim;
@@ -52,8 +51,6 @@ using query = dnnl::query;
 using prop_kind = dnnl::prop_kind;
 using algorithm = dnnl::algorithm;
 using exec_args = std::unordered_map<int, memory>;
-
-using constant_cache_t = graph::constant_tensor_cache_t;
 
 using pd_cache_t = std::unordered_map<op_t *, graph::utils::any_t>;
 struct dnnl_allocator_t {
@@ -67,6 +64,11 @@ struct dnnl_allocator_t {
     static void free(void *p, const dnnl::engine &p_engine,
             const allocator_t *alc, const ::sycl::event &deps);
 #endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    static void free(void *p, const dnnl::engine &p_engine,
+            const allocator_t *alc, const cl_event &deps);
+#endif
 };
 
 format_tag get_ncx_format(size_t ndim);
@@ -78,6 +80,8 @@ dims get_compatible_dilates(const dims &dilates, size_t input_size = 4);
 dims group_dims(const dims &adims, dim groups);
 
 engine make_dnnl_engine(const engine_t &g_engine);
+
+engine make_host_engine();
 
 stream make_dnnl_stream(const engine &p_engine, const stream_t &g_stream);
 
@@ -136,18 +140,8 @@ std::string get_format_tag_str(const dnnl::memory::desc &md);
 
 dnnl::memory::format_tag get_format_tag(const dnnl::memory::desc &md);
 
-size_t generate_constant_cache_key(
+size_t generate_constant_md_hash(
         size_t part_id, const std::vector<dnnl::memory::desc> &const_mds);
-
-#ifndef NDEBUG
-#define BACKEND_DNNL_ENFORCE(condition, message) \
-    do { \
-        error::wrap_c_api((condition) ? dnnl_success : dnnl_invalid_arguments, \
-                (message)); \
-    } while (false)
-#else
-#define BACKEND_DNNL_ENFORCE(condition, message)
-#endif
 
 #define BACKEND_DNNL_CHECK(statement) \
     do { \

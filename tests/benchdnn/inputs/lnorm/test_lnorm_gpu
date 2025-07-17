@@ -8,13 +8,13 @@
 
 --dir=FWD_D,BWD_DW
 --inplace=true
---flags=GCH,CH
+--flags=GCHM,GCH,CH,M
 --batch=option_set_all
 
 --dt=f16
 --dir=FWD_I
 --inplace=true,false
---flags=GCH,CH
+--flags=GCHM,GCH,CH,M
 --batch=option_set_all
 
 # Scales post-op tests
@@ -63,6 +63,10 @@
 
 --tag=abx
 1x2048x1024
+
+# Test CI in Nightly
+--reset
+--batch=test_lnorm_ci
 
 # Test layers of some key and ext GPU DL Frameworks
 --reset

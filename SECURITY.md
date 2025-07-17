@@ -19,7 +19,7 @@ We strongly encourage you to report security vulnerabilities to us privately,
 before disclosing them on public forums or opening a public GitHub issue. 
 Report a vulnerability to us in one of two ways:
 * Open a draft [**GitHub Security Advisory**][2]
-* Send e-mail to the following address: **security@lists.uxlfoundation.org**.
+* Send e-mail to the following address: **security@uxlfoundation.org**.
 Along with the report, please include the following info:
   * A descriptive title.
   * Your name and affiliation (if any).
@@ -64,6 +64,6 @@ If you have any suggestions on how this Policy could be improved, please submit
 an issue or a pull request to this repository. Please **do not** report
 potential vulnerabilities or security flaws via a pull request.
 
-[1]: https://github.com/oneapi-src/oneDNN/releases/latest
-[2]: https://github.com/oneapi-src/oneDNN/security/advisories/new
-[3]: https://github.com/oneapi-src/oneDNN/security/advisories
+[1]: https://github.com/uxlfoundation/oneDNN/releases/latest
+[2]: https://github.com/uxlfoundation/oneDNN/security/advisories/new
+[3]: https://github.com/uxlfoundation/oneDNN/security/advisories

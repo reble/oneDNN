@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include <assert.h>
 
 #include "c_types_map.hpp"
+#include "cache_hit_types.hpp"
 #include "engine.hpp"
 #include "primitive.hpp"
 #include "primitive_attr.hpp"
@@ -75,11 +76,15 @@ struct reorder_primitive_desc_iface_t : public dnnl_primitive_desc {
     }
 
     status_t create_primitive_iface(
-            std::pair<primitive_iface_t *, bool> &primitive_iface,
+            std::pair<primitive_iface_t *, cache_state_t> &primitive_iface,
             const cache_blob_t &cache_blob) const override {
         // Step 1: create impl::primitive_t or get it from primitive cache
-        std::pair<std::shared_ptr<primitive_t>, bool> p;
-        auto status = pd_->create_primitive(p, engine(), cache_blob);
+        std::pair<std::shared_ptr<primitive_t>, cache_state_t> p;
+        // Top level primitive can be fetched from the primitive cache since
+        // it's fetching it faster.
+        constexpr bool force_create_from_blob = false;
+        auto status = pd_->create_primitive(
+                p, engine(), cache_blob, force_create_from_blob);
         if (status != status::success) return status;
         // Step 2: create primitive_iface_t, init and return it to user
         primitive_iface_t *p_iface = nullptr;
@@ -101,6 +106,7 @@ private:
     dnnl::impl::engine_t *scratchpad_engine_;
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct reorder_pd_t : public primitive_desc_t {
     const reorder_desc_t *desc() const { return &desc_; }
     const op_desc_t *op_desc() const override {
@@ -158,10 +164,10 @@ protected:
         init_desc(src_engine_kind, dst_engine_kind, false);
     }
 
-    reorder_pd_t(const reorder_pd_t &other) : primitive_desc_t(other) {
-        src_md_ = other.src_md_;
-        dst_md_ = other.dst_md_;
-
+    reorder_pd_t(const reorder_pd_t &other)
+        : primitive_desc_t(other)
+        , src_md_(other.src_md_)
+        , dst_md_(other.dst_md_) {
         init_desc(other.desc_.src_engine_kind, other.desc_.dst_engine_kind,
                 other.desc_.is_cross_engine);
     }
@@ -176,7 +182,6 @@ protected:
         return *this;
     }
 
-protected:
     void init_desc(engine_kind_t src_engine_kind, engine_kind_t dst_engine_kind,
             bool is_cross_engine) {
         desc_ = reorder_desc_t();
@@ -188,6 +193,7 @@ protected:
         desc_.is_cross_engine = is_cross_engine;
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@
 #include "cpu/x64/jit_sse41_1x1_conv_kernel_f32.hpp"
 #include "cpu/x64/jit_uni_1x1_conv_utils.hpp"
 
-#define GET_OFF(field) offsetof(jit_1x1_conv_call_s, field)
+#define GET_OFF(field) offsetof(jit_1x1_conv_args_t, field)
 
 namespace dnnl {
 namespace impl {
@@ -39,12 +39,10 @@ using namespace dnnl::impl::utils;
 
 using namespace Xbyak;
 
-jit_sse41_1x1_conv_kernel_f32::jit_sse41_1x1_conv_kernel_f32(
+jit_sse41_1x1_conv_kernel_f32_t::jit_sse41_1x1_conv_kernel_f32_t(
         const jit_1x1_conv_conf_t &ajcp, const primitive_attr_t &attr,
         const memory_desc_t &dst_md)
-    : jit_generator(jit_name(), nullptr, MAX_CODE_SIZE, true, sse41)
-    , jcp(ajcp)
-    , attr_(attr) {
+    : jit_generator_t(jit_name(), sse41), jcp(ajcp), attr_(attr) {
     if (jcp.with_eltwise || jcp.with_binary) {
         static constexpr bool preserve_gpr = true;
         static constexpr bool preserve_vmm = false;
@@ -65,7 +63,7 @@ jit_sse41_1x1_conv_kernel_f32::jit_sse41_1x1_conv_kernel_f32(
     }
 }
 
-void jit_sse41_1x1_conv_kernel_f32::generate_bcast_loop(int load_loop_blk) {
+void jit_sse41_1x1_conv_kernel_f32_t::generate_bcast_loop(int load_loop_blk) {
     mov(aux1_reg_bcast_data, reg_bcast_data);
     mov(aux_reg_output_data, reg_output_data);
     mov(bcast_loop_iter, reg_bcast_loop_work);
@@ -112,7 +110,7 @@ void jit_sse41_1x1_conv_kernel_f32::generate_bcast_loop(int load_loop_blk) {
     }
 }
 
-size_t jit_sse41_1x1_conv_kernel_f32::get_fwd_output_ptr_l_off(
+size_t jit_sse41_1x1_conv_kernel_f32_t::get_fwd_output_ptr_l_off(
         int i, int j, int n, bool ignore_dw_conv = false) const {
     return i * get_output_i_offset(jcp, ignore_dw_conv)
             + j * get_output_j_offset(jcp) + n * 4;
@@ -130,7 +128,7 @@ static void iterate(const int load_loop_blk, const int ur, const F &f) {
             for (int n = 0; n < 2; n++)
                 f(i, j, n);
 }
-void jit_sse41_1x1_conv_kernel_f32::apply_postops(
+void jit_sse41_1x1_conv_kernel_f32_t::apply_postops(
         const int load_loop_blk, const int ur) {
     injector_utils::vmm_index_set_t vmm_idxs;
     if (jcp.with_binary) {
@@ -169,7 +167,7 @@ void jit_sse41_1x1_conv_kernel_f32::apply_postops(
     }
 }
 
-void jit_sse41_1x1_conv_kernel_f32::generate_reduce_loop(
+void jit_sse41_1x1_conv_kernel_f32_t::generate_reduce_loop(
         int load_loop_blk, int ur) {
     auto reg_load = [ur, load_loop_blk](int i, int n) {
         return Xmm(2 * ur * load_loop_blk + 2 * i + n + 1);
@@ -362,7 +360,8 @@ void jit_sse41_1x1_conv_kernel_f32::generate_reduce_loop(
     store();
 } // reduce_loop()
 
-void jit_sse41_1x1_conv_kernel_f32::generate_diff_bias_loop(int load_loop_blk) {
+void jit_sse41_1x1_conv_kernel_f32_t::generate_diff_bias_loop(
+        int load_loop_blk) {
     if (!jcp.with_bias || jcp.prop_kind != backward_weights) return;
 
     Label diff_bias_loop, diff_bias_loop_out, diff_bias_init_out;
@@ -429,7 +428,7 @@ void jit_sse41_1x1_conv_kernel_f32::generate_diff_bias_loop(int load_loop_blk) {
     L(diff_bias_loop_out);
 }
 
-void jit_sse41_1x1_conv_kernel_f32::generate() {
+void jit_sse41_1x1_conv_kernel_f32_t::generate() {
     preamble();
 
     sub(rsp, stack_space_needed);
@@ -545,15 +544,21 @@ void jit_sse41_1x1_conv_kernel_f32::generate() {
 
     postamble();
 
-    if (jcp.with_eltwise) postops_injector_->prepare_table();
+    if (jcp.with_eltwise)
+        postops_injector_->prepare_table(/* generate = */ true);
 }
 
-status_t jit_sse41_1x1_conv_kernel_f32::init_conf(jit_1x1_conv_conf_t &jcp,
+status_t jit_sse41_1x1_conv_kernel_f32_t::init_conf(jit_1x1_conv_conf_t &jcp,
         const convolution_desc_t &cd, const memory_desc_wrapper &src_d,
         const memory_desc_wrapper &weights_d, const memory_desc_wrapper &dst_d,
         const primitive_attr_t &attr, int nthreads) {
     // disabling verbose dispatch messages for unsupported isa for better readability
     if (!mayiuse(sse41)) return status::unimplemented;
+
+    // Big int (> INT_MAX) values are unsupported and jcp fields may overflow
+    // TODO: change data type of jcp fields to size_t
+    VDISPATCH_CONV_IC(!has_large_size(cd, src_d, weights_d, dst_d),
+            VERBOSE_BAD_PARAM, "Large size is not supported");
 
     // TODO (Roma): this code is duplicated from the generic kernel; maybe the
     // configuration struct could do some stuff below
@@ -589,8 +594,8 @@ status_t jit_sse41_1x1_conv_kernel_f32::init_conf(jit_1x1_conv_conf_t &jcp,
     jcp.os = jcp.oh * jcp.ow;
     jcp.is = jcp.ih * jcp.iw;
 
-    jcp.typesize_in = sizeof(prec_traits<data_type::f32>::type);
-    jcp.typesize_out = sizeof(prec_traits<data_type::f32>::type);
+    jcp.typesize_in = sizeof(prec_traits_t<data_type::f32>::type);
+    jcp.typesize_out = sizeof(prec_traits_t<data_type::f32>::type);
 
     const auto &post_ops = attr.post_ops_;
 
@@ -619,15 +624,22 @@ status_t jit_sse41_1x1_conv_kernel_f32::init_conf(jit_1x1_conv_conf_t &jcp,
     static constexpr bool sum_at_pos_0_only = true;
     static constexpr bool sum_requires_scale_one = true;
     static constexpr bool sum_requires_zp_zero = true;
-    const bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(sse41,
+    bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(sse41,
             {eltwise, binary, sum}, jcp.post_ops, &dst_d, sum_at_pos_0_only,
             sum_requires_scale_one, sum_requires_zp_zero));
+    // temporary workaround that skips sse41 implementation for ternary
+    // post-ops with scalar broadcasting to avoid register collisions.
+    post_ops_ok_ = post_ops_ok_
+            && IMPLICATION(jcp.with_binary,
+                    !binary_injector::
+                            any_binary_postop_rhs_with_ternary_scalar_bcast(
+                                    post_ops, dst_d));
     VDISPATCH_CONV_IC(post_ops_ok_, VERBOSE_UNSUPPORTED_POSTOP);
 
     const auto dat_tag_nxc = utils::pick(ndims - 3, nwc, nhwc);
     const auto dat_tag_blocked = utils::pick(ndims - 3, nCw8c, nChw8c);
-    jcp.src_tag = src_d.matches_one_of_tag(dat_tag_nxc, dat_tag_blocked);
-    jcp.dst_tag = dst_d.matches_one_of_tag(dat_tag_nxc, dat_tag_blocked);
+    jcp.src_tag = src_d.mb_stride_relaxed_match(dat_tag_nxc, dat_tag_blocked);
+    jcp.dst_tag = dst_d.mb_stride_relaxed_match(dat_tag_nxc, dat_tag_blocked);
     const bool is_data_layout_nxc
             = utils::everyone_is(dat_tag_nxc, jcp.src_tag, jcp.dst_tag);
     const auto dat_tag = is_data_layout_nxc ? dat_tag_nxc : dat_tag_blocked;
@@ -653,7 +665,8 @@ status_t jit_sse41_1x1_conv_kernel_f32::init_conf(jit_1x1_conv_conf_t &jcp,
             && jcp.stride_h == 1 // TODO: support some strides
             && jcp.ow == jcp.iw && jcp.oh == jcp.ih // enforce rpad=0
             && jcp.kh == 1 && jcp.kw == 1;
-    VDISPATCH_CONV_IC(args_ok, VERBOSE_BLOCKING_FAIL);
+    VDISPATCH_CONV_IC(
+            args_ok, VERBOSE_BLOCKING_FAIL, "bad blocking parameters");
 
     jcp.ur = 1;
     if (jcp.with_dw_conv) jcp.ur = nstl::min(jcp.ow, jcp.ur);

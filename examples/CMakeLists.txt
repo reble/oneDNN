@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2016-2024 Intel Corporation
+# Copyright 2016-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,9 +22,20 @@ endif()
 append(CMAKE_C_FLAGS "${CMAKE_EXAMPLE_CCXX_FLAGS}")
 append(CMAKE_CXX_FLAGS "${CMAKE_EXAMPLE_CCXX_FLAGS}")
 
-if(DNNL_SYCL_CUDA)
-    append(CMAKE_CXX_FLAGS "-fsycl-targets=nvptx64-nvidia-cuda")
-    append(CMAKE_CXX_FLAGS "-Wno-linker-warnings")
+if(DNNL_WITH_SYCL)
+    if(DNNL_SYCL_GENERIC)
+        CHECK_CXX_COMPILER_FLAG("-fsycl -fsycl-targets=nvptx64-nvidia-cuda" NVIDIA_TARGET_SUPPORTED)
+    endif()
+
+    # Enable linking SYCL kernels.
+    if(DNNL_SYCL_CUDA OR (DNNL_SYCL_GENERIC AND NVIDIA_TARGET_SUPPORTED))
+        append(CMAKE_CXX_FLAGS "-fsycl-targets=nvptx64-nvidia-cuda")
+        append(CMAKE_CXX_FLAGS "-Wno-linker-warnings")
+    endif()
+
+    if(DNNL_AMD_ENABLE_SYCL_KERNELS)
+        append(CMAKE_CXX_FLAGS "-fsycl-targets=amdgcn-amd-amdhsa -Xsycl-target-backend --offload-arch=${DNNL_AMD_SYCL_KERNELS_TARGET_ARCH}")
+    endif()
 endif()
 
 # propagate sanitizer flags
@@ -44,9 +55,8 @@ append_host_compiler_options(CMAKE_CXX_FLAGS "${DPCPP_CXX_NOWARN_FLAGS}")
 file(GLOB_RECURSE sources *.cpp *.c)
 file(GLOB_RECURSE headers *.hpp *.h)
 
-if(NOT DNNL_EXPERIMENTAL_SPARSE)
-    list(REMOVE_ITEM sources ${CMAKE_CURRENT_SOURCE_DIR}/cpu_matmul_csr.cpp)
-    list(REMOVE_ITEM sources ${CMAKE_CURRENT_SOURCE_DIR}/cpu_matmul_weights_compression.cpp)
+if(NOT DNNL_EXPERIMENTAL_UKERNEL)
+    list(REMOVE_ITEM sources ${CMAKE_CURRENT_SOURCE_DIR}/ukernels/cpu_brgemm.cpp)
 endif()
 
 # Remove tests for CUDA which use unimplemented primitives
@@ -59,7 +69,10 @@ if(DNNL_SYCL_CUDA)
         ${CMAKE_CURRENT_SOURCE_DIR}/primitives/lstm.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/primitives/layer_normalization.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/primitives/reorder.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/shuffle.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/shuffle.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/group_normalization.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/vanilla_rnn.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/lbr_gru.cpp)
 endif()
 
 # Remove examples for Graph API if graph component is not enabled
@@ -69,7 +82,31 @@ if(NOT ONEDNN_BUILD_GRAPH)
         ${CMAKE_CURRENT_SOURCE_DIR}/graph/sycl_getting_started.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/graph/cpu_inference_int8.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/graph/cpu_single_op_partition.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/graph/gpu_single_op_partition.cpp)
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/sycl_single_op_partition.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/gpu_opencl_getting_started.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/sdpa.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/mqa.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/sdpa_stacked_qkv.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/gqa.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/gated_mlp.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/gated_mlp_wei_combined.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/gated_mlp_int4.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/graph/sdpa_bottom_right_causal_mask.cpp
+        )
+endif()
+
+if(DNNL_SYCL_GENERIC)
+    list(REMOVE_ITEM sources
+        # XXX: Enable when InnerProduct is implemented
+        ${CMAKE_CURRENT_SOURCE_DIR}/cnn_inference_f32.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/inner_product.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/rnn_training_f32.cpp
+        # XXX: Enable when Reduction is implemented
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/reduction.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/group_normalization.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/lbr_gru.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/lstm.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/primitives/vanilla_rnn.cpp)
 endif()
 
 if(DNNL_SYCL_HIP)
@@ -162,12 +199,8 @@ foreach(src ${sources})
     endif()
 endforeach()
 
-if (DNNL_INSTALL_MODE STREQUAL "BUNDLE" OR DNNL_INSTALL_MODE STREQUAL "BUNDLE_V2")
-    if(DNNL_INSTALL_MODE STREQUAL "BUNDLE")
-        set(BUNDLE_EXAMPLES_DIR "examples")
-    else()
-        set(BUNDLE_EXAMPLES_DIR "${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME}/examples")
-    endif()
+if (DNNL_INSTALL_MODE STREQUAL "BUNDLE")
+    set(BUNDLE_EXAMPLES_DIR "${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME}/examples")
 
     configure_file(CMakeLists.txt.in CMakeLists.txt @ONLY)
     install(FILES

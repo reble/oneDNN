@@ -1,5 +1,5 @@
-Linking to the Library {#dev_guide_link}
-===========================================
+Link to the Library {#dev_guide_link}
+=====================================
 
 oneDNN includes several header files providing C and C++ APIs
 for the functionality and one or several libraries depending
@@ -7,16 +7,19 @@ on how oneDNN was built.
 
 ## Header Files
 
-| File                                       | Description                       |
-|:-------------------------------------------|:----------------------------------|
-| ``include/oneapi/dnnl/dnnl.h``             | C header                          |
-| ``include/oneapi/dnnl/dnnl.hpp``           | C++ header                        |
-| ``include/oneapi/dnnl/dnnl_types.h``       | Auxiliary C header                |
-| ``include/oneapi/dnnl/dnnl_config.h``      | Auxiliary C header                |
-| ``include/oneapi/dnnl/dnnl_version.h``     | C header with version information |
-| ``include/oneapi/dnnl/dnnl_graph.h``       | C header for graph API            |
-| ``include/oneapi/dnnl/dnnl_graph.hpp``     | C++ header for graph API          |
-| ``include/oneapi/dnnl/dnnl_graph_types.h`` | Auxiliary C header for graph API  |
+| File                                         | Description                        |
+|:---------------------------------------------|:-----------------------------------|
+| ``include/oneapi/dnnl/dnnl.h``               | C header                           |
+| ``include/oneapi/dnnl/dnnl.hpp``             | C++ header                         |
+| ``include/oneapi/dnnl/dnnl_types.h``         | Auxiliary C header                 |
+| ``include/oneapi/dnnl/dnnl_config.h``        | Auxiliary C header                 |
+| ``include/oneapi/dnnl/dnnl_version.h``       | C header with version information  |
+| ``include/oneapi/dnnl/dnnl_graph.h``         | C header for graph API             |
+| ``include/oneapi/dnnl/dnnl_graph.hpp``       | C++ header for graph API           |
+| ``include/oneapi/dnnl/dnnl_graph_types.h``   | Auxiliary C header for graph API   |
+| ``include/oneapi/dnnl/dnnl_ukernel.h``       | C header for ukernel API           |
+| ``include/oneapi/dnnl/dnnl_ukernel.hpp``     | C++ header for ukernel API         |
+| ``include/oneapi/dnnl/dnnl_ukernel_types.h`` | Auxiliary C header for ukernel API |
 
 ## Libraries
 
@@ -54,7 +57,7 @@ clang++ -I${DNNLROOT}/include -L${DNNLROOT}/lib getting_started.cpp -ldnnl
 icpx -I${DNNLROOT}/include -L${DNNLROOT}/lib getting_started.cpp -ldnnl
 ~~~
 
-@note
+@warning
 Applications linked dynamically will resolve the dependencies at runtime. Make
 sure that the dependencies are available in the standard locations defined by
 the operating system, in the locations listed in the `LD_LIBRARY_PATH` (Linux)
@@ -103,7 +106,7 @@ Refer to the
 [Microsoft Visual Studio documentation](https://docs.microsoft.com/en-us/cpp/build/walkthrough-creating-and-using-a-dynamic-link-library-cpp?view=vs-2017)
 on linking the application using MSVS solutions.
 
-@note
+@warning
 Applications linked dynamically will resolve the dependencies at runtime.
 Make sure that the dependencies are available in the standard locations
 defined by the operating system or in the locations listed in the `PATH`

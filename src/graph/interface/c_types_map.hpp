@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,6 +23,10 @@
 
 #include "oneapi/dnnl/dnnl_graph_sycl.h"
 #include "oneapi/dnnl/dnnl_graph_types.h"
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include "oneapi/dnnl/dnnl_graph_ocl.h"
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -59,6 +63,8 @@ const data_type_t u8 = dnnl_u8;
 const data_type_t boolean = dnnl_boolean;
 const data_type_t f8_e5m2 = dnnl_f8_e5m2;
 const data_type_t f8_e4m3 = dnnl_f8_e4m3;
+const data_type_t s4 = dnnl_s4;
+const data_type_t u4 = dnnl_u4;
 } // namespace data_type
 
 using partition_policy_t = dnnl_graph_partition_policy_t;
@@ -150,6 +156,9 @@ const op_kind_t End = dnnl_graph_op_end;
 const op_kind_t Exp = dnnl_graph_op_exp;
 const op_kind_t GELU = dnnl_graph_op_gelu;
 const op_kind_t GELUBackward = dnnl_graph_op_gelu_backward;
+const op_kind_t GenIndex = dnnl_graph_op_gen_index;
+const op_kind_t GreaterEqual = dnnl_graph_op_greater_equal;
+const op_kind_t GroupNorm = dnnl_graph_op_group_norm;
 const op_kind_t HardSigmoid = dnnl_graph_op_hard_sigmoid;
 const op_kind_t HardSigmoidBackward = dnnl_graph_op_hard_sigmoid_backward;
 const op_kind_t HardSwish = dnnl_graph_op_hard_swish;
@@ -238,6 +247,7 @@ const op_attr_t shape = dnnl_graph_op_attr_shape;
 const op_attr_t sizes = dnnl_graph_op_attr_sizes;
 const op_attr_t strides = dnnl_graph_op_attr_strides;
 const op_attr_t zps = dnnl_graph_op_attr_zps;
+const op_attr_t group_shape = dnnl_graph_op_attr_group_shape;
 
 const op_attr_t exclude_pad = dnnl_graph_op_attr_exclude_pad;
 const op_attr_t keep_dims = dnnl_graph_op_attr_keep_dims;
@@ -259,6 +269,10 @@ const op_attr_t weights_format = dnnl_graph_op_attr_weights_format;
 const op_attr_t mode = dnnl_graph_op_attr_mode;
 const op_attr_t qtype = dnnl_graph_op_attr_qtype;
 const op_attr_t rounding_type = dnnl_graph_op_attr_rounding_type;
+
+// Used to indicate the end of all external attributes, note all the new
+// attribute should be added above this one.
+const op_attr_t end = dnnl_graph_op_attr_end;
 
 // internal attributes
 const op_attr_t matched = 0x100;
@@ -282,6 +296,7 @@ namespace property_type {
 const property_type_t undef = dnnl_graph_tensor_property_undef;
 const property_type_t variable = dnnl_graph_tensor_property_variable;
 const property_type_t constant = dnnl_graph_tensor_property_constant;
+const property_type_t host_scalar = dnnl_graph_tensor_property_host_scalar;
 } // namespace property_type
 
 using attribute_kind_t = size_t;
@@ -299,6 +314,10 @@ using host_allocate_f = dnnl_graph_host_allocate_f;
 using host_deallocate_f = dnnl_graph_host_deallocate_f;
 using sycl_allocate_f = dnnl_graph_sycl_allocate_f;
 using sycl_deallocate_f = dnnl_graph_sycl_deallocate_f;
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+using ocl_allocate_f = dnnl_graph_ocl_allocate_f;
+using ocl_deallocate_f = dnnl_graph_ocl_deallocate_f;
+#endif
 using inplace_pair_t = dnnl_graph_inplace_pair_t;
 
 using graph_t = dnnl_graph_graph;

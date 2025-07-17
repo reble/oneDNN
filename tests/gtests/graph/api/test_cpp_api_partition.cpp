@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -100,18 +100,30 @@ TEST(APIPartition, PartitionTest) {
     auto cp = partitions[0].compile(in0, out0, eng);
     // query logical tensor from compiled partition
     auto lt4_opaque = cp.query_logical_tensor(3);
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
     ASSERT_EQ(lt4_opaque.get_layout_type(),
             real_engine_kind == dnnl::engine::kind::gpu
                     ? logical_tensor::layout_type::opaque
                     : logical_tensor::layout_type::strided);
+#else
+    ASSERT_EQ(
+            lt4_opaque.get_layout_type(), logical_tensor::layout_type::strided);
+#endif
 
     auto cp1 = partitions[0].compile(in0, out0, eng);
     // query logical tensor from compiled partition
     auto lt5_opaque = cp1.query_logical_tensor(3);
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
     ASSERT_EQ(lt5_opaque.get_layout_type(),
             real_engine_kind == dnnl::engine::kind::gpu
                     ? logical_tensor::layout_type::opaque
                     : logical_tensor::layout_type::strided);
+#else
+    ASSERT_EQ(
+            lt5_opaque.get_layout_type(), logical_tensor::layout_type::strided);
+#endif
 }
 
 TEST(APIPartition, GetInputOutputIDs) {
@@ -337,9 +349,6 @@ TEST(APIPartitionCache, GetSetCapacity) {
 TEST(APIPartition, F8MatmulPartition) {
     using namespace dnnl::graph;
 
-    SKIP_IF(dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx512_core_fp16,
-            "skip on machine without AVX512_CORE_FP16");
-
     logical_tensor deq0_src {0, logical_tensor::data_type::f8_e4m3, {10, 10},
             logical_tensor::layout_type::strided};
     logical_tensor deq0_dst {1, logical_tensor::data_type::f32, {10, 10},
@@ -372,7 +381,12 @@ TEST(APIPartition, F8MatmulPartition) {
     g.add_op(mm);
     g.finalize();
     auto parts = g.get_partitions();
-    ASSERT_EQ(parts.size(), 1UL);
-    engine eng(engine::kind::cpu, 0);
-    parts[0].compile({deq0_src, deq1_src}, {mm_dst}, eng);
+
+    if (dnnl_get_effective_cpu_isa() < dnnl_cpu_isa_avx512_core_fp16) {
+        ASSERT_EQ(parts.size(), 3UL);
+    } else {
+        ASSERT_EQ(parts.size(), 1UL);
+        engine eng(engine::kind::cpu, 0);
+        parts[0].compile({deq0_src, deq1_src}, {mm_dst}, eng);
+    }
 }

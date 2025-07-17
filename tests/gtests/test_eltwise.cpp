@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -62,6 +62,13 @@ bool hip_check_format_tag(tag first_tag, Rest... rest_tags) {
     return hip_check_format_tag(rest_tags...);
 }
 
+template <typename... Rest>
+bool generic_check_format_tag(tag first_tag, Rest... rest_tags) {
+    const bool ok = hip_check_format_tag(first_tag);
+    if (!ok) return ok;
+    return hip_check_format_tag(rest_tags...);
+}
+
 class eltwise_test_t : public ::testing::TestWithParam<eltwise_test_params_t> {
 private:
     eltwise_test_params_t p;
@@ -82,6 +89,8 @@ protected:
         SKIP_IF_CUDA(!cuda_check_format_tag(p.src_tag, p.dst_tag),
                 "Unsupported format tag");
         SKIP_IF_HIP(!hip_check_format_tag(p.src_tag, p.dst_tag),
+                "Unsupported format tag");
+        SKIP_IF_GENERIC(!generic_check_format_tag(p.src_tag, p.dst_tag),
                 "Unsupported format tag");
         SKIP_IF_CUDA(p.src_dt != p.dst_dt && p.src_dt != dt::undef
                         && p.dst_dt != dt::undef,
@@ -111,8 +120,8 @@ protected:
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
 
-        auto aa = allows_attr_t {false};
-        aa.po_binary = true;
+        allows_attr_t aa {};
+        aa.po_binary = !is_amd_gpu(eng);
 
         auto src_md = memory::desc(p.dims, p.src_dt, p.src_tag);
         auto dst_md = memory::desc(p.dims, p.dst_dt, p.dst_tag);
@@ -177,7 +186,7 @@ protected:
         // eltwise specific types and values
         using pd_t = eltwise_backward::primitive_desc;
         using hint_pd_t = eltwise_forward::primitive_desc;
-        allows_attr_t aa {false}; // doesn't support anything
+        allows_attr_t aa {}; // doesn't support anything
 
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
@@ -312,13 +321,19 @@ protected:
                     "Unsupported combination of algorithm type and alpha "
                     "parameter for CUDA");
 
-            SKIP_FOR_LOOP_HIP(
-                    !impl::utils::one_of(alg, algorithm::eltwise_relu,
-                            algorithm::eltwise_tanh, algorithm::eltwise_elu,
-                            algorithm::eltwise_logistic,
-                            algorithm::eltwise_soft_relu,
-                            algorithm::eltwise_abs),
+            SKIP_FOR_LOOP_HIP(is_fwd(pk)
+                            && !impl::utils::one_of(alg,
+                                    algorithm::eltwise_relu,
+                                    algorithm::eltwise_tanh,
+                                    algorithm::eltwise_elu,
+                                    algorithm::eltwise_logistic,
+                                    algorithm::eltwise_soft_relu,
+                                    algorithm::eltwise_abs),
                     "Unsupported algorithm type for HIP");
+            SKIP_FOR_LOOP_HIP(
+                    alg == algorithm::eltwise_soft_relu && p.alpha != 1.f,
+                    "Unsupported combination of algorithm type and alpha "
+                    "parameter for HIP");
 
             Forward(pk, alg);
 
@@ -330,6 +345,9 @@ protected:
             SKIP_FOR_LOOP_CUDA(
                     !impl::utils::one_of(alg, algorithm::eltwise_relu),
                     "Unsupported algorithm type for CUDA");
+            SKIP_FOR_LOOP_HIP(!impl::utils::one_of(alg, algorithm::eltwise_relu,
+                                      algorithm::eltwise_soft_relu),
+                    "Unsupported algorithm type for HIP");
 
             SKIP_IF(unsupported_data_type(p.diff_src_dt),
                     "Engine does not support this data type.");

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,75 +19,73 @@
 
 #include "cpu/x64/jit_generator.hpp"
 
-#define S16_COPY_KERNEL_CODE_SIZE (4096L * 8)
-
 namespace dnnl {
 namespace impl {
 namespace cpu {
 namespace x64 {
 
-class jit_avx512_core_s16_48x8_copy_an_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_48x8_copy_an_kern);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+class jit_avx512_core_s16_48x8_copy_an_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_48x8_copy_an_kern_t);
+    void generate() override;
 
 public:
-    jit_avx512_core_s16_48x8_copy_an_kern();
+    jit_avx512_core_s16_48x8_copy_an_kern_t();
 };
 
-class jit_avx512_core_s16_48x8_copy_at_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_48x8_copy_at_kern);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+class jit_avx512_core_s16_48x8_copy_at_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_48x8_copy_at_kern_t);
+    void generate() override;
 
 public:
-    jit_avx512_core_s16_48x8_copy_at_kern();
+    jit_avx512_core_s16_48x8_copy_at_kern_t();
 };
 
-class jit_avx512_core_s16_48x8_copy_bn_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_48x8_copy_bn_kern);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+class jit_avx512_core_s16_48x8_copy_bn_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_48x8_copy_bn_kern_t);
+    void generate() override;
 
 public:
-    jit_avx512_core_s16_48x8_copy_bn_kern();
+    jit_avx512_core_s16_48x8_copy_bn_kern_t();
 };
 
-class jit_avx512_core_s16_48x8_copy_bt_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_48x8_copy_bt_kern);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+class jit_avx512_core_s16_48x8_copy_bt_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_48x8_copy_bt_kern_t);
+    void generate() override;
 
 public:
-    jit_avx512_core_s16_48x8_copy_bt_kern();
+    jit_avx512_core_s16_48x8_copy_bt_kern_t();
 };
 
-class jit_avx512_core_s16_24x8_copy_an_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_24x8_copy_an_kern);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+class jit_avx512_core_s16_24x8_copy_an_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_24x8_copy_an_kern_t);
+    void generate() override;
 
 public:
-    jit_avx512_core_s16_24x8_copy_an_kern();
+    jit_avx512_core_s16_24x8_copy_an_kern_t();
 };
 
-class jit_avx512_core_s16_24x8_copy_at_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_24x8_copy_at_kern);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+class jit_avx512_core_s16_24x8_copy_at_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_24x8_copy_at_kern_t);
+    void generate() override;
 
 public:
-    jit_avx512_core_s16_24x8_copy_at_kern();
+    jit_avx512_core_s16_24x8_copy_at_kern_t();
 };
 
-class jit_avx512_core_s16_24x8_copy_bn_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_24x8_copy_bn_kern);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+class jit_avx512_core_s16_24x8_copy_bn_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_24x8_copy_bn_kern_t);
+    void generate() override;
 
 public:
-    jit_avx512_core_s16_24x8_copy_bn_kern();
+    jit_avx512_core_s16_24x8_copy_bn_kern_t();
 };
 
-class jit_avx512_core_s16_24x8_copy_bt_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_24x8_copy_bt_kern);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+class jit_avx512_core_s16_24x8_copy_bt_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_s16_24x8_copy_bt_kern_t);
+    void generate() override;
 
 public:
-    jit_avx512_core_s16_24x8_copy_bt_kern();
+    jit_avx512_core_s16_24x8_copy_bt_kern_t();
 };
 
 } // namespace x64

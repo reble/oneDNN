@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -52,12 +52,7 @@ int str2desc(desc_t *desc, const char *str);
 std::ostream &operator<<(std::ostream &s, const desc_t &d);
 
 struct settings_t : public base_settings_t {
-    settings_t() = default;
-
-    // ctor to save certain fields from resetting
-    settings_t(const char *perf_template) : settings_t() {
-        this->perf_template = perf_template;
-    }
+    using base_settings_t::base_settings_t;
 
     desc_t desc {};
 
@@ -83,58 +78,50 @@ struct settings_t : public base_settings_t {
 struct prb_t : public desc_t {
     // A ctor with common interface across all drivers.
     prb_t(const settings_t &s)
-        : prb_t(s.desc, s.mb[0], s.dir[0], s.dt[0], s.tag[0], s.flags[0],
-                s.inplace[0],
-                settings_t::get_attr(s.scales[0], s.zero_points[0],
-                        s.post_ops[0], s.scratchpad_mode[0], s.fpmath_mode[0]),
-                s.ctx_init[0], s.ctx_exe[0], s.check_alg) {
+        : prb_t(s.desc, s.dir[0], s.dt[0], s.tag[0], s.flags[0], s.check_alg,
+                s.mb[0], s.inplace[0], s.attributes.front(), s.ctx_init[0],
+                s.ctx_exe[0], s.impl_filter) {
         SAFE_V(s.has_single_setup() ? OK : FAIL);
     }
 
-    prb_t(const desc_t &desc, int64_t mb, dir_t dir,
+    prb_t(const desc_t &desc, dir_t dir,
             const std::vector<dnnl_data_type_t> &dt,
-            const std::vector<std::string> &tag, flags_t flags, bool inplace,
-            const attr_t &attr, const thr_ctx_t &ctx_init,
-            const thr_ctx_t &ctx_exe, check_alg_t check_alg)
+            const std::vector<std::string> &tag, flags_t flags,
+            check_alg_t check_alg, int64_t mb, bool inplace, const attr_t &attr,
+            const thr_ctx_t &ctx_init, const thr_ctx_t &ctx_exe,
+            const impl_filter_t &impl_filter)
         : desc_t(desc)
-        , check_alg(check_alg)
         , dir(dir)
         , dt(dt)
         , tag(tag)
         , flags(flags)
+        , check_alg(check_alg)
+        , user_mb(mb)
         , inplace(inplace)
         , attr(attr)
         , ctx_init(ctx_init)
         , ctx_exe(ctx_exe)
-        , user_mb(mb) {
+        , impl_filter(impl_filter) {
 
         if (mb) this->mb = mb;
-        // Broadcast data types if needed
-        if (dt.size() == 1) {
-            const auto val = dt[0]; // Need a copy here.
-            this->dt.assign(2, val);
-        }
 
-        // Broadcast tags if needed
-        if (tag.size() == 1) {
-            const auto val = tag[0];
-            this->tag.assign(2, val);
-        }
+        broadcast_vector(this->dt, 2);
+        broadcast_vector(this->tag, 2);
 
         repro = set_repro_line(); // must be last in ctor to collect right info
     }
-
-    check_alg_t check_alg;
 
     std::string stat_tag;
     dir_t dir;
     std::vector<dnnl_data_type_t> dt;
     std::vector<std::string> tag;
     flags_t flags;
+    check_alg_t check_alg;
+    int64_t user_mb;
     bool inplace;
     attr_t attr;
-    const thr_ctx_t ctx_init, ctx_exe;
-    int64_t user_mb;
+    thr_ctx_t ctx_init, ctx_exe;
+    impl_filter_t impl_filter;
 
     bool use_stats() const { return flags & GLOB_STATS; }
     bool use_sc() const { return flags & USE_SCALE; }
@@ -174,8 +161,11 @@ struct cfg_t {
     // ALG_2: same as ALG_1 for mean and some more variation in src.
     // ALG_AUTO: choose between algorithms automatically.
     //
-    // `density_` is filled according to the following inequation:
+    // `density_` for ALG_0 is filled according to the following inequation:
     //     (exact_bits - log_2(L * density)) / 2 >= flex_bits
+    // For ALG_2 use ~100k non-zero elements. With more elements, rounding issues
+    // are popping up for large spatial due to very long accumulation chains
+    // and potential different order of accumulation.
     cfg_t(const prb_t *prb)
         : exact_bits_(digits_dt(prb->dt[0]))
         , L_(prb->ic / prb->g * prb->id * prb->ih * prb->iw)
@@ -195,13 +185,15 @@ struct cfg_t {
         , flex_mask_((1LL << flex_bits_) - 1)
         , density_(check_alg_ == bnorm::ALG_0
                           ? 1.f * (1LL << (exact_bits_ - 2 * flex_bits_)) / L_
+                          : check_alg_ == bnorm::ALG_2
+                          ? MIN2(100000.f / L_, 1.f)
                           : 1.f) {
         assert(logL_ <= 0 || (1LL << (logL_ - 1)) < L_);
         assert(L_ <= (1LL << logL_));
         assert(flex_bits_ >= min_flex_bits_);
         BENCHDNN_PRINT(6,
-                "[CFG]: check_alg:%s; density:%g; flex_bits:" IFMT "\n",
-                check_alg2str(check_alg_), density_, flex_bits_);
+                "[CFG]: check_alg:%s; L:%zu; density:%g; flex_bits:" IFMT "\n",
+                check_alg2str(check_alg_), (size_t)L_, density_, flex_bits_);
     }
 
     int64_t exact_bits_;
@@ -270,13 +262,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
 void skip_unimplemented_prb(const prb_t *prb, res_t *res);
 void skip_invalid_prb(const prb_t *prb, res_t *res);
-void compute_ref(const prb_t *prb, const args_t &args,
+void compute_ref(const prb_t *prb, dir_t dir, const args_t &args,
         dnnl_primitive_t prim_ref = nullptr);
 
 int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);

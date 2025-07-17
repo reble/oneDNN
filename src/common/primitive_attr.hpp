@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,18 +24,22 @@
 
 #include "c_types_map.hpp"
 #include "nstl.hpp"
+#include "primitive_attr_quant.hpp"
 #include "type_helpers.hpp"
 #include "utils.hpp"
+
+// Use `...` for `msg` and additional variables used in msg
+#define VCHECK_ATTR(cond, ...) \
+    VCONDCHECK(primitive, exec, check, primitive, (cond), \
+            status::invalid_arguments, __VA_ARGS__)
 
 namespace dnnl {
 namespace impl {
 
 const primitive_attr_t &default_attr();
-struct runtime_scales_t;
-const runtime_scales_t &default_runtime_scale();
 
 struct rnn_data_qparams_t : public c_compatible {
-    rnn_data_qparams_t() : scale_(1.), shift_(0.) {}
+    rnn_data_qparams_t() : scale_(1.f), shift_(0.f) {}
     bool has_default_values() const { return (scale_ == 1. && shift_ == 0.); }
     bool defined() const {
         return !is_runtime_value(scale_) && !is_runtime_value(shift_);
@@ -124,14 +128,14 @@ private:
 };
 
 // Note: keep for RNN quantization
-struct scales_t : public c_compatible {
-    scales_t() : count_(1), mask_(0), scales_(scales_buf_) {
-        set_single_scale(1.);
+struct rnn_create_time_scales_t : public c_compatible {
+    rnn_create_time_scales_t() : count_(1), mask_(0), scales_(scales_buf_) {
+        set_single_scale(1.f);
     }
 
-    ~scales_t() { cleanup(); }
+    ~rnn_create_time_scales_t() { cleanup(); }
 
-    bool operator==(const scales_t &rhs) const {
+    bool operator==(const rnn_create_time_scales_t &rhs) const {
         bool ret = count_ == rhs.count_ && mask_ == rhs.mask_
                 && !utils::any_null(scales_, rhs.scales_)
                 && defined() == rhs.defined()
@@ -157,7 +161,7 @@ struct scales_t : public c_compatible {
         return status::success;
     }
 
-    status_t copy_from(const scales_t &other) {
+    status_t copy_from(const rnn_create_time_scales_t &other) {
         return set(other.count_, other.mask_, other.scales_);
     }
 
@@ -177,291 +181,65 @@ private:
         scales_ = scales_buf_;
     }
 
-    DNNL_DISALLOW_COPY_AND_ASSIGN(scales_t);
+    DNNL_DISALLOW_COPY_AND_ASSIGN(rnn_create_time_scales_t);
 };
 
-struct runtime_scales_t : public c_compatible {
-    // Clang-3.8.1 raises an error for a default initialization of a const
-    // object. Const runtime_scales_t object is used as default_scales.
-    // runtime_scales_t() = default;
-    runtime_scales_t() {}
+struct dropout_t : public c_compatible {
+    dropout_t() = default;
 
-    runtime_scales_t &operator=(const runtime_scales_t &rhs) {
-        mask_ = rhs.mask_;
-        is_set_ = rhs.is_set_;
-        ndims_ = rhs.ndims_;
-        if (ndims_ > 0) utils::array_copy(group_dims_, rhs.group_dims_, ndims_);
-        data_type_ = rhs.data_type_;
-        return *this;
+    bool has_default_values() const {
+        return types::is_zero_md(&user_dropout_desc_);
     }
-
-    status_t set(int mask) {
-        mask_ = mask;
-        is_set_ = true;
-        ndims_ = 0;
-        data_type_ = data_type::f32;
-        return status::success;
+    bool operator==(const dropout_t &rhs) const {
+        return user_dropout_desc_ == rhs.user_dropout_desc_;
     }
-
-    status_t set(int ndims, int mask, const dims_t group_dims,
-            data_type_t data_type = data_type::f32) {
-        mask_ = mask;
-        is_set_ = true;
-        ndims_ = ndims;
-        if (ndims > 0) utils::array_copy(group_dims_, group_dims, ndims);
-        data_type_ = data_type;
-        return status::success;
-    }
-
-    bool operator==(const runtime_scales_t &rhs) const {
-        return mask_ == rhs.mask_ && is_set_ == rhs.is_set_
-                && ndims_ == rhs.ndims_
-                && IMPLICATION(ndims_ > 0,
-                        utils::array_cmp(group_dims_, rhs.group_dims_, ndims_))
-                && data_type_ == rhs.data_type_;
-    }
-
-    bool has_default_values() const { return *this == default_runtime_scale(); }
-
-    bool has_default_groups() const { return 0 == ndims_; }
-    bool has_default_data_type() const { return data_type_ == data_type::f32; }
-
-    bool defined() const { return has_default_values(); }
-
-    void reset() { *this = default_runtime_scale(); }
-
-    // TODO: replace with `-1` to remove `is_set_`.
-    // Hide `mask_` under `private:` to force interface usage.
-    int mask_ = 0;
-    bool is_set_ = false;
-    int ndims_ = 0;
-    dims_t group_dims_ = {};
-    data_type_t data_type_ = data_type::f32;
+    status_t set_default_formats(const memory_desc_t *dst_md);
+    dnnl::impl::memory_desc_t dropout_desc_;
+    dnnl::impl::memory_desc_t user_dropout_desc_;
 };
 
-struct arg_scales_t : public c_compatible {
-    arg_scales_t() = default;
+struct rnd_mode_t : public c_compatible {
+    rnd_mode_t() = default;
 
-    const runtime_scales_t &get(int arg) const {
-        static const runtime_scales_t default_scales;
-        const auto it = scales_.find(arg);
-        if (it == scales_.end()) return default_scales;
-        return it->second;
+    bool has_default_values() const { return rounding_modes_map_.empty(); }
+    bool has_default_values(int arg) const { return get(arg) == default_mode; }
+
+    rounding_mode_t get(int arg) const {
+        auto r = rounding_modes_map_.find(arg);
+        if (r == rounding_modes_map_.end()) return default_mode;
+        return rounding_modes_map_.at(arg);
     }
 
-    status_t set(int arg, const runtime_scales_t &scale) {
-        if (!check_arg(arg)) return status::invalid_arguments;
-        scales_[arg] = scale;
+    dnnl_status_t set(int arg, dnnl_rounding_mode_t rm) {
+        if (!check(arg, rm)) return status::invalid_arguments;
+        if (rm != default_mode) rounding_modes_map_[arg] = rm;
         return status::success;
     }
 
-    bool operator==(const arg_scales_t &rhs) const {
-        return scales_ == rhs.scales_;
-    }
-
-    bool has_default_values(const std::vector<int> &skip_args = {}) const {
-        auto predicate = [](const runtime_scales_t &s) {
-            return s.has_default_values();
-        };
-        return has_default_property(skip_args, predicate);
-    }
-
-    bool has_default_data_type(const std::vector<int> &skip_args = {}) const {
-        auto predicate = [](const runtime_scales_t &s) {
-            return s.has_default_data_type();
-        };
-        return has_default_property(skip_args, predicate);
-    }
-
-    bool has_default_groups(const std::vector<int> &skip_args = {}) const {
-        auto predicate = [](const runtime_scales_t &s) {
-            return s.has_default_groups();
-        };
-        return has_default_property(skip_args, predicate);
-    }
-
-    status_t set(int arg, int mask) {
-        if (!check_arg(arg)) return status::invalid_arguments;
-        return scales_[arg].set(mask);
-    }
-
-    status_t set(int arg, int mask, int ndims, const dims_t group_dims,
-            data_type_t data_type) {
-        if (!check_arg(arg)) return status::invalid_arguments;
-        return scales_[arg].set(ndims, mask, group_dims, data_type);
-    }
-
-    status_t get(int arg, int *mask, bool *is_set, int *ndims = nullptr,
-            dims_t group_dims = nullptr) const {
-        if (!check_arg(arg)) return status::invalid_arguments;
-        const auto &s = get(arg);
-        if (mask) *mask = s.mask_;
-        if (is_set) *is_set = s.is_set_;
-        if (ndims) *ndims = s.ndims_;
-        if (group_dims && s.ndims_ > 0)
-            utils::array_copy(group_dims, s.group_dims_, s.ndims_);
-        return status::success;
-    }
-
-    status_t reset(int arg) {
-        if (!check_arg(arg)) return status::invalid_arguments;
-        const auto it = scales_.find(arg);
-        if (it != scales_.end()) scales_.erase(it);
-        return status::success;
-    }
-
-    bool defined() const { return has_default_values(); }
-
-    status_t copy_from(const arg_scales_t &other) {
-        for (auto it = other.scales_.begin(); it != other.scales_.end(); ++it) {
-            // Find an entry that can match the arguments without constructing a
-            // new object.
-            if (scales_.count(it->first) == 1) {
-                auto &entry = scales_[it->first];
-                if (entry == it->second) continue;
-            }
-
-            CHECK(set(it->first, it->second));
-        }
-        return status::success;
-    }
-
-    std::map<int, runtime_scales_t> scales_;
-
-private:
-    bool check_arg(int arg) const {
-        // binary
-        for (const auto &sa : {DNNL_ARG_SRC_0, DNNL_ARG_SRC_1}) {
-            if (arg == sa) return true;
-        }
-        // concat
-        if (arg & DNNL_ARG_MULTIPLE_SRC) return true;
-        // convolution
-        for (const auto &sa : {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST}) {
-            if (arg == sa) return true;
-        }
-        // depth-wise convolution post op
-        for (const auto &sa : {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST}) {
-            if (arg == (DNNL_ARG_ATTR_POST_OP_DW | sa)) return true;
-        }
-        return false;
-    }
-
-    bool has_default_property(const std::vector<int> &skip_args,
-            bool (*predicate)(const runtime_scales_t &)) const {
-        for (const auto &s : scales_) {
-            if (!predicate(s.second)) {
-                bool skip = false;
-                for (const auto &skip_a : skip_args)
-                    if (s.first == skip_a) {
-                        skip = true;
-                        break;
-                    }
-                if (skip) continue;
-                return false;
-            }
-        }
+    bool operator==(const rnd_mode_t &rhs) const {
+        bool res = rounding_modes_map_.size() == rhs.rounding_modes_map_.size();
+        if (!res) return false;
+        for (const auto &e : rounding_modes_map_)
+            if (e.second != rhs.get(e.first)) return false;
         return true;
     }
-};
 
-struct zero_points_t : public c_compatible {
-    bool operator==(const zero_points_t &rhs) const {
-        return mask_src == rhs.mask_src && mask_wei == rhs.mask_wei
-                && mask_dst == rhs.mask_dst && is_set_src == rhs.is_set_src
-                && is_set_wei == rhs.is_set_wei && is_set_dst == rhs.is_set_dst
-                && data_type_wei == rhs.data_type_wei
-                && group_ndims_wei == rhs.group_ndims_wei
-                && IMPLICATION(group_ndims_wei > 0,
-                        utils::array_cmp(group_dims_wei, rhs.group_dims_wei,
-                                group_ndims_wei));
-    }
-
-    // arg-specific checks
-    bool common(int arg) const { return get_mask(arg) == 0; }
-    bool defined(int arg) const { return has_default_values(arg); }
-    bool has_default_values(int arg) const {
-        return is_set(arg) == false && has_default_data_type(arg);
-    }
-    bool has_default_groups(int arg) const {
-        return IMPLICATION(arg == DNNL_ARG_WEIGHTS, group_ndims_wei == 0);
-    }
-    bool has_default_data_type(int arg) const {
-        return get_data_type(arg) == data_type::s32;
-    }
-    // same checks but for all supported arguments at once
-    bool common() const { return check_all(&zero_points_t::common); }
-    bool defined() const { return has_default_values(); }
-    bool has_default_values() const {
-        return check_all(&zero_points_t::has_default_values);
-    }
-    bool has_default_groups() const {
-        return check_all(&zero_points_t::has_default_groups);
-    }
-    bool has_default_data_type() const {
-        return check_all(&zero_points_t::has_default_data_type);
-    }
-
-    status_t get(int arg, int *mask, data_type_t *dt = nullptr) const;
-
-    int get(int arg) const; // Returns 0 if dimension is unset
-
-    data_type_t get_data_type(int arg) const {
-        if (arg == DNNL_ARG_WEIGHTS) return data_type_wei;
-        return data_type::s32;
-    }
-
-    const dim_t *get_groups(int arg) const {
-        if (arg == DNNL_ARG_WEIGHTS) return group_dims_wei;
-        return nullptr;
-    }
-
-    int get_groups_ndims(int arg) const {
-        if (arg == DNNL_ARG_WEIGHTS) return group_ndims_wei;
-        return 0;
-    }
-
-    status_t set(int arg, int mask, int ndims, const dims_t group_dims,
-            data_type_t data_type);
-
-    status_t set(int arg, int mask) {
-        return set(arg, mask, 0, nullptr, data_type::s32);
-    }
-
-    status_t set(int arg) { return set(arg, 0); }
+    std::unordered_map<int, rounding_mode_t> rounding_modes_map_;
 
 private:
-    bool is_set_src = false, is_set_wei = false, is_set_dst = false;
-    int mask_src = 0, mask_wei = 0, mask_dst = 0;
-    data_type_t data_type_wei = data_type::s32;
-    int group_ndims_wei = 0;
-    dims_t group_dims_wei {};
+    const static rounding_mode_t default_mode = rounding_mode::environment;
 
-    int get_mask(int arg) const {
-        int mask = 0;
-        switch (arg) {
-            case DNNL_ARG_SRC: mask = mask_src; break;
-            case DNNL_ARG_WEIGHTS: mask = mask_wei; break;
-            case DNNL_ARG_DST: mask = mask_dst; break;
-            default: mask = 0;
-        }
-        return mask;
+    bool check(int arg, dnnl_rounding_mode_t rm) const {
+        // Only gradients and matmul dst for gradient computation
+        // can use non-default rounding mode.
+        return IMPLICATION(rm != default_mode,
+                utils::one_of(arg, DNNL_ARG_DST, DNNL_ARG_DIFF_SRC,
+                        DNNL_ARG_DIFF_WEIGHTS));
     }
 
-    bool is_set(int arg) const {
-        bool arg_is_set = false;
-        switch (arg) {
-            case DNNL_ARG_SRC: arg_is_set = is_set_src; break;
-            case DNNL_ARG_WEIGHTS: arg_is_set = is_set_wei; break;
-            case DNNL_ARG_DST: arg_is_set = is_set_dst; break;
-            default: arg_is_set = 0;
-        }
-        return arg_is_set;
-    }
-
-    bool check_all(bool (zero_points_t::*f)(int) const) const {
-        for (int arg : {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST})
-            if (!(this->*f)(arg)) return false;
+    bool check() const {
+        for (auto e : rounding_modes_map_)
+            if (!check(e.first, e.second)) return false;
         return true;
     }
 };
@@ -530,11 +308,12 @@ struct dnnl_post_ops : public dnnl::impl::c_compatible {
             dnnl::impl::alg_kind_t alg;
             // This is an unmodifiable user copy of attributes which is used in
             // caching mechanism. Not to be used internally.
-            dnnl::impl::memory_desc_t user_src1_desc;
+            dnnl::impl::memory_desc_t user_src1_desc, user_src2_desc;
+
             // This is a modifiable copy of memory desc. It changes format kind
             // and tag of md in case user passed format_kind::any. To be used
             // everywhere internally.
-            dnnl::impl::memory_desc_t src1_desc;
+            dnnl::impl::memory_desc_t src1_desc, src2_desc;
         };
 
         struct prelu_t {
@@ -588,7 +367,14 @@ struct dnnl_post_ops : public dnnl::impl::c_compatible {
 
         bool is_like_binary() const { return is_binary() || is_prelu(); }
 
-        dnnl::impl::status_t set_depthwise_scales(const float *scales);
+        bool is_binary_with_ternary_op() const {
+            return is_binary()
+                    && (binary.alg == dnnl::impl::alg_kind::binary_select);
+        }
+
+        dnnl::impl::status_t validate_binary(
+                dnnl::impl::engine_kind_t engine_kind,
+                const dnnl::impl::memory_desc_t *dst_desc) const;
 
         bool operator==(const entry_t &rhs) const {
             using namespace dnnl::impl;
@@ -639,7 +425,7 @@ struct dnnl_post_ops : public dnnl::impl::c_compatible {
         }
     };
 
-    dnnl_post_ops() : entry_() {}
+    dnnl_post_ops() = default;
     ~dnnl_post_ops() = default;
 
     dnnl::impl::status_t append_sum(float scale, int32_t zero_point = 0,
@@ -651,11 +437,13 @@ struct dnnl_post_ops : public dnnl::impl::c_compatible {
             dnnl::impl::dim_t kernel_size, dnnl::impl::dim_t stride_size,
             dnnl::impl::dim_t padding_l_size);
     dnnl::impl::status_t append_binary(dnnl::impl::alg_kind_t alg,
-            const dnnl::impl::memory_desc_t *user_src1_desc);
+            const dnnl::impl::memory_desc_t *user_src1_desc,
+            const dnnl::impl::memory_desc_t *user_src2_desc = nullptr);
     dnnl::impl::status_t append_prelu(int mask);
 
     dnnl::impl::status_t prepend_binary(dnnl::impl::alg_kind_t alg,
-            const dnnl::impl::memory_desc_t *user_src1_desc);
+            const dnnl::impl::memory_desc_t *user_src1_desc,
+            const dnnl::impl::memory_desc_t *user_src2_desc = nullptr);
 
     int find(dnnl::impl::primitive_kind_t kind, int start = 0,
             int stop = -1) const {
@@ -675,7 +463,6 @@ struct dnnl_post_ops : public dnnl::impl::c_compatible {
         return dst_dt;
     }
 
-    bool defined() const;
     int len() const { return (int)entry_.size(); }
     bool has_default_values(
             const std::vector<dnnl::impl::primitive_kind_t> &skip_pk
@@ -709,6 +496,9 @@ struct dnnl_post_ops : public dnnl::impl::c_compatible {
                 || entry_[sum_ind].sum.dt == dst_dt;
     }
 
+    dnnl::impl::status_t validate_binary(dnnl::impl::engine_kind_t engine_kind,
+            const dnnl::impl::memory_desc_t *dst_desc) const;
+
     bool contain(dnnl::impl::primitive_kind_t kind, int index) const {
         return find(kind, index, index + 1) == index;
     }
@@ -730,7 +520,8 @@ struct dnnl_post_ops : public dnnl::impl::c_compatible {
 
 private:
     dnnl::impl::status_t validate_binary(dnnl::impl::alg_kind_t alg,
-            const dnnl::impl::memory_desc_t *user_src1_desc) const;
+            const dnnl::impl::memory_desc_t *user_src1_desc,
+            const dnnl::impl::memory_desc_t *user_src2_desc) const;
 
     bool check_sum_consistent_dt(const dnnl::impl::data_type_t dst_dt,
             const bool diverse_sum_dt_allowed = false) const;
@@ -752,7 +543,8 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
         return new dnnl_primitive_attr(*this);
     }
 
-    dnnl_primitive_attr(const dnnl_primitive_attr &other) {
+    dnnl_primitive_attr(const dnnl_primitive_attr &other)
+        : c_compatible(other) {
         if (copy_from(other) != dnnl::impl::status::success)
             is_initialized_ = false;
     }
@@ -760,9 +552,9 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
     dnnl::impl::status_t copy_from(const dnnl_primitive_attr &other) {
         using namespace dnnl::impl;
 
-        output_scales_ = other.output_scales_;
         scales_ = other.scales_;
         zero_points_ = other.zero_points_;
+        rounding_mode_ = other.rounding_mode_;
         scratchpad_mode_ = other.scratchpad_mode_;
         fpmath_ = other.fpmath_;
         acc_mode_ = other.acc_mode_;
@@ -774,6 +566,7 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
                 other.rnn_weights_projection_qparams_));
         CHECK(rnn_tparams_.copy_from(other.rnn_tparams_));
         if (other.gpu_attr_) gpu_attr_ = other.gpu_attr_->clone();
+        dropout_ = other.dropout_;
 
         return status::success;
     }
@@ -782,26 +575,23 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
 
     enum class skip_mask_t : unsigned {
         none = 0,
-        oscale = 1u << 0,
-        oscale_runtime = 1u << 1,
-        scales = 1u << 2,
-        scales_runtime = (unsigned)scales | (1u << 3),
+        scales = 1u << 1,
+        scales_groups = (unsigned)scales | (1u << 2),
+        scales_data_type = (unsigned)scales | (1u << 3),
         zero_points = 1u << 4,
-        zero_points_runtime = (unsigned)zero_points | (1u << 5),
-        post_ops = 1u << 6,
-        rnn_data_qparams = 1u << 7,
-        rnn_weights_qparams = 1u << 8,
-        rnn_tparams = 1u << 9,
-        sum_dt = 1u << 10,
-        rnn_weights_projection_qparams = 1u << 11,
-        gpu_attr = 1u << 12,
-        accumulation_mode = 1u << 13,
-        fpmath_mode = 1u << 14,
-        scales_runtime_groups = (unsigned)scales_runtime | (1u << 15),
-        scales_runtime_data_type = (unsigned)scales_runtime | (1u << 16),
-        zero_points_runtime_groups = (unsigned)zero_points_runtime | (1u << 17),
-        zero_points_runtime_data_type
-        = (unsigned)zero_points_runtime | (1u << 18),
+        zero_points_groups = (unsigned)zero_points | (1u << 5),
+        zero_points_data_type = (unsigned)zero_points | (1u << 6),
+        post_ops = 1u << 7,
+        sum_dt = 1u << 8,
+        rnn_data_qparams = 1u << 9,
+        rnn_weights_qparams = 1u << 10,
+        rnn_tparams = 1u << 11,
+        rnn_weights_projection_qparams = 1u << 12,
+        gpu_attr = 1u << 13,
+        accumulation_mode = 1u << 14,
+        fpmath_mode = 1u << 15,
+        dropout = 1u << 16,
+        rounding_mode = 1u << 17,
     };
 
     /** Returns true if the attributes have default values.
@@ -817,7 +607,6 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
         bool ret = scratchpad_mode_ == rhs.scratchpad_mode_
                 && fpmath_ == rhs.fpmath_ && acc_mode_ == rhs.acc_mode_
                 && deterministic_ == rhs.deterministic_
-                && output_scales_ == rhs.output_scales_
                 && scales_ == rhs.scales_ && zero_points_ == rhs.zero_points_
                 && post_ops_ == rhs.post_ops_
                 && rnn_data_qparams_ == rhs.rnn_data_qparams_
@@ -827,7 +616,9 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
                 && rnn_tparams_ == rhs.rnn_tparams_
                 && ((gpu_attr_ && rhs.gpu_attr_
                             && gpu_attr_->is_equal(*rhs.gpu_attr_))
-                        || (!gpu_attr_ && !rhs.gpu_attr_));
+                        || (!gpu_attr_ && !rhs.gpu_attr_))
+                && dropout_ == rhs.dropout_
+                && rounding_mode_ == rhs.rounding_mode_;
         return ret;
     }
 
@@ -835,6 +626,8 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
             dnnl::impl::fpmath_mode_t fpmath_mode, bool apply_to_int = false);
     dnnl::impl::status_t set_accumulation_mode(
             dnnl::impl::accumulation_mode_t am);
+    dnnl::impl::status_t set_dropout(
+            const dnnl::impl::memory_desc_t *dropout_desc);
     dnnl::impl::status_t set_scratchpad_mode(
             dnnl::impl::scratchpad_mode_t scratchpad_mode);
     dnnl::impl::status_t set_post_ops(const dnnl::impl::post_ops_t &post_ops);
@@ -888,8 +681,7 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
     }
 
     // NOTE: make sure that the types below have overloaded comparison operator
-    dnnl::impl::runtime_scales_t output_scales_;
-    dnnl::impl::arg_scales_t scales_;
+    dnnl::impl::scales_t scales_;
     dnnl::impl::zero_points_t zero_points_;
     dnnl::impl::scratchpad_mode_t scratchpad_mode_;
     dnnl::impl::fpmath_t fpmath_;
@@ -897,9 +689,11 @@ struct dnnl_primitive_attr : public dnnl::impl::c_compatible {
     bool deterministic_;
     dnnl::impl::post_ops_t post_ops_;
     dnnl::impl::rnn_data_qparams_t rnn_data_qparams_;
-    dnnl::impl::scales_t rnn_weights_qparams_;
-    dnnl::impl::scales_t rnn_weights_projection_qparams_;
+    dnnl::impl::rnn_create_time_scales_t rnn_weights_qparams_;
+    dnnl::impl::rnn_create_time_scales_t rnn_weights_projection_qparams_;
     dnnl::impl::rnn_tparams_t rnn_tparams_;
+    dnnl::impl::dropout_t dropout_;
+    dnnl::impl::rnd_mode_t rounding_mode_;
 
     std::unique_ptr<dnnl::impl::primitive_attr_item_t> gpu_attr_;
 

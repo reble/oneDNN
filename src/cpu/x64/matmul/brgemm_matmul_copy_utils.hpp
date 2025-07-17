@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -32,9 +32,12 @@ struct jit_brgemm_matmul_copy_b_t {
         const void *compensation_ptr;
         const void *zp_a_compensation_ptr;
         const void *zp_a_neg_value_ptr;
+        const void *zp_b_value_ptr;
+        const void *scales_ptr;
 
         dim_t current_K_start;
         dim_t current_K_iters;
+        dim_t current_K_pad {0};
         dim_t current_N_blk;
         dim_t dynamic_src_stride;
     };
@@ -44,7 +47,7 @@ struct jit_brgemm_matmul_copy_b_t {
 
     jit_brgemm_matmul_copy_b_t(const brgemm_matmul_conf_t *conf)
         : conf_(conf) {}
-    virtual ~jit_brgemm_matmul_copy_b_t() {}
+    virtual ~jit_brgemm_matmul_copy_b_t() = default;
 
     const brgemm_matmul_conf_t *conf_;
 };
@@ -69,7 +72,7 @@ struct jit_brgemm_matmul_copy_a_t {
 
     jit_brgemm_matmul_copy_a_t(const brgemm_matmul_conf_t *conf)
         : conf_(conf) {}
-    virtual ~jit_brgemm_matmul_copy_a_t() {}
+    virtual ~jit_brgemm_matmul_copy_a_t() = default;
 
     const brgemm_matmul_conf_t *conf_;
 };

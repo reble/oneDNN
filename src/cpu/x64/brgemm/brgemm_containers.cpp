@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ brgemm_kernel_container_t::get_set() {
     return set_;
 }
 
-bool brgemm_desc_container_t::insert(int idx, brgemm_t &brg,
+bool brgemm_desc_container_t::insert(int idx, brgemm_desc_t &brg,
         const std::vector<char> &bd_mask,
         const std::vector<brgemm_batch_element_t> &static_offsets) {
     bd_mask_list_.push_back(bd_mask);
@@ -49,6 +49,8 @@ bool brgemm_desc_container_t::insert(int idx, brgemm_t &brg,
     brg.brgattr.static_offsets = static_offsets_list_.back().data();
 
     const auto ret = map_.insert({brg, idx});
+    const int ref_size = refs_.size();
+    if (idx > ref_size - 1) { refs_.resize(idx + 1); }
     refs_[idx] = &(ret.first->first);
     // if there was no insertion then clean bd_mask and static_offsets
     if (!ret.second) {
@@ -58,7 +60,7 @@ bool brgemm_desc_container_t::insert(int idx, brgemm_t &brg,
     return ret.second;
 }
 
-int brgemm_desc_container_t::insert(brgemm_t &brg,
+int brgemm_desc_container_t::insert(brgemm_desc_t &brg,
         const std::vector<char> &bd_mask,
         const std::vector<brgemm_batch_element_t> &static_offsets) {
     bd_mask_list_.push_back(bd_mask);
@@ -98,7 +100,7 @@ bool brgemm_kernel_container_t::brgemm_kernel_cmp(
     return (std::memcmp(lcode, rcode, lsz) < 0);
 }
 
-status_t brgemm_kernel_container_t::insert(int idx, const brgemm_t *brg) {
+status_t brgemm_kernel_container_t::insert(int idx, const brgemm_desc_t *brg) {
     // Use two level hashing of brgemm kernels:
     // 1. Try to find entry in local brgemm_map_ using brgemm descriptor as a
     // key (we can check if brgemm descriptor is unique inside brgemm primitive)
@@ -121,9 +123,11 @@ status_t brgemm_kernel_container_t::insert(int idx, const brgemm_t *brg) {
     return status::success;
 }
 
-bool brgemm_palette_container_t::insert(int idx, const brgemm_t *brg) {
+bool brgemm_palette_container_t::insert(int idx, const brgemm_desc_t *brg) {
     S_t kernel_palette;
-    CHECK(brgemm_init_tiles(*brg, kernel_palette.data()));
+    auto status = brgemm_init_tiles(*brg, kernel_palette.data());
+    if (status != status::success) return false;
+
     const auto ret = set_.insert(kernel_palette);
     refs_[idx] = &(*ret.first);
     return ret.second;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@
 #include "oneapi/dnnl/dnnl.h"
 #include "oneapi/dnnl/dnnl_sycl.hpp"
 
-#include "sycl/sycl_compat.hpp"
+#include "xpu/sycl/compat.hpp"
 
 #include <algorithm>
 #include <memory>
@@ -35,10 +35,10 @@ class init_kernel;
 
 namespace dnnl {
 
-class sycl_memory_buffer_test : public ::testing::TestWithParam<engine::kind> {
-};
+class sycl_memory_buffer_test_t
+    : public ::testing::TestWithParam<engine::kind> {};
 
-TEST_P(sycl_memory_buffer_test, BasicInteropCtor) {
+TEST_P(sycl_memory_buffer_test_t, BasicInteropCtor) {
     engine::kind eng_kind = GetParam();
     SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
 
@@ -76,7 +76,7 @@ TEST_P(sycl_memory_buffer_test, BasicInteropCtor) {
     }
 }
 
-TEST_P(sycl_memory_buffer_test, ConstructorNone) {
+TEST_P(sycl_memory_buffer_test_t, ConstructorNone) {
     engine::kind eng_kind = GetParam();
     SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
 
@@ -100,7 +100,7 @@ TEST_P(sycl_memory_buffer_test, ConstructorNone) {
     (void)buf;
 }
 
-TEST_P(sycl_memory_buffer_test, ConstructorAllocate) {
+TEST_P(sycl_memory_buffer_test_t, ConstructorAllocate) {
     engine::kind eng_kind = GetParam();
     SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
 
@@ -138,7 +138,7 @@ TEST_P(sycl_memory_buffer_test, ConstructorAllocate) {
     mem.unmap_data(mapped_ptr);
 }
 
-TEST_P(sycl_memory_buffer_test, BasicInteropGetSet) {
+TEST_P(sycl_memory_buffer_test_t, BasicInteropGetSet) {
     engine::kind eng_kind = GetParam();
     SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
 
@@ -178,7 +178,7 @@ TEST_P(sycl_memory_buffer_test, BasicInteropGetSet) {
     }
 }
 
-TEST_P(sycl_memory_buffer_test, InteropReorder) {
+TEST_P(sycl_memory_buffer_test_t, InteropReorder) {
     engine::kind eng_kind = GetParam();
     SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
 #ifdef DNNL_SYCL_HIP
@@ -246,7 +246,7 @@ TEST_P(sycl_memory_buffer_test, InteropReorder) {
     }
 }
 
-TEST_P(sycl_memory_buffer_test, InteropReorderAndUserKernel) {
+TEST_P(sycl_memory_buffer_test_t, InteropReorderAndUserKernel) {
     engine::kind eng_kind = GetParam();
     SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
 
@@ -328,7 +328,7 @@ TEST_P(sycl_memory_buffer_test, InteropReorderAndUserKernel) {
     }
 }
 
-TEST_P(sycl_memory_buffer_test, EltwiseWithUserKernel) {
+TEST_P(sycl_memory_buffer_test_t, EltwiseWithUserKernel) {
     engine::kind eng_kind = GetParam();
     SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
 
@@ -361,9 +361,9 @@ TEST_P(sycl_memory_buffer_test, EltwiseWithUserKernel) {
 
     std::unique_ptr<queue> q;
     if (eng_kind == engine::kind::cpu) {
-        q.reset(new queue(dnnl::impl::sycl::compat::cpu_selector_v));
+        q.reset(new queue(dnnl::impl::xpu::sycl::compat::cpu_selector_v));
     } else {
-        q.reset(new queue(dnnl::impl::sycl::compat::gpu_selector_v));
+        q.reset(new queue(dnnl::impl::xpu::sycl::compat::gpu_selector_v));
     }
 
     q->submit([&](handler &cgh) {
@@ -388,8 +388,142 @@ TEST_P(sycl_memory_buffer_test, EltwiseWithUserKernel) {
     }
 }
 
+TEST_P(sycl_memory_buffer_test_t, MemoryOutOfScope) {
+    engine::kind eng_kind = GetParam();
+    SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
+
+#if DNNL_CPU_RUNTIME != DNNL_RUNTIME_SYCL
+    SKIP_IF(eng_kind == engine::kind::cpu,
+            "Skip this test for classic CPU runtime");
+#endif
+    engine eng(eng_kind, 0);
+
+    memory::dim n = 2048;
+    memory::desc mem_d({n}, memory::data_type::f32, memory::format_tag::a);
+
+    auto eltwise_pd = eltwise_forward::primitive_desc(eng, prop_kind::forward,
+            algorithm::eltwise_relu, mem_d, mem_d, 0.0f);
+    auto eltwise = eltwise_forward(eltwise_pd);
+
+    stream s(eng);
+    {
+        memory mem = sycl_interop::make_memory(
+                mem_d, eng, sycl_interop::memory_kind::buffer);
+        eltwise.execute(s, {{DNNL_ARG_SRC, mem}, {DNNL_ARG_DST, mem}});
+    }
+    s.wait();
+}
+
+TEST_P(sycl_memory_buffer_test_t, TestSparseMemoryCreation) {
+    engine::kind eng_kind = GetParam();
+
+#if DNNL_CPU_RUNTIME != DNNL_RUNTIME_SYCL
+    SKIP_IF(eng_kind == engine::kind::cpu,
+            "Skip this test for classic CPU runtime");
+#endif
+    SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
+
+    engine eng(eng_kind, 0);
+    const int nnz = 12;
+    memory::desc md;
+
+    // COO.
+    ASSERT_NO_THROW(md = memory::desc::coo({64, 128}, memory::data_type::f32,
+                            nnz, memory::data_type::s32));
+    memory mem;
+    // Default memory constructor.
+    EXPECT_NO_THROW(mem = memory(md, eng));
+    // Memory object is expected to have 3 handles.
+    EXPECT_NO_THROW(mem.get_data_handle(0));
+    EXPECT_NO_THROW(mem.get_data_handle(1));
+    EXPECT_NO_THROW(mem.get_data_handle(2));
+
+    // Default interop API to create a memory object.
+    EXPECT_NO_THROW(mem = sycl_interop::make_memory(
+                            md, eng, sycl_interop::memory_kind::buffer));
+    // Memory object is expected to have 3 handles.
+    EXPECT_NO_THROW(mem.get_data_handle(0));
+    EXPECT_NO_THROW(mem.get_data_handle(1));
+    EXPECT_NO_THROW(mem.get_data_handle(2));
+
+    // User provided buffers.
+    buffer<uint8_t, 1> buf_values {range<1>(md.get_size(0))};
+    buffer<uint8_t, 1> buf_row_indices {range<1>(md.get_size(1))};
+    buffer<uint8_t, 1> buf_col_indices {range<1>(md.get_size(2))};
+
+    EXPECT_NO_THROW(mem = sycl_interop::make_memory(md, eng,
+                            sycl_interop::memory_kind::buffer,
+                            {&buf_values, &buf_row_indices, &buf_col_indices}));
+
+    auto &h1 = *reinterpret_cast<buffer<uint8_t, 1> *>(mem.get_data_handle(0));
+    auto &h2 = *reinterpret_cast<buffer<uint8_t, 1> *>(mem.get_data_handle(1));
+    auto &h3 = *reinterpret_cast<buffer<uint8_t, 1> *>(mem.get_data_handle(2));
+
+    ASSERT_EQ(h1, buf_values);
+    ASSERT_EQ(h2, buf_row_indices);
+    ASSERT_EQ(h3, buf_col_indices);
+}
+
+TEST_P(sycl_memory_buffer_test_t, TestSparseMemoryMapUnmap) {
+    engine::kind eng_kind = GetParam();
+
+#if DNNL_CPU_RUNTIME != DNNL_RUNTIME_SYCL
+    SKIP_IF(eng_kind == engine::kind::cpu,
+            "Skip this test for classic CPU runtime");
+#endif
+    SKIP_IF(engine::get_count(eng_kind) == 0, "Engine not found.");
+
+    engine eng(eng_kind, 0);
+
+    const int nnz = 2;
+    memory::desc md;
+
+    // COO.
+    ASSERT_NO_THROW(md = memory::desc::coo({2, 2}, memory::data_type::f32, nnz,
+                            memory::data_type::s32));
+
+    // User provided buffers.
+    std::vector<float> coo_values = {1.5, 2.5};
+    std::vector<int> row_indices = {0, 1};
+    std::vector<int> col_indices = {0, 1};
+
+    buffer<uint8_t, 1> buf_coo_values(
+            (uint8_t *)&coo_values[0], range<1>(md.get_size(0)));
+    buffer<uint8_t, 1> buf_row_indices(
+            (uint8_t *)&row_indices[0], range<1>(md.get_size(1)));
+    buffer<uint8_t, 1> buf_col_indices(
+            (uint8_t *)&col_indices[0], range<1>(md.get_size(2)));
+
+    memory coo_mem;
+    EXPECT_NO_THROW(
+            coo_mem = sycl_interop::make_memory(md, eng,
+                    sycl_interop::memory_kind::buffer,
+                    {&buf_coo_values, &buf_row_indices, &buf_col_indices}));
+
+    float *mapped_coo_values = nullptr;
+    int *mapped_row_indices = nullptr;
+    int *mapped_col_indices = nullptr;
+
+    ASSERT_NO_THROW(mapped_coo_values = coo_mem.map_data<float>(0));
+    ASSERT_NO_THROW(mapped_row_indices = coo_mem.map_data<int>(1));
+    ASSERT_NO_THROW(mapped_col_indices = coo_mem.map_data<int>(2));
+
+    for (size_t i = 0; i < coo_values.size(); i++)
+        ASSERT_EQ(coo_values[i], mapped_coo_values[i]);
+
+    for (size_t i = 0; i < row_indices.size(); i++)
+        ASSERT_EQ(row_indices[i], mapped_row_indices[i]);
+
+    for (size_t i = 0; i < col_indices.size(); i++)
+        ASSERT_EQ(col_indices[i], mapped_col_indices[i]);
+
+    ASSERT_NO_THROW(coo_mem.unmap_data(mapped_coo_values, 0));
+    ASSERT_NO_THROW(coo_mem.unmap_data(mapped_row_indices, 1));
+    ASSERT_NO_THROW(coo_mem.unmap_data(mapped_col_indices, 2));
+}
+
 namespace {
-struct PrintToStringParamName {
+struct print_to_string_param_name_t {
     template <class ParamType>
     std::string operator()(
             const ::testing::TestParamInfo<ParamType> &info) const {
@@ -398,8 +532,8 @@ struct PrintToStringParamName {
 };
 } // namespace
 
-INSTANTIATE_TEST_SUITE_P(Simple, sycl_memory_buffer_test,
+INSTANTIATE_TEST_SUITE_P(Simple, sycl_memory_buffer_test_t,
         ::testing::Values(engine::kind::cpu, engine::kind::gpu),
-        PrintToStringParamName());
+        print_to_string_param_name_t());
 
 } // namespace dnnl

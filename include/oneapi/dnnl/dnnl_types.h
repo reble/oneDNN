@@ -1,5 +1,7 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
+* Copyright 2024-2025 FUJITSU LIMITED
+* Copyright 2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,18 +53,15 @@ typedef enum {
     dnnl_blocked,
     /// A special format kind that indicates that tensor format is opaque.
     dnnl_format_kind_opaque,
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     /// Format kind for sparse tensors.
     dnnl_format_kind_sparse,
-#endif
-    /// Parameter to allow internal only format kinds without undefined
-    /// behavior. This parameter is chosen to be valid for so long as
-    /// sizeof(int) >= 2.
+
+    // Max value to prevent UB for internal-use-only values.
     dnnl_format_kind_max = 0x7fff,
 } dnnl_format_kind_t;
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 /// Sparse encodings.
+/// @sa @ref dev_guide_sparsity
 typedef enum {
     /// Undefined sparse encoding kind, used for empty memory descriptors.
     dnnl_sparse_encoding_undef = 0,
@@ -74,8 +73,9 @@ typedef enum {
     /// only be used to create a primitive descriptor to query the
     /// actual memory descriptor (similar to the format tag `any`).
     dnnl_packed,
+    /// Coordinate Sparse Encoding (COO).
+    dnnl_coo,
 } dnnl_sparse_encoding_t;
-#endif
 
 #ifdef DNNL_EXPERIMENTAL_PROFILING
 /// Profiling data kind.
@@ -84,6 +84,9 @@ typedef enum {
     dnnl_profiling_data_kind_undef = 0,
     /// Data kind to query an execution time in nanoseconds.
     dnnl_profiling_data_kind_time,
+
+    // Max value to prevent UB for internal-use-only values.
+    dnnl_profiling_data_max = 0x7fff,
 } dnnl_profiling_data_kind_t;
 
 #endif
@@ -1022,6 +1025,39 @@ typedef enum {
     dnnl_Ab8a,
     dnnl_BA4b4a,
     dnnl_BA8b4a,
+    dnnl_BA2a24b,
+    dnnl_aCB2b24c,
+    dnnl_BA2a8b,
+    dnnl_aCB2b8c,
+    dnnl_BA8a24b,
+    dnnl_aCB8b24c,
+    dnnl_BA8a16b,
+    dnnl_aCB8b16c,
+    dnnl_BA8a8b,
+    dnnl_aCB8b8c,
+    dnnl_bcad,
+    dnnl_cabd,
+    dnnl_dabc,
+    dnnl_Ab32a,
+    dnnl_aCBd8b8c,
+    dnnl_aCBde8b8c,
+    dnnl_BAc8a8b,
+    dnnl_BAcd8a8b,
+    dnnl_BAcde8a8b,
+    dnnl_aCBdef8b8c,
+    dnnl_abdEC16e4c,
+    dnnl_abDC16d4c,
+    dnnl_BA24b8a,
+    dnnl_aCB24c8b,
+    dnnl_abDC24d8c,
+    dnnl_decbA4a,
+    dnnl_defcbA4a,
+    dnnl_abDC8d8c,
+    dnnl_abDC16d8c,
+    dnnl_aCB8c8b,
+    dnnl_aCB16c8b,
+    dnnl_BA8b8a,
+    dnnl_BA16b8a,
 
     /// Just a sentinel, not real memory format tag. Must be changed after new
     /// format tag is added.
@@ -1157,10 +1193,12 @@ typedef enum {
     /// 5D LSTM projection tensor
     dnnl_ldOi16o = dnnl_abDc16d,
     dnnl_ldOi32o = dnnl_abDc32d,
+    dnnl_ldOI16o4i = dnnl_abDC16d4c,
     dnnl_ldOI32o4i = dnnl_abDC32d4c,
     dnnl_ldIo32i = dnnl_abCd32c,
     /// 6D RNN weights tensor
     dnnl_ldgOi16o = dnnl_abdEc16e,
+    dnnl_ldgOI16o4i = dnnl_abdEC16e4c,
     dnnl_ldgOi32o = dnnl_abdEc32e,
     dnnl_ldgOI32o2i = dnnl_abdEC32e2c,
     dnnl_ldgOI32o4i = dnnl_abdEC32e4c,
@@ -1242,6 +1280,7 @@ typedef enum {
     dnnl_OI8i8o = dnnl_AB8b8a,
 
     // weights, 3D
+    dnnl_IOw8o8i = dnnl_BAc8a8b,
     dnnl_IOw16o16i = dnnl_BAc16a16b,
     dnnl_IOw16i16o = dnnl_BAc16b16a,
     dnnl_OIw16i16o = dnnl_ABc16b16a,
@@ -1312,6 +1351,7 @@ typedef enum {
 
     // weights, 4D
     dnnl_IOhw16i16o = dnnl_BAcd16b16a,
+    dnnl_IOhw8o8i = dnnl_BAcd8a8b,
     dnnl_IOhw16o16i = dnnl_BAcd16a16b,
     dnnl_Ohwi16o = dnnl_Acdb16a,
     dnnl_OhwI16o2i = dnnl_AcdB16a2b,
@@ -1444,6 +1484,7 @@ typedef enum {
     dnnl_OIdhw8o4i = dnnl_ABcde8a4b,
     dnnl_IOdhw16i16o = dnnl_BAcde16b16a,
     dnnl_OIdhw4o8i8o4i = dnnl_ABcde4a8b8a4b,
+    dnnl_IOdhw8o8i = dnnl_BAcde8a8b,
     dnnl_IOdhw16o16i = dnnl_BAcde16a16b,
     dnnl_OIdhw16o16i2o = dnnl_ABcde16a16b2a,
     dnnl_OIdhw8i32o = dnnl_ABcde8b32a,
@@ -1457,6 +1498,7 @@ typedef enum {
     dnnl_Goiw16g = dnnl_Abcd16a,
     dnnl_Goiw8g = dnnl_Abcd8a,
     dnnl_Goiw4g = dnnl_Abcd4a,
+    dnnl_gIOw8o8i = dnnl_aCBd8b8c,
     dnnl_gIOw16o16i = dnnl_aCBd16b16c,
     dnnl_gIOw16i16o = dnnl_aCBd16c16b,
     dnnl_gOIw16i16o = dnnl_aBCd16c16b,
@@ -1502,6 +1544,7 @@ typedef enum {
 
     // weights w/ groups, 4D
     dnnl_gIOhw16i16o = dnnl_aCBde16c16b,
+    dnnl_gIOhw8o8i = dnnl_aCBde8b8c,
     dnnl_gIOhw16o16i = dnnl_aCBde16b16c,
     dnnl_gOhwi16o = dnnl_aBdec16b,
     dnnl_gOhwI16o2i = dnnl_aBdeC16b2c,
@@ -1569,6 +1612,7 @@ typedef enum {
 
     // weights w/ groups, 6D
     dnnl_gIOdhw16i16o = dnnl_aCBdef16c16b,
+    dnnl_gIOdhw8o8i = dnnl_aCBdef8b8c,
     dnnl_gIOdhw16o16i = dnnl_aCBdef16b16c,
     dnnl_gOdhwi16o = dnnl_aBdefc16b,
     dnnl_gOdhwI16o2i = dnnl_aBdefC16b2c,
@@ -1878,8 +1922,10 @@ typedef enum {
     dnnl_gIdhwO16o64i4o = dnnl_aCdefB16b64c4b,
     dnnl_hwioG16g = dnnl_decbA16a,
     dnnl_hwioG8g = dnnl_decbA8a,
+    dnnl_hwioG4g = dnnl_decbA4a,
     dnnl_dhwioG16g = dnnl_defcbA16a,
     dnnl_dhwioG8g = dnnl_defcbA8a,
+    dnnl_dhwioG4g = dnnl_defcbA4a,
     dnnl_NCdhw40n16c = dnnl_ABcde40a16b,
     dnnl_NCw40n16c = dnnl_ABc40a16b,
     dnnl_NChw40n16c = dnnl_ABcd40a16b,
@@ -2005,8 +2051,7 @@ typedef enum {
     /// A group normalization primitive.
     dnnl_group_normalization,
 
-    /// Parameter to allow internal only primitives without undefined behavior.
-    /// This parameter is chosen to be valid for so long as sizeof(int) >= 2.
+    // Max value to prevent UB for internal-use-only values.
     dnnl_primitive_kind_max = 0x7fff,
 } dnnl_primitive_kind_t;
 
@@ -2134,6 +2179,8 @@ typedef enum {
     dnnl_binary_eq = 0x1fffa,
     /// Binary not equal
     dnnl_binary_ne = 0x1fffb,
+    /// Binary select
+    dnnl_binary_select = 0x1fffc,
     /// Nearest Neighbor Resampling Method
     dnnl_resampling_nearest = 0x2fff0,
     /// Linear Resampling Method
@@ -2164,73 +2211,68 @@ typedef enum {
 
 /// Flags for normalization primitives.
 typedef enum {
-    /// Use no normalization flags
+    /// Use no normalization flags. If specified, the library computes mean and
+    /// variance on forward propagation for training and inference, outputs
+    /// them on forward propagation for training, and computes the respective
+    /// derivatives on backward propagation.
     ///
-    /// If specified
-    ///  - on forward training propagation mean and variance are computed and
-    ///    stored as output
-    ///  - on backward propagation compute full derivative wrt data
-    ///  - on backward propagation prop_kind == #dnnl_backward_data has the same
-    ///    behavior as prop_kind == #dnnl_backward
+    /// @note
+    ///     Backward propagation of type prop_kind == #dnnl_backward_data has
+    ///     the same behavior as prop_kind == #dnnl_backward.
     dnnl_normalization_flags_none = 0x0U,
 
-    /// Use global statistics
-    ///
-    /// If specified
-    ///  - on forward propagation use mean and variance provided by user (input)
-    ///  - on backward propagation reduces the amount of computations, since
-    ///    mean and variance are considered as constants
-    ///
-    ///  If not specified:
-    ///   - on forward propagation mean and variance are computed and stored as
-    ///     output
-    ///   - on backward propagation compute full derivative wrt data
+    /// Use global statistics. If specified, the library uses mean and
+    /// variance provided by the user as an input on forward propagation and
+    /// does not compute their derivatives on backward propagation. Otherwise,
+    /// the library computes mean and variance on forward propagation for
+    /// training and inference, outputs them on forward propagation for
+    /// training, and computes the respective derivatives on backward
+    /// propagation.
     dnnl_use_global_stats = 0x1U,
 
-    /// Use scale parameter
-    ///
-    /// If specified:
-    ///  - on forward propagation use scale for the normalization results
-    ///  - on backward propagation (for prop_kind == #dnnl_backward) compute
-    ///    diff wrt scale (hence one extra output used)
+    /// Use scale parameter. If specified, the user is expected to pass scale as
+    /// input on forward propagation. On backward propagation of type
+    /// #dnnl_backward, the library computes its derivative.
     dnnl_use_scale = 0x2U,
 
-    /// Use shift parameter
-    ///
-    /// If specified:
-    ///  - on forward propagation use shift (aka bias) for the normalization
-    ///    results
-    ///  - on backward propagation (for prop_kind == #dnnl_backward) compute
-    ///    diff wrt shift (hence one extra output used)
+    /// Use shift parameter. If specified, the user is expected to pass shift as
+    /// input on forward propagation. On backward propagation of type
+    /// #dnnl_backward, the library computes its derivative.
     dnnl_use_shift = 0x4U,
 
-    /// Fuse with ReLU
+    /// Fuse normalization with ReLU. On training, normalization will require
+    /// the workspace to implement backward propagation. On inference, the
+    /// workspace is not required and behavior is the same as when normalization
+    /// is fused with ReLU using the post-ops API.
     ///
-    /// The flag implies negative slope being 0. On training this is the only
-    /// configuration supported. For inference, to use non-zero negative slope
-    /// consider using @ref dev_guide_attributes_post_ops.
-    ///
-    /// If specified:
-    ///  - on inference this option behaves the same as if the primitive were
-    ///    fused with ReLU using post ops API with zero negative slope.
-    ///  - on training primitive requires workspace (required to be able to
-    ///    perform backward pass)
+    /// @note
+    ///     The flag implies negative slope being 0. On training this is the only
+    ///     configuration supported. For inference, to use non-zero negative slope
+    ///     consider using @ref dev_guide_attributes_post_ops.
     dnnl_fuse_norm_relu = 0x8U,
 
-    /// Fuse with Add and then fuse with ReLU
-    ///
-    /// If specified:
-    ///
-    ///  - on forward propagation apply element-wise binary Add operation to
-    ///    to the normalization results with an additional input tensor and then
-    ///    apply ReLU with negative slope being 0.
-    ///  - on training primitive requires workspace (required to be able to
-    ///    perform backward pass).
-    ///  - on backward propagation save the result of backward ReLU operation
-    ///    with input tensor and workspace from forward pass to extra output
-    ///    tensor and then perform backward normalization.
+    /// Fuse normalization with an elementwise binary Add operation
+    /// followed by ReLU.
+    /// During training, normalization will require a workspace to implement
+    /// backward propagation. For inference, the workspace is not needed.
+    /// On forward propagation, an elementwise binary Add operation is applied
+    /// to the normalization results with an additional input tensor, followed
+    /// by ReLU with a negative slope of 0.
+    /// On backward propagation, the result of the backward ReLU operation
+    /// with the input tensor and workspace from the forward pass is saved
+    /// to an extra output tensor, and backward normalization is performed.
     dnnl_fuse_norm_add_relu = 0x10U,
 
+    /// Use Root Mean Square (RMS) Normalization. In forward propagation,
+    /// the mean is considered zero, and RMS norm is used instead of variance
+    /// for scaling. Only the RMS norm is output during forward propagation for
+    /// training. In backward propagation, the library calculates the derivative
+    /// with respect to the RMS norm only, assuming the mean is zero.
+    ///
+    /// @note
+    ///     When used with #dnnl_use_global_stats,
+    ///     only RMS norm is required to be provided as input.
+    dnnl_rms_norm = 0x20U,
 } dnnl_normalization_flags_t;
 
 /// @} dnnl_api_primitives_common
@@ -2370,6 +2412,15 @@ typedef enum {
     dnnl_scratchpad_mode_user,
 } dnnl_scratchpad_mode_t;
 
+/// Rounding mode
+typedef enum {
+    /// rounding mode dictated by the floating-point environment
+    dnnl_rounding_mode_environment,
+    /// stochastic rounding mode where a random bias is added to the
+    /// trailing mantissa bits before conversion.
+    dnnl_rounding_mode_stochastic,
+} dnnl_rounding_mode_t;
+
 /// @struct dnnl_primitive_attr
 /// @brief An opaque structure for primitive descriptor attributes.
 ///
@@ -2423,6 +2474,8 @@ typedef struct dnnl_primitive *dnnl_primitive_t;
 /// A constant primitive handle.
 typedef const struct dnnl_primitive *const_dnnl_primitive_t;
 
+/// Undefined argument.
+#define DNNL_ARG_UNDEF 0
 /// Source argument #0.
 #define DNNL_ARG_SRC_0 1
 /// A special mnemonic for source argument for primitives that have a
@@ -2505,6 +2558,12 @@ typedef const struct dnnl_primitive *const_dnnl_primitive_t;
 
 /// Bias tensor argument.
 #define DNNL_ARG_BIAS 41
+
+/// Reduce tensor argument.
+#define DNNL_ARG_REDUCE 42
+
+/// Note: when adding a new macro after `DNNL_ARG_REDUCE` please reserve a
+/// space for potential indices for `DNNL_ARG_REDUCE`.
 
 /// Mean values tensor argument.
 #define DNNL_ARG_MEAN 49
@@ -2605,7 +2664,21 @@ typedef const struct dnnl_primitive *const_dnnl_primitive_t;
 /// A special mnemonic for shift argument of normalization primitives.
 #define DNNL_ARG_DIFF_SHIFT 256
 
+/// Rounding mode seed for stochastic rounding
+/// Single seed needed independently of how many arguments need stochastic rounding
+#define DNNL_ARG_ATTR_ROUNDING_SEED 508
+
+/// Dropout mask output buffer.
+#define DNNL_ARG_ATTR_DROPOUT_MASK 509
+
+/// Dropout probability value passed via a buffer.
+#define DNNL_ARG_ATTR_DROPOUT_PROBABILITY 510
+
+/// Dropout RNG seed value passed via a buffer.
+#define DNNL_ARG_ATTR_DROPOUT_SEED 511
+
 /// Output scaling factors provided at execution time.
+/// Deprecated value.
 #define DNNL_ARG_ATTR_OUTPUT_SCALES 513
 
 /// Starting index for source arguments for primitives that take a variable
@@ -2762,13 +2835,11 @@ typedef enum {
     dnnl_query_inner_nblks_s32, ///< number of innermost blocks
     dnnl_query_inner_blks, ///< vector of sizes of the innermost blocks
     dnnl_query_inner_idxs, ///< vector of logical indices of the blocks
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     dnnl_query_sparse_encoding, ///< Sparse encoding
     dnnl_query_nnz_s64, ///< Number of non-zero entries
-    dnnl_query_num_handles_s32, ///< Number of buffers required for a memory
-///  descriptor
-#endif
-    // Max value to prevent UB for internal use only dnnl_query_t
+    dnnl_query_num_handles_s32, ///< Number of buffers required for a memory descriptor
+
+    // Max value to prevent UB for internal-use-only values.
     dnnl_query_max = 0x7fff,
 } dnnl_query_t;
 
@@ -2839,19 +2910,31 @@ typedef enum {
     /// and Intel Core processor family.
     // TODO: Align avx10_1 values to internal representation.
     dnnl_cpu_isa_avx10_1_512 = 0x1ef,
+    /// @copydoc dnnl_cpu_isa_avx10_1_512
     dnnl_cpu_isa_avx512_core_fp16 = dnnl_cpu_isa_avx10_1_512,
 
     /// Intel AVX-512 with float16, Intel DL Boost and bfloat16 support and
     /// Intel AMX with 8-bit integer and bfloat16 support
     // TODO: Align avx10_1 values to internal representation.
     dnnl_cpu_isa_avx10_1_512_amx = 0xfef,
+    /// @copydoc dnnl_cpu_isa_avx10_1_512_amx
     dnnl_cpu_isa_avx512_core_amx = dnnl_cpu_isa_avx10_1_512_amx,
 
     /// Intel AVX-512 with float16, Intel DL Boost and bfloat16 support and
     /// Intel AMX with 8-bit integer, bfloat16 and float16 support
     // TODO: Align avx10_1 values to internal representation.
     dnnl_cpu_isa_avx10_1_512_amx_fp16 = 0x1fef,
+    /// @copydoc dnnl_cpu_isa_avx10_1_512_amx_fp16
     dnnl_cpu_isa_avx512_core_amx_fp16 = dnnl_cpu_isa_avx10_1_512_amx_fp16,
+
+    /// Intel AVX10.2/512 with float16, Intel DL Boost and bfloat16 support
+    /// for Intel Xeon Scalable processor family
+    /// and Intel Core processor family
+    dnnl_cpu_isa_avx10_2_512 = 0x201ff,
+
+    /// Intel AVX10.2/512 with float16, Intel DL Boost and bfloat16 support and
+    /// Intel AMX with 8-bit integer, bfloat16, float16, float8 support
+    dnnl_cpu_isa_avx10_2_512_amx_2 = 0x22fff,
 } dnnl_cpu_isa_t;
 
 /// CPU ISA hints flags
@@ -2871,4 +2954,4 @@ typedef enum {
 }
 #endif
 
-#endif /* ONEAPI_DNNL_TYPES_H */
+#endif // ONEAPI_DNNL_DNNL_TYPES_H

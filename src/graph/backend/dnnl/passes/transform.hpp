@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,12 @@ status_t replace_quant_data_with_binary_post_op(
         std::shared_ptr<subgraph_t> &sg);
 
 status_t fuse_post_ops(std::shared_ptr<subgraph_t> &sg);
+
+// This pass is only used in the sdpa decompose kernel and handle matmul post
+// op. There is no any limit for matmul+post_binary about dims broadcast like
+// full tensor and per tensor broadcast. Because the implementation of sdpa
+// decompose kernel is actually 2d.
+status_t sdp_fuse_post_ops(std::shared_ptr<subgraph_t> &sg);
 
 status_t fuse_src_zero_points(std::shared_ptr<subgraph_t> &sg);
 
@@ -171,14 +177,38 @@ impl::status_t lift_up_quantize(std::shared_ptr<subgraph_t> &sg);
 // have the opportunity to be fused into computation operators
 impl::status_t lift_up_typecast(std::shared_ptr<subgraph_t> &sg);
 
+/// This pass will move add after matmul and insert reshape and transpose before
+/// src1 of add. So that it can have the opportunity to be fused into matmul.
+///                                                          src1(4D)
+///                                                          /
+///          |                                  |        transpose
+///          |                                  |          / (4D)
+///        matmul(3D)                         matmul    reshape
+///          |                                  |      / (3D)
+///        reshape             ----->         add(3D)
+///          | (4D)                             |
+///       transpose   src1(4D)                reshape
+///          |      /                           |(4D)
+///         add(4D)                          transpose
+///          |                                  |
+///
+impl::status_t lift_up_post_add_for_matmul(std::shared_ptr<subgraph_t> &sg);
+
 // This pass will move reshape before Quantize and Dequantize for depthwiseconv.
 // So that it can have the opportunity to be fused into computation operators
 impl::status_t lift_up_weight_reshape_for_depthwiseconv(
         std::shared_ptr<subgraph_t> &sg);
 
-// This pass will compute matmul with the dst layout of following transpose if
-// the operator after transpose need a dense layout
-impl::status_t fuse_dst_transpose_to_matmul(std::shared_ptr<subgraph_t> &sg);
+// This pass will compute matmul with the src layout of transpose before matmul
+impl::status_t fuse_src_transpose_to_matmul(std::shared_ptr<subgraph_t> &sg);
+
+// This pass will compute matmul/sdpa with the dst layout of following transpose
+// if the operator after transpose need a dense layout
+impl::status_t fuse_dst_transpose_to_predecessor(
+        std::shared_ptr<subgraph_t> &sg);
+
+// This pass will fuse all the reshape to its lead op for GQA.
+impl::status_t fuse_reshape_for_gqa(std::shared_ptr<subgraph_t> &sg);
 
 // This pass will fold add_zps into the previous sub_zps with new_zps = sub_zps
 // - add_zps
@@ -235,6 +265,37 @@ impl::status_t fold_pre_mul_scale_into_bn(std::shared_ptr<subgraph_t> &sg);
 ///  (beta * scale)
 ///  ==> dst = (new_gamma * (src - mean) / sqrt(variance + epsilon)) + new_beta
 impl::status_t fold_post_mul_scale_into_bn(std::shared_ptr<subgraph_t> &sg);
+
+/// This pass will translate the subgraph containing subgraph of implicit causal
+/// mask into a dnnl_mask op
+/// for top-left implicit causal mask:
+///           in0
+///         /    |
+///    GenIndex GenIndex             in0  in1
+///        \     /                     \   /
+///      GreaterEqual in0 in1   -->     mask
+///               \  /   /               |
+///                Select
+///                   |
+///
+/// for bottom-right implicit causal mask:
+///           in0
+///         /     |
+///    GenIndex GenIndex
+///  in2   |      |                in0 in1 in2 in3
+///   \_  Add     |                    \ | |  /
+///   in3  |      |           -->        mask
+///     \_Sub     |                       |
+///        \     /
+///      GreaterEqual in0 in1
+///               \  /   /
+///                Select
+///                   |
+///
+status_t fuse_implicit_causal_mask(std::shared_ptr<subgraph_t> &sg);
+
+/// This pass will transform the sdpa subgraph into a dnnl_sdpa op.
+status_t fuse_sdpa(std::shared_ptr<subgraph_t> &sg);
 
 } // namespace dnnl_impl
 } // namespace graph

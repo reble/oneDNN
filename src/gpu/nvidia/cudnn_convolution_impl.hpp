@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,9 +25,9 @@
 #include "common/utils.hpp"
 #include "gpu/nvidia/cudnn_conv_filter_adjustment_base.hpp"
 #include "gpu/nvidia/cudnn_convolution_pd.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/engine.hpp"
+#include "gpu/nvidia/stream.hpp"
 #include "gpu/nvidia/sycl_cuda_scoped_context.hpp"
-#include "gpu/nvidia/sycl_cuda_stream.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 // `CUDNN_FMA_MATH` is available starting from cuDNN v8.
@@ -65,7 +65,15 @@ protected:
     bool with_bias = false;
 
     bool do_scaling = false;
+    bool do_dst_scaling = false;
+    // When we apply scaling to the src and wei
+    // the post ops will need to be computed
+    // in f32 and then quantize using a default
+    // value of 1.0f
+    bool do_src_scaling = false;
+    bool do_wei_scaling = false;
     bool use_temp_dst_ = false;
+    bool use_scales_dst_ = false;
     cudnnDataType_t computation_data_type = CUDNN_DATA_FLOAT;
     cudnnDataType_t reorder_type = CUDNN_DATA_INT8;
 
@@ -77,7 +85,8 @@ public:
             CUDNN_EXECUTE_FUNC_V(cudnnDestroyTensorDescriptor, descs[i]);
         }
     }
-    virtual status_t configure_alg_kind(engine_t *, convolution_pd_t *pd) = 0;
+    virtual status_t configure_alg_kind(impl::engine_t *, convolution_pd_t *pd)
+            = 0;
 
     virtual bool supported_filter_format(
             const memory_desc_t *md) const override {
@@ -96,8 +105,8 @@ public:
     bool using_transformed_filter() const { return filter_needs_transform; }
     bool with_scratchpad() const { return scratchpad_size > 0; }
 
-    virtual status_t init(engine_t *engine, convolution_pd_t *pd,
-            bool use_scratch_dst = false) {
+    virtual status_t init(impl::engine_t *engine, convolution_pd_t *pd,
+            bool use_scratch_dst = false, bool use_scales_dst = false) {
         CHECK(configure_parameters(pd));
         CHECK(create_cudnn_descs(pd));
         CHECK(check_output_dims());
@@ -134,6 +143,10 @@ public:
         with_bias = pd->with_bias();
         beta = 0.0f;
         do_scaling = !pd->attr()->scales_.has_default_values();
+        do_dst_scaling = !pd->attr()->scales_.has_default_values(DNNL_ARG_DST);
+        do_src_scaling = !pd->attr()->scales_.has_default_values(DNNL_ARG_SRC);
+        do_wei_scaling
+                = !pd->attr()->scales_.has_default_values(DNNL_ARG_WEIGHTS);
         dnnl_descs[x] = *pd->invariant_src_md();
         dnnl_descs[weights] = *pd->invariant_wei_md();
         dnnl_descs[y] = *pd->invariant_dst_md();
@@ -202,7 +215,8 @@ public:
 
         return status::success;
     }
-    virtual status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) {
+    virtual status_t init_scratchpad(
+            impl::engine_t *engine, convolution_pd_t *pd) {
         if (filter_needs_transform) {
             auto sz = memory_desc_wrapper(&dnnl_descs[weights]).size();
             auto data_size
@@ -313,7 +327,7 @@ public:
         int expected_dims[CUDNN_DIM_MAX] = {};
         CUDNN_EXECUTE_FUNC_V(cudnnGetConvolutionNdForwardOutputDim, conv_desc,
                 descs[x], weights_desc, ndims[y], &expected_dims[0]);
-        for (size_t i = 0; i < ndims[y]; i++) {
+        for (int i = 0; i < ndims[y]; i++) {
             if (dims[y][i] != expected_dims[i]) return status::unimplemented;
         }
         return status::success;
@@ -378,6 +392,8 @@ public:
     }
 
     bool use_temp_dst() const { return use_temp_dst_; }
+
+    bool use_scales_dst() const { return use_scales_dst_; }
 };
 
 struct cudnn_convolution_impl_fwd_t : public cudnn_convolution_impl_base_t {
@@ -385,6 +401,8 @@ protected:
     cudnnActivationDescriptor_t activation_desc = nullptr;
     cudnnActivationDescriptor_t eltwise_desc = nullptr;
     cudnnTensorDescriptor_t reorder_dst_desc = nullptr;
+    cudnnTensorDescriptor_t y_fp32_desc = nullptr;
+    cudnnOpTensorDescriptor_t op_tensor_desc = nullptr;
     cudnnConvolutionFwdAlgo_t fwd_alg_kind;
     std::vector<cudnnConvolutionFwdAlgoPerf_t> perf;
     int requested_algo_count = 0;
@@ -407,12 +425,17 @@ public:
         if (reorder_dst_desc)
             CUDNN_EXECUTE_FUNC_V(
                     cudnnDestroyTensorDescriptor, reorder_dst_desc);
+        if (y_fp32_desc)
+            CUDNN_EXECUTE_FUNC_V(cudnnDestroyTensorDescriptor, y_fp32_desc);
+        if (op_tensor_desc)
+            CUDNN_EXECUTE_FUNC_V(
+                    cudnnDestroyOpTensorDescriptor, op_tensor_desc);
     }
 
     status_t configure_post_ops(convolution_pd_t *pd) {
         auto &p = pd->attr()->post_ops_;
         num_post_ops = p.len();
-        for (size_t i = 0; i < p.len(); i++) {
+        for (int i = 0; i < p.len(); i++) {
             post_ops[i] = p.entry_[i].kind;
             if (post_ops[i] == dnnl_eltwise) {
                 CHECK(create_and_set_eltwise_descriptor(pd));
@@ -440,19 +463,36 @@ public:
         // If the only post-op is fused then there is no need for temp dst
         if (conv_bias_eltwise && num_post_ops == 1) use_temp_dst_ = false;
 
-        if (data_types[y] == CUDNN_DATA_INT8 && use_temp_dst_) {
+        // We need to take into account if we are scaling
+        // the src. In which case we will need to compute
+        // the post-ops in f32 and then quantize using a
+        // 1.0f scaling factor for dst
+        if (data_types[y] == CUDNN_DATA_INT8 && use_temp_dst_
+                && !(do_dst_scaling || do_src_scaling || do_wei_scaling)) {
             data_types[y] = CUDNN_DATA_FLOAT;
             need_reorder = true;
             CHECK(create_and_set_tensor_descriptor_ex(&reorder_dst_desc,
                     formats[y], reorder_type, ndims[y], dims[y]));
         }
 
+        // If dst needs to be scaled and dst datatype is s8
+        if (y_f32_is_required()) {
+            CUDNN_EXECUTE_FUNC_V(
+                    cudnnCreateOpTensorDescriptor, &op_tensor_desc);
+            cudnnOpTensorOp_t opTensorOp = CUDNN_OP_TENSOR_ADD;
+            cudnnDataType_t opTensorCompType = CUDNN_DATA_FLOAT;
+            cudnnNanPropagation_t opTensorNanOpt = CUDNN_NOT_PROPAGATE_NAN;
+            CUDNN_EXECUTE_FUNC_S(cudnnSetOpTensorDescriptor, op_tensor_desc,
+                    opTensorOp, opTensorCompType, opTensorNanOpt);
+        }
+
         return status::success;
     }
 
-    status_t init(engine_t *engine, convolution_pd_t *pd,
-            bool use_scratch_dst) override {
+    status_t init(impl::engine_t *engine, convolution_pd_t *pd,
+            bool use_scratch_dst, bool use_scales_dst) override {
         use_temp_dst_ = use_scratch_dst;
+        use_scales_dst_ = use_scales_dst;
         CHECK(configure_parameters(pd));
         CHECK(create_cudnn_descs(pd));
         CHECK(configure_alg_kind(engine, pd));
@@ -468,11 +508,29 @@ public:
         const float beta = 0.0f;
         if (flip_formats) {
             CUDNN_EXECUTE_FUNC_V(cudnnTransformTensor, handle, &alpha,
-                    reorder_dst_desc, src, &beta, descs[y], dst);
+                    reorder_dst_desc, src, &beta, y_fp32_desc, dst);
         } else {
-            CUDNN_EXECUTE_FUNC_V(cudnnTransformTensor, handle, &alpha, descs[y],
-                    src, &beta, reorder_dst_desc, dst);
+            CUDNN_EXECUTE_FUNC_V(cudnnTransformTensor, handle, &alpha,
+                    y_fp32_desc, src, &beta, reorder_dst_desc, dst);
         }
+    }
+
+    void execute_f32_dst_sum(cudnnHandle_t handle, void *y, void *y_fp32_data,
+            float alpha_, float beta_) const {
+        float alpha1 = 0.0f;
+        float alpha2 = alpha_;
+        float beta = beta_;
+        CUDNN_EXECUTE_FUNC(cudnnOpTensor, handle, op_tensor_desc, &alpha1,
+                descs[io::y], y, &alpha2, descs[io::y], y, &beta, y_fp32_desc,
+                y_fp32_data);
+    }
+
+    void execute_f32_src_sum(cudnnHandle_t handle, void *x, void *y,
+            float alpha_, float beta_) const {
+        float alpha = alpha_;
+        float beta = beta_;
+        CUDNN_EXECUTE_FUNC_V(cudnnAddTensor, handle, &alpha, descs[io::y], x,
+                &beta, y_fp32_desc, y);
     }
 
     void execute_eltwise(cudnnHandle_t handle, void *src, void *dst) const {
@@ -482,18 +540,34 @@ public:
                 &alpha, descs[io::y], src, &beta, descs[io::y], dst);
     }
 
+    void execute_f32_eltwise(cudnnHandle_t handle, void *src, void *dst) const {
+        float alpha = 1.0f;
+        float beta = 0.0f;
+        CUDNN_EXECUTE_FUNC_V(cudnnActivationForward, handle, eltwise_desc,
+                &alpha, y_fp32_desc, src, &beta, y_fp32_desc, dst);
+    }
+
+    bool y_f32_is_required() const {
+        return ((do_src_scaling || do_dst_scaling || do_wei_scaling)
+                && data_types[io::y] == CUDNN_DATA_INT8);
+    }
+
     void execute(cudnnHandle_t handle,
             const std::vector<void *> &args) const override {
         auto x = args[0], weights = args[1], y = args[2], bias = args[3],
              scratchpad = args[4], post_op_scratch = args[6],
-             post_op_reorder = args[7], src_scale = args[8],
-             wei_scale = args[9], dst_scale = args[10];
+             src_scale = args[7], wei_scale = args[8], dst_scale = args[9];
         void *output = use_temp_dst_ ? post_op_scratch : y;
         if (using_transformed_filter()) {
             auto w_scratch = args[5];
             transform_filter(handle, weights, w_scratch);
             weights = w_scratch;
         }
+        cudaStream_t cuda_stream;
+        CUDNN_EXECUTE_FUNC(cudnnGetStream, handle, &cuda_stream);
+
+        float *y_fp32_data = nullptr;
+        if (y_f32_is_required()) { y_fp32_data = (float *)args[10]; }
 
         bool fused = conv_bias || conv_bias_eltwise;
 
@@ -501,25 +575,29 @@ public:
         if (src_scale || wei_scale) {
             if (src_scale) {
                 float host_src_scale = 1.0f;
-                CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_src_scale,
-                        (CUdeviceptr)src_scale, sizeof(float));
+                CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_src_scale,
+                        (CUdeviceptr)src_scale, sizeof(float), cuda_stream);
                 scale *= host_src_scale;
             }
             if (wei_scale) {
                 float host_wei_scale = 1.0f;
-                CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_wei_scale,
-                        (CUdeviceptr)wei_scale, sizeof(float));
+                CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_wei_scale,
+                        (CUdeviceptr)wei_scale, sizeof(float), cuda_stream);
                 scale *= host_wei_scale;
             }
         }
+
+        auto &y_desc = (y_f32_is_required() || use_temp_dst_) ? y_fp32_desc
+                                                              : descs[io::y];
+        void *y_data = y_f32_is_required() ? y_fp32_data : output;
 
         if (fused) {
             auto err = cudnnConvolutionBiasActivationForward(handle, &scale,
                     descs[io::x], x, weights_desc, weights, conv_desc,
                     fwd_alg_kind, scratchpad, scratchpad_size, &beta,
                     descs[io::y], output, descs[io::bias], bias,
-                    conv_bias_eltwise ? eltwise_desc : activation_desc,
-                    descs[io::y], output);
+                    conv_bias_eltwise ? eltwise_desc : activation_desc, y_desc,
+                    y_data);
             // try to fallback into standalone convolution
             if (err == CUDNN_STATUS_NOT_SUPPORTED) {
                 fused = false;
@@ -533,14 +611,14 @@ public:
             const float bias_beta = 1.0f;
             CUDNN_EXECUTE_FUNC_V(cudnnConvolutionForward, handle, &scale,
                     descs[io::x], x, weights_desc, weights, conv_desc,
-                    fwd_alg_kind, scratchpad, scratchpad_size, &beta,
-                    descs[io::y], output);
+                    fwd_alg_kind, scratchpad, scratchpad_size, &beta, y_desc,
+                    y_data);
             if (with_bias) {
                 CUDNN_EXECUTE_FUNC_V(cudnnAddTensor, handle, &bias_alpha,
-                        descs[io::bias], bias, &bias_beta, descs[io::y],
-                        output);
+                        descs[io::bias], bias, &bias_beta, y_desc, y_data);
             }
         }
+
         // skip first eltwise in case it is fused into convolution
         const int post_ops_start_pos = fused && conv_bias_eltwise;
         for (int i = post_ops_start_pos; i < num_post_ops; i++) {
@@ -548,12 +626,17 @@ public:
             switch (post_ops[i]) {
                 case dnnl_sum:
                     if (need_reorder) {
-                        execute_reorder(handle, y, post_op_reorder, true);
-                        execute_sum(handle, post_op_reorder, post_op_scratch,
-                                sum_scale, 1.0f);
+                        execute_f32_src_sum(
+                                handle, y, post_op_scratch, sum_scale, 1.0f);
                     } else if (last_op) {
-                        execute_sum(
-                                handle, post_op_scratch, y, 1.0f, sum_scale);
+                        if (y_f32_is_required()) {
+                            execute_f32_dst_sum(
+                                    handle, y, y_fp32_data, 1.0f, sum_scale);
+                        } else {
+                            execute_sum(handle, post_op_scratch, y, 1.0f,
+                                    sum_scale);
+                        }
+
                     } else {
                         execute_sum(
                                 handle, y, post_op_scratch, sum_scale, 1.0f);
@@ -563,7 +646,12 @@ public:
 
                 case dnnl_eltwise:
                     if (last_op) {
-                        execute_eltwise(handle, output, y);
+                        if (y_f32_is_required()) {
+                            execute_f32_eltwise(
+                                    handle, y_fp32_data, y_fp32_data);
+                        } else {
+                            execute_eltwise(handle, output, y);
+                        }
                     } else {
                         execute_eltwise(handle, output, post_op_scratch);
                     }
@@ -576,27 +664,47 @@ public:
             execute_reorder(handle, post_op_scratch, y, false);
         }
 
-        if (dst_scale) {
+        if (dst_scale || src_scale || wei_scale) {
             float host_dst_scale = 1.0f;
-            CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_dst_scale,
-                    (CUdeviceptr)dst_scale, sizeof(float));
+            if (dst_scale)
+                CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_dst_scale,
+                        (CUdeviceptr)dst_scale, sizeof(float), cuda_stream);
             float inv_scale = 1.0f / host_dst_scale;
-            CUDNN_EXECUTE_FUNC(
-                    cudnnScaleTensor, handle, descs[io::y], y, &inv_scale);
+            if (data_types[io::y] == CUDNN_DATA_INT8) {
+                float alpha_beta = 0.0f;
+                CUDNN_EXECUTE_FUNC(cudnnOpTensor, handle, op_tensor_desc,
+                        &inv_scale, y_fp32_desc, y_fp32_data, &alpha_beta,
+                        y_fp32_desc, y_fp32_data, &alpha_beta, descs[io::y], y);
+            } else {
+                CUDNN_EXECUTE_FUNC(
+                        cudnnScaleTensor, handle, descs[io::y], y, &inv_scale);
+            }
         }
     }
-    status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
-        stream_t *service_stream;
+    status_t init_scratchpad(
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
-        CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionForwardWorkspaceSize,
-                handle, descs[x], weights_desc, conv_desc, descs[y],
-                fwd_alg_kind, &scratchpad_size));
+        // The scratchpad size will need to be modified in
+        // cases where the dst_scaling is used and the output
+        // uses s8 values.
+        if (use_scales_dst_ || use_temp_dst_) {
+            CHECK(create_and_set_tensor_descriptor(&y_fp32_desc,
+                    CUDNN_DATA_FLOAT, ndims[y], dims[y], strides[y]));
+            CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionForwardWorkspaceSize,
+                    handle, descs[x], weights_desc, conv_desc, y_fp32_desc,
+                    fwd_alg_kind, &scratchpad_size));
+        } else {
+            CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionForwardWorkspaceSize,
+                    handle, descs[x], weights_desc, conv_desc, descs[y],
+                    fwd_alg_kind, &scratchpad_size));
+        }
+
         if (scratchpad_size > 0)
             pd->scratchpad_registry().registrar().book(
                     memory_tracking::names::key_conv_cudnn_algo,
@@ -605,14 +713,13 @@ public:
         return cudnn_convolution_impl_base_t::init_scratchpad(engine, pd);
     }
     status_t configure_alg_kind(
-            engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
         cuda_sycl_scoped_context_handler_t sc(sycl_engine);
-        stream_t *service_stream;
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
         CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionForwardAlgorithmMaxCount,
@@ -627,7 +734,7 @@ public:
                 cudnnGetConvolutionMathType, conv_desc, &expected_math_mode));
 
         auto submit_status = CUDNN_STATUS_NOT_SUPPORTED;
-        for (size_t i = 0; i < returned_algo_count; i++) {
+        for (int i = 0; i < returned_algo_count; i++) {
             submit_status = perf[i].status;
             if (submit_status == CUDNN_STATUS_SUCCESS) {
                 // cudnnFindConvolutionForwardAlgorithm can erroneously report
@@ -737,14 +844,13 @@ protected:
     int requested_algo_count = 0;
     int returned_algo_count = 0;
     status_t configure_alg_kind(
-            engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
         cuda_sycl_scoped_context_handler_t sc(sycl_engine);
-        stream_t *service_stream;
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
         CHECK(CUDNN_EXECUTE_FUNC_S(
@@ -757,7 +863,7 @@ protected:
 
         dnnl_fpmath_mode_t dnnl_fpmath_mode = pd->attr()->fpmath_.mode_;
 
-        for (size_t i = 0; i < returned_algo_count; i++) {
+        for (int i = 0; i < returned_algo_count; i++) {
             if (perf[i].status == CUDNN_STATUS_SUCCESS) {
                 switch (pd->desc()->alg_kind) {
                     case dnnl_convolution_auto:
@@ -803,13 +909,13 @@ protected:
         return status::success;
     }
 
-    status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
-        stream_t *service_stream;
+    status_t init_scratchpad(
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
         CHECK(CUDNN_EXECUTE_FUNC_S(cudnnGetConvolutionBackwardDataWorkspaceSize,
@@ -887,14 +993,13 @@ public:
         return status::success;
     }
     virtual status_t configure_alg_kind(
-            engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
         cuda_sycl_scoped_context_handler_t sc(sycl_engine);
-        stream_t *service_stream;
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
         CHECK(CUDNN_EXECUTE_FUNC_S(
@@ -907,7 +1012,7 @@ public:
 
         dnnl_fpmath_mode_t dnnl_fpmath_mode = pd->attr()->fpmath_.mode_;
 
-        for (size_t i = 0; i < returned_algo_count; i++) {
+        for (int i = 0; i < returned_algo_count; i++) {
             if (perf[i].status == CUDNN_STATUS_SUCCESS) {
                 switch (pd->desc()->alg_kind) {
                     case dnnl_convolution_auto:
@@ -955,13 +1060,13 @@ public:
         return status::success;
     }
 
-    status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
-        stream_t *service_stream;
+    status_t init_scratchpad(
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
         CHECK(CUDNN_EXECUTE_FUNC_S(

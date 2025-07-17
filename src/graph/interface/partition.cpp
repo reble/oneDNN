@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,7 +23,11 @@
 
 #include "oneapi/dnnl/dnnl_graph.h"
 #include "oneapi/dnnl/dnnl_graph_sycl.h"
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include "oneapi/dnnl/dnnl_graph_ocl.h"
+#endif
 
+#include "common/cache_hit_types.hpp"
 #include "common/stream.hpp"
 #include "common/verbose.hpp"
 
@@ -37,9 +41,15 @@
 #include "graph/interface/partition_cache.hpp"
 
 #ifdef DNNL_WITH_SYCL
-#include "graph/utils/sycl_check.hpp"
+#include "oneapi/dnnl/dnnl_sycl.hpp"
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include "graph/utils/ocl_check.hpp"
+#endif
+
+using dnnl::impl::cache_state2str;
+using dnnl::impl::cache_state_t;
 using namespace dnnl::impl::graph;
 
 /// This allows to create a partition directly with an op and an engine kind. In
@@ -187,11 +197,10 @@ status_t DNNL_API dnnl_graph_partition_compile(partition_t *partition,
     std::vector<const logical_tensor_t *> in {inputs, inputs + in_num};
     std::vector<const logical_tensor_t *> out {outputs, outputs + out_num};
 
-    // The boolean in the pair indicates whether the compiled partition is from
+    // The cache_state_t in the pair will track whether the compiled partition is from
     // global cache.
-    //   true - cache_hit, the compiled partition is in the cache
-    //   false - cache_miss, the compiled partition is not in the cache
-    std::pair<compiled_partition_t *, bool> cp {compiled_partition, false};
+    std::pair<compiled_partition_t *, cache_state_t> cp {
+            compiled_partition, cache_state_t::compiled_partition_hit};
 
     if (get_verbose(dnnl::impl::verbose_t::create_profile,
                 dnnl::impl::component_t::graph)) {
@@ -199,7 +208,7 @@ status_t DNNL_API dnnl_graph_partition_compile(partition_t *partition,
         CHECK(partition->compile(cp, in, out, engine));
         double duration_ms = dnnl::impl::get_msec() - start_ms;
 
-        const char *cache_status = cp.second ? ":cache_hit" : ":cache_miss";
+        const char *cache_status = cache_state2str(cp.second);
         VPROF(start_ms, graph, compile, cache_status,
                 compiled_partition->info(), duration_ms);
     } else {
@@ -313,27 +322,13 @@ status_t DNNL_API dnnl_graph_compiled_partition_execute(
 
     if (get_verbose(dnnl::impl::verbose_t::exec_profile,
                 dnnl::impl::component_t::graph)) {
-#ifndef NDEBUG
-        allocator_t *alloc = reinterpret_cast<allocator_t *>(
-                compiled_partition->get_engine()->get_allocator());
-        allocator_t::monitor_t &monitor = alloc->get_monitor();
-        monitor.reset_peak_temp_memory();
-#endif
         stream->wait();
         double start_ms = dnnl::impl::get_msec();
         CHECK(compiled_partition->execute(stream, ins, outs));
         stream->wait();
         double duration_ms = dnnl::impl::get_msec() - start_ms;
-#ifndef NDEBUG
-        VFORMAT(start_ms, graph, exec, VERBOSE_profile, "%s,%g,%zu,%s,%zu,%zu",
-                compiled_partition->info(), duration_ms, alloc->id(),
-                utils::thread_id_to_str(std::this_thread::get_id()).c_str(),
-                monitor.get_total_persist_memory(),
-                monitor.get_peak_temp_memory());
-#else
         VPROF(start_ms, graph, exec, VERBOSE_profile,
                 compiled_partition->info(), duration_ms);
-#endif
     } else {
         CHECK(compiled_partition->execute(stream, ins, outs));
     }
@@ -366,36 +361,8 @@ status_t DNNL_API dnnl_graph_sycl_interop_compiled_partition_execute(
     for (size_t i = 0; i < num_outputs; ++i) {
         outs.emplace_back(**(outputs + i));
     }
-#ifndef NDEBUG
     if (get_verbose(dnnl::impl::verbose_t::exec_profile,
                 dnnl::impl::component_t::graph)) {
-        allocator_t *alloc = reinterpret_cast<allocator_t *>(
-                compiled_partition->get_engine()->get_allocator());
-        allocator_t::monitor_t &monitor = alloc->get_monitor();
-        monitor.reset_peak_temp_memory();
-        stream->wait();
-        double start_ms = dnnl::impl::get_msec();
-        if (deps != nullptr) {
-            const auto &sycl_deps = *(const std::vector<::sycl::event> *)deps;
-            CHECK(compiled_partition->execute_sycl(stream, ins, outs, sycl_deps,
-                    static_cast<::sycl::event *>(sycl_event)));
-        } else {
-            CHECK(compiled_partition->execute_sycl(stream, ins, outs, {},
-                    static_cast<::sycl::event *>(sycl_event)));
-        }
-        stream->wait();
-        double duration_ms = dnnl::impl::get_msec() - start_ms;
-        VFORMAT(start_ms, graph, exec, VERBOSE_profile, "%s,%g,%zu,%s,%zu,%zu",
-                compiled_partition->info(), duration_ms, alloc->id(),
-                utils::thread_id_to_str(std::this_thread::get_id()).c_str(),
-                monitor.get_total_persist_memory(),
-                monitor.get_peak_temp_memory());
-    } else if (get_verbose(dnnl::impl::verbose_t::exec_profile,
-                       dnnl::impl::component_t::graph)) {
-#else
-    if (get_verbose(dnnl::impl::verbose_t::exec_profile,
-                dnnl::impl::component_t::graph)) {
-#endif
         stream->wait();
         double start_ms = dnnl::impl::get_msec();
         if (deps != nullptr) {
@@ -434,6 +401,59 @@ status_t DNNL_API dnnl_graph_sycl_interop_compiled_partition_execute(
     return status::unimplemented;
 #endif
 }
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+status_t DNNL_API dnnl_graph_ocl_interop_compiled_partition_execute(
+        const compiled_partition_t *compiled_partition, stream_t *stream,
+        size_t num_inputs, const tensor_t **inputs, size_t num_outputs,
+        const tensor_t **outputs, const cl_event *deps, int ndeps,
+        cl_event *ocl_event) {
+    if (utils::any_null(stream, compiled_partition, inputs, outputs))
+        return status::invalid_arguments;
+    if (stream->engine()->kind() != engine_kind::gpu) {
+        return status::invalid_arguments;
+    }
+
+    std::vector<tensor_t> ins, outs;
+    ins.reserve(num_inputs);
+    outs.reserve(num_outputs);
+    for (size_t i = 0; i < num_inputs; ++i) {
+        ins.emplace_back(**(inputs + i));
+    }
+    for (size_t i = 0; i < num_outputs; ++i) {
+        outs.emplace_back(**(outputs + i));
+    }
+
+    if (get_verbose(dnnl::impl::verbose_t::exec_profile,
+                dnnl::impl::component_t::graph)) {
+        stream->wait();
+        double start_ms = dnnl::impl::get_msec();
+        if (deps != nullptr) {
+            std::vector<cl_event> ocl_deps(deps, deps + ndeps);
+            CHECK(compiled_partition->execute_ocl(
+                    stream, ins, outs, ocl_deps, ocl_event));
+        } else {
+            CHECK(compiled_partition->execute_ocl(
+                    stream, ins, outs, {}, ocl_event));
+        }
+        stream->wait();
+        double duration_ms = dnnl::impl::get_msec() - start_ms;
+        VPROF(start_ms, graph, exec, VERBOSE_profile,
+                compiled_partition->info(), duration_ms);
+    } else {
+        if (deps != nullptr) {
+            std::vector<cl_event> ocl_deps(deps, deps + ndeps);
+            CHECK(compiled_partition->execute_ocl(
+                    stream, ins, outs, ocl_deps, ocl_event));
+        } else {
+            CHECK(compiled_partition->execute_ocl(
+                    stream, ins, outs, {}, ocl_event));
+        }
+    }
+
+    return status::success;
+}
+#endif
 
 status_t DNNL_API dnnl_graph_compiled_partition_destroy(
         compiled_partition_t *compiled_partition) {
@@ -587,7 +607,9 @@ status_t dnnl_graph_partition::compile(compiled_partition_t *cp,
         auto part = pimpl_->clone();
         const std::vector<std::shared_ptr<op_t>> &fused_op = part->get_ops();
         if (fused_op.empty()) return status::invalid_arguments;
-        auto agraph = graph_t(fused_op, get_engine_kind(), get_fpmath_mode());
+        const auto &fpm = get_fpmath_mode();
+        auto agraph = graph_t(fused_op, get_engine_kind());
+        agraph.set_fpmath_mode(fpm.mode_, fpm.apply_to_int_);
         // set user given logical tensors and infer shape
         agraph.set_user_inputs_outputs(tmp_inputs, tmp_outputs);
         agraph.infer_shape();
@@ -596,7 +618,7 @@ status_t dnnl_graph_partition::compile(compiled_partition_t *cp,
         size_t seed = 0;
         seed = partition_hashing::get_unordered_array_hash(seed, key.ins_);
         seed = partition_hashing::get_unordered_array_hash(seed, key.outs_);
-        std::stringstream filename;
+        stringstream_t filename;
         filename << "graph-" << id() << "-" << seed << ".json";
         agraph.serialize(filename.str());
     }
@@ -622,7 +644,7 @@ status_t dnnl_graph_partition::compile(compiled_partition_t *cp,
 }
 
 status_t dnnl_graph_partition::compile(
-        std::pair<compiled_partition_t *, bool> &compiled_partition,
+        std::pair<compiled_partition_t *, cache_state_t> &compiled_partition,
         std::vector<const logical_tensor_t *> &inputs,
         std::vector<const logical_tensor_t *> &outputs,
         const engine_t *aengine) const {
@@ -635,13 +657,14 @@ status_t dnnl_graph_partition::compile(
         std::vector<const logical_tensor_t *> &inputs;
         std::vector<const logical_tensor_t *> &outputs;
         const engine_t *engine;
-        bool is_create_called;
+        cache_state_t cache_status;
     };
-    create_context_t context {this, inputs, outputs, aengine, false};
+    create_context_t context {this, inputs, outputs, aengine,
+            cache_state_t::compiled_partition_hit};
 
     compiled_partition_cache_t::create_func_ptr_t create = [](void *context) {
         auto &c = *static_cast<create_context_t *>(context);
-        c.is_create_called = true;
+        c.cache_status = cache_state_t::miss;
         std::shared_ptr<compiled_partition_t> cp
                 = std::make_shared<compiled_partition_t>(*c.partition);
         status_t status
@@ -655,8 +678,7 @@ status_t dnnl_graph_partition::compile(
     if (result.status != status::success) return result.status;
 
     compiled_partition.first->init(result.value->pimpl_);
-    // cp is from cache if the create func is not called
-    compiled_partition.second = !context.is_create_called;
+    compiled_partition.second = context.cache_status;
 
     return result.status;
 }
@@ -667,6 +689,8 @@ status_t dnnl_graph_compiled_partition::execute(const stream_t *astream,
     if (astream->engine()->kind() == engine_kind::gpu) {
 #if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
         return execute_sycl(astream, inputs, outputs, {}, nullptr);
+#elif DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+        return execute_ocl(astream, inputs, outputs, {}, nullptr);
 #else
         return status::runtime_error;
 #endif
@@ -723,3 +747,30 @@ status_t dnnl_graph_compiled_partition::execute_sycl(const stream_t *astream,
     return ret;
 }
 #endif // DNNL_WITH_SYCL
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+// It looks very similar to execute_sycl(). Consider to merge them in the
+// future.
+graph::status_t dnnl_graph_compiled_partition::execute_ocl(
+        const graph::stream_t *astream,
+        const std::vector<graph::tensor_t> &inputs,
+        const std::vector<graph::tensor_t> &outputs,
+        const std::vector<cl_event> &ocl_deps, cl_event *ocl_event) const {
+    if (!astream || (astream->engine()->kind() != pimpl_->get_engine()->kind()))
+        return status::invalid_arguments;
+
+    status_t ret;
+
+    const backend_t *backend = src_partition_.get_assigned_backend();
+    if (!backend) return status::invalid_arguments;
+
+    std::vector<tensor_t> processed_inputs, processed_outputs;
+    pre_process(processed_inputs, inputs, backend);
+    pre_process(processed_outputs, outputs, backend);
+
+    ret = pimpl_->execute_ocl(
+            astream, processed_inputs, processed_outputs, ocl_deps, ocl_event);
+
+    return ret;
+}
+#endif

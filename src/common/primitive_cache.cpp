@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -47,9 +47,9 @@ struct primitive_cache_t {
         return result.value != nullptr ? result.value->pd() : nullptr;
     }
 
-    result_t get_or_create(
-            const key_t &key, create_func_t create, void *create_context) {
-        return cache_.get_or_create(key, create, create_context);
+    result_t get_or_create(const key_t &key, create_func_t create,
+            void *create_context, bool force_create) {
+        return cache_.get_or_create(key, create, create_context, force_create);
     }
 
 private:
@@ -128,9 +128,24 @@ std::shared_ptr<primitive_desc_t> primitive_cache_iface_t::get_pd(
 }
 
 primitive_cache_iface_t::result_t primitive_cache_iface_t::get_or_create(
-        const key_t &key, create_func_t create, void *create_context) {
-    auto r = cache_.get_or_create(key, create, create_context);
+        const key_t &key, create_func_t create, void *create_context,
+        bool force_create) {
+    // Specific scenarios, e.g., creation of nested primitives coming from a
+    // cache blob, require forcing the creation through `force_create`.
+    auto r = cache_.get_or_create(key, create, create_context, force_create);
     return {std::move(r.value), r.status};
+}
+
+status_t set_primitive_cache_capacity(
+        int primitive_capacity, int kernel_capacity) {
+    if (primitive_capacity < 0 || kernel_capacity < 0)
+        return status::invalid_arguments;
+#ifndef DNNL_DISABLE_PRIMITIVE_CACHE
+    auto status = global_primitive_cache().set_capacity(primitive_capacity);
+    CHECK(status);
+    return kernel_cache::get().set_capacity(kernel_capacity);
+#endif
+    return status::success;
 }
 
 } // namespace impl
@@ -148,11 +163,5 @@ dnnl::impl::status_t dnnl_get_primitive_cache_capacity(int *capacity) {
 }
 
 dnnl::impl::status_t dnnl_set_primitive_cache_capacity(int capacity) {
-    if (capacity < 0) return dnnl::impl::status::invalid_arguments;
-#ifndef DNNL_DISABLE_PRIMITIVE_CACHE
-    auto status = dnnl::impl::global_primitive_cache().set_capacity(capacity);
-    if (status != dnnl::impl::status::success) return status;
-    return dnnl::impl::kernel_cache::get().set_capacity(capacity);
-#endif
-    return dnnl::impl::status::success;
+    return dnnl::impl::set_primitive_cache_capacity(capacity, capacity);
 }

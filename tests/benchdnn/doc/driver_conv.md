@@ -22,19 +22,18 @@ where *conv-knobs* are:
             Refer to [tags](knobs_tag.md) for details.
  - `--dtag={any [default], ...}` -- physical dst memory layout.
             Refer to [tags](knobs_tag.md) for details.
+ - `--strides=SRC_STRIDES:WEI_STRIDES:DST_STRIDES` -- physical memory layout
+            specification for `src`, `weights`, and `dst` tensors through
+            strides values. Refer to [option documentation](knob_strides.md)
+            for details.
+ - `--bia-dt={undef [default], f32, bf16, f16, ...}` -- bias data type.
+            To run Inner Product without bias, use `undef` data type (default).
+            `--dir=FWD_B|BWD_WB` will set `--bia-dt` to `f32` to preserve
+            compatibility with the former behavior.
+            Refer to [data types](knobs_dt.md) for details.
  - `--alg={DIRECT [default], WINO, AUTO}` -- convolution algorithm. `WINO` is
             Winograd-based convolution. `AUTO` will pick one of `DIRECT` or
             `WINO` automatically, library-based decision.
- - `--attr-scales=STRING` -- scale primitive attribute. No scale is
-            set by default. Refer to [attributes](knobs_attr.md) for details.
- - `--attr-zero-points=STRING` -- zero points primitive attribute. No zero
-            points are set by default. Refer to [attributes](knobs_attr.md)
-            for details.
- - `--attr-post-ops=STRING` -- post operation primitive attribute. No post
-            operations are set by default. Refer to [attributes](knobs_attr.md)
-            for details.
- - `--attr-fpmath=STRING` -- fpmath mode primitive attribute. `strict` math mode
-            is set by default. Refer to [attributes](knobs_attr.md) for details.
  - `--mb=INT` -- override minibatch size specified in the problem description.
              When set to `0`, use minibatch size as defined by the individual
              problem descriptor. The default is `0`.
@@ -42,6 +41,7 @@ where *conv-knobs* are:
             `REGEX`. By default no pattern is applied (run everything).
             Note: Windows may interpret only string arguments surrounded by
             double quotation marks.
+ - Any attributes options. Refer to [attributes](knobs_attr.md) for details.
 
 and *conv-desc* is a problem descriptor. The canonical form is:
 ```
@@ -60,8 +60,8 @@ errors.
 
 The table below shows supported name configurations for this driver:
 
-For data type support, refer to [data types](https://oneapi-src.github.io/oneDNN/dev_guide_data_types.html)
-and [convolution primitive](https://oneapi-src.github.io/oneDNN/dev_guide_convolution.html#data-types)
+For data type support, refer to [data types](https://uxlfoundation.github.io/oneDNN/dev_guide_data_types.html)
+and [convolution primitive](https://uxlfoundation.github.io/oneDNN/dev_guide_convolution.html#data-types)
 documentation.
 
 | src  | wei  | dst  | acc  | cfg             |

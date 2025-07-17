@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *******************************************************************************/
-#ifndef BACKEND_DNNL_OP_EXECUTABLE_HPP
-#define BACKEND_DNNL_OP_EXECUTABLE_HPP
+#ifndef GRAPH_BACKEND_DNNL_OP_EXECUTABLE_HPP
+#define GRAPH_BACKEND_DNNL_OP_EXECUTABLE_HPP
 
 #include <map>
 #include <memory>
@@ -24,10 +24,21 @@
 #include <type_traits>
 #include <unordered_map>
 
+#include "common/primitive.hpp"
+#include "common/sdpa_utils.hpp"
+
 #include "oneapi/dnnl/dnnl.hpp"
 #ifdef DNNL_WITH_SYCL
 #include "oneapi/dnnl/dnnl_sycl.hpp"
-#include <CL/sycl.hpp>
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include "graph/utils/ocl_check.hpp"
+#include "graph/utils/ocl_usm_utils.hpp"
+
+#include "xpu/ocl/usm_utils.hpp"
+
+#include "oneapi/dnnl/dnnl_ocl.hpp"
 #endif
 
 #include <graph/utils/utils.hpp>
@@ -37,6 +48,20 @@
 #include "graph/backend/dnnl/common.hpp"
 #include "graph/backend/dnnl/fusion_info.hpp"
 #include "graph/backend/dnnl/internal_attrs.hpp"
+
+#if (DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE) \
+        && (DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL)
+
+#include "gpu/intel/compute/compute_engine.hpp"
+#include "gpu/intel/compute/compute_stream.hpp"
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include "gpu/intel/ocl/stream.hpp"
+#endif
+#endif
+
+#ifdef DNNL_WITH_SYCL
+#include "gpu/intel/sycl/stream.hpp"
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -87,7 +112,13 @@ struct op_executable_t {
 #ifdef DNNL_WITH_SYCL
     virtual ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const = 0;
+            const std::vector<::sycl::event> &deps) const = 0;
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    virtual cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const = 0;
 #endif
 };
 
@@ -139,7 +170,7 @@ inline std::shared_ptr<op_executable_t> executable_creator(
 // - support data formatting ops like permute/reshape/transpose
 // - support zero-volume tensor (empty tensor) like (1024, 64)x(64, 0)
 //
-// In the execute_sycl fuction, we will run a dummy sycl kernel to gather all
+// In the execute_sycl function, we will run a dummy sycl kernel to gather all
 // the input events
 struct dummy_impl_t : public op_executable_t {
     void execute(const stream &stream,
@@ -151,7 +182,7 @@ struct dummy_impl_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         UNUSED(stream);
 
         // Fast path: if no event, return an immediate event.
@@ -171,6 +202,29 @@ struct dummy_impl_t : public op_executable_t {
         return e;
     }
 #endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        UNUSED(stream);
+
+        // Fast path: if no event, return an immediate event.
+        if (deps.empty()) return {};
+
+        // Fast path: if only one event, return it.
+        if (deps.size() == 1) return deps[0];
+
+        // Otherwise, gather all dependencies.
+        auto q = dnnl::ocl_interop::get_command_queue(stream);
+        cl_event e;
+        auto err = clEnqueueMarkerWithWaitList(
+                q, static_cast<cl_uint>(deps.size()), deps.data(), &e);
+        assert(err == CL_SUCCESS);
+        MAYBE_UNUSED(err);
+        return e;
+    }
+#endif
 };
 
 struct memory_reparser_t : public dummy_impl_t {
@@ -186,20 +240,68 @@ struct memory_reparser_t : public dummy_impl_t {
 
     void execute(const stream &stream,
             const std::unordered_map<int, memory> &args) const override {
-        assertm(args.find(DNNL_ARG_FROM)->second.get_data_handle()
-                        == args.find(DNNL_ARG_TO)->second.get_data_handle(),
-                "memory reparser must be inplaced");
-        dummy_impl_t::execute(stream, args);
+        auto from = args.find(DNNL_ARG_FROM);
+        auto to = args.find(DNNL_ARG_TO);
+        if (from == args.end() || to == args.end()) return;
+
+        if (from->second.get_data_handle() == to->second.get_data_handle())
+            dummy_impl_t::execute(stream, args);
+        else {
+            const memory &dst_mem = to->second;
+            const memory &src_mem = from->second;
+            const memory temp_mem = make_dnnl_memory(dst_mem.get_desc(),
+                    src_mem.get_engine(), src_mem.get_data_handle());
+            dnnl::reorder(temp_mem, dst_mem)
+                    .execute(stream, const_cast<memory &>(temp_mem),
+                            const_cast<memory &>(dst_mem));
+        }
     }
 
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
-        assertm(args.find(DNNL_ARG_FROM)->second.get_data_handle()
-                        == args.find(DNNL_ARG_TO)->second.get_data_handle(),
-                "memory reparser must be inplaced");
-        return dummy_impl_t::execute_sycl(stream, args, deps);
+            const std::vector<::sycl::event> &deps) const override {
+        auto from = args.find(DNNL_ARG_FROM);
+        auto to = args.find(DNNL_ARG_TO);
+        if (from == args.end() || to == args.end()) return {};
+
+        if (from->second.get_data_handle() == to->second.get_data_handle())
+            return dummy_impl_t::execute_sycl(stream, args, deps);
+        else {
+            const memory &src_mem = from->second;
+            const memory &dst_mem = to->second;
+            auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
+            auto e = sycl_queue.memcpy(dst_mem.get_data_handle(),
+                    src_mem.get_data_handle(), dst_mem.get_desc().get_size());
+            return e;
+        }
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto from = args.find(DNNL_ARG_FROM);
+        auto to = args.find(DNNL_ARG_TO);
+        if (from == args.end() || to == args.end()) return {};
+
+        if (from->second.get_data_handle() == to->second.get_data_handle())
+            return dummy_impl_t::execute_ocl(stream, args, deps);
+        else {
+            const memory &src_mem = from->second;
+            const memory &dst_mem = to->second;
+            assert(deps.size() <= 1);
+            // Passing the empty event to memcpy below causes failure.
+            const bool empty = deps.empty() || deps[0] == nullptr;
+            const cl_uint num = empty ? 0 : static_cast<cl_uint>(deps.size());
+            cl_event e;
+            UNUSED_STATUS(xpu::ocl::usm::memcpy(stream.get(),
+                    dst_mem.get_data_handle(), src_mem.get_data_handle(),
+                    dst_mem.get_desc().get_size(), num,
+                    empty ? nullptr : deps.data(), &e));
+            return e;
+        }
     }
 #endif
 };
@@ -222,6 +324,7 @@ struct const_memory_filler_t : public op_executable_t {
         UNUSED(p_engine);
         UNUSED(mgr);
         UNUSED(pd_cache);
+        // NOLINTNEXTLINE(cppcoreguidelines-prefer-member-initializer)
         attr_data_
                 = get_attr_data(op->get_attr<std::vector<attr_dt>>(attr_name),
                         std::is_same<attr_dt, target_dt>());
@@ -254,13 +357,33 @@ struct const_memory_filler_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         void *data_handle = static_cast<void *>(
                 const_cast<target_dt *>(attr_data_.data()));
         const memory &dst_mem = args.find(DNNL_ARG_TO)->second;
         auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
         auto e = sycl_queue.memcpy(dst_mem.get_data_handle(), data_handle,
                 dst_mem.get_desc().get_size());
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        void *data_handle = static_cast<void *>(
+                const_cast<target_dt *>(attr_data_.data()));
+        const memory &dst_mem = args.find(DNNL_ARG_TO)->second;
+        assert(deps.size() <= 1);
+        // Passing the empty event to memcpy below causes failure.
+        const bool empty = deps.empty() || deps[0] == nullptr;
+        const cl_uint num = empty ? 0 : static_cast<cl_uint>(deps.size());
+        cl_event e;
+        UNUSED_STATUS(
+                xpu::ocl::usm::memcpy(stream.get(), dst_mem.get_data_handle(),
+                        data_handle, dst_mem.get_desc().get_size(), num,
+                        empty ? nullptr : deps.data(), &e));
         return e;
     }
 #endif
@@ -283,6 +406,90 @@ private:
 using const_scales_filler
         = const_memory_filler_t<op_attr::scales, float, float>;
 using const_zps_filler = const_memory_filler_t<op_attr::zps, int64_t, int32_t>;
+
+struct host_scalar_executable_t : public op_executable_t {
+    DECLARE_ARG_INDICES_GETTER;
+
+    host_scalar_executable_t(std::shared_ptr<op_t> &op,
+            const dnnl::engine &p_engine, fusion_info_mgr_t &mgr,
+            pd_cache_t &pd_cache) {
+        UNUSED(op);
+        UNUSED(p_engine);
+        UNUSED(mgr);
+        UNUSED(pd_cache);
+    }
+
+    void execute(const stream &stream,
+            const std::unordered_map<int, memory> &args) const override {
+        auto it_src = args.find(DNNL_ARG_FROM);
+        auto it_dst = args.find(DNNL_ARG_TO);
+
+        if (it_src == args.end() || it_dst == args.end()) {
+            assert(!"cannot find memory for DNNL_ARG_FROM or DNNL_ARG_TO");
+            return;
+        }
+
+        const memory &src_mem = it_src->second;
+        const memory &dst_mem = it_dst->second;
+        dst_mem.set_data_handle(src_mem.get_data_handle());
+    }
+
+#ifdef DNNL_WITH_SYCL
+    ::sycl::event execute_sycl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<::sycl::event> &deps) const override {
+        auto it_src = args.find(DNNL_ARG_FROM);
+        auto it_dst = args.find(DNNL_ARG_TO);
+
+        if (it_src == args.end() || it_dst == args.end()) {
+            assert(!"cannot find memory for DNNL_ARG_FROM or DNNL_ARG_TO");
+            return {};
+        }
+
+        const memory &src_mem = it_src->second;
+        const memory &dst_mem = it_dst->second;
+
+        auto prim = dnnl::reorder(src_mem, dst_mem);
+
+        // TODO(xxx): workaround reorder execution which requires the primitive
+        // to have the same engine as stream has.
+        const engine &src_eng = src_mem.get_engine();
+        const engine &dst_eng = dst_mem.get_engine();
+        if (src_eng.get_kind() == engine::kind::cpu
+                && dst_eng.get_kind() == engine::kind::cpu) {
+            auto src_temp = memory(
+                    src_mem.get_desc(), dst_eng, src_mem.get_data_handle());
+            prim = dnnl::reorder(src_temp, dst_mem);
+        }
+
+        auto e = dnnl::sycl_interop::execute(prim, stream, args, deps);
+        if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto it_src = args.find(DNNL_ARG_FROM);
+        auto it_dst = args.find(DNNL_ARG_TO);
+
+        if (it_src == args.end() || it_dst == args.end()) {
+            assert(!"cannot find memory for DNNL_ARG_FROM or DNNL_ARG_TO");
+            return {};
+        }
+
+        const memory &src_mem = it_src->second;
+        const memory &dst_mem = it_dst->second;
+
+        auto prim = dnnl::reorder(src_mem, dst_mem);
+
+        auto e = dnnl::ocl_interop::execute(prim, stream, args, deps);
+        return e;
+    }
+#endif
+};
 
 extern "C" dnnl_status_t dnnl_memory_desc_create_with_string_tag(
         dnnl_memory_desc_t *, int, const dnnl_dims_t, dnnl_data_type_t,
@@ -345,7 +552,7 @@ struct conv_fwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto sycl_deps = deps;
         if (with_sum_) {
             const memory &psrc_mem = args.find(DNNL_GRAPH_ARG_POST_SRC)->second;
@@ -398,6 +605,69 @@ struct conv_fwd_executable_t : public op_executable_t {
     }
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto ocl_deps = deps;
+        if (with_sum_) {
+            const memory &psrc_mem = args.find(DNNL_GRAPH_ARG_POST_SRC)->second;
+            const memory &dst_mem = args.find(DNNL_ARG_DST)->second;
+            if (psrc_mem.get_data_handle() != dst_mem.get_data_handle()) {
+                // psrc_mem and dst_mem may have different data type bug same
+                // buffer size(u8 and s8) for such case, need to reorder
+                // psrc_mem to dst_mem with original data type
+                if (psrc_mem.get_desc().get_data_type()
+                                == dnnl::memory::data_type::s8
+                        && dst_mem.get_desc().get_data_type()
+                                == dnnl::memory::data_type::u8) {
+                    dnnl::memory::desc to_desc = dst_mem.get_desc();
+                    auto format_tag = get_format_tag_str(to_desc);
+                    const auto &dims = to_desc.get_dims();
+                    const auto &dtype = psrc_mem.get_desc().get_data_type();
+                    dnnl_memory_desc_t new_to_desc_c;
+                    dnnl_memory_desc_create_with_string_tag(&new_to_desc_c,
+                            static_cast<int>(dims.size()), dims.data(),
+                            static_cast<dnnl_data_type_t>(dtype),
+                            format_tag.data());
+                    dnnl::memory::desc new_to_desc;
+                    new_to_desc.reset(new_to_desc_c);
+
+                    const memory to_mem
+                            = dnnl::ocl_interop::get_memory_kind(dst_mem)
+                                    == dnnl::ocl_interop::memory_kind::usm
+                            ? dnnl::ocl_interop::make_memory(new_to_desc,
+                                    psrc_mem.get_engine(),
+                                    dnnl::ocl_interop::memory_kind::usm,
+                                    dst_mem.get_data_handle())
+                            : dnnl::ocl_interop::make_memory(new_to_desc,
+                                    psrc_mem.get_engine(),
+                                    reinterpret_cast<cl_mem>(
+                                            dst_mem.get_data_handle()));
+
+                    auto prim = dnnl::reorder(psrc_mem, to_mem);
+                    auto e = dnnl::ocl_interop::execute(prim, stream,
+                            {{DNNL_ARG_FROM, const_cast<memory &>(psrc_mem)},
+                                    {DNNL_ARG_TO,
+                                            const_cast<memory &>(to_mem)}},
+                            ocl_deps);
+                    ocl_deps = {e};
+                } else {
+                    auto prim = dnnl::reorder(psrc_mem, dst_mem);
+                    auto e = dnnl::ocl_interop::execute(prim, stream,
+                            {{DNNL_ARG_FROM, const_cast<memory &>(psrc_mem)},
+                                    {DNNL_ARG_TO,
+                                            const_cast<memory &>(dst_mem)}},
+                            ocl_deps);
+                    ocl_deps = {e};
+                }
+            }
+        }
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, ocl_deps);
+        return e;
+    }
+#endif
+
 private:
     dnnl::convolution_forward prim_;
     bool with_sum_ {false};
@@ -434,7 +704,7 @@ struct deconv_fwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto sycl_deps = deps;
         if (with_sum_) {
             const memory &psrc_mem = args.find(DNNL_GRAPH_ARG_POST_SRC)->second;
@@ -450,6 +720,28 @@ struct deconv_fwd_executable_t : public op_executable_t {
         }
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, sycl_deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto ocl_deps = deps;
+        if (with_sum_) {
+            const memory &psrc_mem = args.find(DNNL_GRAPH_ARG_POST_SRC)->second;
+            const memory &dst_mem = args.find(DNNL_ARG_DST)->second;
+            if (psrc_mem.get_data_handle() != dst_mem.get_data_handle()) {
+                auto prim = dnnl::reorder(psrc_mem, dst_mem);
+                auto e = dnnl::ocl_interop::execute(prim, stream,
+                        {{DNNL_ARG_FROM, const_cast<memory &>(psrc_mem)},
+                                {DNNL_ARG_TO, const_cast<memory &>(dst_mem)}},
+                        ocl_deps);
+                ocl_deps = {e};
+            }
+        }
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, ocl_deps);
         return e;
     }
 #endif
@@ -479,9 +771,18 @@ struct deconv_bwd_data_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -510,9 +811,18 @@ struct deconv_bwd_weights_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -585,7 +895,7 @@ struct matmul_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         if (is_dummy_) { return dummy_impl_.execute_sycl(stream, args, deps); }
 
         auto sycl_deps = deps;
@@ -611,6 +921,38 @@ struct matmul_executable_t : public op_executable_t {
         }
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, sycl_deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        if (is_dummy_) { return dummy_impl_.execute_ocl(stream, args, deps); }
+
+        auto ocl_deps = deps;
+        if (with_sum_) {
+            auto it_dst = args.find(DNNL_ARG_DST);
+            auto it_src = args.find(DNNL_GRAPH_ARG_POST_SRC);
+            if (it_dst == args.end() || it_src == args.end()) {
+                assert(!("cannot find the required memory"));
+                return {};
+            }
+
+            memory &dst_mem = const_cast<memory &>(it_dst->second);
+            memory &psrc_mem = const_cast<memory &>(it_src->second);
+
+            if (psrc_mem.get_data_handle() != dst_mem.get_data_handle()) {
+                auto prim = dnnl::reorder(psrc_mem, dst_mem);
+                auto e = dnnl::ocl_interop::execute(prim, stream,
+                        {{DNNL_ARG_FROM, const_cast<memory &>(psrc_mem)},
+                                {DNNL_ARG_TO, const_cast<memory &>(dst_mem)}},
+                        ocl_deps);
+                ocl_deps = {e};
+            }
+        }
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, ocl_deps);
         return e;
     }
 #endif
@@ -641,9 +983,18 @@ struct eltwise_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -671,9 +1022,18 @@ struct eltwise_bwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -735,7 +1095,7 @@ struct binary_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         if (is_dummy_) { return dummy_impl_.execute_sycl(stream, args, deps); }
 
         auto sycl_deps = deps;
@@ -765,6 +1125,38 @@ struct binary_executable_t : public op_executable_t {
     }
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        if (is_dummy_) { return dummy_impl_.execute_ocl(stream, args, deps); }
+
+        auto ocl_deps = deps;
+        if (with_sum_) {
+            auto it_dst = args.find(DNNL_ARG_DST);
+            auto it_src = args.find(DNNL_GRAPH_ARG_POST_SRC);
+            if (it_dst == args.end() || it_src == args.end()) {
+                assert(!("cannot find the required memory"));
+                return {};
+            }
+
+            memory &dst_mem = const_cast<memory &>(it_dst->second);
+            memory &psrc_mem = const_cast<memory &>(it_src->second);
+
+            if (psrc_mem.get_data_handle() != dst_mem.get_data_handle()) {
+                auto prim = dnnl::reorder(psrc_mem, dst_mem);
+                auto e = dnnl::ocl_interop::execute(prim, stream,
+                        {{DNNL_ARG_FROM, const_cast<memory &>(psrc_mem)},
+                                {DNNL_ARG_TO, const_cast<memory &>(dst_mem)}},
+                        ocl_deps);
+                ocl_deps = {e};
+            }
+        }
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, ocl_deps);
+        return e;
+    }
+#endif
+
 private:
     dnnl::binary prim_;
     bool with_sum_ {false};
@@ -790,9 +1182,18 @@ struct concat_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -820,9 +1221,18 @@ struct shuffle_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -849,9 +1259,18 @@ struct pool_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -879,9 +1298,18 @@ struct pool_bwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -908,9 +1336,18 @@ struct prelu_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -938,9 +1375,18 @@ struct prelu_bwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -986,7 +1432,7 @@ struct reorder_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto sycl_deps = deps;
         if (with_sum_) {
             auto it_dst = args.find(DNNL_ARG_DST);
@@ -1009,6 +1455,35 @@ struct reorder_executable_t : public op_executable_t {
         }
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, sycl_deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto ocl_deps = deps;
+        if (with_sum_) {
+            auto it_dst = args.find(DNNL_ARG_DST);
+            auto it_src = args.find(DNNL_GRAPH_ARG_POST_SRC);
+            if (it_dst == args.end() || it_src == args.end()) {
+                assert(!("cannot find the required memory"));
+                return {};
+            }
+
+            const memory &psrc_mem = it_src->second;
+            const memory &dst_mem = it_dst->second;
+            if (psrc_mem.get_data_handle() != dst_mem.get_data_handle()) {
+                auto prim = dnnl::reorder(psrc_mem, dst_mem);
+                auto e = dnnl::ocl_interop::execute(prim, stream,
+                        {{DNNL_ARG_FROM, const_cast<memory &>(psrc_mem)},
+                                {DNNL_ARG_TO, const_cast<memory &>(dst_mem)}},
+                        ocl_deps);
+                ocl_deps = {e};
+            }
+        }
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, ocl_deps);
         return e;
     }
 #endif
@@ -1039,6 +1514,12 @@ struct bn_folding_t : public op_executable_t {
         dnnl::binary::primitive_desc mul_pd_;
         dnnl::binary::primitive_desc sub_pd_;
 
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+        // binary + sqrt post-op fusion is unsupported on NVIDIA GPU
+        dnnl::eltwise_forward::primitive_desc sqrt_pd_;
+#endif
+
         bool with_bias_ {false};
 
     public:
@@ -1053,6 +1534,13 @@ struct bn_folding_t : public op_executable_t {
             fusion_info_mgr_t &mgr, pd_cache_t &pd_cache) {
         desc_ = create_desc(op, p_engine, mgr, pd_cache);
         add_prim_ = dnnl::binary(desc_.add_pd_);
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+        // binary + sqrt post-op fusion is unsupported on NVIDIA GPU
+        if (p_engine.get_kind() == dnnl::engine::kind::gpu) {
+            sqrt_prim_ = dnnl::eltwise_forward(desc_.sqrt_pd_);
+        }
+#endif
         mul_prim_ = dnnl::binary(desc_.mul_pd_);
         sub_prim_ = dnnl::binary(desc_.sub_pd_);
     }
@@ -1148,7 +1636,7 @@ struct bn_folding_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         UNUSED(args);
 
         auto weights = args.find(DNNL_ARG_WEIGHTS)->second;
@@ -1180,18 +1668,64 @@ struct bn_folding_t : public op_executable_t {
         memory epsilon_mem = make_dnnl_memory(desc_.epsilon_desc_,
                 scratchpad.get_engine(), (void *)buf_start);
 
-        // 1. sqrt_variance = sqrt(variance + epsilon)
         auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
-        sycl_queue
-                .memcpy(epsilon_mem.get_data_handle(), &desc_.epsilon_,
-                        epsilon_mem.get_desc().get_size())
-                .wait();
+        ::sycl::event sycl_deps;
 
-        auto sycl_deps = dnnl::sycl_interop::execute(add_prim_, stream,
-                {{DNNL_ARG_SRC_0, variance}, {DNNL_ARG_SRC_1, epsilon_mem},
-                        {DNNL_ARG_DST, sqrt_variance}},
-                deps);
+        if (scratchpad.get_engine().get_kind() == engine::kind::gpu) {
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
 
+            buf_start += epsilon_mem.get_desc().get_size();
+
+            // variance + epsilon
+            memory variance_epsilon = make_dnnl_memory(desc_.epsilon_desc_,
+                    scratchpad.get_engine(), (void *)buf_start);
+
+            // 1. sqrt_variance = sqrt(variance + epsilon)
+            //auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
+            sycl_queue
+                    .memcpy(epsilon_mem.get_data_handle(), &desc_.epsilon_,
+                            epsilon_mem.get_desc().get_size())
+                    .wait();
+
+            auto sycl_deps0 = dnnl::sycl_interop::execute(add_prim_, stream,
+                    {{DNNL_ARG_SRC_0, variance}, {DNNL_ARG_SRC_1, epsilon_mem},
+                            { DNNL_ARG_DST,
+                                variance_epsilon }},
+                    deps);
+
+            sycl_deps = dnnl::sycl_interop::execute(sqrt_prim_, stream,
+                    {{DNNL_ARG_SRC, variance_epsilon},
+                            { DNNL_ARG_DST,
+                                sqrt_variance }},
+                    {sycl_deps0});
+#else
+
+            // 1. sqrt_variance = sqrt(variance + epsilon)
+            //auto sycl_queue = dnnl::sycl_interop::get_queue(stream);
+            sycl_queue
+                    .memcpy(epsilon_mem.get_data_handle(), &desc_.epsilon_,
+                            epsilon_mem.get_desc().get_size())
+                    .wait();
+
+            sycl_deps = dnnl::sycl_interop::execute(add_prim_, stream,
+                    {{DNNL_ARG_SRC_0, variance}, {DNNL_ARG_SRC_1, epsilon_mem},
+                            {DNNL_ARG_DST, sqrt_variance}},
+                    deps);
+
+#endif
+        } else {
+            // 1. sqrt_variance = sqrt(variance + epsilon)
+            sycl_queue
+                    .memcpy(epsilon_mem.get_data_handle(), &desc_.epsilon_,
+                            epsilon_mem.get_desc().get_size())
+                    .wait();
+
+            sycl_deps = dnnl::sycl_interop::execute(add_prim_, stream,
+                    {{DNNL_ARG_SRC_0, variance}, {DNNL_ARG_SRC_1, epsilon_mem},
+                            {DNNL_ARG_DST, sqrt_variance}},
+                    deps);
+        }
         // 2. updated_weight = weights * scale / sqrt_variance
         memory new_scale(desc_.new_scale_desc_, scale.get_engine(),
                 scale.get_data_handle());
@@ -1245,11 +1779,120 @@ struct bn_folding_t : public op_executable_t {
     }
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        UNUSED(args);
+
+        auto weights = args.find(DNNL_ARG_WEIGHTS)->second;
+        auto bias = desc_.with_bias_ ? args.find(DNNL_ARG_BIAS)->second
+                                     : memory();
+        auto scale = args.find(DNNL_ARG_WEIGHTS_1)->second;
+        auto shift = args.find(DNNL_ARG_WEIGHTS_2)->second;
+        auto mean = args.find(DNNL_ARG_MEAN)->second;
+        auto variance = args.find(DNNL_ARG_VARIANCE)->second;
+        auto scratchpad = args.find(DNNL_ARG_SCRATCHPAD)->second;
+
+        auto updated_weights = args.find(DNNL_ARG_DST_0)->second;
+        auto updated_bias = args.find(DNNL_ARG_DST_1)->second;
+
+        // 0. split scratchpad buffer to specific intermediate memory
+        // sqrt_variance
+
+        char *buf_start = (char *)scratchpad.get_data_handle();
+        memory sqrt_variance = dnnl::ocl_interop::make_memory(
+                variance.get_desc(), scratchpad.get_engine(),
+                dnnl::ocl_interop::memory_kind::usm, (void *)buf_start);
+        buf_start += variance.get_desc().get_size();
+        // zero_bias
+        memory valid_bias = bias;
+        if (bias.get(true) == nullptr || bias.get_data_handle() == nullptr) {
+            valid_bias = dnnl::ocl_interop::make_memory(variance.get_desc(),
+                    scratchpad.get_engine(),
+                    dnnl::ocl_interop::memory_kind::usm, (void *)buf_start);
+            buf_start += valid_bias.get_desc().get_size();
+        }
+        // epsilon
+        memory epsilon_mem = dnnl::ocl_interop::make_memory(desc_.epsilon_desc_,
+                scratchpad.get_engine(), dnnl::ocl_interop::memory_kind::usm,
+                (void *)buf_start);
+
+        // 1. sqrt_variance = sqrt(variance + epsilon)
+        cl_event e;
+        xpu::ocl::usm::memcpy(stream.get(), epsilon_mem.get_data_handle(),
+                &desc_.epsilon_, epsilon_mem.get_desc().get_size(), 0, nullptr,
+                &e);
+        clWaitForEvents(1, &e);
+
+        auto ocl_deps = dnnl::ocl_interop::execute(add_prim_, stream,
+                {{DNNL_ARG_SRC_0, variance}, {DNNL_ARG_SRC_1, epsilon_mem},
+                        {DNNL_ARG_DST, sqrt_variance}},
+                deps);
+
+        // 2. updated_weight = weights * scale / sqrt_variance
+        memory new_scale = dnnl::ocl_interop::make_memory(desc_.new_scale_desc_,
+                scale.get_engine(), dnnl::ocl_interop::memory_kind::usm,
+                scale.get_data_handle());
+        memory new_sqrt_variance = dnnl::ocl_interop::make_memory(
+                desc_.new_variance_desc_, sqrt_variance.get_engine(),
+                dnnl::ocl_interop::memory_kind::usm,
+                sqrt_variance.get_data_handle());
+
+        auto ocl_deps2 = dnnl::ocl_interop::execute(mul_prim_, stream,
+                {{DNNL_ARG_SRC_0, weights}, {DNNL_ARG_SRC_1, new_scale},
+                        {DNNL_ARG_DST, updated_weights},
+                        {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1,
+                                new_sqrt_variance}},
+                {ocl_deps});
+
+        // 3. updated_bias = (bias - mean) * scale / sqrt_variance + shift
+        if (bias.get(true) == nullptr || bias.get_data_handle() == nullptr) {
+            // initialize the bias with zero value
+            std::vector<float> zero(
+                    graph::utils::prod(variance.get_desc().get_dims()), 0.0f);
+            xpu::ocl::usm::memcpy(stream.get(), valid_bias.get_data_handle(),
+                    zero.data(), valid_bias.get_desc().get_size(), 0, nullptr,
+                    &e);
+            clWaitForEvents(1, &e);
+
+            auto ocl_deps3 = dnnl::ocl_interop::execute(sub_prim_, stream,
+                    {{DNNL_ARG_SRC_0, valid_bias}, {DNNL_ARG_SRC_1, mean},
+                            {DNNL_ARG_DST, updated_bias},
+                            {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1,
+                                    scale},
+                            {DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1,
+                                    sqrt_variance},
+                            {DNNL_ARG_ATTR_MULTIPLE_POST_OP(2) | DNNL_ARG_SRC_1,
+                                    shift}},
+                    {ocl_deps2});
+            return ocl_deps3;
+        }
+
+        auto ocl_deps3 = dnnl::ocl_interop::execute(sub_prim_, stream,
+                {{DNNL_ARG_SRC_0, valid_bias}, {DNNL_ARG_SRC_1, mean},
+                        {DNNL_ARG_DST, updated_bias},
+                        {DNNL_ARG_ATTR_MULTIPLE_POST_OP(0) | DNNL_ARG_SRC_1,
+                                scale},
+                        {DNNL_ARG_ATTR_MULTIPLE_POST_OP(1) | DNNL_ARG_SRC_1,
+                                sqrt_variance},
+                        {DNNL_ARG_ATTR_MULTIPLE_POST_OP(2) | DNNL_ARG_SRC_1,
+                                shift}},
+                {ocl_deps2});
+        return ocl_deps3;
+    }
+#endif
+
 private:
     desc_t desc_;
     dnnl::binary add_prim_;
     dnnl::binary mul_prim_;
     dnnl::binary sub_prim_;
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+    // binary + sqrt post-op fusion is unsupported on NVIDIA GPU
+    dnnl::eltwise_forward sqrt_prim_;
+#endif
 };
 
 struct conv_bwd_data_executable_t : public op_executable_t {
@@ -1272,9 +1915,18 @@ struct conv_bwd_data_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1303,9 +1955,18 @@ struct conv_bwd_weights_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1321,8 +1982,8 @@ struct batchnorm_executable_t : public op_executable_t {
 
     batchnorm_executable_t(std::shared_ptr<op_t> &op,
             const dnnl::engine &p_engine, fusion_info_mgr_t &mgr,
-            pd_cache_t &pd_cache) {
-        is_training_ = op->get_attr<bool>(op_attr::is_training);
+            pd_cache_t &pd_cache)
+        : is_training_(op->get_attr<bool>(op_attr::is_training)) {
         float momentum = 0.5;
         if (op->has_attr(op_attr::momentum))
             momentum = op->get_attr<float>(op_attr::momentum);
@@ -1390,7 +2051,7 @@ struct batchnorm_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         if (!is_training_) {
             auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
             if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
@@ -1437,6 +2098,54 @@ struct batchnorm_executable_t : public op_executable_t {
     }
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        if (!is_training_) {
+            auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
+            return e;
+        }
+
+        std::unordered_map<int, memory> exe_args = args;
+        exe_args.erase(DNNL_ARG_SRC_1);
+        exe_args.erase(DNNL_ARG_SRC_2);
+        exe_args.erase(DNNL_ARG_DST_1);
+        exe_args.erase(DNNL_ARG_DST_2);
+
+        auto e0 = dnnl::ocl_interop::execute(prim_, stream, exe_args, deps);
+
+        // calculate running_mean and running_variance
+        auto batch_mean = args.find(DNNL_ARG_MEAN)->second;
+        auto batch_variance = args.find(DNNL_ARG_VARIANCE)->second;
+        auto old_running_mean = args.find(DNNL_ARG_SRC_1)->second;
+        auto old_running_variance = args.find(DNNL_ARG_SRC_2)->second;
+        auto new_running_mean = args.find(DNNL_ARG_DST_1)->second;
+        auto new_running_variance = args.find(DNNL_ARG_DST_2)->second;
+
+        dnnl::engine p_engine = stream.get_engine();
+        // new_running_mean = momentum * old_running_mean +
+        //                                      (1 - momentum) * batch_mean
+        auto sum_prim_0 = dnnl::sum({p_engine, scales_,
+                {old_running_mean.get_desc(), batch_mean.get_desc()}});
+        auto e1 = dnnl::ocl_interop::execute(sum_prim_0, stream,
+                {{DNNL_ARG_MULTIPLE_SRC, old_running_mean},
+                        {DNNL_ARG_MULTIPLE_SRC + 1, batch_mean},
+                        {DNNL_ARG_DST, new_running_mean}},
+                {e0});
+        // new_running_variance = momentum * old_running_variance +
+        //                                  (1 - momentum) * batch_variance
+        auto sum_prim_1 = dnnl::sum({p_engine, scales_,
+                {old_running_variance.get_desc(), batch_variance.get_desc()}});
+        auto e2 = dnnl::ocl_interop::execute(sum_prim_1, stream,
+                {{DNNL_ARG_MULTIPLE_SRC, old_running_variance},
+                        {DNNL_ARG_MULTIPLE_SRC + 1, batch_variance},
+                        {DNNL_ARG_DST, new_running_variance}},
+                {e1});
+        return e2;
+    }
+#endif
+
 private:
     dnnl::batch_normalization_forward prim_;
     bool is_training_ {false};
@@ -1463,9 +2172,18 @@ struct batchnorm_bwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1511,7 +2229,7 @@ struct resampling_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto sycl_deps = deps;
         if (with_sum_) {
             const memory &psrc_mem = args.find(DNNL_GRAPH_ARG_POST_SRC)->second;
@@ -1527,6 +2245,28 @@ struct resampling_executable_t : public op_executable_t {
         }
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, sycl_deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto ocl_deps = deps;
+        if (with_sum_) {
+            const memory &psrc_mem = args.find(DNNL_GRAPH_ARG_POST_SRC)->second;
+            const memory &dst_mem = args.find(DNNL_ARG_DST)->second;
+            if (psrc_mem.get_data_handle() != dst_mem.get_data_handle()) {
+                auto prim = dnnl::reorder(psrc_mem, dst_mem);
+                auto e = dnnl::ocl_interop::execute(prim, stream,
+                        {{DNNL_ARG_FROM, const_cast<memory &>(psrc_mem)},
+                                {DNNL_ARG_TO, const_cast<memory &>(dst_mem)}},
+                        ocl_deps);
+                ocl_deps = {e};
+            }
+        }
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, ocl_deps);
         return e;
     }
 #endif
@@ -1555,9 +2295,18 @@ struct resampling_bwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1586,9 +2335,18 @@ struct layernorm_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1617,9 +2375,18 @@ struct layernorm_bwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1646,9 +2413,18 @@ struct sum_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1676,9 +2452,18 @@ struct softmax_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1706,9 +2491,18 @@ struct softmax_bwd_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
         if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
         return e;
     }
 #endif
@@ -1749,7 +2543,7 @@ struct reduction_executable_t : public op_executable_t {
 #ifdef DNNL_WITH_SYCL
     ::sycl::event execute_sycl(const stream &stream,
             const std::unordered_map<int, memory> &args,
-            const std::vector<::sycl::event> &deps = {}) const override {
+            const std::vector<::sycl::event> &deps) const override {
         auto sycl_deps = deps;
         if (with_sum_) {
             const memory &psrc_mem = args.find(DNNL_GRAPH_ARG_POST_SRC)->second;
@@ -1770,9 +2564,415 @@ struct reduction_executable_t : public op_executable_t {
     }
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto ocl_deps = deps;
+        if (with_sum_) {
+            const memory &psrc_mem = args.find(DNNL_GRAPH_ARG_POST_SRC)->second;
+            const memory &dst_mem = args.find(DNNL_ARG_DST)->second;
+            if (psrc_mem.get_data_handle() != dst_mem.get_data_handle()) {
+                auto prim = dnnl::reorder(psrc_mem, dst_mem);
+                auto e = dnnl::ocl_interop::execute(prim, stream,
+                        {{DNNL_ARG_FROM, const_cast<memory &>(psrc_mem)},
+                                {DNNL_ARG_TO, const_cast<memory &>(dst_mem)}},
+                        ocl_deps);
+                ocl_deps = {e};
+            }
+        }
+
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, ocl_deps);
+        return e;
+    }
+#endif
+
 private:
     dnnl::reduction prim_;
     bool with_sum_ {false};
+};
+
+struct groupnorm_executable_t : public op_executable_t {
+    DECLARE_DESC_CLASS_AND_CREATOR(
+            dnnl::group_normalization_forward::primitive_desc);
+    DECLARE_ARG_INDICES_GETTER;
+
+    groupnorm_executable_t(std::shared_ptr<op_t> &op,
+            const dnnl::engine &p_engine, fusion_info_mgr_t &mgr,
+            pd_cache_t &pd_cache) {
+        auto desc = create_desc(op, p_engine, mgr, pd_cache);
+        prim_ = dnnl::group_normalization_forward(desc);
+    }
+
+    void execute(const stream &stream,
+            const std::unordered_map<int, memory> &args) const override {
+        prim_.execute(stream, args);
+    }
+
+#ifdef DNNL_WITH_SYCL
+    ::sycl::event execute_sycl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<::sycl::event> &deps) const override {
+        auto e = dnnl::sycl_interop::execute(prim_, stream, args, deps);
+        if (stream.get_engine().get_kind() == engine::kind::cpu) e.wait();
+        return e;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        auto e = dnnl::ocl_interop::execute(prim_, stream, args, deps);
+        return e;
+    }
+#endif
+
+private:
+    dnnl::group_normalization_forward prim_;
+};
+
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+using namespace dnnl::impl::gpu::intel;
+#define MAX_NDIMS 6
+#endif
+struct genindex_executable_t : public op_executable_t {
+    DECLARE_ARG_INDICES_GETTER;
+
+    genindex_executable_t(std::shared_ptr<op_t> &op,
+            const dnnl::engine &p_engine, fusion_info_mgr_t &mgr,
+            pd_cache_t &pd_cache)
+        : axis_(op->get_attr<int64_t>(op_attr::axis)) {
+        using ltw = logical_tensor_wrapper_t;
+        const auto &input_lt = op->get_input_value(0)->get_logical_tensor();
+        nelems_ = ltw(input_lt).nelems();
+        ndims_ = ltw(input_lt).ndims();
+        const auto &output_lt = op->get_output_value(0)->get_logical_tensor();
+        for (int i = 0; i < ndims_; i++) {
+            output_dims_[i] = output_lt.dims[i];
+            output_strides_[i] = output_lt.layout.strides[i];
+        }
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+        if (p_engine.get_kind() == engine::kind::gpu) {
+            compute::kernel_ctx_t kernel_ctx;
+            kernel_ctx.define_int("NDIMS", ndims_);
+            for (int d = 0; d < MAX_NDIMS; ++d) {
+                dim_t dim = (d < ndims_) ? output_dims_[d] : 1;
+                dim_t stride = (d < ndims_) ? output_strides_[d] : 0;
+                kernel_ctx.define_int(dnnl::impl::utils::format("D%d", d), dim);
+                kernel_ctx.define_int(
+                        dnnl::impl::utils::format("S%d", d), stride);
+            }
+            auto *compute_engine
+                    = dnnl::impl::utils::downcast<compute::compute_engine_t *>(
+                            p_engine.get());
+            std::vector<compute::kernel_t> kernels(1);
+            compute_engine->create_kernels(&kernels, {"gen_index"}, kernel_ctx);
+            kernel_ = kernels[0];
+        }
+#endif
+    }
+
+    void execute(const stream &stream,
+            const std::unordered_map<int, memory> &args) const override;
+
+#ifdef DNNL_WITH_SYCL
+    ::sycl::event execute_sycl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<::sycl::event> &deps) const override {
+        if (stream.get_engine().get_kind() == engine::kind::cpu) {
+            auto strm_t = stream.get();
+            auto *sycl_stream_impl = dnnl::impl::utils::downcast<
+                    dnnl::impl::xpu::sycl::stream_impl_t *>(strm_t->impl());
+
+            strm_t->before_exec_hook();
+            if (!deps.empty()) { sycl_stream_impl->sycl_ctx().set_deps(deps); }
+
+            execute(stream, args);
+
+            // return output event
+            ::sycl::event return_event = sycl_stream_impl->get_output_event();
+            strm_t->after_exec_hook();
+            return return_event;
+        }
+#if (DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE) \
+        && (DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL)
+        auto compute_stream
+                = dnnl::impl::utils::downcast<compute::compute_stream_t *>(
+                        stream.get());
+        compute::range_t gws = {static_cast<size_t>(nelems_)};
+        auto nd_range = compute::nd_range_t(gws);
+        compute::kernel_arg_list_t arg_list;
+        const auto &dst = *(args.at(DNNL_ARG_DST).get()->memory_storage());
+        arg_list.set(0, dst);
+        arg_list.set(1, axis_);
+        auto *sycl_stream
+                = dnnl::impl::utils::downcast<sycl::stream_t *>(compute_stream);
+        sycl_stream->before_exec_hook();
+        if (!deps.empty()) sycl_stream->sycl_ctx().set_deps(deps);
+
+        kernel_.parallel_for(*compute_stream, nd_range, arg_list,
+                sycl_stream->sycl_ctx().get_deps(),
+                sycl_stream->sycl_ctx().get_deps());
+        auto return_event = sycl_stream->get_output_event();
+
+        sycl_stream->after_exec_hook();
+        return return_event;
+#else
+        assertm(false,
+                "genindex opexcutable is only implemented for intel vendor "
+                "under SYCL runtime ");
+        throw std::runtime_error("Unimplement");
+#endif
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+        auto compute_stream
+                = dnnl::impl::utils::downcast<compute::compute_stream_t *>(
+                        stream.get());
+
+        compute::range_t gws = {static_cast<size_t>(nelems_)};
+
+        auto nd_range = compute::nd_range_t(gws);
+        compute::kernel_arg_list_t arg_list;
+        const auto &dst = *(args.at(DNNL_ARG_DST).get()->memory_storage());
+        arg_list.set(0, dst);
+        arg_list.set(1, axis_);
+        auto *ocl_stream
+                = dnnl::impl::utils::downcast<gpu::intel::ocl::stream_t *>(
+                        compute_stream);
+
+        ocl_stream->before_exec_hook();
+
+        if (!deps.empty()) {
+            std::vector<xpu::ocl::wrapper_t<cl_event>> events(deps.size());
+            for (size_t i = 0; i < deps.size(); i++)
+                events[i] = xpu::ocl::wrapper_t<cl_event>(deps[i], true);
+            ocl_stream->ocl_ctx().set_deps(events);
+        }
+
+        kernel_.parallel_for(*compute_stream, nd_range, arg_list,
+                compute_stream->ctx().get_deps(),
+                compute_stream->ctx().get_deps());
+
+        cl_event return_event = nullptr;
+        if ((ocl_stream->flags() & stream_flags::in_order) == 0) {
+            auto last = ocl_stream->get_output_event();
+            return_event = last.release();
+        }
+
+        ocl_stream->after_exec_hook();
+        return return_event;
+#else
+        assertm(false,
+                "genindex opexcutable is only implemented for intel vendor "
+                "under OCL runtime ");
+        throw std::runtime_error("Unimplement");
+#endif
+    }
+#endif
+
+private:
+    int axis_, nelems_, ndims_;
+    dims_t output_dims_, output_strides_;
+
+#if (DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE) \
+        && (DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL)
+    compute::kernel_t kernel_;
+#endif
+};
+
+struct sdpa_executable_t : public op_executable_t {
+    DECLARE_ARG_INDICES_GETTER;
+
+    sdpa_executable_t(std::shared_ptr<op_t> &op, const dnnl::engine &p_engine,
+            fusion_info_mgr_t &mgr, pd_cache_t &pd_cache)
+        : with_scale_(op->get_attr<bool>(op_attr::with_scale))
+        , mask_type_(static_cast<attn_mask_type_t>(
+                  op->get_attr<int64_t>(op_attr::mask_type))) {
+
+        auto md_q = make_dnnl_memory_desc(
+                op->get_input_value(0)->get_logical_tensor());
+        auto md_k = make_dnnl_memory_desc(
+                op->get_input_value(1)->get_logical_tensor());
+        auto md_v = make_dnnl_memory_desc(
+                op->get_input_value(2)->get_logical_tensor());
+        auto md_dst = make_dnnl_memory_desc(
+                op->get_output_value(0)->get_logical_tensor());
+
+        auto scale_dt = impl::data_type::undef;
+        size_t idx = 3;
+        if (with_scale_)
+            scale_dt = op->get_input_value(idx++)
+                               ->get_logical_tensor()
+                               .data_type;
+
+        dnnl::memory::desc md_mask;
+        with_explicit_mask_ = mask_type_ == attn_mask_type::buffer;
+        if (with_explicit_mask_)
+            md_mask = make_dnnl_memory_desc(
+                    op->get_input_value(idx++)->get_logical_tensor());
+
+        dnnl::primitive_attr attr;
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+        attr.set_fpmath_mode(
+                static_cast<dnnl::fpmath_mode>(mgr.get_fpmath_mode().mode_));
+        if (op->has_attr(op_attr::is_invert_scale))
+            is_invert_scale_ = op->get_attr<bool>(op_attr::is_invert_scale);
+
+        dim_t kv_head_number
+                = op->get_input_value(1)->get_logical_tensor().dims[1];
+
+        const std::string &softmax_mode
+                = op->get_attr<std::string>(op_attr::mode);
+        const alg_kind_t softmax_alg = softmax_mode == "inf_as_zero"
+                ? alg_kind::softmax_accurate_inf_as_zero
+                : alg_kind::softmax_accurate;
+        status_t s = create_sdpa_pd(sdpa_pd_, p_engine.get(), md_q.get(),
+                md_k.get(), md_v.get(), md_dst.get(), md_mask.get(), scale_dt,
+                is_invert_scale_, kv_head_number, mask_type_, softmax_alg,
+                attr.get());
+        if (s != dnnl::impl::status::success) {
+            is_initialized_ = false;
+        } else {
+            status_t s = sdpa_pd_->create_primitive(sdpa_prim_, p_engine.get());
+            is_initialized_ = s == status::success ? true : false;
+        }
+    }
+
+    bool is_initialized() const { return is_initialized_; }
+
+    void execute(const stream &stream,
+            const std::unordered_map<int, memory> &args) const override {
+        exec_args_t exec_args;
+        memory_arg_t mem_arg_q = {(args.at(DNNL_ARG_QUERIES)).get(), true};
+        memory_arg_t mem_arg_k = {(args.at(DNNL_ARG_KEYS)).get(), true};
+        memory_arg_t mem_arg_v = {(args.at(DNNL_ARG_VALUES)).get(), true};
+        memory_arg_t mem_arg_dst = {(args.at(DNNL_ARG_DST)).get(), false};
+        memory_arg_t mem_arg_scale = {
+                with_scale_ ? (args.at(DNNL_ARG_SCALE)).get() : nullptr, true};
+        memory_arg_t mem_arg_mask
+                = {with_explicit_mask_ ? (args.at(DNNL_ARG_ATTN_MASK)).get()
+                                       : nullptr,
+                        true};
+
+        exec_args[DNNL_ARG_QUERIES] = mem_arg_q;
+        exec_args[DNNL_ARG_KEYS] = mem_arg_k;
+        exec_args[DNNL_ARG_VALUES] = mem_arg_v;
+        exec_args[DNNL_ARG_DST] = mem_arg_dst;
+        exec_args[DNNL_ARG_SCALE] = mem_arg_scale;
+        exec_args[DNNL_ARG_ATTN_MASK] = mem_arg_mask;
+
+        exec_ctx_t ctx(stream.get(), std::move(exec_args));
+        sdpa_prim_->execute(ctx);
+    }
+
+#ifdef DNNL_WITH_SYCL
+    ::sycl::event execute_sycl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<::sycl::event> &deps) const override {
+
+        exec_args_t exec_args;
+        memory_arg_t mem_arg_q = {(args.at(DNNL_ARG_QUERIES)).get(), true};
+        memory_arg_t mem_arg_k = {(args.at(DNNL_ARG_KEYS)).get(), true};
+        memory_arg_t mem_arg_v = {(args.at(DNNL_ARG_VALUES)).get(), true};
+        memory_arg_t mem_arg_dst = {(args.at(DNNL_ARG_DST)).get(), false};
+        memory_arg_t mem_arg_scale = {
+                with_scale_ ? (args.at(DNNL_ARG_SCALE)).get() : nullptr, true};
+        memory_arg_t mem_arg_mask
+                = {with_explicit_mask_ ? (args.at(DNNL_ARG_ATTN_MASK)).get()
+                                       : nullptr,
+                        true};
+
+        exec_args[DNNL_ARG_QUERIES] = mem_arg_q;
+        exec_args[DNNL_ARG_KEYS] = mem_arg_k;
+        exec_args[DNNL_ARG_VALUES] = mem_arg_v;
+        exec_args[DNNL_ARG_DST] = mem_arg_dst;
+        exec_args[DNNL_ARG_SCALE] = mem_arg_scale;
+        exec_args[DNNL_ARG_ATTN_MASK] = mem_arg_mask;
+        auto strm_t = stream.get();
+        exec_ctx_t ctx(strm_t, std::move(exec_args));
+        auto *sycl_stream_impl = dnnl::impl::utils::downcast<
+                dnnl::impl::xpu::sycl::stream_impl_t *>(strm_t->impl());
+
+        strm_t->before_exec_hook();
+
+        if (!deps.empty()) sycl_stream_impl->sycl_ctx().set_deps(deps);
+
+        sdpa_prim_->execute(ctx);
+
+        ::sycl::event return_event = sycl_stream_impl->get_output_event();
+        strm_t->after_exec_hook();
+        return return_event;
+    }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event execute_ocl(const stream &stream,
+            const std::unordered_map<int, memory> &args,
+            const std::vector<cl_event> &deps) const override {
+        exec_args_t exec_args;
+        memory_arg_t mem_arg_q = {(args.at(DNNL_ARG_QUERIES)).get(), true};
+        memory_arg_t mem_arg_k = {(args.at(DNNL_ARG_KEYS)).get(), true};
+        memory_arg_t mem_arg_v = {(args.at(DNNL_ARG_VALUES)).get(), true};
+        memory_arg_t mem_arg_dst = {(args.at(DNNL_ARG_DST)).get(), false};
+        memory_arg_t mem_arg_scale = {
+                with_scale_ ? (args.at(DNNL_ARG_SCALE)).get() : nullptr, true};
+        memory_arg_t mem_arg_mask
+                = {with_explicit_mask_ ? (args.at(DNNL_ARG_ATTN_MASK)).get()
+                                       : nullptr,
+                        true};
+
+        exec_args[DNNL_ARG_QUERIES] = mem_arg_q;
+        exec_args[DNNL_ARG_KEYS] = mem_arg_k;
+        exec_args[DNNL_ARG_VALUES] = mem_arg_v;
+        exec_args[DNNL_ARG_DST] = mem_arg_dst;
+        exec_args[DNNL_ARG_SCALE] = mem_arg_scale;
+        exec_args[DNNL_ARG_ATTN_MASK] = mem_arg_mask;
+
+        exec_ctx_t ctx(stream.get(), std::move(exec_args));
+
+        auto *ocl_stream
+                = dnnl::impl::utils::downcast<gpu::intel::ocl::stream_t *>(
+                        stream.get());
+
+        ocl_stream->before_exec_hook();
+
+        if (!deps.empty()) {
+            std::vector<xpu::ocl::wrapper_t<cl_event>> events(deps.size());
+            for (size_t i = 0; i < deps.size(); i++)
+                events[i] = xpu::ocl::wrapper_t<cl_event>(deps[i], true);
+            ocl_stream->ocl_ctx().set_deps(events);
+        }
+
+        sdpa_prim_->execute(ctx);
+
+        cl_event return_event = nullptr;
+        if ((ocl_stream->flags() & stream_flags::in_order) == 0) {
+            auto last = ocl_stream->get_output_event();
+            return_event = last.release();
+        }
+
+        ocl_stream->after_exec_hook();
+        return return_event;
+    }
+#endif
+
+private:
+    std::shared_ptr<primitive_desc_t> sdpa_pd_;
+    std::shared_ptr<primitive_t> sdpa_prim_;
+    bool with_scale_;
+    bool with_explicit_mask_;
+    attn_mask_type_t mask_type_;
+    bool is_invert_scale_;
+    bool is_initialized_;
 };
 
 } // namespace dnnl_impl

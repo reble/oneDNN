@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,9 +18,12 @@
 #include <limits.h>
 #include <stdint.h>
 
+#include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,7 +31,6 @@
 #include "oneapi/dnnl/dnnl.h"
 
 #include "common.hpp"
-#include "utils/parser.hpp"
 
 #include "utils/parallel.hpp"
 
@@ -67,18 +69,14 @@ const char *state2str(res_state_t state) {
     return "STATE_UNDEF";
 }
 
-const char *skip_reason2str(skip_reason_t skip_reason) {
-#define CASE(x) \
-    if (skip_reason == (x)) return STRINGIFY(x)
-    CASE(CASE_NOT_SUPPORTED);
-    CASE(DATA_TYPE_NOT_SUPPORTED);
-    CASE(INVALID_CASE);
-    CASE(NOT_ENOUGH_RAM);
-    CASE(SKIP_IMPL_HIT);
-    CASE(SKIP_START);
-#undef CASE
-    return "SKIP_UNKNOWN";
-}
+namespace skip_reason {
+std::string case_not_supported("Case not supported");
+std::string data_type_not_supported("Data type not supported");
+std::string invalid_case("Invalid case");
+std::string not_enough_ram("Not enough RAM");
+std::string skip_impl_hit("Skip-impl option hit");
+std::string skip_start("Skip-start option hit");
+} // namespace skip_reason
 
 dir_t str2dir(const char *str) {
 #define CASE(x) \
@@ -97,76 +95,83 @@ dir_t str2dir(const char *str) {
 
 void parse_result(res_t &res, const char *pstr) {
     auto &bs = benchdnn_stat;
+
+    // Can be updated for `INITIALIZED`. TODO: remove this.
     const char *state = state2str(res.state);
+    bool is_failed = false;
+    bool print_me = true;
 
     switch (res.state) {
-        case UNTESTED:
-            BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
-            bs.failed++;
-            break;
+        case UNTESTED: is_failed = true; break;
         case EXECUTED:
-            if (bench_mode == bench_mode_t::exec)
-                BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
             bs.passed++;
+            if (bench_mode != bench_mode_t::exec) print_me = false;
             break;
-        case FAILED:
-            bs.failed++;
-            BENCHDNN_PRINT(0, "%d:%s (errors:%lu total:%lu) __REPRO: %s\n",
-                    bs.tests, state, (unsigned long)res.errors,
-                    (unsigned long)res.total, pstr);
-            break;
-        case SKIPPED:
-            BENCHDNN_PRINT(0, "%d:%s (%s) __REPRO: %s\n", bs.tests, state,
-                    skip_reason2str(res.reason), pstr);
-            bs.skipped++;
-            break;
+        case FAILED: is_failed = true; break;
+        case SKIPPED: bs.skipped++; break;
         case UNIMPLEMENTED:
-            BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
+            is_failed = true;
             bs.unimplemented++;
-            bs.failed++;
             break;
         case INVALID_ARGUMENTS:
-            BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
+            is_failed = true;
             bs.invalid_arguments++;
-            bs.failed++;
             break;
-        case MISTRUSTED:
-            BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
-            bs.mistrusted++;
-            break;
-        case PASSED:
-            BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
-            bs.passed++;
-            break;
-        case LISTED:
-            BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
-            bs.listed++;
-            break;
+        case MISTRUSTED: bs.mistrusted++; break;
+        case PASSED: bs.passed++; break;
+        case LISTED: bs.listed++; break;
         case INITIALIZED:
             // TODO: workaround for failed fill functions.
             if (bench_mode != bench_mode_t::init) {
+                is_failed = true;
                 state = "FAILED";
-                bs.failed++;
             } else {
                 bs.passed++;
             }
-
-            BENCHDNN_PRINT(0, "%d:%s __REPRO: %s\n", bs.tests, state, pstr);
             break;
-        default: assert(!"unknown state"); SAFE_V(FAIL);
+        default:
+            BENCHDNN_PRINT(0, "%s\n",
+                    "Error: unknown state encountered in \'parse_results()\'.");
+            SAFE_V(FAIL);
     }
 
+    std::string reason;
+    if (!res.reason.empty()) { reason = " (" + res.reason + ")"; }
+
+    std::string error_stat;
+    if (res.errors > 0) {
+        error_stat = " (errors:" + std::to_string(res.errors)
+                + " total:" + std::to_string(res.total) + ")";
+    }
+
+    using bt = timer::timer_t;
+
+    const auto &tct = res.timer_map.get_timer(timer::names::test_case_timer);
+    // Round to integer for nicer input.
+    // Use `sum` mode because it consists of two separate parts - creation and
+    // execution.
+    const int64_t tct_ms = static_cast<int64_t>(tct.ms(bt::mode_t::sum));
+    std::string tct_str = " (" + std::to_string(tct_ms) + " ms)";
+
+    // This is the common format of the repro line ([] - for optional entries):
+    // case_num:status[ (reason)][ (error_stats)] (time) __REPRO: prb_str
+    std::string full_repro = std::to_string(bs.tests) + ":" + std::string(state)
+            + reason + error_stat + tct_str + " __REPRO: " + pstr;
+    if (is_failed) {
+        bs.failed++;
+        bs.failed_cases.emplace(bs.tests, full_repro);
+    }
+    if (print_me) { BENCHDNN_PRINT(0, "%s\n", full_repro.c_str()); }
+
+    // Update this after collecting stats.
     bs.tests++;
     assert(bs.tests
             == bs.passed + bs.skipped + bs.mistrusted + bs.failed + bs.listed);
 
-    using bt = timer::timer_t;
-    using namespace timer::names;
-
     if (has_bench_mode_bit(mode_bit_t::perf)) {
         const auto &t = res.timer_map.perf_timer();
         for (int mode = 0; mode < (int)bt::n_modes; ++mode)
-            bs.ms[perf_timer][mode] += t.ms((bt::mode_t)mode);
+            bs.ms[timer::names::perf_timer][mode] += t.ms((bt::mode_t)mode);
     }
 
     for (const auto &e : timer::get_global_service_timers()) {
@@ -209,6 +214,7 @@ static void *zmalloc_protect(size_t size) {
     // Protect one page right after the block of size bytes
     int err = mprotect(ptr_protect, page_sz, PROT_NONE);
     if (err != 0) {
+        printf("Error: mprotect returned \'%s\'.\n", strerror(errno));
         ::free(ptr_start);
         return nullptr;
     }
@@ -239,10 +245,87 @@ static void zfree_protect(void *ptr) {
     ::free(ptr_start);
 }
 #endif
+struct memory_registry_t {
+    void add(void *ptr, size_t size) {
+        std::lock_guard<std::mutex> g(m_);
+        assert(allocations_.find(ptr) == allocations_.end());
+        allocations_.emplace(std::pair<void *, size_t>(ptr, size));
+        total_size_ += size;
+
+        BENCHDNN_PRINT(8,
+                "[CHECK_MEM]: zmalloc request with size %s, total "
+                "allocation size: %s\n",
+                smart_bytes(size).c_str(), smart_bytes(total_size_).c_str());
+        warn_size_check();
+    }
+    void remove(void *ptr) {
+        std::lock_guard<std::mutex> g(m_);
+        const size_t size = allocations_[ptr];
+        total_size_ -= size;
+
+        BENCHDNN_PRINT(8,
+                "[CHECK_MEM]: zfree request with size %s, total "
+                "allocation size: %s\n",
+                smart_bytes(size).c_str(), smart_bytes(total_size_).c_str());
+        allocations_.erase(ptr);
+    }
+
+    void set_expected_max(size_t size) {
+        constexpr float expected_trh = 1.1f; // Smooth out small allocations.
+        expected_max_ = static_cast<size_t>(expected_trh * size);
+        has_warned_ = false;
+        warn_size_check();
+    }
+
+private:
+    size_t size() const { return total_size_; }
+    void warn_size_check() {
+        const bool is_max_set = expected_max_ != unset_;
+        // Verify the total amount of allocated memory when it starts exceeding
+        // 1 GB threshold. Small amount of memory is highly unlikely cause OOM.
+        // There's an idea to add a portion of RAM into account as well, keep
+        // only 1 GB so far to check if it proves working well.
+        const bool is_total_size_big = total_size_ >= 1024 * 1024 * 1024;
+        const bool is_total_size_unexpected = total_size_ > expected_max_;
+        // Perf mode might have cold-cache enabled which potentially allocates
+        // unaccounted memory. To avoid a dependency on a cold-cache in this
+        // file, just rely on perf mode.
+        if (!has_bench_mode_bit(mode_bit_t::perf) && !has_warned_ && is_max_set
+                && is_total_size_big && is_total_size_unexpected) {
+            BENCHDNN_PRINT(0,
+                    "[CHECK_MEM][ERROR]: Memory use is underestimated. Current "
+                    "allocation size: %s; expected size: %s.\n",
+                    smart_bytes(total_size_).c_str(),
+                    smart_bytes(expected_max_).c_str());
+            // Prevent spamming logs with subsequent overflowing allocations;
+            has_warned_ = true;
+        }
+    }
+    static constexpr size_t unset_ = 0;
+    size_t expected_max_ = unset_;
+    size_t total_size_ = 0;
+    bool has_warned_ = false;
+    std::unordered_map<void *, size_t> allocations_;
+    std::mutex m_;
+};
+
+memory_registry_t &zmalloc_registry() {
+    static memory_registry_t reg {};
+    return reg;
+}
+
+void set_zmalloc_max_expected_size(size_t size) {
+    zmalloc_registry().set_expected_max(size);
+}
 
 void *zmalloc(size_t size, size_t align) {
 #ifdef BENCHDNN_MEMORY_CHECK
-    if (has_bench_mode_bit(mode_bit_t::corr)) { return zmalloc_protect(size); }
+    if (has_bench_mode_bit(mode_bit_t::exec)
+            && !has_bench_mode_bit(mode_bit_t::perf)) {
+        void *ptr = zmalloc_protect(size);
+        zmalloc_registry().add(ptr, size);
+        return ptr;
+    }
 #endif
 
     void *ptr;
@@ -260,14 +343,17 @@ void *zmalloc(size_t size, size_t align) {
     if (has_bench_mode_bit(mode_bit_t::perf) && (size < align)) size = align;
     int rc = ::posix_memalign(&ptr, align, size);
 #endif /* _WIN32 */
+    zmalloc_registry().add(ptr, size);
     return rc == 0 ? ptr : nullptr;
 }
 
 // zfree behavior is aligned with UNIX free().
 void zfree(void *ptr) {
     if (!ptr) return;
+    zmalloc_registry().remove(ptr);
 #ifdef BENCHDNN_MEMORY_CHECK
-    if (has_bench_mode_bit(mode_bit_t::corr)) {
+    if (has_bench_mode_bit(mode_bit_t::exec)
+            && !has_bench_mode_bit(mode_bit_t::perf)) {
         zfree_protect(ptr);
         return;
     }
@@ -319,31 +405,16 @@ bool match_regex(const char *str, const char *pattern) {
 }
 #endif /* _WIN32 */
 
-bool maybe_skip(const std::string &impl_str) {
-    if (skip_impl.empty()) return false;
-
-    size_t start_pos = 0;
-    // Iterate over impls in skip list.
-    while (start_pos != std::string::npos) {
-        const auto skip_impl_item
-                = parser::get_substr(skip_impl, start_pos, ',');
-        if (skip_impl_item.empty()) continue;
-        if (impl_str.find(skip_impl_item) != std::string::npos) return true;
-    }
-
-    return false;
-}
-
 bool skip_start(res_t *res, int idx) {
     if (idx < test_start) {
         res->state = SKIPPED;
-        res->reason = SKIP_START;
+        res->reason = skip_reason::skip_start;
         return true;
     }
     return false;
 }
 
-#if defined(_WIN32) && !defined(__GNUC__)
+#if defined(_WIN32)
 #include <windows.h>
 #define PATH_MAX MAX_PATH
 static char *dirname(char *path) {
@@ -439,6 +510,8 @@ std::string locate_file(const std::string &fname) {
                 BENCHDNN_PRINT(50, "file used: %s\n", fullname.c_str());
                 ifs.close();
                 return fullname;
+            } else {
+                BENCHDNN_PRINT(50, "File not found at: %s\n", fullname.c_str());
             }
             ifs.close();
         }
@@ -456,7 +529,7 @@ int batch(const char *fname, bench_f bench) {
     std::string str;
     bool continued_line = false;
     while (ifs >> str) {
-        if (str.length() == 0) continue;
+        if (str.empty()) continue;
 
         // shell style comments
         if (str.front() == '#') {
@@ -505,7 +578,17 @@ int64_t div_up(const int64_t a, const int64_t b) {
     return (a + b - 1) / b;
 }
 
+size_t div_up(const size_t a, const size_t b) {
+    SAFE_V(b != 0 ? OK : FAIL);
+    return (a + b - 1) / b;
+}
+
 int64_t rnd_up(const int64_t a, const int64_t b) {
+    SAFE_V(b != 0 ? OK : FAIL);
+    return div_up(a, b) * b;
+}
+
+size_t rnd_up(const size_t a, const size_t b) {
     SAFE_V(b != 0 ? OK : FAIL);
     return div_up(a, b) * b;
 }
@@ -653,4 +736,87 @@ void print_dhw(bool &print_d, bool &print_h, bool &print_w, int ndims,
     print_h = ndims == 4 || (ndims == 5 && (!cubic_shape || canonical));
     print_w = ndims == 3 || (ndims == 5 && (!cubic_shape || canonical))
             || (ndims == 4 && (!square_shape || canonical));
+}
+
+// Copied from utils::getenv.
+// An underlined unified implementation for getting env var value.
+int getenv(const char *name, char *buffer, int buffer_size) {
+    if (name == nullptr || buffer_size < 0
+            || (buffer == nullptr && buffer_size > 0))
+        return INT_MIN;
+
+    int result = 0;
+    int term_zero_idx = 0;
+    size_t value_length = 0;
+
+#ifdef _WIN32
+    value_length = GetEnvironmentVariable(name, buffer, buffer_size);
+#else
+    const char *value = ::getenv(name);
+    value_length = value == nullptr ? 0 : strlen(value);
+#endif
+
+    if (value_length > INT_MAX)
+        result = INT_MIN;
+    else {
+        int int_value_length = (int)value_length;
+        if (int_value_length >= buffer_size) {
+            result = -int_value_length;
+        } else {
+            term_zero_idx = int_value_length;
+            result = int_value_length;
+#ifndef _WIN32
+            if (value) strncpy(buffer, value, buffer_size - 1);
+#endif
+        }
+    }
+
+    if (buffer != nullptr) buffer[term_zero_idx] = '\0';
+    return result;
+}
+
+// Copied from utils::getenv_int_user.
+// Collects an integer value from an env var.
+int benchdnn_getenv_int(const char *name, int default_value) {
+    int value = default_value;
+    // # of digits in the longest 32-bit signed int + sign + terminating null
+    const int len = 12;
+    char value_str[len];
+    if (getenv(name, value_str, len) > 0) { value = atoi(value_str); }
+    return value;
+}
+
+// Copied from utils::getenv_string_user.
+// Collects a string lower case value from an env var.
+std::string benchdnn_getenv_string(const char *name) {
+    // Random number to fit possible string input.
+    std::string value;
+    const int len = 128;
+    char value_str[len];
+    if (getenv(name, value_str, len) > 0) { value = value_str; }
+    std::transform(value.begin(), value.end(), value.begin(), ::tolower);
+    return value;
+}
+
+std::string smart_bytes(double bytes) {
+    std::string s;
+    static constexpr int oneK = 1024;
+
+    if (bytes < oneK) {
+        s = std::to_string(static_cast<size_t>(bytes)) + " B";
+        return s;
+    }
+    auto KB = bytes / oneK;
+    if (KB < oneK) {
+        s = std::to_string(KB) + " KB";
+        return s;
+    }
+    auto MB = KB / oneK;
+    if (MB < oneK) {
+        s = std::to_string(MB) + " MB";
+        return s;
+    }
+    auto GB = MB / oneK;
+    s = std::to_string(GB) + " GB";
+    return s;
 }

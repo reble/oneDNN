@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2022 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -64,8 +64,9 @@ status_t gemm_x8s8s32x_inner_product_fwd_t::execute_forward(
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
     auto scratchpad = ctx.get_scratchpad_grantor();
-    const float *scales = precompute_scales(
-            scratchpad, src_scales, wei_scales, OC, pd()->attr());
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
+    const float *scales = precompute_scales(scratchpad, src_scales, wei_scales,
+            IC, OC, false, wei_scale_mask > 0, pd()->attr());
 
     int32_t *acc = pd()->dst_is_acc_
             ? (int32_t *)dst
@@ -77,13 +78,13 @@ status_t gemm_x8s8s32x_inner_product_fwd_t::execute_forward(
     if (smd.data_type == data_type::s8) {
         const int8_t off_b = 0;
         const int8_t *src_ = reinterpret_cast<const int8_t *>(src);
-        CHECK(gemm_s8x8s32(wei_tr ? "T" : "N", src_tr ? "T" : "N", "F", &M, &N,
+        CHECK(gemm_s8s8s32(wei_tr ? "T" : "N", src_tr ? "T" : "N", "F", &M, &N,
                 &K, &onef, weights, wei_tr ? &K : &M, &off_a, src_,
                 src_tr ? &N : &K, &off_b, &zerof, acc, &M, &off_c));
     } else if (smd.data_type == data_type::u8) {
         const uint8_t off_b = 0;
         const uint8_t *src_ = reinterpret_cast<const uint8_t *>(src);
-        CHECK(gemm_s8x8s32(wei_tr ? "T" : "N", src_tr ? "T" : "N", "F", &M, &N,
+        CHECK(gemm_s8u8s32(wei_tr ? "T" : "N", src_tr ? "T" : "N", "F", &M, &N,
                 &K, &onef, weights, wei_tr ? &K : &M, &off_a, src_,
                 src_tr ? &N : &K, &off_b, &zerof, acc, &M, &off_c));
     } else {

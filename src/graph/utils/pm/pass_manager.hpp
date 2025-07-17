@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -31,6 +31,13 @@ namespace impl {
 namespace graph {
 namespace pass {
 
+// The pass filter function returns true if the pass is desired under the
+// given policy. Each backend should define its own filter function.
+using pass_filter_fn
+        = std::function<bool(const pass_base_ptr &, partition_policy_t)>;
+
+bool default_pass_filter(const pass_base_ptr &pass, partition_policy_t policy);
+
 /*!
  * \brief pass_registry is a registry class that
  *        is responsible for registering pass
@@ -40,9 +47,9 @@ class pass_registry_t {
 
 public:
     // register a pass
-    pass_base &register_pass(const std::string &backend_name,
+    pass_base_t &register_pass(const std::string &backend_name,
             const std::string &pass_name, pass_create_fn fn);
-    pass_base &register_pass(const pass_base_ptr &pass);
+    pass_base_t &register_pass(const pass_base_ptr &pass);
     // get registered passes
     const std::list<pass_base_ptr> &get_passes() const { return passes_; }
 
@@ -96,9 +103,12 @@ public:
     // run all passes enabled according to passConfig
     impl::status_t run_passes(graph_t &agraph,
             const std::string &pass_config_json,
-            partition_policy_t policy = partition_policy::fusion);
+            partition_policy_t policy = partition_policy::fusion,
+            const pass_filter_fn &filter_fn = default_pass_filter);
+
     impl::status_t run_passes(graph_t &agraph, std::istream *fs,
-            partition_policy_t policy = partition_policy::fusion);
+            partition_policy_t policy = partition_policy::fusion,
+            const pass_filter_fn &filter_fn = default_pass_filter);
 };
 
 } // namespace pass

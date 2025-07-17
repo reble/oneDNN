@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -96,15 +96,18 @@ class inner_product_test_bwd_data_t
 protected:
     void SetUp() override {
         auto p = ::testing::TestWithParam<inprod_test_params_t>::GetParam();
-        SKIP_IF_CUDA(!cuda_check_format_tags(p.diff_src_format,
+        SKIP_IF_CUDA(!cuda_generic_check_format_tags(p.diff_src_format,
                              p.weights_format, p.diff_dst_format),
                 "Unsupported format tag");
         SKIP_IF_CUDA(p.ndims > 5, "Unsupported number of dimensions");
+        SKIP_IF_GENERIC(!cuda_generic_check_format_tags(p.diff_src_format,
+                                p.weights_format, p.diff_dst_format),
+                "Unsupported format tag");
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status);
     }
 
-    bool cuda_check_format_tags(memory::format_tag diff_src_format,
+    bool cuda_generic_check_format_tags(memory::format_tag diff_src_format,
             memory::format_tag wei_format, memory::format_tag diff_dst_format) {
         bool diff_src_ok = diff_src_format == memory::format_tag::ncdhw
                 || diff_src_format == memory::format_tag::ndhwc
@@ -145,7 +148,7 @@ protected:
 
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
-        memory::data_type data_type = data_traits<data_t>::data_type;
+        memory::data_type data_type = data_traits_t<data_t>::data_type;
         ASSERT_EQ(data_type, dnnl::memory::data_type::f32);
 
         memory::dims diff_src_dims = {ipd.mb, ipd.ic},
@@ -178,7 +181,7 @@ protected:
         auto ip_primitive_desc = pd_t(eng, ip_diff_src_desc, ip_weights_desc,
                 ip_diff_dst_desc, ip_fwd_pdesc);
 
-        allows_attr_t aa {false}; // doesn't support anything
+        allows_attr_t aa {}; // doesn't support anything
         test_bwd_pd_constructors<pd_t, hint_pd_t>(ip_primitive_desc,
                 ip_fwd_pdesc, aa, ip_diff_src_desc, ip_weights_desc,
                 ip_diff_dst_desc);

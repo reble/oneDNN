@@ -1,7 +1,7 @@
 # Verbose log converter
 
 Verbose log converter is a tool that allows to convert [oneDNN
-verbose](https://oneapi-src.github.io/oneDNN/dev_guide_verbose.html)
+verbose](https://uxlfoundation.github.io/oneDNN/dev_guide_verbose.html)
 output to various outputs (input files for benchdnn and execution
 statistics breakdown at this time). The tool can be extended to
 produce other types of output by adding generators.
@@ -13,7 +13,7 @@ produce other types of output by adding generators.
 The script is compatible with the specific oneDNN version with which it is distributed.
 Compatibility with other oneDNN versions is not guaranteed.
 To get an appropriate version of the script:
- - Identify `DNNL_VERSION_HASH` located in `include/oneapi/dnnl/dnnl_config.h`.
+ - Identify `DNNL_VERSION_HASH` located in `include/oneapi/dnnl/dnnl_version_hash.h`.
  - Download the script from oneDNN repository with that particular hash.
 
 ## Usage
@@ -44,6 +44,8 @@ python3 verbose_converter.py [-h] [-i INPUT] [-p PARSER] [-a ACTION] [-s SPLIT]
             of particular driver.
   - `{-g,--generator} benchdnn [default], ...` target generator.
             Refer to ``Generators`` below.
+  - `{-e,--events} event [event ...]` -- list of events to parse. Possible
+            event values: `create` and `exec`. Default is `create` and `exec`.
 
 ### Option 2: as Python module
 ``` python
@@ -64,6 +66,7 @@ output = verbose_converter.convert(verbose_level, parser, input, action,
             Refer to ``Verbose`` below.
   - `generator STRING` -- target generator.
             Refer to ``Generators`` below.
+  - `events LIST` -- list of events to parse. Default is ['create', 'exec'].
 
 ### Return value
   - `status STRING` -- status of conversion.

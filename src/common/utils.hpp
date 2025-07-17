@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,6 +25,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <locale>
+#include <sstream>
 #include <string>
 
 #include <memory>
@@ -52,37 +54,41 @@ namespace impl {
 
 #define DNNL_SHORT_CIRCUIT_SELF_ASSIGN(other) \
     do { \
-        if (this == &other) return *this; \
+        if (this == &(other)) return *this; \
     } while (0)
 
 #define DNNL_SHORT_CIRCUIT_SELF_COMPARISON(other) \
     do { \
-        if (this == &other) return true; \
+        if (this == &(other)) return true; \
     } while (0)
 
 #define DNNL_DISALLOW_COPY_AND_ASSIGN(T) \
     T(const T &) = delete; \
-    T &operator=(const T &) = delete;
+    void operator=(const T &) = delete;
 
 // Sanity check for 64 bits
 static_assert(sizeof(void *) == 8, "oneDNN supports 64-bit architectures only");
 
+// Note: if `f` has any explicit templated arguments, e.g., func<A, B>, then
+// compiler returns `error: macro "CHECK" passed 2 arguments, but takes just 1`.
+// The solution is to use an alias, e.g. `using func_alias = func<A, B>;` and
+// use `func_alias` in CHECK, then it compiles.
 #define CHECK(f) \
     do { \
-        status_t _status_ = f; \
-        if (_status_ != status::success) return _status_; \
+        dnnl::impl::status_t _status_ = f; \
+        if (_status_ != dnnl::impl::status::success) return _status_; \
     } while (0)
 
 #define CHECK_BOOL(f) \
     do { \
-        status_t _status_ = f; \
-        if (_status_ != status::success) return false; \
+        dnnl::impl::status_t _status_ = f; \
+        if (_status_ != dnnl::impl::status::success) return false; \
     } while (0)
 
 #define UNUSED_STATUS(f) \
     do { \
-        status_t _status_ = f; \
-        assert(_status_ == status::success); \
+        dnnl::impl::status_t _status_ = f; \
+        assert(_status_ == dnnl::impl::status::success); \
         MAYBE_UNUSED(_status_); \
     } while (0)
 
@@ -100,41 +106,50 @@ namespace utils {
 
 /* SFINAE helper -- analogue to std::enable_if */
 template <bool expr, class T = void>
-struct enable_if {};
+struct enable_if {}; // NOLINT(readability-identifier-naming)
+
 template <class T>
 struct enable_if<true, T> {
-    typedef T type;
+    using type = T;
 };
+
+// Replacement implementation of std::enable_if_t from C++14, included here for
+// interoperability with C++11
+template <bool B, class T = void>
+using enable_if_t = typename enable_if<B, T>::type;
+
+template <typename T>
+using is_vector = std::is_same<T, typename std::vector<typename T::value_type>>;
 
 /* analogue std::conditional */
 template <bool, typename, typename>
-struct conditional {};
+struct conditional {}; // NOLINT(readability-identifier-naming)
 template <typename T, typename F>
 struct conditional<true, T, F> {
-    typedef T type;
+    using type = T;
 };
 template <typename T, typename F>
 struct conditional<false, T, F> {
-    typedef F type;
+    using type = F;
 };
 
 template <bool, typename, bool, typename, typename>
-struct conditional3 {};
+struct conditional3 {}; // NOLINT(readability-identifier-naming)
 template <typename T, typename FT, typename FF>
 struct conditional3<true, T, false, FT, FF> {
-    typedef T type;
+    using type = T;
 };
 template <typename T, typename FT, typename FF>
 struct conditional3<false, T, true, FT, FF> {
-    typedef FT type;
+    using type = FT;
 };
 template <typename T, typename FT, typename FF>
 struct conditional3<false, T, false, FT, FF> {
-    typedef FF type;
+    using type = FF;
 };
 
 template <bool, typename U, U, U>
-struct conditional_v {};
+struct conditional_v {}; // NOLINT(readability-identifier-naming)
 template <typename U, U t, U f>
 struct conditional_v<true, U, t, f> {
     static constexpr U value = t;
@@ -145,16 +160,16 @@ struct conditional_v<false, U, t, f> {
 };
 
 template <typename T>
-struct remove_reference {
-    typedef T type;
+struct remove_reference { // NOLINT(readability-identifier-naming)
+    using type = T;
 };
 template <typename T>
 struct remove_reference<T &> {
-    typedef T type;
+    using type = T;
 };
 template <typename T>
 struct remove_reference<T &&> {
-    typedef T type;
+    using type = T;
 };
 
 template <typename T>
@@ -177,6 +192,7 @@ std::unique_ptr<T> make_unique(Args &&...args) {
     return std::unique_ptr<T>(new T(std::forward<Args>(args)...));
 }
 
+// NOLINTBEGIN(performance-unnecessary-value-param)
 template <typename T, typename P>
 constexpr bool everyone_is(T val, P item) {
     return val == item;
@@ -185,7 +201,9 @@ template <typename T, typename P, typename... Args>
 constexpr bool everyone_is(T val, P item, Args... item_others) {
     return val == item && everyone_is(val, item_others...);
 }
+// NOLINTEND(performance-unnecessary-value-param)
 
+// NOLINTBEGIN(performance-unnecessary-value-param)
 template <typename T, typename P>
 constexpr bool one_of(T val, P item) {
     return val == item;
@@ -194,6 +212,7 @@ template <typename T, typename P, typename... Args>
 constexpr bool one_of(T val, P item, Args... item_others) {
     return val == item || one_of(val, item_others...);
 }
+// NOLINTEND(performance-unnecessary-value-param)
 
 template <typename T, typename P>
 constexpr P map(T pat, P def) {
@@ -209,11 +228,30 @@ constexpr bool any_null(Args... ptrs) {
     return one_of(nullptr, ptrs...);
 }
 
+// For some unknown reason, GCC 11.x and beyond can't compile specific places
+// of the library that involve this routine. It's connected to the fact that
+// this function is inline and defined in a header.
+#if defined(__GNUC__) && __GNUC__ > 8 && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wrestrict"
+// /usr/include/bits/string_fortified.h:29:33: warning: ‘void* __builtin_memcpy(
+//     void*, const void*, long unsigned int)’ accessing 18446744056529682432 or
+//     more bytes at offsets 320 and 0 overlaps 9223372002495037441 bytes at
+//     offset -9223372019674906625 [-Wrestrict]
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+// warning: ‘void* __builtin_memcpy(void*, const void*, long unsigned int)’
+//     specified bound between 18446744056529682432 and 18446744073709551608
+//     exceeds maximum object size 9223372036854775807 [-Wstringop-overflow=]
+#endif
 template <typename T>
 inline void array_copy(T *dst, const T *src, size_t size) {
     for (size_t i = 0; i < size; ++i)
         dst[i] = src[i];
 }
+#if defined(__GNUC__) && __GNUC__ > 8 && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
 template <typename T>
 inline bool array_cmp(const T *a1, const T *a2, size_t size) {
     for (size_t i = 0; i < size; ++i)
@@ -228,7 +266,7 @@ inline void array_set(T *arr, const U &val, size_t size) {
 
 namespace product_impl {
 template <size_t>
-struct int2type {};
+struct int2type {}; // NOLINT(readability-identifier-naming)
 
 template <typename T>
 constexpr int product_impl(const T *arr, int2type<0>) {
@@ -455,11 +493,10 @@ T pick_by_prop_kind(prop_kind_t prop_kind, const T &val_fwd, const T &val_bwd_d,
 }
 
 template <typename Telem, size_t Tdims>
-struct array_offset_calculator {
+struct array_offset_calculator { // NOLINT(readability-identifier-naming)
     template <typename... Targs>
-    array_offset_calculator(Telem *base, Targs... Fargs) : _dims {Fargs...} {
-        _base_ptr = base;
-    }
+    array_offset_calculator(Telem *base, Targs... Fargs)
+        : _base_ptr(base), _dims {Fargs...} {}
 
     template <typename... Targs>
     array_offset_calculator(std::nullptr_t, Targs... Fargs) = delete;
@@ -515,7 +552,14 @@ const char *format_cvt_impl(T &&t) {
 
 template <typename... Args>
 std::string format_impl(const char *fmt, Args... args) {
+    // volatile here is a workaround for GCC 8 format-truncation warning e.g.:
+    // ‘%d’ directive output truncated writing 1 byte into a region of size 0
+    // triggered by overaggressive optmization in '-O3'; fixed in GCC 9+
+#if defined(__GNUC__) && __GNUC__ == 8 && !defined(__clang__)
+    volatile size_t sz = snprintf(nullptr, 0, fmt, args...);
+#else
     size_t sz = snprintf(nullptr, 0, fmt, args...);
+#endif
     std::string buf(sz + 1, '\0');
     snprintf(&buf[0], sz + 1, fmt, args...);
     buf.resize(sz);
@@ -528,15 +572,15 @@ std::string format(const char *fmt, Args &&...args) {
 }
 
 inline bool need_src_or_dst_check(
-        bool is_fwd, int o, int i, int k, int p, int s, int d) {
+        bool is_fwd, dim_t o, dim_t i, dim_t k, dim_t p, dim_t s, dim_t d) {
     if (is_fwd) {
-        int i_min = -p;
-        int i_max = (o - 1) * s - p + (k - 1) * (1 + d);
+        dim_t i_min = -p;
+        dim_t i_max = (o - 1) * s - p + (k - 1) * (1 + d);
         return (i_min < 0) || (i_max >= i);
     }
     // Backward.
-    int os_min = p - (k - 1) * (1 + d);
-    int os_max = (i - 1) + p;
+    dim_t os_min = p - (k - 1) * (1 + d);
+    dim_t os_max = (i - 1) + p;
     return (os_min < 0) || (os_max >= o * s);
 }
 
@@ -568,15 +612,23 @@ inline int get_dims_mask(const dims_t dims1, const dims_t dims2, int ndims,
     return mask;
 };
 
-inline void copy_dims_with_mask(
-        dims_t ddims, const dims_t sdims, int ndims, int mask) {
+// The function can be used to get dimensions for memory descriptors or
+// dimensions for logical offset. First ones are happy to have ones when mask
+// is not applied. This allows to initialize them with existing functions using
+// tags/strides. Latter ones are not nappy with ones and must have zeros as
+// logical offsets starts with 0. `fill_with_one` flag regulates the behavior
+// between them.
+inline void copy_dims_with_mask(dims_t ddims, const dims_t sdims, int ndims,
+        int mask, bool fill_with_one = false) {
     for (int d = 0; d < ndims; ++d) {
-        ddims[d] = (mask & (1 << d)) ? sdims[d] : 0;
+        ddims[d] = (mask & (1 << d)) ? sdims[d]
+                                     : static_cast<dim_t>(fill_with_one);
     }
 }
 
-inline void apply_mask_on_dims(dims_t dims, int ndims, int mask) {
-    copy_dims_with_mask(dims, dims, ndims, mask);
+inline void apply_mask_on_dims(
+        dims_t dims, int ndims, int mask, bool fill_with_one = false) {
+    copy_dims_with_mask(dims, dims, ndims, mask, fill_with_one);
 }
 
 inline void dim_iterator(const dims_t dims, dims_t indices, int ndims) {
@@ -637,10 +689,50 @@ int getenv_int_user(const char *name, int default_value = 0);
 // "DNNL_" (secondary) prefixes.
 std::string getenv_string_user(const char *name);
 
+// These are locale-invariant wrappers to define streaming objects for
+// string manipulation. Use these instead of the std library variants, namely,
+// std::stringstream, std::istringstream and std::ostringstream to ensure
+// locale-independent string behavior.
+struct stringstream_t : public std::stringstream {
+    template <typename... Args>
+    stringstream_t(Args &&...args)
+        : std::stringstream(std::forward<Args>(args)...) {
+        this->imbue(std::locale::classic());
+    }
+
+private:
+    using std::stringstream::imbue;
+};
+
+struct istringstream_t : public std::istringstream {
+    template <typename... Args>
+    istringstream_t(Args &&...args)
+        : std::istringstream(std::forward<Args>(args)...) {
+        this->imbue(std::locale::classic());
+    }
+
+private:
+    using std::istringstream::imbue;
+};
+
+struct ostringstream_t : public std::ostringstream {
+    template <typename... Args>
+    ostringstream_t(Args &&...args)
+        : std::ostringstream(std::forward<Args>(args)...) {
+        this->imbue(std::locale::classic());
+    }
+
+private:
+    using std::ostringstream::imbue;
+};
+
 // Various getter for profiling info
 bool get_jit_dump();
 unsigned get_jit_profiling_flags();
 std::string get_jit_profiling_jitdumpdir();
+// Checks if the filepath is a valid path and not a symlink to ensure
+// the application only processes secure files.
+status_t check_for_symlinks(const char *filename, bool *res);
 FILE *fopen(const char *filename, const char *mode);
 int getpagesize();
 
@@ -680,7 +772,7 @@ public:
     constexpr setting_t(const T init) : value_ {init}, initialized_ {false} {}
     bool initialized() { return initialized_; }
     T get() { return value_; }
-    void set(T new_value) {
+    void set(const T &new_value) {
         value_ = new_value;
         initialized_ = true;
     }
@@ -703,32 +795,6 @@ inline int float2int(float x) {
 inline float int2float(int x) {
     return utils::bit_cast<float>(x);
 }
-
-// XXX: Currently SYCL doesn't provide an API to get device UUID but
-// we need to be able to distinguish OpenCL device from Level0 device.
-// As a temporary solution the compound ID will be used for that.
-// Below is a table explaning what the numbers are for different backends:
-//
-// -------------------------------------------------------------
-//  Backend      | Compound ID
-// -------------------------------------------------------------
-//  Host         | <backend_t::host, 0, 0>
-//  OpenCL       | <backend_t::opencl, cl_device, 0>
-//  NVIDIA       | <backend_t::nvidia, cuDevice, 0>
-//  Level0       | <backend_t::level0, uuid[0-63], uuid[64-127]>
-//  Pure CPU     | <0, 0, 0>
-//  Pure GPU     | <0, cl_device, 0>
-using device_id_t = std::tuple<int, uint64_t, uint64_t>;
-
-struct device_id_hash_t {
-    size_t operator()(const device_id_t &id) const {
-        size_t result = 0;
-        result = hash_combine(result, std::get<0>(id));
-        result = hash_combine(result, std::get<1>(id));
-        result = hash_combine(result, std::get<2>(id));
-        return result;
-    }
-};
 
 // A setting (basically a value) that can be set() multiple times until the
 // time first time the get() method is called. The set() method is expected to
@@ -803,6 +869,79 @@ struct nop_deleter_t {
 template <typename T>
 using maybe_unique_ptr = std::unique_ptr<T, nop_deleter_t>;
 #endif // DNNL_MAYBE_UNIQUE_PTR_IS_UNIQUE
+
+// Common abstraction to manipulate nibbles in memory as pairs
+struct nibble2_t {
+
+    // constructs a nibble pair from a pair of uint8_t values
+    nibble2_t(uint8_t low_, uint8_t high_) : low(low_), high(high_) {}
+
+    // constructs a nibble pairs from an uin8_t, taking its low and high part
+    nibble2_t(uint8_t pack_) : low(pack_ & 0xf), high((pack_ >> 4) & 0xf) {}
+
+    // sets low (idx=0) or high (idx=1)  nibble.
+    inline void set(uint8_t val, int idx) {
+        switch (idx) {
+            case 0: low = val; return;
+            case 1: high = val; return;
+            default: assert(!"Out of range index"); return;
+        }
+    }
+
+    // returns low (idx = 0) or high (idx = 1) nibble in a uint8_t
+    inline uint8_t get(int idx) const {
+        switch (idx) {
+            case 0: return low;
+            case 1: return high;
+            default: assert(!"out of range index"); return 0;
+        }
+    }
+
+    // returns pair of nibbles as uint8t
+    inline uint8_t get() const { return static_cast<uint8_t>(high << 4 | low); }
+
+private:
+    uint8_t low : 4;
+    uint8_t high : 4;
+};
+static_assert(sizeof(nibble2_t) == 1, "nibble2_t must be 1 byte");
+
+/// Iterates through a binary integer
+/// usage:
+///
+/// for(int idx : mask_iterator(13)) { // 13 == 1101
+///     printf("%d\t", idx);
+/// }
+/// output: 0  2  3
+class mask_iterator { // NOLINT(readability-identifier-naming)
+    int mask_;
+    int index_;
+
+public:
+    using iterator_category = std::input_iterator_tag;
+    using difference_type = int;
+    using value_type = int;
+    using pointer = value_type *;
+    using reference = value_type &;
+    mask_iterator() : mask_(0), index_(0) {}
+    mask_iterator(int mask) : mask_(mask), index_(0) {
+        if ((mask_ & 0x1) == 0) { ++(*this); }
+    }
+    mask_iterator &begin() { return *this; }
+    mask_iterator end() const { return 0; }
+    value_type operator*() const { return index_; }
+    mask_iterator &operator++() {
+        do {
+            index_++;
+            mask_ >>= 1;
+        } while ((mask_ & 0x1) == 0 && mask_ != 0);
+        if (mask_ == 0) { index_ = 0; }
+        return *this;
+    }
+    bool operator!=(const mask_iterator &other) const {
+        return mask_ != other.mask_ || index_ != other.index_;
+    }
+};
 
 } // namespace impl
 } // namespace dnnl

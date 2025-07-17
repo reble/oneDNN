@@ -7,8 +7,8 @@ requests! To get started, see the GitHub
 You can:
 
 - Submit your changes directly with a
-  [pull request](https://github.com/oneapi-src/oneDNN/pulls)
-- Log a bug or feedback with an [issue](https://github.com/oneapi-src/oneDNN/issues)
+  [pull request](https://github.com/uxlfoundation/oneDNN/pulls)
+- Log a bug or feedback with an [issue](https://github.com/uxlfoundation/oneDNN/issues)
 
 **See also:** [Contributor Covenant](CODE_OF_CONDUCT.md) code of conduct.
 
@@ -54,7 +54,7 @@ For Comments (RFC) process, which consists of opening, discussing, and
 accepting (promoting) RFC pull requests.
 
 More information about the process can be found in the dedicated
-[`rfcs`](https://github.com/oneapi-src/oneDNN/tree/rfcs) branch.
+[`rfcs`](https://github.com/uxlfoundation/oneDNN/tree/rfcs) branch.
 
 ## Code contribution guidelines
 
@@ -137,7 +137,18 @@ following information:
 oneDNN uses gtests for lightweight functional testing and benchdnn for
 performance and functional testing.
 
-Be sure to extend the existing tests when fixing an issue.
+Verify the modified code is covered by existing tests. If not, update the
+coverage to validate the change and sumbit it as a part of the PR.
 
-Developing new benchdnn tests can be hard, so it is a good idea to start with
-gtests first.
+Use the following command to run tests selected by a build configuration:
+``` sh
+    ctest
+```
+
+To modify the coverage, use the
+[`ONEDNN_TEST_SET`](https://uxlfoundation.github.io/oneDNN/dev_guide_build_options.html#onednn-test-set)
+build option. More information with examples can be found in [build guide](https://uxlfoundation.github.io/oneDNN/dev_guide_build.html#validate-the-build).
+Before submitting any code, it is advised to run the `NIGHTLY` test set.
+
+More details on how to run benchdnn can be found in
+[benchdnn documentation](tests/benchdnn/doc/benchdnn_general_info.md#running-tests).

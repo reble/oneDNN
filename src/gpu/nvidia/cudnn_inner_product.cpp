@@ -18,10 +18,10 @@
 #include "gpu/nvidia/cudnn_inner_product.hpp"
 #include "gpu/nvidia/cudnn_conv_inner_product.hpp"
 #include "gpu/nvidia/cudnn_gemm_inner_product.hpp"
+#include "gpu/nvidia/stream.hpp"
 #include "gpu/nvidia/sycl_cuda_scoped_context.hpp"
-#include "gpu/nvidia/sycl_cuda_stream.hpp"
-#include "sycl/sycl_buffer_memory_storage.hpp"
-#include "sycl/sycl_memory_storage_helper.hpp"
+#include "xpu/sycl/buffer_memory_storage.hpp"
+#include "xpu/sycl/memory_storage_helper.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -31,8 +31,8 @@ namespace nvidia {
 status_t cudnn_inner_product_fwd_t::execute(const exec_ctx_t &ctx) const {
     if (pd()->has_zero_dim_memory()) return status::success;
 
-    nvidia::sycl_cuda_stream_t *cuda_stream
-            = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
+    nvidia::stream_t *cuda_stream
+            = utils::downcast<nvidia::stream_t *>(ctx.stream());
 
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
         auto arg_src = CTX_IN_SYCL_MEMORY(DNNL_ARG_SRC);
@@ -49,8 +49,10 @@ status_t cudnn_inner_product_fwd_t::execute(const exec_ctx_t &ctx) const {
                 memory_tracking::names::key_iprod_int_dat_in_acc_dt);
         auto arg_spacial_scratch
                 = CTX_SCRATCH_SYCL_MEMORY(memory_tracking::names::key_none);
+        auto arg_f32_bias_scratch = CTX_SCRATCH_SYCL_MEMORY(
+                memory_tracking::names::key_iprod_bias_bf16_convert_wsp);
         compat::host_task(cgh, [=, this](const compat::interop_handle &ih) {
-            auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
+            auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(
                     cuda_stream->engine());
             auto sc = cuda_sycl_scoped_context_handler_t(sycl_engine);
             // SYCL out-of-order queue encapsulates multiple CUstream objects.
@@ -72,6 +74,7 @@ status_t cudnn_inner_product_fwd_t::execute(const exec_ctx_t &ctx) const {
             args.push_back(arg_src_scale.get_native_pointer(ih));
             args.push_back(arg_wei_scale.get_native_pointer(ih));
             args.push_back(arg_dst_scale.get_native_pointer(ih));
+            args.push_back(arg_f32_bias_scratch.get_native_pointer(ih));
 
             pd()->inner_product_impl_->execute(
                     cudnn_handle, cublas_handle, args);
@@ -81,8 +84,8 @@ status_t cudnn_inner_product_fwd_t::execute(const exec_ctx_t &ctx) const {
 
 status_t cudnn_inner_product_bwd_data_t::execute(const exec_ctx_t &ctx) const {
     if (pd()->has_zero_dim_memory()) return status::success;
-    nvidia::sycl_cuda_stream_t *cuda_stream
-            = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
+    nvidia::stream_t *cuda_stream
+            = utils::downcast<nvidia::stream_t *>(ctx.stream());
 
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
         auto arg_diff_dst = CTX_IN_SYCL_MEMORY(DNNL_ARG_DIFF_DST);
@@ -94,7 +97,7 @@ status_t cudnn_inner_product_bwd_data_t::execute(const exec_ctx_t &ctx) const {
                 = CTX_SCRATCH_SYCL_MEMORY(memory_tracking::names::key_none);
 
         compat::host_task(cgh, [=, this](const compat::interop_handle &ih) {
-            auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
+            auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(
                     cuda_stream->engine());
             auto sc = cuda_sycl_scoped_context_handler_t(sycl_engine);
             // SYCL out-of-order queue encapsulates multiple CUstream objects.
@@ -122,8 +125,8 @@ status_t cudnn_inner_product_bwd_data_t::execute(const exec_ctx_t &ctx) const {
 status_t cudnn_inner_product_bwd_weights_t::execute(
         const exec_ctx_t &ctx) const {
 
-    nvidia::sycl_cuda_stream_t *cuda_stream
-            = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
+    nvidia::stream_t *cuda_stream
+            = utils::downcast<nvidia::stream_t *>(ctx.stream());
 
     if (pd()->has_zero_dim_memory()) {
         auto wei_sz = memory_desc_wrapper(pd()->diff_weights_md(0)).size();
@@ -158,7 +161,7 @@ status_t cudnn_inner_product_bwd_weights_t::execute(
                 = CTX_SCRATCH_SYCL_MEMORY(memory_tracking::names::key_none);
 
         compat::host_task(cgh, [=, this](const compat::interop_handle &ih) {
-            auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
+            auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(
                     cuda_stream->engine());
             auto sc = cuda_sycl_scoped_context_handler_t(sycl_engine);
             // SYCL out-of-order queue encapsulates multiple CUstream objects.

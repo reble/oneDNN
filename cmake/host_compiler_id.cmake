@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2024 Intel Corporation
+# Copyright 2024-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -63,29 +63,31 @@ else()
     message(STATUS "Host compiler: ${DPCPP_HOST_COMPILER}")
 endif()
 
-# Only GNU compiler is supported as a custom host compiler at this point.
-execute_process(COMMAND ${DPCPP_HOST_COMPILER} -c -DTRY_GNU ${PROJECT_SOURCE_DIR}/cmake/host_compiler_id.cpp -o ${PROJECT_BINARY_DIR}/host_compiler_id.o
-                RESULT_VARIABLE EXECUTE_STATUS ERROR_VARIABLE STDERR_MESSAGE)
+function(IDENTIFY_HOST_COMPILER_KIND)
+    macro(TRY_IDENTIFY KIND)
+        execute_process(COMMAND ${DPCPP_HOST_COMPILER} -c -DTRY_${KIND} ${PROJECT_SOURCE_DIR}/cmake/host_compiler_id.cpp -o ${PROJECT_BINARY_DIR}/host_compiler_id.o
+                        RESULT_VARIABLE EXECUTE_STATUS ERROR_VARIABLE STDERR_MESSAGE)
+        if("${EXECUTE_STATUS}" STREQUAL "0")
+            set(DPCPP_HOST_COMPILER_KIND "${KIND}" PARENT_SCOPE)
+            set(STDERR_MESSAGE "${STDERR_MESSAGE}" PARENT_SCOPE)
+            return()
+        endif()
+    endmacro()
 
-if("${EXECUTE_STATUS}" STREQUAL "0")
-    set(DPCPP_HOST_COMPILER_KIND "GNU")
-else()
-    # This should be changed to "INFO" kind of messages when we add support for
-    # more host compiler kinds. Or we can comment them out and keep for debug
-    # purposes.
-    if(NOT STDERR_MESSAGE STREQUAL "")
-        message(FATAL_ERROR "Host compiler identification process failed with the following status: \"${EXECUTE_STATUS}\". The error message: \"${STDERR_MESSAGE}\".")
-    else()
-        message(FATAL_ERROR "Host compiler identification process failed with the following status: \"${EXECUTE_STATUS}\".")
-    endif()
-endif()
+    TRY_IDENTIFY(GNU)
+    TRY_IDENTIFY(CLANG)
+
+    message(FATAL_ERROR "The provided host compiler could not be identified")
+endfunction()
+
+IDENTIFY_HOST_COMPILER_KIND()
 
 message(STATUS "Host compiler kind: ${DPCPP_HOST_COMPILER_KIND}")
 
 # Preprocessor prints out major and minor versions of the compiler when
 # compiling host_compiler_id.cpp. Using the regex below to extract
 # the versions from the preprocessor message.
-string(REGEX MATCH "([0-9]+\\.[0-9]+)" _ "${STDERR_MESSAGE}")
+string(REGEX MATCH "host compiler version: ([0-9]+\\.[0-9]+)" _ "${STDERR_MESSAGE}")
 set(DPCPP_HOST_COMPILER_VER ${CMAKE_MATCH_1} CACHE INTERNAL "")
 
 string(REPLACE "." ";" DPCPP_HOST_COMPILER_VER_LIST ${DPCPP_HOST_COMPILER_VER})
@@ -96,7 +98,13 @@ message(STATUS "Host compiler version: ${DPCPP_HOST_COMPILER_MAJOR_VER}.${DPCPP_
 
 # Check the version of the provided host compiler.
 if(DPCPP_HOST_COMPILER_KIND STREQUAL "GNU")
-    if((DPCPP_HOST_COMPILER_MAJOR_VER LESS 7) OR (DPCPP_HOST_COMPILER_MAJOR_VER EQUAL 7 AND DPCPP_HOST_COMPILER_MINOR_VER LESS 4))
-        message(FATAL_ERROR "The minimum version of ${DPCPP_HOST_COMPILER_KIND} host compiler is 7.4.")
+    if(DPCPP_HOST_COMPILER_MAJOR_VER LESS 8)
+        message(FATAL_ERROR "The minimum version of ${DPCPP_HOST_COMPILER_KIND} host compiler is 8.0.")
+    endif()
+endif()
+
+if(DPCPP_HOST_COMPILER_KIND STREQUAL "CLANG")
+    if(DPCPP_HOST_COMPILER_MAJOR_VER LESS 11)
+        message(FATAL_ERROR "The minimum version of ${DPCPP_HOST_COMPILER_KIND} host compiler is 11.0.")
     endif()
 endif()

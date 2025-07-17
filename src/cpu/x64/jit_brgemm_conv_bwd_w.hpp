@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -46,14 +46,8 @@ namespace x64 {
 
 struct brgemm_convolution_bwd_weights_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_weights_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_weights_pd_t(adesc, attr, hint_fwd_pd)
-            , jcp_()
-            , brgs_sz_(0)
-            , bs_c(0) {}
-
-        ~pd_t() = default;
+        using cpu_convolution_bwd_weights_pd_t::
+                cpu_convolution_bwd_weights_pd_t;
 
         DECLARE_COMMON_PD_T(
                 JIT_IMPL_NAME_HELPER("brgconv_bwd_w:", jcp_.isa, ""),
@@ -61,14 +55,14 @@ struct brgemm_convolution_bwd_weights_t : public primitive_t {
 
         status_t init(engine_t *engine);
 
-        jit_brgemm_conv_conf_t jcp_;
+        jit_brgemm_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
         jit_conv_conf_t jit_jcp_;
         void copy2jit_jcp();
 
-        int brgs_sz_;
+        int brgs_sz_ = 0;
         std::shared_ptr<brgemm_containers::brgemm_desc_container_t> brgs_;
 
-        int bs_c;
+        int bs_c = 0;
         std::vector<int> batchsizes;
         bool are_empty_bs {false};
 
@@ -128,9 +122,6 @@ struct brgemm_convolution_bwd_weights_t : public primitive_t {
 
     brgemm_convolution_bwd_weights_t(const pd_t *apd) : primitive_t(apd) {}
 
-    typedef typename prec_traits<data_type::bf16>::type src_data_t;
-    typedef typename prec_traits<data_type::bf16>::type diff_dst_data_t;
-
     status_t init(engine_t *engine) override;
 
     status_t execute(const exec_ctx_t &ctx) const override {
@@ -163,37 +154,46 @@ private:
     status_t add_brg_kernel(int bs, int M, int i_N, int i_K, int i_init);
     void call_brgemm_kernel(
             thread_info_t &btc, int brg_idx, int batch_size, void *ptr_C) const;
+
     inline dim_t wei_offset_int(
             int g, int oc_b, int ic_b, int kd, int kh, int kw) const {
         const auto &jcp = pd()->jcp_;
-        const dim_t const_extra_offset = jcp.ic_block * jcp.oc_block;
-        dim_t extra_offset
-                = ((kd * jcp.kh + kh) * jcp.kw + kw) * const_extra_offset;
+        const dim_t kw_offset = jcp.ic_block * jcp.oc_block;
+        dim_t extra_offset = ((kd * jcp.kh + kh) * jcp.kw + kw) * kw_offset;
         return (dim_t)((g * jcp.nb_oc + oc_b) * jcp.nb_ic + ic_b) * jcp.kd
-                * jcp.kh * jcp.kw * jcp.ic_block * jcp.oc_block
+                * jcp.kh * jcp.kw * kw_offset
                 + extra_offset;
     }
 
     inline dim_t wei_offset_int(int g, int oc_b, int ic_b, int kX) const {
         const auto &jcp = pd()->jcp_;
-        const dim_t const_extra_offset = jcp.kw * jcp.ic_block * jcp.oc_block;
-        dim_t extra_offset = (jcp.ndims == 5) ? kX * jcp.kh * const_extra_offset
-                                              : kX * const_extra_offset;
-        return (dim_t)((g * jcp.nb_oc + oc_b) * jcp.nb_ic + ic_b) * jcp.kd
-                * jcp.kh * jcp.kw * jcp.ic_block * jcp.oc_block
-                + extra_offset;
+        const dim_t kh_offset = jcp.kw * jcp.ic_block * jcp.oc_block;
+        dim_t extra_offset
+                = (jcp.ndims == 5) ? static_cast<dim_t>(kX) * jcp.kh : kX;
+        const auto res = ((dim_t)((g * jcp.nb_oc + oc_b) * jcp.nb_ic + ic_b)
+                                         * jcp.kd * jcp.kh
+                                 + extra_offset)
+                * kh_offset;
+        return res;
     }
 
-    inline dim_t wei_offset_ext(int g, int oc_b, int ic_b, int kX) const {
+    inline dim_t wei_offset_ext(int g, int oc_b, int ic_b) const {
         const auto &jcp = pd()->jcp_;
-        const int nb_ic = utils::div_up(jcp.ic, 2 * jcp.ic_block);
-        const dim_t const_extra_offset
-                = jcp.kw * jcp.ic_block * jcp.oc_block * 2;
-        dim_t extra_offset = (jcp.ndims == 5) ? kX * jcp.kh * const_extra_offset
-                                              : kX * const_extra_offset;
-        return (dim_t)((g * jcp.nb_oc + oc_b) * nb_ic + ic_b) * jcp.kd * jcp.kh
-                * jcp.kw * jcp.ic_block * jcp.oc_block * 2
-                + extra_offset;
+        const int vnni_granularity = data_type_vnni_granularity(jcp.wei_dt);
+        if (vnni_granularity == 0) {
+            assert(!"Invalid vnni granularity.");
+            return 0;
+        }
+
+        const int vnni_ic_b = ic_b / vnni_granularity;
+        const int vnni_ic_block = vnni_granularity * jcp.ic_block;
+        const int vnni_nb_ic = utils::div_up(jcp.ic, vnni_ic_block);
+        const dim_t kh_offset
+                = static_cast<dim_t>(jcp.kw) * jcp.oc_block * vnni_ic_block;
+        const auto res
+                = (dim_t)((g * jcp.nb_oc + oc_b) * vnni_nb_ic + vnni_ic_b)
+                * jcp.kd * jcp.kh * kh_offset;
+        return res;
     }
 
     inline int get_end(int start, int step, int limit) const {

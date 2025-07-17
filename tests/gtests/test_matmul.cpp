@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -259,15 +259,21 @@ protected:
 
         auto matmul_pd = pd_t(eng, src_md, weights_md, bia_md, dst_md, attr);
 
-        auto aa = allows_attr_t {false};
-        aa.po_binary = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
+        allows_attr_t aa {};
+        aa.po_binary = !is_amd_gpu(eng);
         aa.po_eltwise = true;
-        aa.po_prelu = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
+        aa.po_prelu = !is_amd_gpu(eng);
         aa.po_sum = true;
-        aa.scales = true;
+        // scales are not supported by HIP
+        aa.scales = !is_amd_gpu(eng);
         bool is_int8 = impl::utils::one_of(src_md.get_data_type(),
                 memory::data_type::s8, memory::data_type::u8);
         if (is_int8) aa.zp = true;
+
+#ifdef DNNL_SYCL_GENERIC
+        aa.po_prelu = true;
+        aa.po_binary = true;
+#endif
 
         test_fwd_pd_constructors<pd_t>(
                 matmul_pd, aa, src_md, weights_md, bia_md, dst_md);

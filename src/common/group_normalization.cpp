@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -147,19 +147,25 @@ status_t group_normalization_attr_check(const group_normalization_desc_t &desc,
 
         const bool is_int8 = utils::one_of(src_dt, data_type::s8, data_type::u8)
                 || utils::one_of(dst_dt, data_type::s8, data_type::u8);
-        if (is_int8) fwd_attr_mask |= smask_t::scales_runtime;
+        if (is_int8) fwd_attr_mask |= smask_t::scales;
 
         VCHECK_GNORM_UNIMPL(attr->has_default_values(fwd_attr_mask, dst_dt),
                 VERBOSE_UNSUPPORTED_ATTR);
 
         // Check scales
         if (!attr->scales_.has_default_values()) {
-            const auto &sc = attr->scales_;
-            const int mask_src = sc.get(DNNL_ARG_SRC).mask_;
-            const int mask_dst = sc.get(DNNL_ARG_DST).mask_;
-
-            VCHECK_GNORM_UNIMPL(utils::everyone_is(0, mask_src, mask_dst),
+            static const std::vector<int> supported_args {
+                    DNNL_ARG_SRC, DNNL_ARG_DST};
+            VCHECK_GNORM_UNIMPL(
+                    attr->scales_.has_default_values(supported_args),
                     VERBOSE_UNSUPPORTED_SCALES_CFG);
+
+            for (int arg : supported_args) {
+                if (attr->scales_.has_default_values(arg)) continue;
+
+                const int mask = attr->scales_.get_mask(arg);
+                VCHECK_GNORM_UNIMPL(mask == 0, VERBOSE_UNSUPPORTED_SCALES_CFG);
+            }
         }
 
         // Check post-ops
@@ -168,6 +174,9 @@ status_t group_normalization_attr_check(const group_normalization_desc_t &desc,
             using namespace primitive_kind;
             VCHECK_GNORM_UNIMPL(po.has_default_values({binary, eltwise}),
                     VERBOSE_UNSUPPORTED_POSTOP);
+
+            // Note: verbose support is inside the call.
+            CHECK(po.validate_binary(engine->kind(), &desc.dst_desc));
         }
     } else {
         VCHECK_GNORM_UNIMPL(false, VERBOSE_UNSUPPORTED_ATTR);

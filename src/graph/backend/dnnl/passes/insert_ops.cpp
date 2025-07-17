@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -28,6 +28,10 @@
 #include "graph/backend/dnnl/internal_attrs.hpp"
 #include "graph/backend/dnnl/passes/insert_ops.hpp"
 #include "graph/backend/dnnl/passes/utils.hpp"
+
+#define VCHECK_INSERT_OPS(cond, status, msg, ...) \
+    VCONDCHECK(graph, create, check, insert_ops, (cond), status, msg, \
+            ##__VA_ARGS__);
 
 namespace dnnl {
 namespace impl {
@@ -154,6 +158,7 @@ std::unordered_map<op_kind_t, std::pair<io_indices_t, io_indices_t>>
                 {op_kind::dnnl_prelu_bwd, {{0, 1, 2}, {0, 1}}},
                 {op_kind::dnnl_resampling, {{0}, {0}}},
                 {op_kind::dnnl_resampling_bwd, {{0, 1}, {0}}},
+                {op_kind::dnnl_groupnorm, {{0}, {0}}},
 };
 
 // insert permute for those ops only requiring data_format attribute
@@ -331,15 +336,24 @@ status_t insert_to_group_for_reorder(std::shared_ptr<subgraph_t> &sg) {
             // reorder's input has blocked format with group
             // while output has plain format, perhaps for
             // backward path. No such case for now, disable
-            return status::unimplemented;
+            VCHECK_INSERT_OPS(false, status::unimplemented,
+                    "unsupported i/o dimentions to insert to_group for "
+                    "reorder, input ndims: %d, output ndims: %d",
+                    in_md.get_ndims(), out_md.get_ndims());
         } else if (in_md.get_ndims() + 1 == out_md.get_ndims()) {
             // reorder's input has plain format while output
             // has blocked format with group, typically for
             // weight prepacking
             auto group = out_md.get_dims()[0];
-            if (group * out_md.get_dims()[1] != in_md.get_dims()[0])
-                return status::invalid_shape;
-
+            VCHECK_INSERT_OPS(
+                    group * out_md.get_dims()[1] == in_md.get_dims()[0],
+                    status::invalid_shape,
+                    "unmatched shape to insert to_group for reorder, group: "
+                    "%ld,"
+                    "output dims[1]: %ld, input dims[0], %ld",
+                    static_cast<long int>(group),
+                    static_cast<long int>(out_md.get_dims()[1]),
+                    static_cast<long int>(in_md.get_dims()[0]));
             // insert to_group op
             op_ptr to_group_op = std::make_shared<op_t>(op_kind::dnnl_to_group);
             to_group_op->set_attr<int64_t>(op_attr::groups, group);
@@ -347,12 +361,95 @@ status_t insert_to_group_for_reorder(std::shared_ptr<subgraph_t> &sg) {
             rewriter.insert_op_before(to_group_op, cur_op, 0);
         } else {
             // illegal shape
-            return status::invalid_shape;
+            VCHECK_INSERT_OPS(false, status::invalid_shape,
+                    "invalid shape to insert to_group for reorder");
         }
     }
 
     rewriter.run();
     return status::success;
+}
+
+status_t insert_permute_for_dynamic_mul_scale_sub_zp(
+        std::shared_ptr<subgraph_t> &sg) {
+    subgraph_rewriter_t rewriter(sg);
+    std::vector<op_ptr> permute_op_group;
+
+    for (auto &cur_op : sg->get_ops()) {
+        if (cur_op->get_kind() != op_kind::dnnl_sub_zps
+                && cur_op->get_kind() != op_kind::dnnl_mul_scales)
+            continue;
+
+        if (cur_op->get_attr<std::string>(op_attr::qtype) == "per_tensor")
+            continue;
+
+        // This pass only handle dynamic quantization
+        if (cur_op->get_kind() == op_kind::dnnl_sub_zps) {
+            if (!cur_op->has_attr(op_attr::with_runtime_zps)
+                    || !cur_op->get_attr<bool>(op_attr::with_runtime_zps))
+                continue;
+
+            auto out_val = cur_op->get_output_values()[0];
+            auto consumers = out_val->get_consumers();
+            if (consumers.empty()) continue;
+
+            auto &consumer_op = consumers[0].get_op();
+            if (consumer_op.get_kind() != op_kind::dnnl_mul_scales) continue;
+            if (!consumer_op.has_attr(op_attr::with_runtime_scales)
+                    || !consumer_op.get_attr<bool>(
+                            op_attr::with_runtime_scales))
+                continue;
+
+            auto scale_out_val = consumer_op.get_output_values()[0];
+            auto &scale_consumer_op
+                    = scale_out_val->get_consumers()[0].get_op();
+            if (scale_consumer_op.get_kind() != op_kind::dnnl_matmul) continue;
+
+            if (scale_consumer_op.has_attr(op_attr::transpose_b)
+                    && scale_consumer_op.get_attr<bool>(op_attr::transpose_b)) {
+
+                permute_op_group.emplace_back(cur_op);
+            }
+        } else {
+            if (!cur_op->has_attr(op_attr::with_runtime_scales)
+                    || !cur_op->get_attr<bool>(op_attr::with_runtime_scales))
+                continue;
+
+            auto out_val = cur_op->get_output_values()[0];
+            auto consumers = out_val->get_consumers();
+            if (consumers.empty()) continue;
+
+            auto &consumer_op = consumers[0].get_op();
+            if (consumer_op.get_kind() != op_kind::dnnl_matmul) continue;
+
+            if (consumer_op.has_attr(op_attr::transpose_b)
+                    && consumer_op.get_attr<bool>(op_attr::transpose_b)) {
+                permute_op_group.emplace_back(cur_op);
+            }
+        }
+    }
+
+    if (permute_op_group.empty()) return status::success;
+
+    for (auto &cur_op : permute_op_group) {
+        auto ndims = cur_op->get_input_value(0)->get_logical_tensor().ndims;
+        if (cur_op->get_attr<std::string>(op_attr::qtype) == "per_group") {
+            op_ptr permute_op = std::make_shared<op_t>(op_kind::dnnl_permute);
+            auto perm = get_last_two_dims_permutation(ndims);
+            permute_op->set_attr<std::vector<int64_t>>(
+                    op_attr::permutation, perm);
+            rewriter.insert_op_before(permute_op, cur_op, 1);
+
+            auto group_shape = cur_op->get_attr<std::vector<int64_t>>(
+                    op_attr::group_shape);
+            std::swap(group_shape[ndims - 1], group_shape[ndims - 2]);
+            cur_op->set_attr<std::vector<int64_t>>(
+                    op_attr::group_shape, group_shape);
+        }
+    }
+
+    rewriter.run();
+    return infer_shape(sg);
 }
 
 status_t insert_permute_for_matmul(std::shared_ptr<subgraph_t> &sg) {
@@ -477,6 +574,108 @@ status_t insert_reshape_for_ndx2d_matmul(std::shared_ptr<subgraph_t> &sg) {
     return infer_shape(sg);
 }
 
+status_t insert_reshape_for_sdpa(std::shared_ptr<subgraph_t> &sg) {
+    subgraph_rewriter_t rewriter(sg);
+
+    for (auto &cur_op : sg->get_ops()) {
+        if (cur_op->get_kind() != op_kind::dnnl_sdpa) continue;
+
+        int32_t query_ndims
+                = cur_op->get_input_value(0)->get_logical_tensor().ndims;
+        if (query_ndims != 5) continue;
+
+        // Insert reshape for Query
+        auto query_dims = logical_tensor_wrapper_t(
+                cur_op->get_input_value(0)->get_logical_tensor())
+                                  .vdims();
+        dims expected_query_dims {
+                query_dims[0], -1, query_dims[3], query_dims[4]};
+        op_ptr reshape_query = std::make_shared<op_t>(op_kind::dnnl_reshape);
+        reshape_query->set_attr<bool>(op_attr::special_zero, false);
+        reshape_query->set_attr<std::vector<int64_t>>(
+                op_attr::shape, expected_query_dims);
+        rewriter.insert_op_before(reshape_query, cur_op, 0);
+
+        // Insert reshape for Key
+        auto key_dims = logical_tensor_wrapper_t(
+                cur_op->get_input_value(1)->get_logical_tensor())
+                                .vdims();
+        dims expected_key_dims {key_dims[0], -1, key_dims[3], key_dims[4]};
+        op_ptr reshape_key = std::make_shared<op_t>(op_kind::dnnl_reshape);
+        reshape_key->set_attr<bool>(op_attr::special_zero, false);
+        reshape_key->set_attr<std::vector<int64_t>>(
+                op_attr::shape, expected_key_dims);
+        rewriter.insert_op_before(reshape_key, cur_op, 1);
+
+        // Insert reshape for value
+        auto value_dims = logical_tensor_wrapper_t(
+                cur_op->get_input_value(2)->get_logical_tensor())
+                                  .vdims();
+        dims expected_value_dims {
+                value_dims[0], -1, value_dims[3], value_dims[4]};
+        op_ptr reshape_value = std::make_shared<op_t>(op_kind::dnnl_reshape);
+        reshape_value->set_attr<bool>(op_attr::special_zero, false);
+        reshape_value->set_attr<std::vector<int64_t>>(
+                op_attr::shape, expected_value_dims);
+        rewriter.insert_op_before(reshape_value, cur_op, 2);
+
+        size_t index = 3;
+        // Insert reshape for scale
+        if (cur_op->get_attr<bool>(op_attr::with_scale)) {
+            int32_t scale_ndims = cur_op->get_input_value(index)
+                                          ->get_logical_tensor()
+                                          .ndims;
+            if (scale_ndims == 5) {
+                auto scale_dims = logical_tensor_wrapper_t(
+                        cur_op->get_input_value(index)->get_logical_tensor())
+                                          .vdims();
+                dims expected_scale_dims {
+                        scale_dims[0], -1, scale_dims[3], scale_dims[4]};
+                op_ptr reshape_scale
+                        = std::make_shared<op_t>(op_kind::dnnl_reshape);
+                reshape_scale->set_attr<bool>(op_attr::special_zero, false);
+                reshape_scale->set_attr<std::vector<int64_t>>(
+                        op_attr::shape, expected_scale_dims);
+                rewriter.insert_op_before(reshape_scale, cur_op, index);
+            }
+            index += 1;
+        }
+        // Insert reshape for mask
+        if (cur_op->get_attr<int64_t>(op_attr::mask_type)
+                == static_cast<int64_t>(attn_mask_type::buffer)) {
+            int32_t mask_ndims = cur_op->get_input_value(index)
+                                         ->get_logical_tensor()
+                                         .ndims;
+            if (mask_ndims == 5) {
+                auto mask_dims = logical_tensor_wrapper_t(
+                        cur_op->get_input_value(index)->get_logical_tensor())
+                                         .vdims();
+                dims expected_mask_dims {
+                        mask_dims[0], -1, mask_dims[3], mask_dims[4]};
+                op_ptr reshape_mask
+                        = std::make_shared<op_t>(op_kind::dnnl_reshape);
+                reshape_mask->set_attr<bool>(op_attr::special_zero, false);
+                reshape_mask->set_attr<std::vector<int64_t>>(
+                        op_attr::shape, expected_mask_dims);
+                rewriter.insert_op_before(reshape_mask, cur_op, index);
+            }
+        }
+
+        // Insert reshape for output
+        auto output_dims = logical_tensor_wrapper_t(
+                cur_op->get_output_value(0)->get_logical_tensor())
+                                   .vdims();
+        const dims &expected_output_dims = output_dims;
+        op_ptr reshape_output = std::make_shared<op_t>(op_kind::dnnl_reshape);
+        reshape_output->set_attr<bool>(op_attr::special_zero, false);
+        reshape_output->set_attr<std::vector<int64_t>>(
+                op_attr::shape, expected_output_dims);
+        rewriter.insert_op_after(reshape_output, cur_op, 0);
+    }
+    rewriter.run();
+    return infer_shape(sg);
+}
+
 status_t insert_unsqueeze_and_squeeze_for_matmul(
         std::shared_ptr<subgraph_t> &sg) {
     subgraph_rewriter_t rewriter(sg);
@@ -487,7 +686,11 @@ status_t insert_unsqueeze_and_squeeze_for_matmul(
 
         int32_t src_ndims = op->get_input_value(0)->get_logical_tensor().ndims;
         int32_t wei_ndims = op->get_input_value(1)->get_logical_tensor().ndims;
-        assertm(src_ndims >= 1 && wei_ndims >= 1, "invalid dims");
+        VCHECK_INSERT_OPS(src_ndims >= 1 && wei_ndims >= 1,
+                status::invalid_shape,
+                "src_ndims and wei_ndims should >= 1, src_ndims: %d, "
+                "wei_ndims: %d",
+                src_ndims, wei_ndims);
 
         int32_t unsqueezed_dst_ndims
                 = std::max(std::max(src_ndims, wei_ndims), 2);
@@ -604,8 +807,9 @@ impl::status_t insert_runtime_u8_to_s8_for_matmul(
                 // add a binary add here.
             }
         } else {
-            assertm(cur_op->num_inputs() == index,
-                    "only support insert input at the end of inputs");
+            VCHECK_INSERT_OPS(cur_op->num_inputs() == index,
+                    status::unimplemented,
+                    "only support insert input for wei at the end of inputs");
             std::vector<int64_t> zp {-128};
             auto zps_op = std::make_shared<op_t>(op_kind::dnnl_add_zps);
             zps_op->set_attr<std::string>(op_attr::qtype, "per_tensor");
@@ -657,6 +861,7 @@ impl::status_t insert_runtime_u8_to_s8_for_matmul(
         const_zps_dst_value->set_layout_type(layout_type::strided);
         const_zps_dst_value->set_strides({1});
         const_zps_op->add_output(const_zps_dst_value);
+        u8_to_s8_op->set_attr<std::string>(op_attr::qtype, "per_tensor");
         u8_to_s8_op->set_attr(op_attr::with_runtime_dst_zps, true);
         rewriter.insert_op_before(u8_to_s8_op, cur_op, 1);
         u8_to_s8_op->connect_input(1, const_zps_dst_value);
@@ -746,10 +951,11 @@ status_t insert_unsqueeze_for_prelu(std::shared_ptr<subgraph_t> &sg) {
         const bool per_channel_broadcast
                 = cur_op->get_attr<bool>(op_attr::per_channel_broadcast);
 
-        if (!prelu_doable(ltw(src_lt).vdims(), ltw(wei_lt).vdims(), data_format,
-                    per_channel_broadcast)) {
-            return status::invalid_shape;
-        }
+        const bool prelu_doable_status = prelu_doable(ltw(src_lt).vdims(),
+                ltw(wei_lt).vdims(), data_format, per_channel_broadcast);
+        VCHECK_INSERT_OPS(prelu_doable_status, status::invalid_shape,
+                "invalid shape to insert unsqueeze for prelu");
+
         // insert unsqueeze op
         int32_t src_ndims = src_lt.ndims;
         int32_t wei_ndims = wei_lt.ndims;
@@ -799,10 +1005,11 @@ status_t insert_unsqueeze_and_squeeze_for_prelu_bwd(
         const bool per_channel_broadcast
                 = wei_vdims.size() == 1 && wei_vdims[0] != 1;
 
-        if (!prelu_doable(ltw(src_lt).vdims(), wei_vdims, data_format,
-                    per_channel_broadcast)) {
-            return status::invalid_shape;
-        }
+        const bool prelu_doable_status = prelu_doable(ltw(src_lt).vdims(),
+                wei_vdims, data_format, per_channel_broadcast);
+        VCHECK_INSERT_OPS(prelu_doable_status, status::invalid_shape,
+                "invalid shape to insert unsqueeze for prelu");
+
         // insert unsqueeze op
         int32_t src_ndims = src_lt.ndims;
         int32_t wei_ndims = wei_lt.ndims;
@@ -892,6 +1099,42 @@ status_t insert_unsqueeze_and_squeeze_for_reduction(
         cur_op->set_attr(op_attr::keep_dims, true);
     }
 
+    rewriter.run();
+    return infer_shape(sg);
+}
+
+status_t insert_host_scalar(std::shared_ptr<subgraph_t> &sg) {
+    subgraph_rewriter_t rewriter(sg);
+    for (const auto &val : sg->get_input_values()) {
+        logical_tensor_t lt = val->get_logical_tensor();
+        if (lt.property == property_type::host_scalar) {
+            // Create a new dnnl_host_scalar op
+            op_ptr host_scalar_op
+                    = std::make_shared<op_t>(op_kind::dnnl_host_scalar);
+            logical_tensor_t host_scalar_op_out_lt
+                    = empty_logical_tensor_with_default_id();
+            auto host_scalar_op_out_val = std::make_shared<value_t>(
+                    *host_scalar_op, 0, host_scalar_op_out_lt, true);
+            host_scalar_op_out_val->set_data_type(lt.data_type);
+
+            std::shared_ptr<value_t> shared_val;
+            auto consumers = val->get_consumers();
+            for (const auto &consumer : consumers) {
+                if (!shared_val) {
+                    shared_val = consumer.get_op().get_input_value(
+                            consumer.get_offset());
+                }
+                val->remove_consumer(consumer.get_op(), consumer.get_offset());
+                consumer.get_op().connect_input(
+                        consumer.get_offset(), host_scalar_op_out_val);
+            }
+
+            val->add_consumer(*host_scalar_op, 0);
+            host_scalar_op->add_input(shared_val);
+            host_scalar_op->add_output(host_scalar_op_out_val);
+            rewriter.to_insert(host_scalar_op);
+        }
+    }
     rewriter.run();
     return infer_shape(sg);
 }

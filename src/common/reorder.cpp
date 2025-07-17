@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,6 +37,10 @@ namespace impl {
 #define VCHECK_REORDER(cond, msg, ...) \
     VCONDCHECK(primitive, create, check, reorder, (cond), \
             status::invalid_arguments, msg, ##__VA_ARGS__);
+
+#define VCHECK_REORDER_UNIMPL(cond, msg, ...) \
+    VCONDCHECK(primitive, create, check, reorder, (cond), \
+            status::unimplemented, msg, ##__VA_ARGS__);
 
 namespace {
 engine_t *get_reorder_engine(engine_t *src_engine, engine_t *dst_engine) {
@@ -89,7 +93,7 @@ status_t reorder_primitive_desc_create(std::shared_ptr<primitive_desc_t> &pd,
     if (attr == nullptr) attr = &default_attr();
 
     // Zero points are only allowed for integral data types
-    auto zero_points = attr->zero_points_;
+    const auto &zero_points = attr->zero_points_;
     VCHECK_REORDER(IMPLICATION(!types::is_integral_dt(src_md->data_type),
                            zero_points.has_default_values(DNNL_ARG_SRC)),
             VERBOSE_UNSUPPORTED_ZP_CFG);
@@ -97,6 +101,48 @@ status_t reorder_primitive_desc_create(std::shared_ptr<primitive_desc_t> &pd,
     VCHECK_REORDER(IMPLICATION(!types::is_integral_dt(dst_md->data_type),
                            zero_points.has_default_values(DNNL_ARG_DST)),
             VERBOSE_UNSUPPORTED_ZP_CFG);
+
+    // Check scales
+    if (!attr->scales_.has_default_values()) {
+        static const std::vector<int> supported_args {
+                DNNL_ARG_SRC, DNNL_ARG_DST};
+        VCHECK_REORDER_UNIMPL(attr->scales_.has_default_values(supported_args),
+                VERBOSE_UNSUPPORTED_SCALES_CFG);
+
+        const auto &sc = attr->scales_;
+        const auto &sc_src = sc.get(DNNL_ARG_SRC);
+        const int mask_src = sc.get_mask(DNNL_ARG_SRC);
+
+        VCHECK_REORDER(IMPLICATION(utils::one_of(src_md->data_type,
+                                           data_type::s4, data_type::u4),
+                               mask_src > 0),
+                VERBOSE_INVALID_DATATYPE, "mask for int4 source");
+
+        if (!sc_src.has_default_groups()) {
+            const int src_ndims = s_mdw.ndims();
+            const bool group_dims_are_consistent
+                    = IMPLICATION(sc_src.get_group(0) > 1,
+                              src_md->dims[src_ndims - 2] % sc_src.get_group(0)
+                                      == 0)
+                    && IMPLICATION(sc_src.get_group(1) > 1,
+                            src_md->dims[src_ndims - 1] % sc_src.get_group(1)
+                                    == 0);
+            VCHECK_REORDER(group_dims_are_consistent,
+                    "groups dimensions are not consistent with reorder "
+                    "dimensions");
+
+            // Groups are always applied to last two dimensions. Check that
+            // input scale mask is consistent with this limitation.
+            const bool mask_applies_to_last_two_dims
+                    = (mask_src & (1 << (src_ndims - 1)))
+                    && (mask_src & (1 << (src_ndims - 2)));
+            VCHECK_REORDER(mask_applies_to_last_two_dims,
+                    "mask is not consistent with groups");
+        }
+
+        VCHECK_REORDER(sc.get(DNNL_ARG_DST).has_default_groups(),
+                VERBOSE_UNSUPPORTED_SCALES_CFG);
+    }
 
     bool is_cross_engine = src_engine != dst_engine
             && utils::one_of(

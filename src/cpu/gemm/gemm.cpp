@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2024 Intel Corporation
 * Copyright 2022 IBM Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -43,7 +43,7 @@
 
 using namespace dnnl::impl::cpu::x64;
 #elif DNNL_PPC64
-#include "cpu/ppc64/ppc64_gemm_driver.hpp"
+#include "cpu/ppc64/gemm/gemm_driver.hpp"
 using namespace dnnl::impl::cpu::ppc64;
 #elif DNNL_S390X
 #include "cpu/s390x/gemm.h"
@@ -185,8 +185,7 @@ dnnl_status_t try_cblas_gemm_s8u8s32(const char *transa, const char *transb,
 #endif
 }
 
-template <>
-dnnl_status_t gemm_s8x8s32(const char *transa, const char *transb,
+dnnl_status_t gemm_s8u8s32(const char *transa, const char *transb,
         const char *offsetc, const dim_t *M, const dim_t *N, const dim_t *K,
         const float *alpha, const int8_t *A, const dim_t *LDA, const int8_t *ao,
         const uint8_t *B, const dim_t *LDB, const uint8_t *bo,
@@ -210,11 +209,10 @@ dnnl_status_t gemm_s8x8s32(const char *transa, const char *transb,
     }
 #elif DNNL_PPC64
 #ifdef __MMA__
-    int ATflag = (*transa == 'T') || (*transa == 't');
-    int BTflag = (*transb == 'T') || (*transb == 't');
 
-    return cblas_gemm_s8x8s32_ppc64(ATflag, BTflag, offsetc, *M, *N, *K, *alpha,
-            A, *LDA, ao, B, *LDB, bo, C, *beta, *LDC, co, 0);
+    status = gemm_driver(transa, transb, offsetc, M, N, K, alpha, A, LDA, ao, B,
+            LDB, bo, beta, C, LDC, co, false);
+    if (status != status::unimplemented) return status;
 #endif
 #elif DNNL_S390X
 #if defined(__VX__)
@@ -227,8 +225,7 @@ dnnl_status_t gemm_s8x8s32(const char *transa, const char *transb,
             B, LDB, bo, beta, C, LDC, co);
 }
 
-template <>
-dnnl_status_t gemm_s8x8s32(const char *transa, const char *transb,
+dnnl_status_t gemm_s8s8s32(const char *transa, const char *transb,
         const char *offsetc, const dim_t *M, const dim_t *N, const dim_t *K,
         const float *alpha, const int8_t *A, const dim_t *LDA, const int8_t *ao,
         const int8_t *B, const dim_t *LDB, const int8_t *bo, const float *beta,
@@ -241,7 +238,7 @@ dnnl_status_t gemm_s8x8s32(const char *transa, const char *transb,
     if (*M == 0 || *N == 0 || *K == 0) return dnnl_success;
 
 #if DNNL_X64 && !__BUILD_GEMM_NONE
-    bool use_jit = mayiuse(avx512_core);
+    bool use_jit = mayiuse(avx512_core) && __BUILD_GEMM_AVX512;
     bool use_s8u8 = true
             && utils::everyone_is(0, *ao, *bo) // so far a requirement
             && IMPLICATION(USE_MKL_IGEMM == 0, mayiuse(sse41));
@@ -261,18 +258,9 @@ dnnl_status_t gemm_s8x8s32(const char *transa, const char *transb,
 
 #if DNNL_PPC64
 #ifdef __MMA__
-    int ATflag = (*transa == 'T') || (*transa == 't');
-    int BTflag = (*transb == 'T') || (*transb == 't');
-
-    // Note please that the coercion of "B" and "bo" from int8_t to uint8_t is
-    // accompanied by the last parameter being set to "1" instead of "0", as
-    // in the analogous call in the previous routine above.
-    // This last parameter flags the fact of the coercion, so the called routine
-    // can process "B" and "bo" appropriately.
-
-    return cblas_gemm_s8x8s32_ppc64(ATflag, BTflag, offsetc, *M, *N, *K, *alpha,
-            A, *LDA, ao, (const uint8_t *)B, *LDB, (const uint8_t *)bo, C,
-            *beta, *LDC, co, 1);
+    status = gemm_driver(transa, transb, offsetc, M, N, K, alpha, A, LDA, ao, B,
+            LDB, bo, beta, C, LDC, co, false);
+    if (status != status::unimplemented) return status;
 #endif
 #elif DNNL_S390X
 #if defined(__VX__)
@@ -299,7 +287,7 @@ dnnl_status_t gemm_bf16bf16f32(const char *transa, const char *transb,
     bfloat16_t *dummy_bo = nullptr;
     float *dummy_co = nullptr;
 
-    if (mayiuse(avx512_core)) {
+    if (mayiuse(avx512_core) && __BUILD_GEMM_AVX512) {
         auto status = gemm_driver(transa, transb, dummyOffsetC, M, N, K, alpha,
                 (const bfloat16_t *)A, lda, dummy_ao, (const bfloat16_t *)B,
                 ldb, dummy_bo, beta, (float *)C, ldc, dummy_co, false);

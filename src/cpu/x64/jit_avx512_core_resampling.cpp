@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -752,7 +752,7 @@ private:
     }
 
     static constexpr std::size_t simd_w() {
-        return cpu_isa_traits<avx512_core>::vlen / sizeof(float);
+        return cpu_isa_traits_t<avx512_core>::vlen / sizeof(float);
     }
 
     Zmm zmm_src = Zmm(1);
@@ -801,7 +801,7 @@ private:
 jit_avx512_core_resampling_kernel_base_t::
         jit_avx512_core_resampling_kernel_base_t(
                 const resampling_pd_t *pd, const char *name)
-    : jit_generator(name), pd_(pd) {}
+    : jit_generator_t(name), pd_(pd) {}
 
 data_type_t jit_avx512_core_resampling_kernel_base_t::src_data_type() const {
     if (pd_->is_fwd())
@@ -820,6 +820,8 @@ data_type_t jit_avx512_core_resampling_kernel_base_t::dst_data_type() const {
 status_t jit_avx512_core_resampling_bwd_t::pd_t::init(engine_t *engine) {
     using namespace format_tag;
     using namespace data_type;
+    // disabling verbose dispatch messages for unsupported isa for
+    // better readability
     if (!mayiuse(avx512_core)) return status::unimplemented;
     VDISPATCH_RESAMPLING(!is_fwd(), VERBOSE_BAD_PROPKIND);
     VDISPATCH_RESAMPLING(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
@@ -840,7 +842,7 @@ status_t jit_avx512_core_resampling_bwd_t::pd_t::init(engine_t *engine) {
     format_tag_t dat_tag = memory_desc_matches_one_of_tag(*diff_src_md(), nCw8c,
             nChw8c, nCdhw8c, nCw16c, nChw16c, nCdhw16c, nwc, nhwc, ndhwc);
     VDISPATCH_RESAMPLING(memory_desc_matches_tag(*diff_dst_md(), dat_tag),
-            VERBOSE_UNSUPPORTED_TAG);
+            VERBOSE_UNSUPPORTED_TAG_S, "diff_dst");
 
     return status::success;
 }

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -43,6 +43,7 @@ struct stat_and_data_kernel_t {
     virtual void operator()(const void *src, void *dst, const float *scale,
             const float *shift, float *mean, float *var,
             const float *src_scales, const float *dst_scales,
+            const void *post_ops_binary_rhs_arg_vec,
             const size_t block_size) const {};
 
     virtual status_t create_kernel() { return status::success; }
@@ -93,56 +94,7 @@ struct jit_uni_layer_normalization_fwd_t : public primitive_t {
 
         DECLARE_COMMON_PD_T("jit:uni", jit_uni_layer_normalization_fwd_t);
 
-        status_t init(engine_t *engine) {
-            using namespace data_type;
-            using skip_mask_t = primitive_attr_t::skip_mask_t;
-            const memory_desc_wrapper src_d(src_md());
-
-            VDISPATCH_LNORM(is_fwd(), VERBOSE_BAD_PROPKIND);
-            VDISPATCH_LNORM(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
-            VDISPATCH_LNORM(
-                    utils::one_of(src_md()->data_type, f32, bf16, f16, s8, u8),
-                    VERBOSE_UNSUPPORTED_DT);
-            VDISPATCH_LNORM(
-                    utils::one_of(dst_md()->data_type, f32, bf16, f16, s8, u8),
-                    VERBOSE_UNSUPPORTED_DT);
-            VDISPATCH_LNORM(
-                    IMPLICATION(utils::one_of(bf16, src_md()->data_type,
-                                        dst_md()->data_type),
-                            mayiuse(avx512_core) || mayiuse(avx2_vnni_2)),
-                    VERBOSE_ISA_DT_MISMATCH);
-            VDISPATCH_LNORM(
-                    IMPLICATION(utils::one_of(f16, src_md()->data_type,
-                                        dst_md()->data_type),
-                            mayiuse(avx512_core_fp16) || mayiuse(avx2_vnni_2)),
-                    VERBOSE_ISA_DT_MISMATCH);
-            VDISPATCH_LNORM(
-                    stat_md()->data_type == f32, VERBOSE_UNSUPPORTED_DT);
-            VDISPATCH_LNORM(check_scale_shift_data_type(),
-                    VERBOSE_UNSUPPORTED_FEATURE,
-                    "unsupported scale or shift data type");
-            VDISPATCH_LNORM(
-                    attr()->has_default_values(skip_mask_t::scales_runtime),
-                    VERBOSE_UNSUPPORTED_ATTR);
-            VDISPATCH_LNORM(attr_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
-            VDISPATCH_LNORM(
-                    set_default_formats_common(), VERBOSE_UNSUPPORTED_TAG);
-            VDISPATCH_LNORM(src_d.is_blocking_desc(), VERBOSE_BLOCKING_FAIL);
-            // plain format, last logical dim is last physical
-            VDISPATCH_LNORM(src_d.blocking_desc().strides[ndims() - 1] == 1,
-                    VERBOSE_BLOCKING_FAIL);
-
-            CHECK(fill_compatible_stats_md(*src_md(), reordered_stat_md_));
-
-            if (reordered_stat_md_ != *stat_md() && !stats_are_tmp()) {
-                CHECK(reorder_primitive_desc_create(reorder_pd_, engine,
-                        stats_are_src() ? stat_md() : &reordered_stat_md_,
-                        stats_are_src() ? &reordered_stat_md_ : stat_md()));
-            }
-
-            init_scratchpad();
-            return status::success;
-        }
+        status_t init(engine_t *engine);
 
         bool use_tmp_stats() const { return reorder_pd_ || stats_are_tmp(); }
 
@@ -154,8 +106,10 @@ struct jit_uni_layer_normalization_fwd_t : public primitive_t {
             using namespace memory_tracking::names;
             auto scratchpad = scratchpad_registry().registrar();
             if (use_tmp_stats()) {
-                scratchpad.template book<float>(
-                        key_lnorm_tmp_mean, across_axis());
+                if (!skip_mean()) {
+                    scratchpad.template book<float>(
+                            key_lnorm_tmp_mean, across_axis());
+                }
                 scratchpad.template book<float>(
                         key_lnorm_tmp_var, across_axis());
             }
@@ -176,7 +130,8 @@ struct jit_uni_layer_normalization_fwd_t : public primitive_t {
     }
 
     jit_uni_layer_normalization_fwd_t(const pd_t *apd) : primitive_t(apd) {}
-    virtual ~jit_uni_layer_normalization_fwd_t() = default;
+
+    ~jit_uni_layer_normalization_fwd_t() override = default;
 
     void reorder_stat(const exec_ctx_t &ctx, engine_t *engine,
             const memory_arg_t &in, const memory_arg_t &out) const {
@@ -199,26 +154,42 @@ struct jit_uni_layer_normalization_fwd_t : public primitive_t {
         using namespace memory_tracking::names;
         engine_t *engine = ctx.stream()->engine();
         auto scratchpad = ctx.get_scratchpad_grantor();
-        auto mean_mem = scratchpad.get_memory_storage(key_lnorm_tmp_mean);
+
+        bool skip_mean = pd()->skip_mean();
+
+        std::unique_ptr<memory_t, memory_deleter_t> mean;
+        if (!skip_mean) {
+            auto mean_mem = scratchpad.get_memory_storage(key_lnorm_tmp_mean);
+            CHECK(safe_ptr_assign(mean,
+                    new memory_t(engine, &(pd()->reordered_stat_md_),
+                            std::move(mean_mem))));
+        }
+        std::unique_ptr<memory_t, memory_deleter_t> variance;
         auto variance_mem = scratchpad.get_memory_storage(key_lnorm_tmp_var);
-        memory_t mean(engine, &(pd()->reordered_stat_md_), std::move(mean_mem));
-        memory_t variance(
-                engine, &(pd()->reordered_stat_md_), std::move(variance_mem));
+        CHECK(safe_ptr_assign(variance,
+                new memory_t(engine, &(pd()->reordered_stat_md_),
+                        std::move(variance_mem))));
 
         // reorder input stats
         if (pd()->stats_are_src() && reorder_) {
-            reorder_stat(
-                    ctx, engine, ctx.args().at(DNNL_ARG_MEAN), {&mean, false});
+            if (!skip_mean) {
+                reorder_stat(ctx, engine, ctx.args().at(DNNL_ARG_MEAN),
+                        {mean.get(), false});
+            }
             reorder_stat(ctx, engine, ctx.args().at(DNNL_ARG_VARIANCE),
-                    {&variance, false});
+                    {variance.get(), false});
         }
+
         status_t status = execute_forward(ctx);
         if (status != status::success) return status;
+
         // reorder output stats
         if (!pd()->stats_are_src() && reorder_) {
-            reorder_stat(
-                    ctx, engine, {&mean, true}, ctx.args().at(DNNL_ARG_MEAN));
-            reorder_stat(ctx, engine, {&variance, true},
+            if (!skip_mean) {
+                reorder_stat(ctx, engine, {mean.get(), true},
+                        ctx.args().at(DNNL_ARG_MEAN));
+            }
+            reorder_stat(ctx, engine, {variance.get(), true},
                     ctx.args().at(DNNL_ARG_VARIANCE));
         }
 
@@ -277,10 +248,11 @@ struct jit_uni_layer_normalization_bwd_t : public primitive_t {
                     attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_LNORM(
                     set_default_formats_common(), VERBOSE_UNSUPPORTED_TAG);
-            VDISPATCH_LNORM(src_d.is_blocking_desc(), VERBOSE_BLOCKING_FAIL);
+            VDISPATCH_LNORM(src_d.is_blocking_desc(), VERBOSE_BLOCKING_FAIL,
+                    "blocking descriptor fail");
             // plain format, last logical dim is last physical
             VDISPATCH_LNORM(src_d.blocking_desc().strides[ndims() - 1] == 1,
-                    VERBOSE_BLOCKING_FAIL);
+                    VERBOSE_BLOCKING_FAIL, "bad stride value");
 
             CHECK(fill_compatible_stats_md(*src_md(), reordered_stat_md_));
 
@@ -334,7 +306,8 @@ struct jit_uni_layer_normalization_bwd_t : public primitive_t {
     }
 
     jit_uni_layer_normalization_bwd_t(const pd_t *apd) : primitive_t(apd) {}
-    virtual ~jit_uni_layer_normalization_bwd_t() = default;
+
+    ~jit_uni_layer_normalization_bwd_t() override = default;
 
     void reorder_stat(const exec_ctx_t &ctx, engine_t *engine,
             const memory_arg_t &in, const memory_arg_t &out) const {
@@ -356,20 +329,33 @@ struct jit_uni_layer_normalization_bwd_t : public primitive_t {
          * as data tensor (i.e. data in abcd, stats in abc) and user's
          * input/output statistics are reordered if necessary */
 
+        bool skip_mean = pd()->skip_mean();
+
         if (reorder_) {
             engine_t *engine = ctx.stream()->engine();
             auto scratchpad = ctx.get_scratchpad_grantor();
-            auto mean_mem = scratchpad.get_memory_storage(key_lnorm_tmp_mean);
+
+            std::unique_ptr<memory_t, memory_deleter_t> mean;
+            if (!skip_mean) {
+                auto mean_mem
+                        = scratchpad.get_memory_storage(key_lnorm_tmp_mean);
+                CHECK(safe_ptr_assign(mean,
+                        new memory_t(engine, &(pd()->reordered_stat_md_),
+                                std::move(mean_mem))));
+            }
             auto variance_mem
                     = scratchpad.get_memory_storage(key_lnorm_tmp_var);
-            memory_t mean(
-                    engine, &(pd()->reordered_stat_md_), std::move(mean_mem));
-            memory_t variance(engine, &(pd()->reordered_stat_md_),
-                    std::move(variance_mem));
-            reorder_stat(
-                    ctx, engine, ctx.args().at(DNNL_ARG_MEAN), {&mean, false});
+            std::unique_ptr<memory_t, memory_deleter_t> variance;
+            CHECK(safe_ptr_assign(variance,
+                    new memory_t(engine, &(pd()->reordered_stat_md_),
+                            std::move(variance_mem))));
+
+            if (!skip_mean) {
+                reorder_stat(ctx, engine, ctx.args().at(DNNL_ARG_MEAN),
+                        {mean.get(), false});
+            }
             reorder_stat(ctx, engine, ctx.args().at(DNNL_ARG_VARIANCE),
-                    {&variance, false});
+                    {variance.get(), false});
         }
 
         return execute_backward(ctx);

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2024 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,9 +16,23 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/ocl/gen9_softmax.hpp"
-#include "gpu/ocl/ref_softmax.hpp"
-#include "gpu/ocl/reusable_softmax.hpp"
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/reusable_softmax.hpp"
+#include "gpu/intel/simple_softmax.hpp"
+#include "gpu/intel/xe_softmax.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+#include "gpu/nvidia/cudnn_softmax.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_AMD
+#include "gpu/amd/miopen_softmax.hpp"
+#endif
+
+#ifdef GENERIC_SYCL_KERNELS_ENABLED
+#include "gpu/generic/sycl/ref_softmax.hpp"
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -31,14 +45,20 @@ using namespace dnnl::impl::prop_kind;
 const std::map<pk_impl_key_t, std::vector<impl_list_item_t>>
         impl_list_map REG_SOFTMAX_P({
     {{forward}, {
-        INSTANCE(ocl::gen9_softmax_fwd_t)
-        INSTANCE(ocl::ref_softmax_fwd_t)
-        INSTANCE(ocl::reusable_softmax_fwd_t)
+        GPU_INSTANCE_INTEL(intel::reusable_softmax_fwd_t)
+        GPU_INSTANCE_INTEL(intel::xe_softmax_fwd_t)
+        GPU_INSTANCE_INTEL(intel::simple_softmax_fwd_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_softmax_fwd_t)
+        GPU_INSTANCE_AMD(amd::miopen_softmax_fwd_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_sycl_softmax_fwd_t)
         nullptr,
     }},
     {{backward}, REG_BWD_PK({
-        INSTANCE(ocl::gen9_softmax_bwd_t)
-        INSTANCE(ocl::ref_softmax_bwd_t)
+        GPU_INSTANCE_INTEL(intel::xe_softmax_bwd_t)
+        GPU_INSTANCE_INTEL(intel::simple_softmax_bwd_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_softmax_bwd_t)
+        GPU_INSTANCE_AMD(amd::miopen_softmax_bwd_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_sycl_softmax_bwd_t)
         nullptr,
     })},
 });

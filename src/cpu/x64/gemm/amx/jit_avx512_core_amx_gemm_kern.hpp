@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,14 +24,14 @@ namespace impl {
 namespace cpu {
 namespace x64 {
 
-class jit_avx512_core_amx_gemm_kern : public jit_generator {
+class jit_avx512_core_amx_gemm_kern_t : public jit_generator_t {
 public:
-    jit_avx512_core_amx_gemm_kern(
+    jit_avx512_core_amx_gemm_kern_t(
             int typea, int typeb, int typec, int betaZero);
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_amx_gemm_kern);
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_amx_gemm_kern_t);
 
 protected:
-    void generate() override ATTRIBUTE_OPTIMIZE;
+    void generate() override;
     const int typea;
     const int typeb;
     const int typec;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -35,8 +35,8 @@ namespace impl {
 namespace cpu {
 
 namespace nhwc_pooling {
-size_t strided_offset(const int _n, const size_t _sn, const int _d,
-        const size_t _sd, const int _h, const size_t _sh, const int _w,
+size_t strided_offset(const dim_t _n, const size_t _sn, const dim_t _d,
+        const size_t _sd, const dim_t _h, const size_t _sh, const dim_t _w,
         const size_t _sw);
 }
 
@@ -76,10 +76,10 @@ struct nhwc_pooling_fwd_t : public primitive_t {
                     VERBOSE_UNSUPPORTED_TAG);
             VDISPATCH_POOLING(
                     memory_desc_matches_tag(*src_md(), desired_fmt_tag),
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "src");
             VDISPATCH_POOLING(
                     memory_desc_matches_tag(*dst_md(), desired_fmt_tag),
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "dst");
             VDISPATCH_POOLING(
                     attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_POSTOP);
@@ -113,8 +113,8 @@ struct nhwc_pooling_fwd_t : public primitive_t {
 
     nhwc_pooling_fwd_t(const pd_t *apd) : primitive_t(apd) {}
 
-    using data_t = typename prec_traits<d_type>::type;
-    using ker_data_t = typename prec_traits<data_type::f32>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
+    using ker_data_t = typename prec_traits_t<data_type::f32>::type;
 
     status_t init(engine_t *engine) override {
         ref_post_ops_
@@ -130,14 +130,15 @@ struct nhwc_pooling_fwd_t : public primitive_t {
 
 private:
     status_t execute_forward(const exec_ctx_t &ctx) const;
-    void array_div_by_const(const int n, const ker_data_t *src,
+    void array_div_by_const(const dim_t n, const ker_data_t *src,
             const size_t num, ker_data_t *dst) const;
-    void array_add(const int n, const ker_data_t *src, ker_data_t *dst) const;
-    void array_nhwc_max(const int n, ker_data_t *dst, const ker_data_t *src,
+    void array_add(const dim_t n, const ker_data_t *src, ker_data_t *dst) const;
+    void array_nhwc_max(const dim_t n, ker_data_t *dst, const ker_data_t *src,
             unsigned char *ws, const size_t ws_offset, const data_type_t ws_dt,
             const int index) const;
-    void array_nhwc_initialize(const int n, ker_data_t *dst, unsigned char *ws,
-            const size_t ws_offset, const data_type_t ws_dt) const;
+    void array_nhwc_initialize(const dim_t n, ker_data_t *dst,
+            unsigned char *ws, const size_t ws_offset,
+            const data_type_t ws_dt) const;
 
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
     std::unique_ptr<ref_post_ops_t> ref_post_ops_;
@@ -173,10 +174,10 @@ struct nhwc_pooling_bwd_t : public primitive_t {
                     attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_POOLING(
                     memory_desc_matches_tag(*diff_dst_md(), desired_fmt_tag),
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "diff_dst");
             VDISPATCH_POOLING(
                     memory_desc_matches_tag(*diff_src_md(), desired_fmt_tag),
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "diff_src");
             VDISPATCH_POOLING(!is_dilated(), VERBOSE_UNSUPPORTED_FEATURE,
                     "does not support dilations");
 
@@ -210,7 +211,7 @@ struct nhwc_pooling_bwd_t : public primitive_t {
     };
 
     nhwc_pooling_bwd_t(const pd_t *apd) : primitive_t(apd) {}
-    typedef typename prec_traits<d_type>::type data_t;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t execute(const exec_ctx_t &ctx) const override {
         return execute_backward(ctx);

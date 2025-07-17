@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2024 Intel Corporation
+ * Copyright 2020-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -36,15 +36,12 @@
 #include "graph/backend/dnnl/common.hpp"
 #include "graph/backend/dnnl/internal_ops.hpp"
 #include "graph/backend/dnnl/layout_id_mgr.hpp"
-#include "graph/backend/dnnl/patterns/data_type_check_pass.hpp"
 #include "graph/backend/dnnl/utils.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace graph {
 namespace dnnl_impl {
-
-class dnnl_partition_impl_t;
 
 // gcc4.8.5 can 't support enum class as key
 struct enum_hash_t {
@@ -54,72 +51,12 @@ struct enum_hash_t {
     }
 };
 
-struct kernel_base_t {
-    virtual ~kernel_base_t() = default;
-
-    status_t compile(const dnnl_partition_impl_t *part, const engine_t *aengine,
-            const std::vector<logical_tensor_t> &inputs,
-            const std::vector<logical_tensor_t> &outputs) {
-        auto ret = compile_impl(part, aengine, inputs, outputs);
-        if (ret != status::success) return ret;
-        return prepare_inplace_pairs_impl();
-    }
-
-    status_t execute(const stream_t *astream,
-            const std::vector<tensor_t> &inputs,
-            const std::vector<tensor_t> &outputs) {
-        return execute_impl(astream, inputs, outputs);
-    }
-
-#ifdef DNNL_WITH_SYCL
-    status_t execute_sycl(const stream_t *astream,
-            const std::vector<tensor_t> &inputs,
-            const std::vector<tensor_t> &outputs,
-            const std::vector<::sycl::event> &sycl_deps,
-            ::sycl::event *sycl_event) {
-        return sycl_execute_impl(
-                astream, inputs, outputs, sycl_deps, sycl_event);
-    }
-
-    virtual status_t sycl_execute_impl(const stream_t *astream,
-            const std::vector<tensor_t> &inputs,
-            const std::vector<tensor_t> &outputs,
-            const std::vector<::sycl::event> &sycl_deps,
-            ::sycl::event *sycl_event)
-            = 0;
-#endif
-
-    virtual status_t compile_impl(const dnnl_partition_impl_t *part,
-            const engine_t *aengine,
-            const std::vector<logical_tensor_t> &inputs,
-            const std::vector<logical_tensor_t> &outputs)
-            = 0;
-
-    virtual status_t execute_impl(const stream_t *astream,
-            const std::vector<tensor_t> &inputs,
-            const std::vector<tensor_t> &outputs)
-            = 0;
-
-    virtual status_t prepare_inplace_pairs_impl() { return status::success; };
-
-    bool enabled_constant_cache() const;
-
-    std::vector<inplace_pair_t> inplace_pairs_;
-    dnnl::engine p_engine_;
-};
-
-using kernel_ptr = std::shared_ptr<kernel_base_t>;
-using FCreateKernel = std::function<kernel_ptr(void)>;
-
-kernel_ptr large_partition_kernel_creator();
-kernel_ptr dummy_kernel_creator();
-
-class dnnl_backend : public backend_t {
+class dnnl_backend_t : public backend_t {
     friend class dnnl_partition_impl_t;
 
 public:
-    static dnnl_backend &get_singleton() {
-        static dnnl_backend ins("dnnl_backend", /*priority*/ 1.f);
+    static dnnl_backend_t &get_singleton() {
+        static dnnl_backend_t ins("dnnl_backend", /*priority*/ 1.f);
         return ins;
     }
 
@@ -147,7 +84,8 @@ public:
                     engine_kind::cpu,
 #endif
 
-#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL \
+        || DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
                     engine_kind::gpu,
 #endif
                 };
@@ -156,66 +94,47 @@ public:
 
     status_t get_partitions(
             graph_t &agraph, partition_policy_t policy) override {
-        // Note: This environment variable is internal and for test purpose. It
-        // can be changed or removed without prior notice. Users should avoid
-        // using it in their applications. Enabling the environment variable may
-        // cause some tests and examples to fail.
-        const bool disable_dnnl_bkd
-                = graph::utils::getenv_int_internal("DISABLE_DNNL_BACKEND", 0)
-                > 0;
-        if (disable_dnnl_bkd) return status::success;
-
-        // Note: This environment variable is internal and for test/debug
-        // purpose. It can be changed or removed without prior notice. Users
-        // should avoid using it in their applications. Enabled by default.
-        const bool enable_large_partition
-                = graph::utils::getenv_int_internal("ENABLE_LARGE_PARTITION", 1)
-                > 0;
-
-        // FIXME(xx): Here we only changes the passes in registry. If json file
-        // existed, pm will run passes according to the json file, the env var
-        // will not take effect.
-        // - priority > 20.f: large fusion pattern
+        // - priority == 50.f: data type check pass (fixed highest priority)
+        // - 50.f > priority > 20.f: large fusion pattern
         // - 20.f >= priority > 8.f: normal fusion pattern
         // - priority <= 8.f: debug fusion pattern (single op fusion)
-        const float priority_ths = (policy == graph::partition_policy::fusion
-                                           && enable_large_partition)
-                ? std::numeric_limits<float>::max()
-                : policy == graph::partition_policy::fusion ? 20.0f
-                                                            : 8.0f;
-        graph::pass::pass_registry_t filtered_registry;
-        for (auto &pass : get_pass_registry().get_passes()) {
-            if (pass->get_priority() > priority_ths) continue;
-            filtered_registry.register_pass(pass);
-        }
+        const float priority_ths
+                = (policy == graph::partition_policy::fusion) ? 100.f : 8.0f;
 
-        graph::pass::pass_manager_t pm(filtered_registry);
+        const auto &dnnl_pass_filter
+                = [priority_ths](const graph::pass::pass_base_ptr &pass,
+                          partition_policy_t policy) -> bool {
+            UNUSED(policy);
+            return pass->get_priority() <= priority_ths;
+        };
+
+        auto &pass_registry = get_pass_registry();
+        graph::pass::pass_manager_t pm(pass_registry);
+
 #ifdef DNNL_ENABLE_GRAPH_DUMP
         std::string pass_config_json = "dnnl_graph_passes.json";
         std::ifstream fs(pass_config_json.c_str());
         if (fs) {
-            printf("onednn_graph_verbose,info,pattern,load,%s\n",
-                    pass_config_json.c_str());
-            fflush(stdout);
+            verbose_printf(
+                    "graph,info,pattern,load,%s\n", pass_config_json.c_str());
         } else {
             if (getenv_int_user("GRAPH_DUMP", 0) > 0
                     || graph::utils::check_verbose_string_user(
                             "GRAPH_DUMP", "pattern")) {
-                printf("onednn_graph_verbose,info,pattern,dump,%s\n",
+                verbose_printf("graph,info,pattern,dump,%s\n",
                         pass_config_json.c_str());
-                fflush(stdout);
                 pm.print_passes(pass_config_json);
             }
         }
-        pm.run_passes(agraph, &fs, policy);
+        pm.run_passes(agraph, &fs, policy, dnnl_pass_filter);
 #else
-        pm.run_passes(agraph, "", policy);
+        pm.run_passes(agraph, "", policy, dnnl_pass_filter);
 #endif
         return status::success;
     }
 
 private:
-    dnnl_backend(const std::string &name, float priority);
+    dnnl_backend_t(const std::string &name, float priority);
 
     static graph::pass::pass_registry_t register_passes();
     bool register_op_schemas();

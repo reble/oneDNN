@@ -1,6 +1,6 @@
 /*******************************************************************************
 * Copyright 2017-2022 Intel Corporation
-* Copyright 2020-2022 FUJITSU LIMITED
+* Copyright 2020-2024 FUJITSU LIMITED
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -82,7 +82,7 @@ struct jit_uni_pooling_fwd_t : public primitive_t {
     jit_uni_pooling_fwd_t &operator=(jit_uni_pooling_fwd_t &&) = default;
     ~jit_uni_pooling_fwd_t();
 
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t init(engine_t *engine) override;
 
@@ -151,7 +151,7 @@ struct jit_uni_pooling_bwd_t : public primitive_t {
     jit_uni_pooling_bwd_t &operator=(jit_uni_pooling_bwd_t &&) = default;
     ~jit_uni_pooling_bwd_t();
 
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t init(engine_t *engine) override;
 

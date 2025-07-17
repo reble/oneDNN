@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,12 +22,12 @@
 
 #include "common/batch_normalization_pd.hpp"
 #include "common/c_types_map.hpp"
-#include "common/primitive.hpp"
 #include "common/type_helpers.hpp"
+#include "gpu/gpu_primitive.hpp"
 #include "gpu/nvidia/cudnn_batch_normalization_executor.hpp"
 #include "gpu/nvidia/cudnn_batch_normalization_impl.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
-#include "gpu/nvidia/sycl_cuda_stream.hpp"
+#include "gpu/nvidia/engine.hpp"
+#include "gpu/nvidia/stream.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -38,7 +38,7 @@ namespace nvidia {
 struct cudnn_batch_normalization_common_t {
     template <typename pd_t>
     static status_t execute(
-            const exec_ctx_t &ctx, engine_t *engine, const pd_t *pd) {
+            const exec_ctx_t &ctx, impl::engine_t *engine, const pd_t *pd) {
         if (memory_desc_wrapper(pd->src_md()).has_zero_dim())
             return status::success;
         return pd->executor_->execute(ctx, engine, pd->bnorm_impl_);
@@ -60,14 +60,14 @@ struct cudnn_batch_normalization_common_t {
     }
 };
 
-struct cudnn_batch_normalization_fwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct cudnn_batch_normalization_fwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
     struct pd_t : public batch_normalization_fwd_pd_t {
         using batch_normalization_fwd_pd_t::batch_normalization_fwd_pd_t;
 
         DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_batch_normalization_fwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
             using namespace types;
 
@@ -80,8 +80,9 @@ struct cudnn_batch_normalization_fwd_t : public primitive_t {
                 return status::unimplemented;
 
             const auto attr_skip_mask = primitive_attr_t::skip_mask_t::post_ops;
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+            auto *sycl_engine_impl
+                    = utils::downcast<const xpu::sycl::engine_impl_t *>(
+                            engine->impl());
 
             bool ok = is_fwd()
                     && utils::one_of(src_md()->data_type, f16, f32, s8, bf16)
@@ -91,7 +92,7 @@ struct cudnn_batch_normalization_fwd_t : public primitive_t {
                     && IMPLICATION(
                             utils::one_of(data_type::bf16, src_md()->data_type,
                                     dst_md()->data_type),
-                            has_bf16_support(sycl_engine->device()))
+                            has_bf16_support(sycl_engine_impl->device()))
                     && IMPLICATION(!attr()->has_default_values(),
                             attr()->post_ops_.len() == 1 && with_relu_post_op())
                     && IMPLICATION(utils::one_of(src_md()->data_type, s8, f16),
@@ -128,18 +129,15 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 };
 
-struct cudnn_batch_normalization_bwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct cudnn_batch_normalization_bwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public batch_normalization_bwd_pd_t {
-        pd_t(const batch_normalization_desc_t *adesc,
-                const primitive_attr_t *attr,
-                const batch_normalization_fwd_pd_t *hint_fwd_pd)
-            : batch_normalization_bwd_pd_t(adesc, attr, hint_fwd_pd) {}
+        using batch_normalization_bwd_pd_t::batch_normalization_bwd_pd_t;
 
         DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_batch_normalization_bwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
             using namespace types;
 
@@ -149,8 +147,9 @@ struct cudnn_batch_normalization_bwd_t : public primitive_t {
                     | normalization_flags::use_shift;
             if ((~norm_flags_supported & desc()->flags) != 0)
                 return status::unimplemented;
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+            auto *sycl_engine_impl
+                    = utils::downcast<const xpu::sycl::engine_impl_t *>(
+                            engine->impl());
 
             bool ok = !is_fwd()
                     && (utils::everyone_is(f32, src_md()->data_type,
@@ -163,7 +162,7 @@ struct cudnn_batch_normalization_bwd_t : public primitive_t {
                             utils::one_of(data_type::bf16, src_md()->data_type,
                                     diff_src_md()->data_type,
                                     diff_dst_md()->data_type),
-                            has_bf16_support(sycl_engine->device()))
+                            has_bf16_support(sycl_engine_impl->device()))
                     && check_scale_shift_data_type()
                     && attr()->has_default_values()
                     && set_default_formats_common()

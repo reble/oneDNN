@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2024 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -33,17 +33,7 @@
 
 namespace rnn {
 
-using create_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t &,
-        res_t *)>;
-using check_cache_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t *,
-        res_t *)>;
-using do_func_t = std::function<int(
-        const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &,
-        const prb_t &, res_t *)>;
-using driver_task_executor_t = rnn_task_executor_t<prb_t, perf_report_t,
-        create_func_t, check_cache_func_t, do_func_t>;
+TASK_EXECUTOR_DECL_TYPES;
 
 void check_correctness(
         const settings_t &s, driver_task_executor_t &task_executor) {
@@ -63,24 +53,18 @@ void check_correctness(
     for_(const auto &i_n_layer : s.n_layer)
     for_(const auto &i_n_iter : s.n_iter)
     for_(const auto &i_mb : s.mb)
-    for_(const auto &i_scratchpad_mode : s.scratchpad_mode)
-    for_(const auto &i_fpmath_mode : s.fpmath_mode)
-    for_(const auto &i_acc_mode : s.acc_mode)
-    for_(const auto &i_deterministic : s.deterministic)
+    for_(const auto &i_attr : s.attributes)
     for_(const auto &i_ctx_init : s.ctx_init)
     for (const auto &i_ctx_exe : s.ctx_exe) {
-        auto attr = settings_t::get_attr(
-                i_scratchpad_mode, i_fpmath_mode, i_acc_mode, i_deterministic);
-
         auto prb = std::make_shared<prb_t>(s.desc,
-                dt_conf_t::create(i_cfg, attr), i_tag, i_prop, i_alg,
+                dt_conf_t::create(i_cfg, i_attr), i_tag, i_prop, i_alg,
                 i_with_peephole, i_with_projection, i_direction, i_scale_policy,
-                i_scale_proj_policy, i_flags, i_activation, attr, i_ctx_init,
-                i_ctx_exe, s.alpha, s.beta, i_skip_nonlinear, i_trivial_strides,
-                i_n_layer, i_n_iter, i_mb);
+                i_scale_proj_policy, i_flags, i_activation, s.alpha, s.beta,
+                i_skip_nonlinear, i_trivial_strides, i_n_layer, i_n_iter, i_mb,
+                i_attr, i_ctx_init, i_ctx_exe, s.impl_filter);
 
         task_executor.submit(
-                std::move(prb), s.perf_template, createit, check_cacheit, doit);
+                std::move(prb), s.perf_template, createit, checkit, doit);
     }
 }
 
@@ -89,7 +73,7 @@ int verify_input(const settings_t &s) {
     for (const auto &i_scale_policy : s.scale_policy) {
         if (!(i_scale_policy == policy_t::COMMON
                     || i_scale_policy == policy_t::PER_OC)) {
-            std::stringstream ss;
+            dnnl::impl::stringstream_t ss;
             ss << i_scale_policy;
             const std::string cpp_pstr = ss.str();
             const char *policy_s = cpp_pstr.c_str();
@@ -186,23 +170,14 @@ int bench(int argc, char **argv) {
                 || parse_vector_option(s.with_projection, def.with_projection,
                         str2bool, argv[0], "with-projection",
                         help_with_projection)
-                || parse_attr_scratchpad_mode(
-                        s.scratchpad_mode, def.scratchpad_mode, argv[0])
-                || parse_attr_fpmath_mode(
-                        s.fpmath_mode, def.fpmath_mode, argv[0])
-                || parse_attr_deterministic(
-                        s.deterministic, def.deterministic, argv[0])
-                || parse_ctx_init(s.ctx_init, def.ctx_init, argv[0])
-                || parse_ctx_exe(s.ctx_exe, def.ctx_exe, argv[0])
-                || parse_perf_template(s.perf_template, s.perf_template_def,
-                        s.perf_template_csv(), argv[0])
-                || parse_reset(s, argv[0]) || parse_help(argv[0]);
+                || parse_driver_shared_settings(s, def, argv[0]);
         if (!parsed_options) {
             catch_unknown_options(argv[0]);
 
             SAFE(str2desc(&s.desc, argv[0]), CRIT);
 
             SAFE(verify_input(s), WARN);
+            s.finalize();
             check_correctness(s, task_executor);
         }
     }

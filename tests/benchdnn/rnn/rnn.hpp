@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2024 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -226,12 +226,7 @@ struct dt_conf_t {
 };
 
 struct settings_t : public base_settings_t {
-    settings_t() = default;
-
-    // ctor to save certain fields from resetting
-    settings_t(const char *perf_template) : settings_t() {
-        this->perf_template = perf_template;
-    }
+    using base_settings_t::base_settings_t;
 
     desc_t desc {};
 
@@ -283,23 +278,14 @@ struct settings_t : public base_settings_t {
 struct prb_t : public desc_t {
     // A ctor with common interface across all drivers.
     prb_t(const settings_t &s)
-        : prb_t(s.desc,
-                dt_conf_t::create(s.cfg[0],
-                        settings_t::get_attr(s.scales[0], s.zero_points[0],
-                                s.post_ops[0], s.scratchpad_mode[0],
-                                s.fpmath_mode[0], s.acc_mode[0])),
+        : prb_t(s.desc, dt_conf_t::create(s.cfg[0], s.attributes.front()),
                 s.tag[0], s.prop[0], s.alg[0], s.with_peephole[0],
                 s.with_projection[0], s.direction[0], s.scale_policy[0],
-                s.scale_proj_policy[0], s.flags[0], s.activation[0],
-                settings_t::get_attr(s.scales[0], s.zero_points[0],
-                        s.post_ops[0], s.scratchpad_mode[0], s.fpmath_mode[0]),
-                s.ctx_init[0], s.ctx_exe[0], s.alpha, s.beta,
-                s.skip_nonlinear[0], s.trivial_strides[0], s.n_layer[0],
-                s.n_iter[0], s.mb[0]) {
+                s.scale_proj_policy[0], s.flags[0], s.activation[0], s.alpha,
+                s.beta, s.skip_nonlinear[0], s.trivial_strides[0], s.n_layer[0],
+                s.n_iter[0], s.mb[0], s.attributes.front(), s.ctx_init[0],
+                s.ctx_exe[0], s.impl_filter) {
         SAFE_V(s.has_single_setup() ? OK : FAIL);
-        // Just for better styling, no real reason to keep it separate.
-        this->attr = settings_t::get_attr(s.scales[0], s.zero_points[0],
-                s.post_ops[0], s.scratchpad_mode[0], s.fpmath_mode[0]);
     }
 
     prb_t(const desc_t &desc, const dt_conf_t &cfg,
@@ -307,10 +293,11 @@ struct prb_t : public desc_t {
             bool with_peephole, bool with_projection,
             dnnl_rnn_direction_t direction, policy_t scale_policy,
             policy_t scale_proj_policy, unsigned int flags,
-            activation_t activation, const attr_t &attr,
-            const thr_ctx_t &ctx_init, const thr_ctx_t &ctx_exe, float alpha,
-            float beta, bool skip_nonlinear, bool trivial_strides,
-            int64_t n_layer, int64_t n_iter, int64_t mb = 0)
+            activation_t activation, float alpha, float beta,
+            bool skip_nonlinear, bool trivial_strides, int64_t n_layer,
+            int64_t n_iter, int64_t mb, const attr_t &attr,
+            const thr_ctx_t &ctx_init, const thr_ctx_t &ctx_exe,
+            const impl_filter_t &impl_filter)
         : desc_t(desc)
         , cfg(cfg)
         , tag(tag)
@@ -324,27 +311,28 @@ struct prb_t : public desc_t {
         , wei_proj_scales_policy(scale_proj_policy)
         , flags(flags)
         , activation(activation)
-        , attr(attr)
-        , ctx_init(ctx_init)
-        , ctx_exe(ctx_exe)
-        , user_mb(mb)
         , alpha(alpha)
         , beta(beta)
         , skip_nonlinear(skip_nonlinear)
         , trivial_strides(trivial_strides)
+        , user_mb(mb)
         , ops(0.0)
-        , linear_cscale(0.0f) {
+        , linear_cscale(0.0f)
+        , attr(attr)
+        , ctx_init(ctx_init)
+        , ctx_exe(ctx_exe)
+        , impl_filter(impl_filter)
+        , wei_nscales(0)
+        , wei_scales_mask(0x0)
+        , wei_proj_nscales(0)
+        , wei_proj_scales_mask(0x0) {
 
         if (n_layer) this->n_layer = n_layer;
         if (n_iter) this->n_iter = n_iter;
         if (mb) this->mb = mb;
         count_ops();
 
-        // Broadcast data types if needed
-        if (tag.size() == 1) {
-            const auto val = tag[0]; // Need a copy here.
-            this->tag.assign(3, val);
-        }
+        broadcast_vector(this->tag, 3);
 
         wei_scales = nullptr;
         wei_proj_scales = nullptr;
@@ -439,6 +427,37 @@ struct prb_t : public desc_t {
         return 0;
     }
 
+    int ndims(rnn_data_kind_t kind) const {
+        switch (kind) {
+            case SRC_LAYER:
+            case DST_LAYER:
+            case AUGRU_ATTENTION:
+            case DIFF_SRC_LAYER:
+            case DIFF_DST_LAYER:
+            case DIFF_AUGRU_ATTENTION: return 3;
+            case SRC_ITER:
+            case SRC_ITER_C:
+            case WEIGHTS_PEEPHOLE:
+            case WEIGHTS_PROJECTION:
+            case BIAS:
+            case DST_ITER:
+            case DST_ITER_C:
+            case DIFF_SRC_ITER:
+            case DIFF_SRC_ITER_C:
+            case DIFF_WEIGHTS_PEEPHOLE:
+            case DIFF_WEIGHTS_PROJECTION:
+            case DIFF_BIAS:
+            case DIFF_DST_ITER:
+            case DIFF_DST_ITER_C: return 4;
+            case WEIGHTS_LAYER:
+            case WEIGHTS_ITER:
+            case DIFF_WEIGHTS_LAYER:
+            case DIFF_WEIGHTS_ITER: return 5;
+            default: assert(!"unknown data kind");
+        }
+        return 0;
+    }
+
     bool is_int8() const {
         return cfg[SRC_LAYER].dt == dnnl_u8 || cfg[SRC_LAYER].dt == dnnl_s8;
     }
@@ -468,12 +487,17 @@ struct prb_t : public desc_t {
     policy_t wei_proj_scales_policy;
     unsigned int flags;
     activation_t activation;
+    float alpha;
+    float beta;
+    bool skip_nonlinear;
+    bool trivial_strides;
+    int64_t user_mb;
+    double ops;
+    float linear_cscale;
     bool inplace = false; // Lacks placement, always considered `false`.
     attr_t attr;
     thr_ctx_t ctx_init, ctx_exe;
-    int64_t user_mb;
-    float alpha;
-    float beta;
+    impl_filter_t impl_filter;
 
     float data_scale, data_shift;
 
@@ -485,11 +509,7 @@ struct prb_t : public desc_t {
     int wei_proj_nscales;
     int wei_proj_scales_mask;
 
-    bool skip_nonlinear;
-    bool trivial_strides;
-    double ops;
     float *linear_scales;
-    float linear_cscale;
 
 private:
     std::string repro;
@@ -560,15 +580,14 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
 void skip_unimplemented_prb(const prb_t *prb, res_t *res);
 void skip_invalid_prb(const prb_t *prb, res_t *res);
-void compute_ref(const prb_t *prb, const args_t &args,
+void compute_ref(const prb_t *prb, dir_t dir, const args_t &args,
         dnnl_primitive_t prim_ref = nullptr);
 void compute_ref_fwd(const prb_t &prb, const args_t &args);
 void compute_ref_bwd(const prb_t &prb, const args_t &args);
 
 int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t &prb, res_t *res);
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t &prb, res_t *res);

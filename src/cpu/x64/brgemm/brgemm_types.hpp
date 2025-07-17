@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,14 +20,20 @@
 #include "common/primitive_attr.hpp"
 #include "cpu/platform.hpp"
 #include "cpu/x64/cpu_isa_traits.hpp"
+#include "cpu/x64/jit_generator.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace cpu {
 namespace x64 {
 
+// NOLINTBEGIN(modernize-use-using)
+// GCC treats using and typedef differently for enums and structs
+// https://stackoverflow.com/questions/48613758
 // The type defines organization of batch of matrices
 typedef enum {
+    // Undefined brgemm batch kind
+    brgemm_batch_kind_undef = 0,
     // A and B arrays of pointers
     brgemm_addr = 1,
     // Base address and array of offsets from base address.
@@ -52,13 +58,6 @@ typedef enum {
     per_n = 3,
     per_k = 4,
 } brgemm_broadcast_t;
-
-struct brgemm_strides_t {
-    // Stride between A matrices
-    dim_t stride_a;
-    // Stride between B matrices
-    dim_t stride_b;
-};
 
 typedef enum {
     brgemm_lo_default = 0,
@@ -85,6 +84,46 @@ typedef enum {
     brgemm_hint_nt_false,
     brgemm_hint_nt_true,
 } brgemm_kernel_hint_nt_t;
+// NOLINTEND(modernize-use-using)
+
+struct brgemm_strides_t {
+    // Stride between A matrices
+    dim_t stride_a;
+    // Stride between B matrices
+    dim_t stride_b;
+};
+
+// NOLINTBEGIN(modernize-use-using)
+// memory advice feature heuristic is based on the performance tests done
+// on simulator and lets the tile loading snoop for other cores caches if
+// the A/B matrices are shared. thus, if already shared, no need to fetch
+// from lower level memories the assumption is that if we don't divide
+// the C matrix evenly on row chunks per thread, then it worth checking
+// mem advice as there will be sharing
+typedef enum {
+    brgemm_hint_mem_advice_undef = 0,
+
+    // only matrix A is read shared between threads. selected when
+    // there is sharing of data between threads over the A matrix
+    // when chunks are processed horizontally and the threads don't
+    // divide the A buffer w/o remainder in chunks. Thus, it is worth
+    // sharing between threads
+    // or when chunks are processed vertically and split between threads
+    brgemm_hint_mem_advice_A,
+
+    // only matrix B is read shared between threads. selected when
+    // there is sharing of data between threads over the A matrix
+    // when chunks are processed vertically and the threads don't
+    // divide the A buffer w/o remainder in chunks. Thus, it is worth
+    // sharing between threads.
+    // or when chunks are processed horizontally and split between threads
+    brgemm_hint_mem_advice_B,
+
+    // if both conditions above apply, it worth sharing on both A and B buffer
+    // between threads
+    brgemm_hint_mem_advice_A_B,
+} brgemm_kernel_hint_mem_advice_t;
+// NOLINTEND(modernize-use-using)
 
 struct brgemm_prf_t {
     int dist0 {-1};
@@ -94,11 +133,7 @@ struct brgemm_prf_t {
 };
 
 struct brgemm_batch_element_t {
-    brgemm_batch_element_t() {
-        ptr.A = ptr.B = nullptr;
-        vvpad.top = vvpad.bottom = 0;
-        has_s8s8_comp_batch_pad = 0;
-    }
+    brgemm_batch_element_t() { ptr.A = ptr.B = nullptr; }
     union {
         struct {
             const void *A;
@@ -110,14 +145,14 @@ struct brgemm_batch_element_t {
         } offset;
     };
     struct {
-        dim_t top;
-        dim_t bottom;
+        dim_t top = 0;
+        dim_t bottom = 0;
     } vvpad; // w.r.t. M dimension
 
     // Used to calculate compensation when batch padding is present.
     // Note: batch_pad represent the overlap between weights and the height
     // dimension w.r.t. convolution dimensions.
-    dim_t has_s8s8_comp_batch_pad;
+    dim_t has_s8s8_comp_batch_pad = 0;
 };
 
 struct DNNL_API brgemm_attr_t {
@@ -136,7 +171,22 @@ struct DNNL_API brgemm_attr_t {
             = brgemm_kernel_prefetching_t::brgemm_prf_default;
     brgemm_prf_t hint_prfA, hint_prfB, hint_prfC;
 
-    bool wary_tail_read;
+    // This parameter determines how we will read the tail by K dimension from
+    // matrix A. For AMX if the parameter is true then the brgemm will first
+    // copy the data to the intermediate buffer and only then use the tileload.
+    // For non-AMX the A data are loaded byte by byte if flag is set
+    bool wary_A_k_tail_read {false};
+    // For AMX the K dimension given to the brgemm is required to be divisible
+    // by vnni granularity. In addition blocking by K dimension may not be
+    // optimal if K greater than tile size and divisible by it.
+    // The parameter 'extendable_k' enables the brgemm to use the optimal K
+    // block size assuming that the following requirements for the matrix B are
+    // fulfilled:
+    //  - It is ​​properly blocked (64 bytes block by K dimension).
+    //  - The dimension K is padded by zeros.
+    // For K tail handling in this case the brgemm behavior is determined by the
+    // 'wary_A_k_tail_read' parameter.
+    bool extendable_k {false};
     bool generate_skip_accumulation;
     // Value of bd_mask_level specifies how bd_mask is used in brgemm kernel
     // 0 – bd_mask is not used
@@ -150,6 +200,7 @@ struct DNNL_API brgemm_attr_t {
     // interleave stores or not
     bool use_interleave_stores;
     impl::fpmath_mode_t fpmath_mode = fpmath_mode::strict;
+    bool b_is_vnni {false};
     // Second level leading dimension describing distance between 16-line
     // blocks in case of blocked layout. Used to calculate address of next
     // bd block. By default are equal to regular leading dimension parameters
@@ -160,14 +211,16 @@ struct DNNL_API brgemm_attr_t {
     // and there is no unrolling by batchsize in kernel
     bool var_bs {false};
     bool postops_only {false};
-    // Grouping in batch. Used by brdgmm
-    int bs_group {0};
+    // Hint for bs_group value in brgemm_desc_t
+    int hint_bs_group {0};
 
     int hint_bd_block {0};
     int hint_ld_block {0};
     int hint_bd_block2 {0};
     int hint_ld_block2 {0};
     bool hint_ununroll_bd_loop {false};
+
+    brgemm_kernel_hint_mem_advice_t mem_advice {brgemm_hint_mem_advice_undef};
 
     brgemm_kernel_hint_nt_t hint_load_nt_A {brgemm_hint_nt_undef};
     brgemm_kernel_hint_nt_t hint_load_nt_B {brgemm_hint_nt_undef};
@@ -186,10 +239,10 @@ struct DNNL_API brgemm_attr_t {
     const brgemm_batch_element_t *static_offsets;
 };
 
-struct brgemm_t {
-    brgemm_t() {}
-    brgemm_t(const brgemm_t &other);
-    DNNL_API ~brgemm_t();
+struct brgemm_desc_t {
+    brgemm_desc_t() = default;
+    brgemm_desc_t(const brgemm_desc_t &other);
+    DNNL_API ~brgemm_desc_t();
 
     // Note: new added parameters must be taken into account in the brgemm
     // comparison function
@@ -231,6 +284,9 @@ struct brgemm_t {
     bool with_eltwise = false;
     bool with_binary = false;
     bool with_scales = false;
+    bool skip_zp_b_compensation = false;
+    bool skip_scales = false;
+    bool n_bcast_1_load = false;
 
     brgemm_broadcast_t zp_type_a = brgemm_broadcast_t::none;
     brgemm_broadcast_t zp_type_b = brgemm_broadcast_t::none;
@@ -238,6 +294,8 @@ struct brgemm_t {
 
     int is_oc_scale = 0;
     bool with_dst_scales = false;
+    // Grouping in batch used by brdgmm kernel
+    int bs_group {0};
 
     brgemm_attr_t brgattr;
 
@@ -263,9 +321,11 @@ struct brgemm_t {
     bool is_tmm = false;
     bool is_int8 = false, is_int8_tmm = false;
     bool is_bf16 = false, is_bf16_tmm = false, is_bf16_emu = false;
+    bool is_fp8 = false, is_fp8_tmm = false;
     bool is_f16 = false, is_f16_tmm = false;
     bool is_f32 = false;
     bool is_bf32 = false;
+    bool is_tf32 = false;
 
     bool has_int8_vnni = false;
 
@@ -287,11 +347,24 @@ struct brgemm_t {
 
     static constexpr int MAX_VPAD = 100;
     static constexpr int AMX_TILES_NUM = 8;
+    static constexpr int tilesize = 1024;
 
     void set_attr(const primitive_attr_t *ppdattr);
     void set_dst_md(const memory_desc_t *pdst_md);
     const primitive_attr_t *attr() const { return attr_; };
     const memory_desc_t *dst_md() const { return dst_md_; };
+
+    // return 'true' when FP8 MAC is not natively supported by the CPU ISA
+    bool is_fp8_via_convert() const {
+        return is_fp8
+                && utils::one_of(isa_impl, avx10_1_512_amx_fp16, avx10_2_512);
+    }
+
+    bool is_fp8_via_convert_non_amx() const {
+        return is_fp8_via_convert() && isa_impl == avx10_2_512;
+    }
+
+    bool is_input_convert() const { return is_bf32 || is_fp8_via_convert(); }
 
     bool is_row_major() const {
         assert(layout != brgemm_layout_undef);
@@ -329,7 +402,8 @@ struct brgemm_t {
 
     int get_A_tensor(int m, bool m_tail = false) const noexcept {
         const auto full_A_tiles = get_num_A_tiles() - (bdb_tail ? 1 : 0);
-        auto M = m_tail ? get_num_A_tiles() - 1 : m % full_A_tiles;
+        auto M = (m_tail || full_A_tiles == 0) ? get_num_A_tiles() - 1
+                                               : m % full_A_tiles;
         return (get_num_C_tiles() + M);
     }
 
@@ -344,38 +418,124 @@ struct brgemm_t {
 
     int get_B_tensor(int n, bool n_tail = false) const noexcept {
         const auto full_B_tiles = get_num_B_tiles() - (ldb_tail ? 1 : 0);
-        auto N = n_tail ? get_num_B_tiles() - 1 : n % full_B_tiles;
+        auto N = (n_tail || full_B_tiles == 0) ? get_num_B_tiles() - 1
+                                               : n % full_B_tiles;
         return (get_num_C_tiles() + get_num_A_tiles() + N);
+    }
+
+    int get_convert_wsp_buffer_size() const noexcept {
+        if (!is_input_convert()) return 0;
+        const int n_bdb = bd_block2;
+        const int n_rdb = rdb + (rdb_tail != 0);
+        const int n_ldb = ldb + (ldb_tail != 0);
+        const int downcvt_tiles = brgattr.max_bs * n_rdb * (n_bdb + n_ldb);
+        return downcvt_tiles * tilesize;
     }
 
     int get_wsp_buffer_size() const noexcept {
         int sz = 0;
         if (is_tmm) {
-            constexpr int tilesize = 1024;
             sz = get_num_C_tiles() * tilesize; // postops buffer
-            if (is_bf32) {
-                const int n_bdb = bd_block2;
-                const int n_rdb = rdb + (rdb_tail != 0);
-                const int n_ldb = ldb + (ldb_tail != 0);
-                const int downcvt_tiles
-                        = brgattr.max_bs * n_rdb * (n_bdb + n_ldb);
-                sz += downcvt_tiles * tilesize;
-            }
+            sz += get_convert_wsp_buffer_size();
+            if (amx_wary_k_tail()) sz += tilesize;
         }
         return sz;
     }
 
-    bool is_b_data_layout_vnni() {
-        // True in general, only exception is f16 with avx512_core_fp16.
-        // We also return `true` for bf32 (brgattr.fpmath_.mode_ = bf16),
-        // because the data transformation to vnni layout is internal
-        // and transparent to user.
-        return !(dt_b == data_type::f16 && isa_impl == avx512_core_fp16);
+    // A class version of the `static` version of the function.
+    // Note: used in benchdnn only, not used inside the library.
+    bool is_b_data_layout_vnni() const {
+        return is_b_data_layout_vnni(dt_a, dt_b, brgattr.b_is_vnni, isa_impl);
     }
+
+    // This function indicates when VNNI granularity packing is expected by the
+    // kernel.
+    //
+    // Note: used as the `static` function in ukernel only, not anywhere else.
+    //   `static`-ness is required to identify if the transform routine must be
+    //   used for the ukernel to work properly. This information is critical
+    //   because the transform routine accepts only 4 `ldb` values which affects
+    //   ukernel creation. Otherwise, the user must create the ukernel object,
+    //   query the packing info, and if it's required, likely re-create the
+    //   object with a different `ldb` value, which may not work because
+    //   creation stage for user's application may not provide all the info to
+    //   create a ukernel object.
+    // Note: for `bf32` (or brgattr.fpmath_mode_ == bf16) the function returns
+    //   `true` because the data transformation to vnni layout is internal and
+    //   transparent to the user.
+    // Note: the library MUST NOT break the ability to provide this information
+    //   without brgemm_desc_t object creation.
+    static bool is_b_data_layout_vnni(data_type_t dt_a, data_type_t dt_b,
+            bool attr_b_is_vnni, cpu_isa_t isa) {
+        using namespace data_type;
+        switch (dt_b) {
+            case f32: return false;
+            // Note: `dt_a == f32` means implicit up-conversion of B to f32.
+            case f16:
+                return dt_a != f32
+                        && (is_f16_b_non_amx_vnni(dt_b, attr_b_is_vnni, isa)
+                                || is_superset(isa, avx512_core_amx_fp16)
+                                || is_superset(isa, avx2_vnni_2));
+            // Note: `dt_a == f32` means implicit up-conversion of B to f32.
+            case bf16: return dt_a != f32;
+            default: return true;
+        }
+    }
+
+    // This function indicates when the kernel would operate with the D pointer
+    // (`true`) and when not (`false`). It's important to distinguish these two
+    // cases due to the fact that kernel would ignore D pointer completely if
+    // no post-accumulation work is identified.
+    //
+    // Correspondent decisions are done in `store_accumulators` function.
+    // The function is used inside kernel generation and ukernel API.
+    // TODO: extend usage to primitives (each of them utilize their own copy
+    // of this definition).
+    bool are_post_ops_applicable() const {
+        const bool has_zero_points = !utils::everyone_is(
+                brgemm_broadcast_t::none, zp_type_a, zp_type_b, zp_type_c);
+        return dt_c != dt_d || with_eltwise || with_binary || with_scales
+                || with_bias || with_sum || req_s8s8_compensation
+                || has_zero_points || with_dst_scales;
+    }
+
     bool is_xf16() const noexcept { return is_bf16 || is_f16; }
 
-    bool operator==(const brgemm_t &rhs) const;
-    bool operator<(const brgemm_t &rhs) const;
+    bool is_f16_b_non_amx_vnni() const {
+        return is_f16_b_non_amx_vnni(dt_b, brgattr.b_is_vnni, isa_impl);
+    }
+
+    // Note: `static` version appears because of `static is_b_data_layout_vnni`.
+    static bool is_f16_b_non_amx_vnni(
+            data_type_t dt_b, bool attr_b_is_vnni, cpu_isa_t isa) {
+        // This function controls the code section which relies on
+        // `avx512_core_fp16` instructions directly.
+        return dt_b == data_type::f16 && attr_b_is_vnni
+                && isa == avx512_core_fp16;
+    }
+
+    bool reduce_by_words() const {
+        return is_bf16_tmm || is_f16_tmm || is_input_convert();
+    }
+    int max_rd_block() const {
+        return is_tf32 ? 16 : reduce_by_words() ? 32 : 64;
+    }
+    int rd_block_step() const {
+        return is_tf32 ? 1 : (reduce_by_words() && !is_fp8) ? 2 : 4;
+    }
+
+    bool amx_may_extend_k() const {
+        return (is_superset(isa_impl, avx512_core_amx) && brgattr.extendable_k
+                && (reduce_dim % data_type_vnni_granularity(dt_a)
+                        || (reduce_dim > max_rd_block()
+                                && reduce_dim % max_rd_block())));
+    }
+    bool amx_wary_k_tail() const {
+        return amx_may_extend_k() && brgattr.wary_A_k_tail_read;
+    }
+
+    bool operator==(const brgemm_desc_t &rhs) const;
+    bool operator<(const brgemm_desc_t &rhs) const;
 
 private:
     primitive_attr_t *attr_ {nullptr};
@@ -388,7 +548,7 @@ private:
 
     // The default assignment operator is intended to be used in custom copy
     // constructor only to avoid copying field-by-field
-    brgemm_t &operator=(const brgemm_t &) = default;
+    brgemm_desc_t &operator=(const brgemm_desc_t &) = default;
 };
 
 struct brgemm_dynamic_values_t {
@@ -437,6 +597,7 @@ struct brgemm_kernel_params_t {
 
     const void *a_zp_compensations = nullptr;
     const void *b_zp_compensations = nullptr;
+    const void *a_zp_values = nullptr;
     const void *c_zp_values = nullptr;
     size_t skip_accm = 0;
     int32_t zp_a_val = 1;
@@ -447,43 +608,56 @@ struct brgemm_kernel_params_t {
     dim_t dynamic_LDD = 0;
 };
 
-template <cpu_isa_t isa, typename Vmm>
+template <typename Vmm>
 struct jit_brgemm_kernel_t;
 struct jit_brgemm_amx_uker_base_t;
-template <cpu_isa_t isa, typename Vmm>
+template <typename Vmm>
 struct jit_brdgmm_kernel_base_t;
-class jit_generator;
+class jit_generator_t;
 
 struct brgemm_kernel_t {
-    brgemm_kernel_t() {};
-    virtual ~brgemm_kernel_t() {};
+    brgemm_kernel_t() = default;
+    virtual ~brgemm_kernel_t() = default;
     virtual status_t create_kernel() = 0;
     virtual void operator()(brgemm_kernel_params_t *) const = 0;
-    virtual const jit_generator *get_jit_generator() const = 0;
+    virtual const jit_generator_t *get_jit_generator() const = 0;
+    virtual const brgemm_desc_t &get_brg() const = 0;
 };
 
-template <cpu_isa_t isa, typename Vmm>
-struct brgemm_kernel_common_t : public brgemm_kernel_t {
-    brgemm_kernel_common_t(const brgemm_t &abrd);
-    ~brgemm_kernel_common_t();
+struct jit_base_brgemm_kernel_t : public jit_generator_t {
+    jit_base_brgemm_kernel_t(const char *impl_name, cpu_isa_t isa_impl)
+        : jit_generator_t(impl_name, isa_impl) {}
+    virtual const brgemm_desc_t &get_brg() const = 0;
+};
 
-    status_t create_kernel();
-    void operator()(brgemm_kernel_params_t *) const;
-    virtual const jit_generator *get_jit_generator() const;
+template <typename Vmm>
+struct brgemm_kernel_common_t : public brgemm_kernel_t {
+    brgemm_kernel_common_t(const brgemm_desc_t &abrd);
+    ~brgemm_kernel_common_t() override;
+
+    status_t create_kernel() override;
+    void operator()(brgemm_kernel_params_t *) const override;
+    const jit_generator_t *get_jit_generator() const override;
+    const brgemm_desc_t &get_brg() const override {
+        return ((jit_base_brgemm_kernel_t *)brgemm_kernel_)->get_brg();
+    }
 
 private:
-    jit_brgemm_kernel_t<isa, Vmm> *brgemm_kernel_ = nullptr;
+    jit_brgemm_kernel_t<Vmm> *brgemm_kernel_ = nullptr;
 
     DNNL_DISALLOW_COPY_AND_ASSIGN(brgemm_kernel_common_t);
 };
 
 struct brgemm_amx_uker_t : public brgemm_kernel_t {
-    brgemm_amx_uker_t(const brgemm_t &abrd);
-    ~brgemm_amx_uker_t();
+    brgemm_amx_uker_t(const brgemm_desc_t &abrd);
+    ~brgemm_amx_uker_t() override;
 
-    status_t create_kernel();
-    void operator()(brgemm_kernel_params_t *) const;
-    virtual const jit_generator *get_jit_generator() const;
+    status_t create_kernel() override;
+    void operator()(brgemm_kernel_params_t *) const override;
+    const jit_generator_t *get_jit_generator() const override;
+    const brgemm_desc_t &get_brg() const override {
+        return ((jit_base_brgemm_kernel_t *)brgemm_kernel_)->get_brg();
+    }
 
 private:
     jit_brgemm_amx_uker_base_t *brgemm_kernel_ = nullptr;
@@ -491,24 +665,27 @@ private:
     DNNL_DISALLOW_COPY_AND_ASSIGN(brgemm_amx_uker_t);
 };
 
-template <cpu_isa_t isa, typename Vmm>
+template <typename Vmm>
 struct brdgmm_kernel_t : public brgemm_kernel_t {
-    brdgmm_kernel_t(const brgemm_t &abrd);
-    ~brdgmm_kernel_t();
+    brdgmm_kernel_t(const brgemm_desc_t &abrd);
+    ~brdgmm_kernel_t() override;
 
-    status_t create_kernel();
-    void operator()(brgemm_kernel_params_t *) const;
-    virtual const jit_generator *get_jit_generator() const;
+    status_t create_kernel() override;
+    void operator()(brgemm_kernel_params_t *) const override;
+    const jit_generator_t *get_jit_generator() const override;
+    const brgemm_desc_t &get_brg() const override {
+        return ((jit_base_brgemm_kernel_t *)brgemm_kernel_)->get_brg();
+    }
 
 private:
-    jit_brdgmm_kernel_base_t<isa, Vmm> *brgemm_kernel_ = nullptr;
+    jit_brdgmm_kernel_base_t<Vmm> *brgemm_kernel_ = nullptr;
 
     DNNL_DISALLOW_COPY_AND_ASSIGN(brdgmm_kernel_t);
 };
 
 /// @param bias Vector of bias (vector length is N)
 /// @param scales - Vector of scale factor values which represents combination
-///     scale factors for matrixes A and B. If brgemm_t::is_oc_scale = true
+///     scale factors for matrixes A and B. If brgemm_desc_t::is_oc_scale = true
 ///     vector length is N otherwise it must be broadcasted to vector of simd
 ///     width length
 /// @param binary_post_ops_rhs - Ptr to table of pointers to tensors used as rhs
@@ -547,7 +724,8 @@ struct brgemm_post_ops_data_t {
             const void *b_zp_compensations = nullptr,
             const void *c_zp_values = nullptr, bool skip_accumulation = false,
             int32_t zp_a_val = 1, bool do_only_comp = false,
-            bool do_only_zp_a_val = false, const float *dst_scales = nullptr)
+            bool do_only_zp_a_val = false, const float *dst_scales = nullptr,
+            const void *a_zp_values = nullptr)
         : bias(bias)
         , scales(scales)
         , binary_post_ops_rhs(binary_post_ops_rhs)
@@ -562,7 +740,8 @@ struct brgemm_post_ops_data_t {
         , zp_a_val {zp_a_val}
         , do_only_comp {do_only_comp}
         , do_only_zp_a_val {do_only_zp_a_val}
-        , dst_scales(dst_scales) {}
+        , dst_scales(dst_scales)
+        , a_zp_values(a_zp_values) {}
 
     const void *bias = nullptr;
     const float *scales = nullptr;
@@ -579,6 +758,7 @@ struct brgemm_post_ops_data_t {
     const bool do_only_comp = false;
     const bool do_only_zp_a_val = false;
     const float *dst_scales = nullptr;
+    const void *a_zp_values = nullptr;
 };
 
 } // namespace x64

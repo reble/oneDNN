@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -50,6 +50,8 @@ struct gemm_bf16_inner_product_fwd_t : public primitive_t {
             using namespace utils;
             using namespace data_type;
 
+            // disabling verbose dispatch messages for unsupported isa for
+            // better readability
             if (!mayiuse(avx512_core)) return status::unimplemented;
             VDISPATCH_INNER_PRODUCT(is_fwd(), VERBOSE_BAD_PROPKIND);
             VDISPATCH_INNER_PRODUCT(
@@ -63,6 +65,8 @@ struct gemm_bf16_inner_product_fwd_t : public primitive_t {
                     IMPLICATION(with_bias(),
                             one_of(weights_md(1)->data_type, f32, bf16)),
                     VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_INNER_PRODUCT(set_default_params() == status::success,
+                    VERBOSE_UNSUPPORTED_TAG);
             VDISPATCH_INNER_PRODUCT(
                     attr()->has_default_values(
                             primitive_attr_t::skip_mask_t::post_ops,
@@ -75,8 +79,6 @@ struct gemm_bf16_inner_product_fwd_t : public primitive_t {
             VDISPATCH_INNER_PRODUCT(inner_product_utils::post_ops_ok(
                                             attr()->post_ops_, &dst_md_),
                     VERBOSE_UNSUPPORTED_POSTOP);
-            VDISPATCH_INNER_PRODUCT(set_default_params() == status::success,
-                    VERBOSE_UNSUPPORTED_TAG);
             VDISPATCH_INNER_PRODUCT(dense_gemm_consitency_check(
                                             src_md(), weights_md(), dst_md()),
                     VERBOSE_INCOMPATIBLE_GEMM_FMT);
@@ -106,10 +108,10 @@ struct gemm_bf16_inner_product_fwd_t : public primitive_t {
 
     gemm_bf16_inner_product_fwd_t(const pd_t *apd) : primitive_t(apd) {}
 
-    typedef typename prec_traits<dst_data_type>::type dst_data_t;
-    typedef typename prec_traits<data_type::f32>::type acc_data_t;
-    typedef typename prec_traits<data_type::bf16>::type src_data_t;
-    typedef typename prec_traits<data_type::bf16>::type wei_data_t;
+    using dst_data_t = typename prec_traits_t<dst_data_type>::type;
+    using acc_data_t = typename prec_traits_t<data_type::f32>::type;
+    using src_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using wei_data_t = typename prec_traits_t<data_type::bf16>::type;
 
     status_t init(engine_t *engine) override {
         const bool has_bias = pd()->with_bias();
@@ -156,7 +158,8 @@ struct gemm_bf16_inner_product_bwd_data_t : public primitive_t {
 
         status_t init(engine_t *engine) {
             using namespace data_type;
-
+            // disabling verbose dispatch messages for unsupported isa for
+            // better readability
             if (!mayiuse(avx512_core)) return status::unimplemented;
             VDISPATCH_INNER_PRODUCT(
                     desc()->prop_kind == prop_kind::backward_data,
@@ -201,10 +204,10 @@ struct gemm_bf16_inner_product_bwd_data_t : public primitive_t {
 
     gemm_bf16_inner_product_bwd_data_t(const pd_t *apd) : primitive_t(apd) {}
 
-    typedef typename prec_traits<data_type::bf16>::type diff_dst_data_t;
-    typedef typename prec_traits<data_type::f32>::type acc_data_t;
-    typedef typename prec_traits<diff_src_data_type>::type diff_src_data_t;
-    typedef typename prec_traits<data_type::bf16>::type wei_data_t;
+    using diff_dst_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using acc_data_t = typename prec_traits_t<data_type::f32>::type;
+    using diff_src_data_t = typename prec_traits_t<diff_src_data_type>::type;
+    using wei_data_t = typename prec_traits_t<data_type::bf16>::type;
 
     status_t execute(const exec_ctx_t &ctx) const override {
         return execute_backward_data(ctx);
@@ -227,7 +230,8 @@ struct gemm_bf16_inner_product_bwd_weights_t : public primitive_t {
         status_t init(engine_t *engine) {
             using namespace utils;
             using namespace data_type;
-
+            // disabling verbose dispatch messages for unsupported isa for
+            // better readability
             if (!mayiuse(avx512_core)) return status::unimplemented;
             VDISPATCH_INNER_PRODUCT(
                     desc()->prop_kind == prop_kind::backward_weights,
@@ -312,10 +316,10 @@ struct gemm_bf16_inner_product_bwd_weights_t : public primitive_t {
         return status::success;
     }
 
-    typedef typename prec_traits<data_type::bf16>::type diff_dst_data_t;
-    typedef typename prec_traits<data_type::f32>::type acc_data_t;
-    typedef typename prec_traits<data_type::bf16>::type src_data_t;
-    typedef typename prec_traits<diff_wei_data_type>::type diff_wei_data_t;
+    using diff_dst_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using acc_data_t = typename prec_traits_t<data_type::f32>::type;
+    using src_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using diff_wei_data_t = typename prec_traits_t<diff_wei_data_type>::type;
 
     status_t execute(const exec_ctx_t &ctx) const override {
         return execute_backward_weights(ctx);

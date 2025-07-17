@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 * Copyright 2023 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,10 +21,12 @@
 // api type strings
 #define VERBOSE_primitive "primitive"
 #define VERBOSE_graph "graph"
+#define VERBOSE_ukernel "ukernel"
 #define VERBOSE_common "common"
 
 // log type strings
 #define VERBOSE_error "error"
+#define VERBOSE_warn "warning"
 #define VERBOSE_create "create"
 #define VERBOSE_create_nested "create_nested"
 #define VERBOSE_exec "exec"
@@ -41,9 +43,9 @@
 // verbose messages
 #define VERBOSE_PROFILING_UNSUPPORTED "profiling capabilities are not supported"
 #define VERBOSE_INVALID_DEVICE_ENV "invalid %s device in environment: index %zu"
-#define VERBOSE_INVALID_ENGINE_KIND "no %s device is available"
+#define VERBOSE_INVALID_ENGINE_KIND "no %s %s device is available"
 #define VERBOSE_INVALID_ENGINE_IDX \
-    "%zu %s devices are available but %zu was queried"
+    "%zu %s devices are available but device index %zu was queried"
 #define VERBOSE_INVALID_ACC_MODE "bad accumulation mode %s"
 #define VERBOSE_NULL_ARG "one of the mandatory arguments is nullptr"
 #define VERBOSE_BAD_ENGINE_KIND "bad engine kind"
@@ -63,6 +65,9 @@
 #define VERBOSE_INCONSISTENT_DIM "dimension %s:%d is inconsistent with %s:%d"
 #define VERBOSE_INCONSISTENT_NDIMS \
     "tensors %s and %s have inconsistent number of dimensions"
+// TODO: replace the version above with the version below.
+#define VERBOSE_INCONSISTENT_NDIMS_WITH_VALS \
+    "tensors %s and %s have inconsistent number of dimensions (%d) and (%d)"
 #define VERBOSE_INCONSISTENT_DT "tensors %s and %s have inconsistent datatypes"
 #define VERBOSE_INCONSISTENT_MDS "inconsistent %s and %s mds"
 #define VERBOSE_INCONSISTENT_ALPHA_BETA \
@@ -70,6 +75,7 @@
 #define VERBOSE_INCONSISTENT_PRB "problem is not mathematically consistent"
 #define VERBOSE_BAD_NDIMS "%s has a bad number of dimensions %d"
 #define VERBOSE_BAD_DIM "bad dimension %s:%d"
+#define VERBOSE_OUT_OF_RANGE_DIMS "out-of-range dimensions for %s"
 
 #define VERBOSE_UNSUPPORTED_ISA "unsupported isa"
 #define VERBOSE_UNSUPPORTED_DT "unsupported datatype"
@@ -84,33 +90,53 @@
 #define VERBOSE_UNSUPPORTED_SPARSE_CFG "unsupported sparse md configuration"
 #define VERBOSE_UNSUPPORTED_FEATURE "unsupported feature for implementation: %s"
 #define VERBOSE_UNSUPPORTED_DEVICE_FEATURE "%s feature unavailable for device"
+#define VERBOSE_UNSUPPORTED_BACKEND "unsupported %s backend"
+#define VERBOSE_UNSUPPORTED_PAD_FEATURE "unsupported feature for padding: %s"
+#define VERBOSE_UNSUPPORTED_TENSOR_LAYOUT "unsupported %s tensor layout"
+#define VERBOSE_UNSUPPORTED_ARCH "unsupported %s architecture"
 
 #define VERBOSE_UNSUPPORTED_TAG "unsupported format tag"
 #define VERBOSE_UNSUPPORTED_TAG_S "unsupported format tag for %s"
+#define VERBOSE_UNSUPPORTED_FORMAT_KIND "unsupported format kind"
+
 #define VERBOSE_ISA_SPARSE_ENCODING_MISMATCH \
     "sparse encoding is not supported on this isa"
 #define VERBOSE_ISA_DT_MISMATCH \
     "datatype configuration not supported on this isa"
 #define VERBOSE_OFFSET_DT_MISMATCH "%s offsets do not fit into %s datatype"
+#define VERBOSE_PROPKIND_DT_MISMATCH "datatype and propagation kind mismatch"
 #define VERBOSE_WS_MISMATCH \
     "workspace mismatch between forward and backward primitive " \
     "descriptors"
+#define VERBOSE_TENSOR_FORMAT_MISMATCH \
+    "memory formats for %s and %s tensors do not match"
+
 #define VERBOSE_WS_INIT "workspace initialization failed"
 #define VERBOSE_SCRATCHPAD_INIT "scratchpad initialization unsuccessful"
 
-#define VERBOSE_BLOCKING_FAIL "blocking heuristic failed"
+#define VERBOSE_BLOCKING_FAIL "blocking heuristic fail: %s"
+#define VERBOSE_LARGE_SHAPES "large shapes fall back"
 #define VERBOSE_SMALL_SHAPES "small shapes fall back"
 #define VERBOSE_NONTRIVIAL_STRIDE "only trivial strides are supported"
 #define VERBOSE_UNSUPPORTED_MEM_STRIDE "unsupported memory stride"
 
-#define VERBOSE_PADDING_ERROR "padding error for implementation: %s"
-#define VERBOSE_IMPL_HEURISTIC_FAIL "implementation heuristic failed: %s"
-#define VERBOSE_1x1CONV_HEURISTIC_FAIL \
-    "failed heuristic for 1x1 convolution: %s"
-#define VERBOSE_PERF_HEURISTICS_DISABLED \
-    "performance heuristics disabled for %s"
+#define VERBOSE_IMPL_HEURISTIC_FAIL "heuristic fail: %s"
+#define VERBOSE_1x1CONV_HEURISTIC_FAIL "heuristic fail for 1x1 convolution: %s"
 #define VERBOSE_SCRATCHPAD_LIMIT "scratchpad memory limit exceeded"
-#define VERBOSE_PRIMITIVE_CREATION_FAIL "failed to create nested primitive %s"
+#define VERBOSE_PRIMITIVE_CREATION_FAIL "failed to create nested %s primitive"
+#define VERBOSE_DESC_CREATION_FAIL "failed to create %s descriptor"
+#define VERBOSE_SHAPE_RESTRICTION "failed shape restrictions"
 #define VERBOSE_INCOMPATIBLE_GEMM_FMT "incompatible gemm format"
+
+#define VERBOSE_DEVICE_CTX_MISMATCH "device not found in the given context"
+#define VERBOSE_MISSING_OCL_DEVICE "%s OpenCL device not found"
+#define VERBOSE_INVALID_PLATFORM "unsupported %s platform (expected %s got %s)"
+#define VERBOSE_ENGINE_CREATION_FAIL "failed to create %s engine with index %zu"
+#define VERBOSE_KERNEL_CREATION_FAIL "failed to create %s kernel"
+#define VERBOSE_DETERMINISTIC_FAIL "failed to run kernel deterministically"
+#define VERBOSE_SKIP_PRIMITIVE_IMPL \
+    "skipping or dispatching to another implementation"
+#define VERBOSE_MEM_DESC_CHECK_FAIL "bad arguments for memory descriptor"
+#define VERBOSE_INVALID_MEM_IDX "invalid memory index"
 
 #endif

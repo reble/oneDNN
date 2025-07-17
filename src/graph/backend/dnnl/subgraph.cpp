@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,17 +42,21 @@ namespace dnnl {
 namespace impl {
 namespace graph {
 namespace dnnl_impl {
+#define VCHECK_SUBGRAPH(cond, status, msg, ...) \
+    VCONDCHECK(graph, create, check, subgraph, (cond), status, msg, \
+            ##__VA_ARGS__);
 using op_t = op_t;
 using op_ptr = std::shared_ptr<op_t>;
 using value_ptr = std::shared_ptr<value_t>;
 using ltw = logical_tensor_wrapper_t;
 
 subgraph_t::subgraph_t(const std::vector<op_ptr> &ops, const dnnl::engine &eng,
-        impl::fpmath_mode_t fpm_mode, bool can_use_blocked_layout,
+        const graph::fpmath_t &fpm_mode, bool can_use_blocked_layout,
         bool reset_layout)
-    : graph_t(ops, static_cast<engine_kind_t>(eng.get_kind()), fpm_mode)
+    : graph_t(ops, static_cast<engine_kind_t>(eng.get_kind()))
     , p_engine_(&eng)
     , fusion_info_mgr_(fpm_mode, can_use_blocked_layout) {
+    set_fpmath_mode(fpm_mode.mode_, fpm_mode.apply_to_int_);
     if (reset_layout) { set_all_layout_to_any(get_mutable_ops()); }
 }
 
@@ -155,7 +159,7 @@ status_t subgraph_visualizer_t::run(const std::shared_ptr<subgraph_t> &sg,
 
     std::ofstream out;
 
-    std::string backend_name = dnnl_backend::get_singleton().get_name();
+    std::string backend_name = dnnl_backend_t::get_singleton().get_name();
     std::string partition_name = "partition_" + std::to_string(partition_id_);
     std::string index_str = std::to_string(index_++);
     const std::string &pass_name = name_suffix;
@@ -278,10 +282,8 @@ status_t subgraph_validator_t::run(const std::shared_ptr<subgraph_t> &sg) {
         if (!opm) { return status::invalid_graph_op; }
 
         // Validate
-        if (!opm->verify(op, false)) {
-            assertm(false, "schema verify failed");
-            return status::invalid_graph_op;
-        }
+        VCHECK_SUBGRAPH(opm->verify(op, false), status::invalid_graph_op,
+                "schema verify failed for op %s", op->get_name().c_str());
 
         // Not allow undefined attributes
         const auto &expected_attrs = opm->get_attrs();
@@ -320,13 +322,11 @@ status_t subgraph_validator_t::run(const std::shared_ptr<subgraph_t> &sg) {
                 auto groups = op->get_attr<int64_t>(op_attr::groups);
                 bool ok = data_fmt == "NCX" && filter_fmt == "OIX"
                         && groups == 1;
-                if (!ok) {
-                    DEBUG_PRINT_ERROR("data_format:" + data_fmt + ";"
-                            + "filter_format:" + filter_fmt + ";"
-                            + "groups:" + std::to_string(groups));
-                    assertm(false, "additional verify failed");
-                    return status::invalid_graph_op;
-                }
+                VCHECK_SUBGRAPH(ok, status::invalid_graph_op,
+                        "additional verify failed for dnnl_convolution,  "
+                        "data_format:%s, filter_format:%s, groups:%ld",
+                        data_fmt.c_str(), filter_fmt.c_str(),
+                        static_cast<long int>(groups));
             }
         } else {
             // TODO(qun)
@@ -382,10 +382,6 @@ void subgraph_rewriter_t::run() {
 
     to_be_removed_ops_.clear();
     to_be_inserted_ops_.clear();
-}
-
-subgraph_rewriter_t::~subgraph_rewriter_t() {
-    run();
 }
 
 void subgraph_rewriter_t::fuse_op_to_successor(const op_ptr &op) {
@@ -445,6 +441,26 @@ void subgraph_rewriter_t::insert_op_before(const op_ptr &inserted_op,
     auto new_val = std::make_shared<value_t>(*inserted_op, 0, new_lt, true);
     auto in_dtype = in_val->get_logical_tensor().data_type;
     new_val->set_data_type(in_dtype);
+
+    if (inserted_op->get_kind() == op_kind::dnnl_permute
+            && (base_op->get_kind() == op_kind::dnnl_mul_scales
+                    || base_op->get_kind() == op_kind::dnnl_sub_zps)) {
+        // Only abx tag is respected for scale and zps inputs, should set
+        // strides explicitly and execute reorder.
+
+        dnnl::memory::desc in_md
+                = make_dnnl_memory_desc(in_val->get_logical_tensor());
+        const auto &perm = inserted_op->get_attr<std::vector<int64_t>>(
+                op_attr::permutation);
+        std::vector<int> int_perm(perm.size(), -1);
+        for (size_t i = 0; i < perm.size(); i++) {
+            int_perm[i] = static_cast<int>(perm[i]);
+        }
+        dnnl::memory::desc out_md = in_md.permute_axes(int_perm);
+        const auto &dims = out_md.get_dims();
+        // set the strides with abx tag.
+        new_val->set_strides(get_dense_strides(dims));
+    }
 
     if (k == std::numeric_limits<size_t>::max()) {
         k = inserted_op->num_outputs();

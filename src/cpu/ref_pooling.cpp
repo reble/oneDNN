@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -89,7 +89,7 @@ status_t ref_pooling_fwd_t<data_type, acc_type>::execute_forward(
             const auto off = get_offset(ws_d, mb, oc, od, oh, ow);
             if (ws_dt == data_type::u8) {
                 assert(0 <= value
-                        && value <= numeric_limits<typename prec_traits<
+                        && value <= numeric_limits<typename prec_traits_t<
                                         data_type::u8>::type>::max());
                 ws[off] = value;
             } else
@@ -375,6 +375,8 @@ template struct ref_pooling_fwd_t<data_type::f32>;
 template struct ref_pooling_fwd_t<data_type::s32>;
 template struct ref_pooling_fwd_t<data_type::bf16, data_type::f32>;
 template struct ref_pooling_fwd_t<data_type::f16, data_type::f32>;
+template struct ref_pooling_fwd_t<data_type::f8_e5m2, data_type::f32>;
+template struct ref_pooling_fwd_t<data_type::f8_e4m3, data_type::f32>;
 template struct ref_pooling_fwd_t<data_type::s8, data_type::s32>;
 template struct ref_pooling_fwd_t<data_type::u8, data_type::s32>;
 

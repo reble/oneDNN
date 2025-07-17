@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ using namespace prop_kind;
 using namespace data_type;
 using namespace brgemm_utils;
 
-brgemm_t::brgemm_t(const brgemm_t &other) {
+brgemm_desc_t::brgemm_desc_t(const brgemm_desc_t &other) {
     *this = other;
     // Since copy above will make `attr_` and `dst_md_` point to `other`,
     // nulling them in `this` to avoid cleaning `other` object members.
@@ -50,30 +50,30 @@ brgemm_t::brgemm_t(const brgemm_t &other) {
     set_dst_md(other.dst_md());
 }
 
-brgemm_t::~brgemm_t() {
+brgemm_desc_t::~brgemm_desc_t() {
     cleanup_attr();
     cleanup_dst_md();
 }
 
-void brgemm_t::set_attr(const primitive_attr_t *ppdattr) {
+void brgemm_desc_t::set_attr(const primitive_attr_t *ppdattr) {
     if (ppdattr == attr_) return;
     cleanup_attr();
     if (ppdattr) attr_ = new primitive_attr_t(*ppdattr);
 }
 
-void brgemm_t::set_dst_md(const memory_desc_t *pdst_md) {
+void brgemm_desc_t::set_dst_md(const memory_desc_t *pdst_md) {
     if (pdst_md == dst_md_) return;
     cleanup_dst_md();
     if (pdst_md) dst_md_ = new memory_desc_t(*pdst_md);
 }
 
-void brgemm_t::cleanup_attr() {
+void brgemm_desc_t::cleanup_attr() {
     if (attr_ == nullptr) return;
     delete attr_;
     attr_ = nullptr;
 }
 
-void brgemm_t::cleanup_dst_md() {
+void brgemm_desc_t::cleanup_dst_md() {
     if (dst_md_ == nullptr) return;
     delete dst_md_;
     dst_md_ = nullptr;
@@ -205,6 +205,7 @@ void brgemm_kernel_execute_postops(const brgemm_kernel_t *brg_kernel, int bs,
     brgemm_p.first_mb_matrix_addr_off = post_ops_data.first_mb_matrix_addr_off;
     brgemm_p.a_zp_compensations = post_ops_data.a_zp_compensations;
     brgemm_p.b_zp_compensations = post_ops_data.b_zp_compensations;
+    brgemm_p.a_zp_values = post_ops_data.a_zp_values;
     brgemm_p.c_zp_values = post_ops_data.c_zp_values;
     brgemm_p.ptr_dst_scales = post_ops_data.dst_scales;
     if (dynamic_values) {
@@ -218,11 +219,12 @@ void brgemm_kernel_execute_postops(const brgemm_kernel_t *brg_kernel, int bs,
     (*brg_kernel)(&brgemm_p);
 }
 
-status_t brgemm_desc_init(brgemm_t *brg, cpu_isa_t isa,
+status_t brgemm_desc_init(brgemm_desc_t *brg, cpu_isa_t isa,
         brgemm_batch_kind_t type, impl::data_type_t dt_a,
         impl::data_type_t dt_b, bool transA, bool transB,
         brgemm_layout_t layout, float alpha, float beta, dim_t LDA, dim_t LDB,
-        dim_t LDC, dim_t M, dim_t N, dim_t K, const brgemm_strides_t *strides) {
+        dim_t LDC, dim_t M, dim_t N, dim_t K, const brgemm_strides_t *strides,
+        bool is_tf32) {
     /*
     m - number of rows of the matrix op(A) and number of rows of the matrix C
     n - number of columns of the matrix op(B) and number of columns of the matrix C
@@ -240,17 +242,31 @@ status_t brgemm_desc_init(brgemm_t *brg, cpu_isa_t isa,
     */
     if (brg == nullptr) return status::invalid_arguments;
     if (transA || transB) return status::unimplemented;
+    if (type == brgemm_batch_kind_t::brgemm_batch_kind_undef)
+        return status::invalid_arguments;
 
-    brgemm_utils::init_brgemm_conf(brg, isa, type, dt_a, dt_b, layout, alpha,
-            beta, LDA, LDB, LDC, M, N, K, strides);
+    CHECK(brgemm_utils::init_brgemm_conf(brg, isa, type, dt_a, dt_b, layout,
+            alpha, beta, LDA, LDB, LDC, M, N, K, strides, false /* is_bf32 */,
+            is_tf32));
 
     if (utils::one_of(true, brg->is_runtime_lda, brg->is_runtime_ldb))
         return status::unimplemented;
 
     if (M <= 0 || N <= 0 || K <= 0) return status::invalid_arguments;
 
-    if (utils::everyone_is(
-                false, brg->is_int8, brg->is_bf16, brg->is_f32, brg->is_f16))
+    // Upper bound, this can likely be improved by accounting for blocking
+    dim_t max_a_stride = brg->LDA * types::data_type_size(brg->dt_a)
+            * (brg->layout == brgemm_col_major ? K : M);
+    dim_t max_b_stride = brg->LDB * types::data_type_size(brg->dt_b)
+            * (brg->layout == brgemm_col_major ? N : K);
+    dim_t max_c_stride = brg->LDC * types::data_type_size(brg->dt_c)
+            * (brg->layout == brgemm_col_major ? N : M);
+
+    // Required for EVEX encoding for offsets
+    const dim_t max_stride = std::numeric_limits<int32_t>::max();
+    if ((max_a_stride > max_stride && !brg->is_runtime_lda)
+            || (max_b_stride > max_stride && !brg->is_runtime_ldb)
+            || (max_c_stride >= max_stride && !brg->is_runtime_ldc))
         return status::unimplemented;
 
     // Only amx_int8 kernel supports u8 weights.
@@ -258,17 +274,10 @@ status_t brgemm_desc_init(brgemm_t *brg, cpu_isa_t isa,
                 brg->dt_b == u8, is_superset(brg->isa_impl, avx512_core_amx)))
         return status::unimplemented;
 
-    CHECK(brgemm_blocking(brg));
-
-    // avx2_vnni_2 kernel with xf16 data type requires blocked weights.
-    if (brg->isa_impl == avx2_vnni_2 && brg->is_xf16()
-            && brg->LDB % brg->ld_block > 0)
-        return status::unimplemented;
-
     return status::success;
 }
 
-status_t brdgmm_desc_init(brgemm_t *brg, cpu_isa_t isa,
+status_t brdgmm_desc_init(brgemm_desc_t *brg, cpu_isa_t isa,
         brgemm_batch_kind_t type, impl::data_type_t dt_a,
         impl::data_type_t dt_b, bool transA, brgemm_layout_t layout,
         float alpha, float beta, dim_t LDA, dim_t LDC, dim_t M, dim_t N,
@@ -288,13 +297,12 @@ status_t brdgmm_desc_init(brgemm_t *brg, cpu_isa_t isa,
                 false, brg->is_int8, brg->is_bf16, brg->is_f32, brg->is_f16))
         return status::unimplemented;
 
-    CHECK(brdgmm_blocking(brg));
-
     return status::success;
 }
 
-status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
-        const memory_desc_t *dst_md, dim_t LDD, impl::data_type_t dt_bias) {
+status_t brgemm_desc_set_postops(brgemm_desc_t *brg,
+        const primitive_attr_t *attr, const memory_desc_t *dst_md, dim_t LDD,
+        impl::data_type_t dt_bias) {
     if (!brg || !dst_md) return status::invalid_arguments;
 
     brg->set_attr(attr);
@@ -319,6 +327,11 @@ status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
                 is_superset(brg->isa_impl, avx512_core_fp16)
                         || is_superset(brg->isa_impl, avx2_vnni_2)))
         return status::unimplemented;
+    if (!IMPLICATION(one_of(data_type::f8_e5m2, dt_bias, dt_d)
+                        || one_of(data_type::f8_e4m3, dt_bias, dt_d),
+                utils::one_of(true, mayiuse(avx512_core_amx_fp16),
+                        mayiuse(avx10_2_512))))
+        return status::unimplemented;
     // check that combination of data types is allowed
     if ((brg->dt_a == data_type::u8 && brg->dt_b == data_type::s8)
             && (!one_of(dt_d, data_type::u8, data_type::s8, data_type::s32,
@@ -340,6 +353,19 @@ status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
                         && one_of(dt_bias, data_type::undef, data_type::f32,
                                 data_type::f16)))
         return status::unimplemented;
+    const auto bias_f8_e5m2_compatible
+            = one_of(dt_d, data_type::f32, data_type::f16, data_type::bf16,
+                      data_type::f8_e5m2)
+            && one_of(dt_bias, data_type::undef, data_type::f32, data_type::f16,
+                    data_type::bf16, data_type::f8_e5m2, data_type::f8_e4m3);
+    const auto bias_f8_e4m3_compatible
+            = one_of(dt_d, data_type::f32, data_type::f16, data_type::bf16,
+                      data_type::f8_e4m3)
+            && one_of(dt_bias, data_type::undef, data_type::f32, data_type::f16,
+                    data_type::bf16, data_type::f8_e4m3, data_type::f8_e5m2);
+    if (!IMPLICATION(brg->is_fp8,
+                bias_f8_e5m2_compatible || bias_f8_e4m3_compatible))
+        return status::unimplemented;
 
     brg->dt_d = dt_d;
     brg->typesize_D = types::data_type_size(brg->dt_d);
@@ -352,9 +378,6 @@ status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
     if (brg->is_int8 && brg->dt_d == bf16)
         brg->is_bf16_emu
                 = !(mayiuse(avx512_core_bf16) || brg->isa_impl == avx2_vnni_2);
-
-    // Rerun blocking heuristic due to reduced zmm register count
-    if (brg->is_bf16_emu && brg->is_dgmm) CHECK(brdgmm_blocking(brg));
 
     if (!brg->attr()) return status::success;
 
@@ -382,12 +405,15 @@ status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
                             false /*sum_requires_zp_zero*/,
                             true /*sum_requires_same_params*/,
                             {broadcasting_strategy_t::per_oc,
+                                    broadcasting_strategy_t::per_oc_d,
                                     broadcasting_strategy_t::scalar,
                                     broadcasting_strategy_t::per_mb,
                                     broadcasting_strategy_t::per_mb_spatial,
                                     broadcasting_strategy_t::per_mb_w,
                                     broadcasting_strategy_t::per_w,
+                                    broadcasting_strategy_t::per_hw,
                                     broadcasting_strategy_t::batch,
+                                    broadcasting_strategy_t::spatial,
                                     broadcasting_strategy_t::no_broadcast})))
         return status::unimplemented;
 
@@ -405,61 +431,68 @@ status_t brgemm_desc_set_postops(brgemm_t *brg, const primitive_attr_t *attr,
 
     const auto &src_scales = attr->scales_.get(DNNL_ARG_SRC);
     const auto &wei_scales = attr->scales_.get(DNNL_ARG_WEIGHTS);
-    brg->with_scales = !src_scales.has_default_values()
-            || !wei_scales.has_default_values()
-            || brg->with_weights_scale_adjust;
+    brg->with_scales = !brg->skip_scales
+            && (!src_scales.has_default_values()
+                    || !wei_scales.has_default_values()
+                    || brg->with_weights_scale_adjust);
     if (brg->with_scales) {
         // Note. the current version supports only two different output scale
         // types:
-        //     1) common (mask_ = 0)
+        //     1) common (mask = 0)
         //     2) per_n_dim_scale - broadcast across n dimension;
         //        for convolution and inner product promitives it corresponds
-        //        to "per_oc" mask_ = 1 << 1; for matmul - to
-        //        mask_ = (1 << (ndims - 1))), where ndims is number of
+        //        to "per_oc" mask = 1 << 1; for matmul - to
+        //        mask = (1 << (ndims - 1))), where ndims is number of
         //        dimensions for original matmul problem
-        // So if wei_scales.mask_ != 0 (not common) it's assumed here that scale
-        // type is per_n_dim_scale and driver which calls brgemm kernel checked
-        // that mask has correct value for this case
-        brg->is_oc_scale = wei_scales.mask_ != 0;
+        // So if wei_scales.get_mask() > 0 (not common) it's assumed here that
+        // scale type is per_n_dim_scale and driver which calls brgemm kernel
+        // checked that mask has correct value for this case
+        brg->is_oc_scale = wei_scales.get_mask() > 0;
     }
 
     const auto &dst_scales = attr->scales_.get(DNNL_ARG_DST);
     brg->with_dst_scales = !dst_scales.has_default_values();
-    const bool scales_ok = src_scales.mask_ == 0 && dst_scales.mask_ == 0
-            && attr->scales_.has_default_values(
-                    {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST});
+    const bool scales_ok = attr->scales_.has_default_values({DNNL_ARG_SRC,
+                                   DNNL_ARG_WEIGHTS, DNNL_ARG_DST})
+            && IMPLICATION(!src_scales.has_default_values(),
+                    src_scales.get_mask() == 0)
+            && IMPLICATION(!dst_scales.has_default_values(),
+                    dst_scales.get_mask() == 0);
     if (!scales_ok) return status::unimplemented;
 
     auto init_zp_type
             = [&](brgemm_broadcast_t &zp_type, int mem_arg) -> status_t {
-        auto zero_points = attr->zero_points_;
+        const auto &zp = attr->zero_points_;
+        // Always init a default value;
+        zp_type = brgemm_broadcast_t::none;
 
-        // common zero point type is supported for now
-        if (!zero_points.common(mem_arg)) return status::unimplemented;
+        const bool skip_zero_point
+                = mem_arg == DNNL_ARG_WEIGHTS && brg->skip_zp_b_compensation;
+        if (skip_zero_point) return status::success;
 
-        zp_type = zero_points.has_default_values(mem_arg)
-                ? brgemm_broadcast_t::none
-                : brgemm_broadcast_t::per_tensor;
+        if (!zp.has_default_values(mem_arg)) {
+            int mask = zp.get_mask(mem_arg);
+            if (mask == 0) {
+                zp_type = brgemm_broadcast_t::per_tensor;
+            } else if (mask == (1 << 1)) {
+                zp_type = brgemm_broadcast_t::per_n;
+            } else {
+                return status::unimplemented;
+            }
+        }
+
         return status::success;
     };
 
-    init_zp_type(brg->zp_type_a, DNNL_ARG_SRC);
-    init_zp_type(brg->zp_type_b, DNNL_ARG_WEIGHTS);
-    init_zp_type(brg->zp_type_c, DNNL_ARG_DST);
-
-    // src zero points require additional register in brgemm & brdgmm kernel
-    const bool is_zp_src = brg->zp_type_a != brgemm_broadcast_t::none;
-    if (brg->is_dgmm) {
-        const bool sum_needs_vmm = (!is_superset(brg->isa_impl, avx512_core))
-                && brg->with_sum && brg->sum_scale != 1.f;
-        if (is_zp_src || sum_needs_vmm) CHECK(brdgmm_blocking(brg));
-    } else if (is_zp_src || brg->is_bf16_emu)
-        CHECK(brgemm_blocking(brg));
+    CHECK(init_zp_type(brg->zp_type_a, DNNL_ARG_SRC));
+    CHECK(init_zp_type(brg->zp_type_b, DNNL_ARG_WEIGHTS));
+    CHECK(init_zp_type(brg->zp_type_c, DNNL_ARG_DST));
 
     return status::success;
 }
 
-status_t brgemm_desc_set_attr(brgemm_t *brg, const brgemm_attr_t &brgattr) {
+status_t brgemm_desc_set_attr(
+        brgemm_desc_t *brg, const brgemm_attr_t &brgattr) {
     if (brg == nullptr) return status::invalid_arguments;
 
     // negative padding is not supported
@@ -468,8 +501,8 @@ status_t brgemm_desc_set_attr(brgemm_t *brg, const brgemm_attr_t &brgattr) {
 
     if (!brg->is_dgmm) {
         // virtual padding size is restricted by MAX_VPAD value
-        if (brgattr.max_top_vpad > brgemm_t::MAX_VPAD
-                || brgattr.max_bottom_vpad > brgemm_t::MAX_VPAD)
+        if (brgattr.max_top_vpad > brgemm_desc_t::MAX_VPAD
+                || brgattr.max_bottom_vpad > brgemm_desc_t::MAX_VPAD)
             return status::unimplemented;
     }
 
@@ -480,44 +513,9 @@ status_t brgemm_desc_set_attr(brgemm_t *brg, const brgemm_attr_t &brgattr) {
         return status::unimplemented;
 
     brg->brgattr = brgattr;
+    brg->bs_group = brgattr.hint_bs_group;
 
     if (brgattr.fpmath_mode != fpmath_mode::strict) maybe_try_bf32(brg);
-
-    const int max_vpad = nstl::max(brgattr.max_top_vpad,
-            brgattr.max_bottom_vpad); // these should be equal
-    bool hint_blocking_set
-            = (brgattr.hint_bd_block != 0 || brgattr.hint_bd_block2 != 0
-                    || brgattr.hint_ld_block != 0 || brgattr.hint_ld_block2 != 0
-                    || brgattr.hint_load_nt_A != brgemm_hint_nt_undef
-                    || brgattr.hint_load_nt_B != brgemm_hint_nt_undef
-                    || brgattr.bs_group > 1);
-    if (brgattr.use_uker || brg->is_bf16_tmm || hint_blocking_set
-            || brgattr.bd_mask_level
-            || brgattr.fpmath_mode != fpmath_mode::strict || max_vpad > 0) {
-        if (brg->is_dgmm)
-            CHECK(brdgmm_blocking(brg));
-        else
-            CHECK(brgemm_blocking(brg));
-    }
-
-    if (!brg->is_dgmm) {
-        // virtual padding is restricted by bd_block size due to
-        // brgemm_kernel implementation. TODO: remove this restriction
-        const int min_bd_block
-                = brg->bdb_tail > 0 ? brg->bdb_tail : brg->bd_block;
-        if ((max_vpad > min_bd_block)) return status::unimplemented;
-    }
-
-    brg->LDA2 = (brgattr.LDA2 != 0) ? brgattr.LDA2 : brg->LDA;
-    brg->LDB2 = (brgattr.LDB2 != 0) ? brgattr.LDB2 : brg->LDB;
-    brg->LDC2_M = (brgattr.LDC2_M != 0) ? brgattr.LDC2_M : brg->LDC;
-    brg->LDC2_N = (brgattr.LDC2_N != 0) ? brgattr.LDC2_N : brg->ld_block;
-
-    brg->is_blocked = (brg->LDA2 != brg->LDA || brg->LDB2 != brg->LDB
-            || brg->LDC2_M != brg->LDC || brg->LDC2_N != brg->ld_block);
-
-    if (!IMPLICATION(brg->is_blocked, brg->layout = brgemm_row_major))
-        return status::invalid_arguments;
 
     // virtual padding is not supported for "amx"
     if ((brgattr.max_top_vpad > 0 || brgattr.max_bottom_vpad > 0)
@@ -540,81 +538,69 @@ status_t brgemm_desc_set_attr(brgemm_t *brg, const brgemm_attr_t &brgattr) {
             && brg->prfC.dist2 < 0)
         brg->prfC.dist2 = 0;
 
+    if (brg->is_fp8
+            && !utils::one_of(true,
+                    is_superset(brg->isa_impl, avx512_core_amx_fp16),
+                    is_superset(brg->isa_impl, avx10_2_512)))
+        return status::unimplemented;
+
+    return status::success;
+}
+
+status_t brgemm_desc_finalize(brgemm_desc_t *brg) {
+    if (brg == nullptr) return status::invalid_arguments;
+
+    const int max_vpad = nstl::max(
+            brg->brgattr.max_top_vpad, brg->brgattr.max_bottom_vpad);
+
+    if (brg->is_dgmm)
+        CHECK(brdgmm_blocking(brg));
+    else
+        CHECK(brgemm_blocking(brg));
+
+    if (!brg->is_dgmm) {
+        // virtual padding is restricted by bd_block size due to
+        // brgemm_kernel implementation. TODO: remove this restriction
+        const int min_bd_block
+                = brg->bdb_tail > 0 ? brg->bdb_tail : brg->bd_block;
+        if ((max_vpad > min_bd_block)) return status::unimplemented;
+    }
+
     return status::success;
 }
 
 status_t brgemm_kernel_create(
-        brgemm_kernel_t **brg_kernel, const brgemm_t &brg) {
+        brgemm_kernel_t **brg_kernel, const brgemm_desc_t &brg) {
     if (!brg_kernel) return status::invalid_arguments;
     *brg_kernel = nullptr;
 
+    if (utils::one_of(data_type::f64, brg.dt_a, brg.dt_b, brg.dt_c, brg.dt_d,
+                brg.dt_bias, brg.sum_dt))
+        return status::unimplemented;
+
     if (brg.is_dgmm) {
         if (brg.type == brgemm_static_offs) return status::unimplemented;
-#define CASE(isa) \
-    case isa: \
-        CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel, \
-                new brdgmm_kernel_t<isa, typename cpu_isa_traits<isa>::Vmm>( \
-                        brg))); \
-        break
-        switch (brg.isa_impl) {
-            CASE(avx512_core_fp16);
-            CASE(avx512_core_bf16);
-            CASE(avx512_core_vnni);
-            CASE(avx512_core);
-            CASE(avx2_vnni_2);
-            CASE(avx2_vnni);
-            CASE(avx2);
-            default: return status::unimplemented;
+        if (brg.is_zmm) {
+            CHECK(safe_ptr_assign<brgemm_kernel_t>(
+                    *brg_kernel, new brdgmm_kernel_t<Xbyak::Zmm>(brg)));
+        } else if (brg.is_ymm) {
+            CHECK(safe_ptr_assign<brgemm_kernel_t>(
+                    *brg_kernel, new brdgmm_kernel_t<Xbyak::Ymm>(brg)));
         }
-#undef CASE
     } else if (can_dispatch_uker(&brg)) {
         CHECK(safe_ptr_assign<brgemm_kernel_t>(
                 *brg_kernel, new brgemm_amx_uker_t(brg)));
     } else {
         if (brg.type == brgemm_static_offs) return status::unimplemented;
         if (brg.is_tmm) {
-            if (brg.is_f16_tmm) {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx512_core_amx_fp16,
-                                Xbyak::Tmm>(brg)));
-            } else {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx512_core_amx, Xbyak::Tmm>(
-                                brg)));
-            }
+            CHECK(safe_ptr_assign<brgemm_kernel_t>(
+                    *brg_kernel, new brgemm_kernel_common_t<Xbyak::Tmm>(brg)));
         } else if (brg.is_zmm) {
-            // isa specific instantiations are required because
-            // post-ops require template isa param.
-            if (brg.isa_impl == avx512_core_fp16) {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx512_core_fp16,
-                                Xbyak::Zmm>(brg)));
-            } else if (brg.isa_impl == avx512_core_bf16) {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx512_core_bf16,
-                                Xbyak::Zmm>(brg)));
-            } else if (brg.isa_impl == avx512_core_vnni) {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx512_core_vnni,
-                                Xbyak::Zmm>(brg)));
-            } else {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx512_core, Xbyak::Zmm>(
-                                brg)));
-            }
+            CHECK(safe_ptr_assign<brgemm_kernel_t>(
+                    *brg_kernel, new brgemm_kernel_common_t<Xbyak::Zmm>(brg)));
         } else if (brg.is_ymm) {
-            if (brg.isa_impl == avx2) {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx2, Xbyak::Ymm>(brg)));
-            } else if (brg.isa_impl == avx2_vnni) {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx2_vnni, Xbyak::Ymm>(
-                                brg)));
-            } else if (brg.isa_impl == avx2_vnni_2) {
-                CHECK(safe_ptr_assign<brgemm_kernel_t>(*brg_kernel,
-                        new brgemm_kernel_common_t<avx2_vnni_2, Xbyak::Ymm>(
-                                brg)));
-            }
+            CHECK(safe_ptr_assign<brgemm_kernel_t>(
+                    *brg_kernel, new brgemm_kernel_common_t<Xbyak::Ymm>(brg)));
         }
     }
     if (!(*brg_kernel)) return status::unimplemented;
@@ -633,23 +619,26 @@ status_t brgemm_kernel_destroy(brgemm_kernel_t *brg_kernel) {
     return status::success;
 }
 
-status_t brgemm_init_tiles(const brgemm_t &brg, char palette[64]) {
-    constexpr int max_palette_size_in_bytes = 64;
-
+status_t brgemm_init_tiles(const brgemm_desc_t &brg, char palette[64]) {
     if (!brg.is_tmm) return status::unimplemented;
 
-    //TODO: Add support of tail processing by reduction dimension
     auto rd_block = (!brg.rdb && brg.rdb_tail) ? brg.rdb_tail : brg.rd_block;
-    if (brg.is_bf32) rd_block = utils::rnd_up(rd_block, 2 /*vnni_granularity*/);
+    if (brg.is_input_convert())
+        rd_block = utils::rnd_up(rd_block, 2 /*vnni_granularity*/);
+    else
+        rd_block = utils::rnd_up(rd_block, brg.rd_step);
 
     palette_config_t *buff = (palette_config_t *)(palette);
 
     char *_tc = (char *)(buff);
+    static constexpr int max_palette_size_in_bytes = 64;
     for (int i = 0; i < max_palette_size_in_bytes; i++)
         _tc[i] = 0;
 
-    const int typesize_A = brg.is_bf32 ? sizeof(bfloat16_t) : brg.typesize_A;
-    const int typesize_B = brg.is_bf32 ? sizeof(bfloat16_t) : brg.typesize_B;
+    const int typesize_A
+            = brg.is_input_convert() ? sizeof(int16_t) : brg.typesize_A;
+    const int typesize_B
+            = brg.is_input_convert() ? sizeof(int16_t) : brg.typesize_B;
 
     const int rd_step = 4 / typesize_A;
 
@@ -658,9 +647,9 @@ status_t brgemm_init_tiles(const brgemm_t &brg, char palette[64]) {
     const auto Br = (brg.typesize_C != 0) ? Ac / brg.typesize_C : 0;
 
     if (brg.get_num_A_tiles() + brg.get_num_B_tiles() + brg.get_num_C_tiles()
-            > brgemm_t::AMX_TILES_NUM) {
+            > brgemm_desc_t::AMX_TILES_NUM) {
         assert(!"brgemm internal error: invalid blocking");
-        return status::unimplemented;
+        return status::runtime_error;
     }
 
     // Due to interleaving tileload/tmul we don't support blocking 1x6 and 6x1
@@ -711,17 +700,17 @@ inline int sign(T v) {
     return (v > 0) ? 1 : ((v < 0) ? -1 : 0);
 }
 
-int brgemm_cmp(const brgemm_t &lhs, const brgemm_t &rhs) {
+int brgemm_cmp(const brgemm_desc_t &lhs, const brgemm_desc_t &rhs) {
     // The macro CMP_BRGEMM_FIELD is designed to compare numerical parameters.
     // Float parameters must not be NaN
 #define CMP_BRGEMM_FIELD(x) \
     if ((lhs.x) != (rhs.x)) return sign((lhs.x) - (rhs.x))
 
-    // This function compares brgemm_t objects within a single brgemm primitive.
+    // This function compares brgemm_desc_t objects within a single brgemm primitive.
     // Comparison of objects from different primitives is not guaranteed due to
     // dependencies of brgemm descriptor on a primitive attributes.
 
-    // Compare all non-pointer parameters of brgemm_t except derived
+    // Compare all non-pointer parameters of brgemm_desc_t except derived
     CMP_BRGEMM_FIELD(bcast_dim);
     CMP_BRGEMM_FIELD(load_dim);
     CMP_BRGEMM_FIELD(reduce_dim);
@@ -759,6 +748,7 @@ int brgemm_cmp(const brgemm_t &lhs, const brgemm_t &rhs) {
 
     CMP_BRGEMM_FIELD(is_oc_scale);
     CMP_BRGEMM_FIELD(with_dst_scales);
+    CMP_BRGEMM_FIELD(bs_group);
 
     // Compare all non-pointer parameters of brgemm_attr_t except derived
     CMP_BRGEMM_FIELD(brgattr.max_bs);
@@ -778,11 +768,13 @@ int brgemm_cmp(const brgemm_t &lhs, const brgemm_t &rhs) {
     CMP_BRGEMM_FIELD(brgattr.hint_prfB.dist2);
     CMP_BRGEMM_FIELD(brgattr.hint_prfC.dist1);
     CMP_BRGEMM_FIELD(brgattr.hint_prfC.dist2);
-    CMP_BRGEMM_FIELD(brgattr.wary_tail_read);
+    CMP_BRGEMM_FIELD(brgattr.wary_A_k_tail_read);
+    CMP_BRGEMM_FIELD(brgattr.extendable_k);
     CMP_BRGEMM_FIELD(brgattr.generate_skip_accumulation);
     CMP_BRGEMM_FIELD(brgattr.bd_mask_level);
     CMP_BRGEMM_FIELD(brgattr.use_uker);
     CMP_BRGEMM_FIELD(brgattr.use_interleave_stores);
+    CMP_BRGEMM_FIELD(brgattr.b_is_vnni);
     CMP_BRGEMM_FIELD(brgattr.fpmath_mode);
     CMP_BRGEMM_FIELD(brgattr.LDA2);
     CMP_BRGEMM_FIELD(brgattr.LDB2);
@@ -790,7 +782,7 @@ int brgemm_cmp(const brgemm_t &lhs, const brgemm_t &rhs) {
     CMP_BRGEMM_FIELD(brgattr.LDC2_N);
     CMP_BRGEMM_FIELD(brgattr.var_bs);
     CMP_BRGEMM_FIELD(brgattr.postops_only);
-    CMP_BRGEMM_FIELD(brgattr.bs_group);
+    CMP_BRGEMM_FIELD(brgattr.hint_bs_group);
 
     CMP_BRGEMM_FIELD(brgattr.hint_bd_block);
     CMP_BRGEMM_FIELD(brgattr.hint_ld_block);
@@ -818,11 +810,11 @@ int brgemm_cmp(const brgemm_t &lhs, const brgemm_t &rhs) {
 }
 } // namespace
 
-bool brgemm_t::operator==(const brgemm_t &rhs) const {
+bool brgemm_desc_t::operator==(const brgemm_desc_t &rhs) const {
     return (brgemm_cmp(*this, rhs) == 0);
 }
 
-bool brgemm_t::operator<(const brgemm_t &rhs) const {
+bool brgemm_desc_t::operator<(const brgemm_desc_t &rhs) const {
     return (brgemm_cmp(*this, rhs) < 0);
 }
 

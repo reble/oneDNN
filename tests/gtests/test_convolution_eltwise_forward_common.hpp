@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include "common/math_utils.hpp"
 #include "dnnl_test_common.hpp"
-#include "math_utils.hpp"
 #include "oneapi/dnnl/dnnl.hpp"
 #include "gtest/gtest.h"
 
@@ -111,13 +111,13 @@ void compute_ref_conv_eltwise_fwd(const test_convolution_sizes_t &c,
 
 template <typename data_t_src, typename data_t_wei, typename data_t_acc,
         typename data_t_dst>
-class convolution_eltwise_test
+class convolution_eltwise_test_t
     : public ::testing::TestWithParam<test_convolution_eltwise_params_t> {
 protected:
-    virtual void SetUp() {
-        memory::data_type data_type_src = data_traits<data_t_src>::data_type;
-        memory::data_type data_type_dst = data_traits<data_t_dst>::data_type;
-        memory::data_type data_type_wei = data_traits<data_t_wei>::data_type;
+    void SetUp() override {
+        memory::data_type data_type_src = data_traits_t<data_t_src>::data_type;
+        memory::data_type data_type_dst = data_traits_t<data_t_dst>::data_type;
+        memory::data_type data_type_wei = data_traits_t<data_t_wei>::data_type;
 
         SKIP_IF(unsupported_data_type(data_type_src),
                 "Engine does not support this data type.");
@@ -161,6 +161,24 @@ protected:
                                         memory::format_tag::odhwi))),
                 "Format is not supported.");
 
+        SKIP_IF_GENERIC(
+                !(generic_check_format_tags(p.formats.src_format)
+                        && generic_check_format_tags(p.formats.dst_format)
+                        && impl::utils::one_of(p.formats.weights_format,
+                                /* weights formats */
+                                memory::format_tag::goiw,
+                                memory::format_tag::goihw,
+                                memory::format_tag::goidhw,
+                                memory::format_tag::oiw,
+                                memory::format_tag::oihw,
+                                memory::format_tag::oidhw,
+                                memory::format_tag::bacd,
+                                memory::format_tag::bcda,
+                                memory::format_tag::acbde,
+                                memory::format_tag::iohw,
+                                memory::format_tag::hwigo)),
+                "Format is not supported.");
+
         SKIP_IF_CUDA(p.alg != algorithm::eltwise_relu
                         && p.alg != algorithm::eltwise_tanh
                         && p.alg != algorithm::eltwise_elu
@@ -176,6 +194,17 @@ protected:
                 "Unsupported algorithm type for HIP");
         SKIP_IF_HIP(p.alg == algorithm::eltwise_relu || p.eltwise_alpha != 0.0,
                 "DNNL only supports relu w/ slope=0 for integers");
+
+        SKIP_IF_GENERIC(
+                !impl::utils::one_of(p.alg, algorithm::eltwise_relu,
+                        algorithm::eltwise_linear, algorithm::eltwise_clip,
+                        algorithm::eltwise_clip_v2,
+                        algorithm::eltwise_hardswish,
+                        algorithm::eltwise_gelu_tanh,
+                        algorithm::eltwise_gelu_erf, algorithm::eltwise_tanh,
+                        algorithm::eltwise_logistic, algorithm::eltwise_swish,
+                        algorithm::eltwise_elu),
+                "Unsupported algorithm");
 
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status);
@@ -201,6 +230,14 @@ protected:
                                 memory::format_tag::aBcde4b)));
     }
 
+    bool generic_check_format_tags(memory::format_tag tag) {
+        return (impl::utils::one_of(tag, memory::format_tag::ab,
+                memory::format_tag::abc, memory::format_tag::abcd,
+                memory::format_tag::abcde, memory::format_tag::abcdef,
+                memory::format_tag::acb, memory::format_tag::acdb,
+                memory::format_tag::acdeb));
+    }
+
     virtual void Test() {
         test_convolution_eltwise_params_t p = ::testing::TestWithParam<
                 test_convolution_eltwise_params_t>::GetParam();
@@ -210,9 +247,9 @@ protected:
         float eltwise_alpha = p.eltwise_alpha;
         float eltwise_beta = p.eltwise_beta;
 
-        memory::data_type data_type_src = data_traits<data_t_src>::data_type;
-        memory::data_type data_type_dst = data_traits<data_t_dst>::data_type;
-        memory::data_type data_type_wei = data_traits<data_t_wei>::data_type;
+        memory::data_type data_type_src = data_traits_t<data_t_src>::data_type;
+        memory::data_type data_type_dst = data_traits_t<data_t_dst>::data_type;
+        memory::data_type data_type_wei = data_traits_t<data_t_wei>::data_type;
 
         test_convolution_sizes_t cd = p.sizes;
 

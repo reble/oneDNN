@@ -1,6 +1,7 @@
 /*******************************************************************************
 * Copyright 2021-2022 Intel Corporation
-* Copyright 2021-2022 FUJITSU LIMITED
+* Copyright 2021-2024 FUJITSU LIMITED
+* Copyright 2024-2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,7 +24,7 @@
 
 #include "cpu/aarch64/jit_uni_dw_conv_kernel_f32.hpp"
 
-#define GET_OFF(field) static_cast<int32_t>(offsetof(jit_conv_call_s, field))
+#define GET_OFF(field) static_cast<int32_t>(offsetof(jit_conv_args_t, field))
 
 namespace dnnl {
 namespace impl {
@@ -37,40 +38,49 @@ using namespace dnnl::impl::utils;
 using namespace Xbyak_aarch64;
 
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_fwd_kernel_f32<isa>::load_src(int ur_ch_blocks, int ur_w) {
+void jit_uni_dw_conv_fwd_kernel_f32_t<isa>::load_src(
+        int ur_ch_blocks, int ur_w) {
 
     const auto dst_layout_nxc = is_dst_layout_nxc();
     const auto ch_blk = jcp.ch_block;
     const auto ocb_stride = dst_layout_nxc ? ch_blk : jcp.oh * jcp.ow * ch_blk;
     const auto ow_stride = dst_layout_nxc ? jcp.ngroups : ch_blk;
-
     for (int ch = 0; ch < ur_ch_blocks; ch++) {
         for (int ow = 0; ow < ur_w; ow++) {
-            ZReg zreg_acc = get_acc_reg(ch * ur_w + ow);
             ZRegS zregs_acc = get_acc_reg_s(ch * ur_w + ow);
 
             int b_off = ch * ch_blk;
             if (this->jcp.with_bias) {
                 add_imm(reg_tmp_addr, reg_bias, b_off * sizeof(float),
                         reg_tmp_imm);
-                ldr(zreg_acc, ptr(reg_tmp_addr));
+                ld1w(zregs_acc, P_ALL_ONE, ptr(reg_tmp_addr));
             } else
                 fmov(zregs_acc); // zero clear
 
             int o_off = ch * ocb_stride + ow * ow_stride;
             if (this->jcp.with_sum) {
-                add_imm(reg_tmp_addr, reg_output, o_off * sizeof(float),
+                add_imm(reg_tmp_addr, reg_output, o_off * jcp.typesize_out,
                         reg_tmp_imm);
-                ldr(ZReg(0), ptr(reg_tmp_addr));
-                fadd(zregs_acc, zregs_acc, ZRegS(0));
+                if (jcp.dst_dt == data_type::f32) {
+                    ld1w(ZRegS(0), P_ALL_ONE, ptr(reg_tmp_addr));
+                    fadd(zregs_acc, zregs_acc, ZRegS(0));
+                } else if (jcp.dst_dt == data_type::bf16) {
+                    ld1h(ZRegS(0), P_ALL_ONE, ptr(reg_tmp_addr));
+                    // Convert BF16 input to FP32
+                    lsl(ZRegS(0), ZRegS(0), 16);
+                    fadd(zregs_acc, zregs_acc, ZRegS(0));
+                } else {
+                    assert(!"Unsupported: data type");
+                }
             }
         }
     }
 }
 
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_fwd_kernel_f32<isa>::apply_filter_unrolled(
+void jit_uni_dw_conv_fwd_kernel_f32_t<isa>::apply_filter_unrolled(
         int ur_ch_blocks, int ur_w, int pad_l, int pad_r) {
+
     int ch_blk = jcp.ch_block;
     int dilate_h = jcp.dilate_h + 1;
     int dilate_w = jcp.dilate_w + 1;
@@ -96,15 +106,22 @@ void jit_uni_dw_conv_fwd_kernel_f32<isa>::apply_filter_unrolled(
             ldr(aux_reg_input, ptr(aux_reg_input_buffer_ptr));
             add(aux_reg_input, aux_reg_input, reg_iw_offset);
         }
+
         for (int ch = 0; ch < ur_ch_blocks; ch++) {
             for (int kw = 0; kw < jcp.kw; kw++) {
                 int ker_off = ch * jcp.kh * jcp.kw * ch_blk + kw * ch_blk;
 
-                ZReg zreg_ker = get_ker_reg(0);
-                ZRegS zregs_ker = get_ker_reg_s(0);
-                add_imm(reg_tmp_addr, aux_reg_kernel, ker_off * sizeof(float),
+                ZReg zregs_ker = get_ker_reg(0);
+                add_imm(reg_tmp_addr, aux_reg_kernel, ker_off * jcp.typesize_in,
                         reg_tmp_imm);
-                ldr(zreg_ker, ptr(reg_tmp_addr));
+
+                if (jcp.dst_dt == data_type::f32) {
+                    ld1w(zregs_ker.s, P_ALL_ONE, ptr(reg_tmp_addr));
+                } else if (jcp.dst_dt == data_type::bf16) {
+                    ld1h(zregs_ker.s, P_ALL_ONE, ptr(reg_tmp_addr));
+                } else {
+                    assert(!"Unsupported: data type");
+                }
 
                 int ow_start = get_ow_start(kw, pad_l);
                 int ow_end = get_ow_end(ur_w, kw, pad_r);
@@ -113,27 +130,34 @@ void jit_uni_dw_conv_fwd_kernel_f32<isa>::apply_filter_unrolled(
                             + (ow * stride_w - pad_l) * iw_stride
                             + kw * dilate_w * iw_stride;
 
-                    ZReg zreg_src = get_src_reg(0);
-                    ZRegS zregs_src = get_src_reg_s(0);
+                    ZReg zregs_src = get_src_reg(0);
                     add_imm(reg_tmp_addr, aux_reg_input,
                             inp_off * jcp.typesize_in, reg_tmp_imm);
-                    ldr(zreg_src, ptr(reg_tmp_addr));
 
-                    ZRegS zregs_acc = get_acc_reg_s(ch * ur_w + ow);
-                    fmla(zregs_acc, P_ALL_ONE, zregs_src, zregs_ker);
+                    if (jcp.dst_dt == data_type::f32) {
+                        ld1w(zregs_src.s, P_ALL_ONE, ptr(reg_tmp_addr));
+                        ZRegS zregs_acc = get_acc_reg_s(ch * ur_w + ow);
+                        fmla(zregs_acc, P_ALL_ONE, zregs_src.s, zregs_ker.s);
+                    } else if (jcp.dst_dt == data_type::bf16) {
+                        ld1h(zregs_src.s, P_ALL_ONE, ptr(reg_tmp_addr));
+                        ZRegS zregs_acc = get_acc_reg_s(ch * ur_w + ow);
+                        bfmlalb(zregs_acc, zregs_src.h, zregs_ker.h);
+                    } else {
+                        assert(!"Unsupported: data type");
+                    }
                 }
             }
         }
 
-        add_imm(aux_reg_kernel, aux_reg_kernel, jcp.kw * ch_blk * sizeof(float),
-                reg_tmp_imm);
+        add_imm(aux_reg_kernel, aux_reg_kernel,
+                jcp.kw * ch_blk * jcp.typesize_in, reg_tmp_imm);
         if (jcp.is_fused_conv) {
             // Move to next row pointer in the buffer
             add_imm(aux_reg_input_buffer_ptr, aux_reg_input_buffer_ptr,
                     sizeof(void *), reg_tmp_imm);
         } else {
             add_imm(aux_reg_input, aux_reg_input,
-                    ih_stride * dilate_h * sizeof(float), reg_tmp_imm);
+                    ih_stride * dilate_h * jcp.typesize_in, reg_tmp_imm);
         }
 
         sub(iter_kh, iter_kh, 1);
@@ -145,14 +169,14 @@ void jit_uni_dw_conv_fwd_kernel_f32<isa>::apply_filter_unrolled(
 }
 
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_fwd_kernel_f32<isa>::apply_activation(
+void jit_uni_dw_conv_fwd_kernel_f32_t<isa>::apply_activation(
         int ur_ch_blocks, int ur_w) {
     if (this->jcp.with_eltwise) {
         eltwise_injector_->compute_vector_range(4, ur_w * ur_ch_blocks + 4);
     }
 }
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_fwd_kernel_f32<isa>::store_dst(
+void jit_uni_dw_conv_fwd_kernel_f32_t<isa>::store_dst(
         int ur_ch_blocks, int ur_w) {
 
     const auto dst_layout_nxc = is_dst_layout_nxc();
@@ -163,18 +187,26 @@ void jit_uni_dw_conv_fwd_kernel_f32<isa>::store_dst(
     for (int ch = 0; ch < ur_ch_blocks; ch++) {
         for (int ow = 0; ow < ur_w; ow++) {
             const int o_off = ch * ocb_stride + ow * ow_stride;
-
-            ZReg zreg_dst = get_acc_reg(ch * ur_w + ow);
-
-            add_imm(reg_tmp_addr, reg_output, o_off * sizeof(float),
+            add_imm(reg_tmp_addr, reg_output, o_off * jcp.typesize_out,
                     reg_tmp_imm);
-            str(zreg_dst, ptr(reg_tmp_addr));
+            if (jcp.dst_dt == data_type::f32) {
+                ZRegS zreg_dst = get_acc_reg_s(ch * ur_w + ow);
+                st1w(zreg_dst, P_ALL_ONE, ptr(reg_tmp_addr));
+            } else if (jcp.dst_dt == data_type::bf16) {
+                ZReg zreg_dst = get_acc_reg(ch * ur_w + ow);
+                // Convert fp32 to bf16
+                bfcvt(zreg_dst.h, P_ALL_ONE, zreg_dst.s);
+                // Store the bf16 value doing the downcast
+                st1h(zreg_dst.s, P_ALL_ONE, ptr(reg_tmp_addr));
+            } else {
+                assert(!"Unsupported: data type");
+            }
         }
     }
 }
 
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_fwd_kernel_f32<isa>::compute_loop(
+void jit_uni_dw_conv_fwd_kernel_f32_t<isa>::compute_loop(
         int ur_w, int ur_ch_blocks, int pad_l, int pad_r) {
 
     const bool ch_loop = ur_ch_blocks > jcp.nb_ch_blocking;
@@ -251,7 +283,7 @@ void jit_uni_dw_conv_fwd_kernel_f32<isa>::compute_loop(
 }
 
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_fwd_kernel_f32<isa>::ow_loop(int ur_ch_blocks) {
+void jit_uni_dw_conv_fwd_kernel_f32_t<isa>::ow_loop(int ur_ch_blocks) {
 
     int iw = jcp.iw;
     int ow = jcp.ow;
@@ -321,9 +353,12 @@ void jit_uni_dw_conv_fwd_kernel_f32<isa>::ow_loop(int ur_ch_blocks) {
 }
 
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_fwd_kernel_f32<isa>::generate() {
+void jit_uni_dw_conv_fwd_kernel_f32_t<isa>::generate() {
+    const int simd_w_ = cpu_isa_traits<isa>::vlen / sizeof(float);
     this->preamble();
-
+    //TO DO : renaming predicate register (P_ALL_ONE)
+    if (simd_w_ != cpu_sveLen / sizeof(float))
+        set_preg(P_ALL_ONE.s, simd_w_, X_TMP_0, X_TMP_1);
     if (jcp.is_fused_conv) {
         ldr(reg_input_buffer_ptr, ptr(abi_param1, GET_OFF(src)));
         mov(reg_iw_offset, 0);
@@ -365,10 +400,11 @@ void jit_uni_dw_conv_fwd_kernel_f32<isa>::generate() {
     if (jcp.with_eltwise) { eltwise_injector_->prepare_table(); }
 }
 
-template struct jit_uni_dw_conv_fwd_kernel_f32<sve_512>;
+template struct jit_uni_dw_conv_fwd_kernel_f32_t<sve_512>;
+template struct jit_uni_dw_conv_fwd_kernel_f32_t<sve_256>;
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::load_ddst(
+inline void jit_uni_dw_conv_bwd_data_kernel_f32_t<isa>::load_ddst(
         int ur_ch_blocks, int ur_str_w) {
     for (int ch = 0; ch < ur_ch_blocks; ch++) {
         for (int w = 0; w < ur_str_w; w++) {
@@ -379,7 +415,7 @@ inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::load_ddst(
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::apply_filter(
+inline void jit_uni_dw_conv_bwd_data_kernel_f32_t<isa>::apply_filter(
         int ur_ch_blocks, int ur_str_w) {
     int kw = jcp.kw;
     int kh = jcp.kh;
@@ -412,21 +448,19 @@ inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::apply_filter(
             for (int ch = 0; ch < ur_ch_blocks;
                     ch++) { // unrolloing channel blocks
                 int ker_off = ch * kh * kw * ch_blk;
-                ZReg zreg_ker = get_ker_reg(0);
                 ZRegS zregs_ker = get_ker_reg_s(0);
 
                 add_imm(reg_tmp_addr, aux1_reg_kernel, ker_off * sizeof(float),
                         reg_tmp_imm);
-                ldr(zreg_ker, ptr(reg_tmp_addr));
+                ld1w(zregs_ker, P_ALL_ONE / T_z, ptr(reg_tmp_addr));
 
                 for (int w = 0; w < ur_str_w; w++) {
                     int ddst_off = (ch * oh * ow + w) * ch_blk;
 
-                    ZReg zreg_src = get_src_reg(0);
                     ZRegS zregs_src = get_src_reg_s(0);
                     add_imm(reg_tmp_addr, aux1_reg_ddst,
                             ddst_off * sizeof(float), reg_tmp_imm);
-                    ldr(zreg_src, ptr(reg_tmp_addr));
+                    ld1w(zregs_src, P_ALL_ONE / T_z, ptr(reg_tmp_addr));
 
                     ZRegS zregs_acc = get_acc_reg_s(ch * ur_str_w + w);
                     fmla(zregs_acc, P_ALL_ONE, zregs_src, zregs_ker);
@@ -455,7 +489,7 @@ inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::apply_filter(
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::store_dsrc(
+inline void jit_uni_dw_conv_bwd_data_kernel_f32_t<isa>::store_dsrc(
         int ur_ch_blocks, int ur_str_w) {
     int ch_blk = jcp.ch_block;
     int iw = jcp.iw;
@@ -465,17 +499,17 @@ inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::store_dsrc(
     for (int ch = 0; ch < ur_ch_blocks; ch++) {
         for (int w = 0; w < ur_str_w; w++) {
             int dsrc_off = (ch * ih * iw + w * stride_w) * ch_blk;
-            ZReg zreg_acc = get_acc_reg(ch * ur_str_w + w);
+            ZRegS zregs_acc = get_acc_reg_s(ch * ur_str_w + w);
 
             add_imm(reg_tmp_addr, reg_dsrc, dsrc_off * sizeof(float),
                     reg_tmp_imm);
-            str(zreg_acc, ptr(reg_tmp_addr));
+            st1w(zregs_acc, P_ALL_ONE / T_z, ptr(reg_tmp_addr));
         }
     }
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::loop_body(
+inline void jit_uni_dw_conv_bwd_data_kernel_f32_t<isa>::loop_body(
         int ur_ch_blocks) {
     Label unrolled_w_label;
     Label tail_w_label;
@@ -533,7 +567,7 @@ inline void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::loop_body(
 }
 
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::generate() {
+void jit_uni_dw_conv_bwd_data_kernel_f32_t<isa>::generate() {
     preamble();
 
     ldr(reg_dsrc, ptr(abi_param1, GET_OFF(src)));
@@ -568,10 +602,11 @@ void jit_uni_dw_conv_bwd_data_kernel_f32<isa>::generate() {
     this->postamble();
 }
 
-template struct jit_uni_dw_conv_bwd_data_kernel_f32<sve_512>;
+template struct jit_uni_dw_conv_bwd_data_kernel_f32_t<sve_512>;
+template struct jit_uni_dw_conv_bwd_data_kernel_f32_t<sve_256>;
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::zero_filter() {
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::zero_filter() {
     for (int i = 0; i < jcp.kw; ++i) {
         ZRegS zregs_acc = get_acc_reg_s(i);
         fmov(zregs_acc); // zero clear
@@ -579,7 +614,7 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::zero_filter() {
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::load_filter() {
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::load_filter() {
     for (int i = 0; i < jcp.kw; ++i) {
         int off_filter = i * simd_w;
         add_imm(reg_tmp_addr, reg_tmp_filter, off_filter * sizeof(float),
@@ -597,12 +632,12 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::load_filter() {
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::zero_bias() {
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::zero_bias() {
     ZRegS zregs_bias = get_bias_reg_s(0);
     fmov(zregs_bias); // zero clear
 }
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::load_bias() {
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::load_bias() {
     if (simd_w == 16) {
         ZReg zreg_bias = get_bias_reg(0);
         ldr(zreg_bias, ptr(reg_bias_baddr));
@@ -615,7 +650,8 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::load_bias() {
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_ow_step_unroll(
+inline void
+jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::compute_ow_step_unroll(
         int unroll_w, int l_pad, int pad_offset, int ow_block) {
 
     const int iw_block = ow_block * jcp.stride_w;
@@ -713,7 +749,7 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_ow_step_unroll(
 
 template <cpu_isa_t isa>
 inline void
-jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_bias_step_unroll(
+jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::compute_bias_step_unroll(
         const int unroll_w) {
     for (int i = 0; i < unroll_w; ++i) {
         ZRegS zregs_bias = get_bias_reg_s(0);
@@ -732,7 +768,7 @@ jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_bias_step_unroll(
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::store_filter() {
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::store_filter() {
     for (int i = 0; i < jcp.kw; ++i) {
         int off_filter = i * simd_w;
         add_imm(reg_tmp_addr, reg_tmp_filter, off_filter * sizeof(float),
@@ -750,7 +786,7 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::store_filter() {
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::store_bias() {
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::store_bias() {
     if (simd_w == 16) {
         ZReg zreg_bias = get_bias_reg(0);
         str(zreg_bias, ptr(reg_bias_baddr));
@@ -763,7 +799,7 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::store_bias() {
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_bias_loop(
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::compute_bias_loop(
         const int block_size) {
     Label oh_label;
     Label ow_blk_label;
@@ -777,11 +813,11 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_bias_loop(
     ldr(reg_oh,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, oh_index))));
+                            offsetof(jit_dw_conv_args_t, oh_index))));
     ldr(reg_oh_worksize,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, oh_count))));
+                            offsetof(jit_dw_conv_args_t, oh_count))));
 
     mov(reg_tmp_output, reg_output_baddr);
     L(oh_label);
@@ -813,7 +849,8 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_bias_loop(
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_zero_filter() {
+inline void
+jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::compute_zero_filter() {
 
     const int ch_offset = jcp.ch_block;
 
@@ -822,7 +859,7 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_zero_filter() {
     ldr(reg_exec_flags,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, exec_flags))));
+                            offsetof(jit_dw_conv_args_t, exec_flags))));
     and_(reg_exec_flags, reg_exec_flags, FLAG_ZERO_FILTER);
     tst(reg_exec_flags, reg_exec_flags);
     b(EQ, skip_zeroing_label);
@@ -850,7 +887,7 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_zero_filter() {
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_h_step(
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::compute_h_step(
         int unroll_w, int l_pad, int pad_offset, int ow_block) {
 
     const int ch_offset = jcp.ch_block;
@@ -894,7 +931,7 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_h_step(
 }
 
 template <cpu_isa_t isa>
-inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_h_loop(
+inline void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::compute_h_loop(
         int unroll_w, int l_pad, int pad_offset, int ow_block) {
 
     // last index of output that is not influenced by right padding
@@ -910,15 +947,15 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_h_loop(
     ldr(reg_oh,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, oh_index))));
+                            offsetof(jit_dw_conv_args_t, oh_index))));
     ldr(reg_oh_worksize,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, oh_count))));
+                            offsetof(jit_dw_conv_args_t, oh_count))));
     ldr(reg_kh_count,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, kh_count))));
+                            offsetof(jit_dw_conv_args_t, kh_count))));
 
     mov(reg_tmp_output, reg_output_baddr);
     mov(reg_tmp_input, reg_input_baddr);
@@ -977,7 +1014,7 @@ inline void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_h_loop(
 
 template <cpu_isa_t isa>
 inline void
-jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_ow_block_unroll() {
+jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::compute_ow_block_unroll() {
 
     const int ch_offset = jcp.ch_block;
     int ow = jcp.ow;
@@ -1021,14 +1058,14 @@ jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_ow_block_unroll() {
         ldr(reg_bias_baddr,
                 ptr(abi_param1,
                         static_cast<int32_t>(
-                                offsetof(jit_dw_conv_call_s, bias))));
+                                offsetof(jit_dw_conv_args_t, bias))));
 
         zero_bias();
 
         ldr(reg_exec_flags,
                 ptr(abi_param1,
                         static_cast<int32_t>(
-                                offsetof(jit_dw_conv_call_s, exec_flags))));
+                                offsetof(jit_dw_conv_args_t, exec_flags))));
 
         and_(reg_exec_flags, reg_exec_flags, FLAG_ZERO_BIAS);
         tst(reg_exec_flags, reg_exec_flags);
@@ -1047,7 +1084,7 @@ jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_ow_block_unroll() {
     ldr(reg_kh_offset,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, filter_pad_off))));
+                            offsetof(jit_dw_conv_args_t, filter_pad_off))));
     add(reg_filter_baddr, reg_filter_baddr, reg_kh_offset);
 
     /* compute left padded block */
@@ -1095,34 +1132,37 @@ jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::compute_ow_block_unroll() {
 }
 
 template <cpu_isa_t isa>
-void jit_uni_dw_conv_bwd_weights_kernel_f32<isa>::generate() {
+void jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>::generate() {
+    const int simd_w_ = cpu_isa_traits<isa>::vlen / sizeof(float);
     preamble();
+    //TO DO : renaming predicate register (P_ALL_ONE)
+    if (simd_w_ != cpu_sveLen / sizeof(float)) {
+        set_preg(P_ALL_ONE.s, simd_w_, X_TMP_0, X_TMP_1);
+    }
 
-    if (simd_w == 16)
-        ptrue(P_ALL_ONE.b);
-    else if (simd_w == 8)
-        ptrue(P_ALL_ONE.b, VL32);
-    else
-        assert(!"Unsupport: simd_w != 16, 8");
+    if (simd_w_ != 16 && simd_w_ != 8) {
+        assert(!"Unsupported: simd_w != 16, 8");
+    }
 
     ldr(reg_input_baddr,
             ptr(abi_param1,
-                    static_cast<int32_t>(offsetof(jit_dw_conv_call_s, input))));
+                    static_cast<int32_t>(offsetof(jit_dw_conv_args_t, input))));
     ldr(reg_output_baddr,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, output))));
+                            offsetof(jit_dw_conv_args_t, output))));
     ldr(reg_filter_baddr,
             ptr(abi_param1,
                     static_cast<int32_t>(
-                            offsetof(jit_dw_conv_call_s, filter))));
+                            offsetof(jit_dw_conv_args_t, filter))));
 
     compute_ow_block_unroll();
 
     this->postamble();
 }
 
-template struct jit_uni_dw_conv_bwd_weights_kernel_f32<sve_512>;
+template struct jit_uni_dw_conv_bwd_weights_kernel_f32_t<sve_512>;
+template struct jit_uni_dw_conv_bwd_weights_kernel_f32_t<sve_256>;
 
 } // namespace aarch64
 } // namespace cpu

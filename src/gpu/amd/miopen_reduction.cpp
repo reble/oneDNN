@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,11 +15,13 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include "common/compiler_workarounds.hpp"
+
 #include "gpu/amd/miopen_reduction.hpp"
+#include "gpu/amd/stream.hpp"
 #include "gpu/amd/sycl_hip_scoped_context.hpp"
-#include "gpu/amd/sycl_hip_stream.hpp"
-#include "sycl/sycl_buffer_memory_storage.hpp"
-#include "sycl/sycl_memory_storage_helper.hpp"
+#include "xpu/sycl/buffer_memory_storage.hpp"
+#include "xpu/sycl/memory_storage_helper.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -30,8 +32,7 @@ status_t miopen_reduction_t::execute(const exec_ctx_t &ctx) const {
     if (memory_desc_wrapper(pd()->src_md()).has_zero_dim())
         return status::success;
 
-    amd::sycl_hip_stream_t *hip_stream
-            = utils::downcast<amd::sycl_hip_stream_t *>(ctx.stream());
+    amd::stream_t *hip_stream = utils::downcast<amd::stream_t *>(ctx.stream());
 
     return hip_stream->interop_task([&](::sycl::handler &cgh) {
         auto arg_src = CTX_IN_SYCL_MEMORY(DNNL_ARG_SRC);
@@ -39,17 +40,18 @@ status_t miopen_reduction_t::execute(const exec_ctx_t &ctx) const {
         auto arg_scratch
                 = CTX_SCRATCH_SYCL_MEMORY(memory_tracking::names::key_none);
 
-        compat::host_task(cgh, [=](const compat::interop_handle &ih) {
-            auto &sycl_engine = *utils::downcast<sycl_hip_engine_t *>(
-                    hip_stream->engine());
-            auto sc = hip_sycl_scoped_context_handler_t(sycl_engine);
-            auto handle = hip_stream->get_miopen_handle();
+        compat::host_task(cgh,
+                [= WA_THIS_COPY_CAPTURE](const compat::interop_handle &ih) {
+                    auto &sycl_engine = *utils::downcast<amd::engine_t *>(
+                            hip_stream->engine());
+                    auto sc = hip_sycl_scoped_context_handler_t(sycl_engine);
+                    auto handle = hip_stream->get_miopen_handle();
 
-            void *a = arg_src.get_native_pointer(ih);
-            void *c = arg_dst.get_native_pointer(ih);
-            void *scratch = arg_scratch.get_native_pointer(ih);
-            pd()->reduction_impl_->execute(handle, a, c, scratch);
-        });
+                    void *a = arg_src.get_native_pointer(ih);
+                    void *c = arg_dst.get_native_pointer(ih);
+                    void *scratch = arg_scratch.get_native_pointer(ih);
+                    pd()->reduction_impl_->execute(handle, a, c, scratch);
+                });
     });
 }
 

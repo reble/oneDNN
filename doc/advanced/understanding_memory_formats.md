@@ -115,9 +115,9 @@ in this example.
 
 One can create memory with **NCHW** data layout using
 #dnnl_nchw of the enum type #dnnl_format_tag_t defined in
-[dnnl_types.h](https://github.com/oneapi-src/oneDNN/blob/master/include/oneapi/dnnl/dnnl_types.h)
+[dnnl_types.h](https://github.com/uxlfoundation/oneDNN/blob/main/include/oneapi/dnnl/dnnl_types.h)
 for the C API, and dnnl::memory::format_tag::nchw defined in
-[dnnl.hpp](https://github.com/oneapi-src/oneDNN/blob/master/include/oneapi/dnnl/dnnl.hpp)
+[dnnl.hpp](https://github.com/uxlfoundation/oneDNN/blob/main/include/oneapi/dnnl/dnnl.hpp)
 for the C++ API.
 
 
@@ -137,17 +137,15 @@ For a single image (**N** = 1), this format is very similar to how
 where the image is kept pixel by pixel and every pixel contains all
 required information about colors (for instance, three channels for 24bit BMP).
 
-NHWC data format is the default one for
-[TensorFlow](https://www.tensorflow.org/performance/performance_guide#data_formats).
+NHWC is the default data format for image recognition in
+[TensorFlow](https://www.tensorflow.org/api_docs/python/tf/conv).
 
 This layout corresponds to #dnnl_nhwc or dnnl::memory::format_tag::nhwc.
 
 
 #### CHWN
 
-The last example here for the plain data layout is **CHWN**, which is used by
-[Neon](https://neon.nervanasys.com/index.html/design.html#data-layout).
-This layout might be very interesting from a vectorization perspective if
+The last example here for the plain data layout is **CHWN**. This layout might be very interesting from a vectorization perspective if
 an appropriate batch size is used, but on the other hand users cannot always
 have *good* batch size (for example, in case of real-time inference batch is
 typically 1).
@@ -222,6 +220,7 @@ the function above is:
 
     dnnl_memory_desc_create_with_strides(&md, ndims, dims, dnnl_f32, strides);
 ~~~
+
 In particular, whenever a user creates memory with the #dnnl_nchw format,
 oneDNN computes the strides and fills the structure on behalf of the
 user.

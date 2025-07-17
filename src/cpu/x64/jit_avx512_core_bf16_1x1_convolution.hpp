@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -42,13 +42,7 @@ namespace x64 {
 template <impl::data_type_t dst_type>
 struct jit_avx512_core_bf16_1x1_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        using dw_conv_pd_type = cpu_convolution_fwd_pd_t;
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd)
-            , jcp_()
-            , rtus_()
-            , jcp_dw_(nullptr) {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         pd_t(const pd_t &other) : cpu_convolution_fwd_pd_t(other) {
             if (copy(other) != status::success) is_initialized_ = false;
@@ -59,7 +53,8 @@ struct jit_avx512_core_bf16_1x1_convolution_fwd_t : public primitive_t {
 
         status_t init(engine_t *engine) {
             using namespace data_type;
-            // disabling verbose dispatch messages for unsupported isa for better readability
+            // Disabling verbose dispatch messages for unsupported isa for
+            // better readability.
             if (!mayiuse(avx512_core)) return status::unimplemented;
 
             VDISPATCH_CONV(is_fwd(), VERBOSE_BAD_PROPKIND);
@@ -84,16 +79,19 @@ struct jit_avx512_core_bf16_1x1_convolution_fwd_t : public primitive_t {
 
             const convolution_desc_t *conv_d = desc();
             const memory_desc_t *src_d = src_md();
+
+            // TODO: make `rtus_prepare` assign initialized object to `rtus_`
             rtus_prepare(this, conv_d, src_d, dst_md(), weights_md());
 
-            CHECK(jit_avx512_core_bf16_1x1_conv_kernel::init_conf(jcp_, *conv_d,
-                    *src_d, *weights_md(), *dst_md(), attr_,
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_avx512_core_bf16_1x1_conv_kernel_t::init_conf(jcp_,
+                    *conv_d, *src_d, *weights_md(), *dst_md(), attr_,
                     dnnl_get_max_threads(), rtus_.reduce_src_));
 
             if (jcp_.with_dw_conv) CHECK(depthwise_po_init(engine));
 
             auto scratchpad = scratchpad_registry().registrar();
-            CHECK(jit_avx512_core_bf16_1x1_conv_kernel::init_scratchpad(
+            CHECK(jit_avx512_core_bf16_1x1_conv_kernel_t::init_scratchpad(
                     scratchpad, jcp_));
 
             rtus_prepare_space_info(this, scratchpad, jcp_.nthr);
@@ -105,16 +103,17 @@ struct jit_avx512_core_bf16_1x1_convolution_fwd_t : public primitive_t {
             return cpu_convolution_fwd_pd_t::dst_md(index);
         }
 
+        // NOLINTBEGIN(google-default-arguments)
         const memory_desc_t *dst_md(
                 int index = 0, bool user_input = false) const override {
-            return jcp_.with_dw_conv
+            return dw_conv_pd_ && jcp_.with_dw_conv
                     ? dw_conv_pd_->dst_md(index, user_input)
                     : cpu_convolution_fwd_pd_t::dst_md(index, user_input);
         }
 
         const memory_desc_t *arg_md(
                 int arg, bool user_input = false) const override {
-            if (jcp_.with_dw_conv) {
+            if (dw_conv_pd_ && jcp_.with_dw_conv) {
                 switch (arg) {
                     case DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_SRC:
                         return cpu_convolution_fwd_pd_t::dst_md(0, user_input);
@@ -127,21 +126,22 @@ struct jit_avx512_core_bf16_1x1_convolution_fwd_t : public primitive_t {
             }
             return convolution_fwd_pd_t::arg_md(arg, user_input);
         }
+        // NOLINTEND(google-default-arguments)
 
         arg_usage_t arg_usage(int arg) const override {
             if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS))
                 return arg_usage_t::input;
 
-            if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS)
-                    && attr_post_op_dw_inputs() > 1)
-                return arg_usage_t::input;
+            if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS))
+                return attr_post_op_dw_inputs() > 1 ? arg_usage_t::input
+                                                    : arg_usage_t::unused;
 
             return convolution_fwd_pd_t::arg_usage(arg);
         }
 
-        jit_1x1_conv_conf_t jcp_;
-        reduce_to_unit_stride_t rtus_;
-        jit_conv_conf_t *jcp_dw_; // doesn't own a resource
+        jit_1x1_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
+        reduce_to_unit_stride_t rtus_ = utils::zero<decltype(rtus_)>();
+        jit_conv_conf_t *jcp_dw_ = nullptr; // doesn't own a resource
         std::unique_ptr<cpu_convolution_fwd_pd_t> dw_conv_pd_;
 
     protected:
@@ -225,21 +225,22 @@ struct jit_avx512_core_bf16_1x1_convolution_fwd_t : public primitive_t {
             // for 1x1: Check that no better ISA is available.
             // for dw: Always fuse with same ISA.
             // Caveat: May be a better dw conv exists.
-            VDISPATCH_CONV(!mayiuse(avx512_core_amx),
-                    "heuristic to skip implementation when higher ISA is "
-                    "supported");
+            VDISPATCH_CONV_IC(!mayiuse(avx512_core_amx),
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL, "higher ISA is supported");
 
-            VDISPATCH_CONV(attr_1x1.post_ops_.find(primitive_kind::sum) == -1,
-                    VERBOSE_UNSUPPORTED_POSTOP);
+            VDISPATCH_CONV_IC(
+                    attr_1x1.post_ops_.find(primitive_kind::sum) == -1,
+                    VERBOSE_UNSUPPORTED_FEATURE, "unsupported sum post-op");
 
             // TODO: Below may be further tuned.
-            VDISPATCH_CONV(
-                    l2_cache * 2 < src_d.size(), "cache size check failed");
+            VDISPATCH_CONV_IC(l2_cache * 2 < src_d.size(),
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL, "cache size check failed");
 
             // load_grp_count check can be redundant due to l2 check
             // above. Adding it explicitly as the current driver doesn't
             // work if this condition fails.
-            VDISPATCH_CONV(jcp_1x1.load_grp_count < 2, "load group count > 1");
+            VDISPATCH_CONV_IC(jcp_1x1.load_grp_count < 2,
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL, "load group count > 1");
 
             int dw_po_index
                     = attr_1x1.post_ops_.find(primitive_kind::convolution);
@@ -270,16 +271,17 @@ struct jit_avx512_core_bf16_1x1_convolution_fwd_t : public primitive_t {
                 return status::unimplemented;
 #undef CASE
 
-            VDISPATCH_CONV(
+            VDISPATCH_CONV_IC(
                     dnnl_memory_desc_equal(&src_md, dw_conv_pd_->src_md(0)),
                     VERBOSE_INCONSISTENT_MDS, "src_md", "dw_conv_pd_->src_md");
-            VDISPATCH_CONV(jcp_1x1.oc_without_padding % jcp_1x1.oc_block == 0,
-                    "output-channel is not an exact multiple of oc_block "
-                    "(currently unsupported padded output-channel)");
-            VDISPATCH_CONV(IMPLICATION(jcp_dw->ow_block,
-                                   jcp_dw->ow_block == jcp_dw->ow),
-                    "heuristic: ow_block does not equal output-width "
-                    "(unsupported output-width partitioning)");
+            VDISPATCH_CONV_IC(
+                    jcp_1x1.oc_without_padding % jcp_1x1.oc_block == 0,
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL,
+                    "output-channel is not an exact multiple of oc_block");
+            VDISPATCH_CONV_IC(IMPLICATION(jcp_dw->ow_block,
+                                      jcp_dw->ow_block == jcp_dw->ow),
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL,
+                    "ow_block does not equal output-width");
 
             assert(dw_conv_pd_->dst_md(0)->format_kind != format_kind::any);
             assert(dw_conv_pd_->weights_md(0)->format_kind != format_kind::any);
@@ -322,16 +324,16 @@ struct jit_avx512_core_bf16_1x1_convolution_fwd_t : public primitive_t {
     jit_avx512_core_bf16_1x1_convolution_fwd_t(const pd_t *apd)
         : primitive_t(apd) {}
 
-    typedef typename prec_traits<data_type::bf16>::type src_data_t;
-    typedef typename prec_traits<data_type::bf16>::type wei_data_t;
-    typedef typename prec_traits<dst_type>::type dst_data_t;
+    using src_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using wei_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using dst_data_t = typename prec_traits_t<dst_type>::type;
     // Note: In case of fused depthwise convolution, the final output datatype
     // may not be dst_data_t.
-    typedef typename prec_traits<dst_type>::type dw_wei_data_t;
+    using dw_wei_data_t = typename prec_traits_t<dst_type>::type;
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
-                new jit_avx512_core_bf16_1x1_conv_kernel(
+                new jit_avx512_core_bf16_1x1_conv_kernel_t(
                         pd()->jcp_, *pd()->attr(), *pd()->dst_1x1_md(0))));
         CHECK(kernel_->create_kernel());
 
@@ -360,21 +362,17 @@ private:
             const void *post_ops_binary_rhs_arg_vec_dw) const;
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
-    std::unique_ptr<jit_avx512_core_bf16_1x1_conv_kernel> kernel_;
+    std::unique_ptr<jit_avx512_core_bf16_1x1_conv_kernel_t> kernel_;
     std::unique_ptr<rtus_driver_t<avx512_core>> rtus_driver_;
     using dw_conv_kernel_t
-            = jit_uni_dw_conv_fwd_kernel<avx512_core, data_type::bf16>;
+            = jit_uni_dw_conv_fwd_kernel_t<avx512_core, data_type::bf16>;
     std::unique_ptr<dw_conv_kernel_t> kernel_dw_;
 };
 
 template <impl::data_type_t diff_src_type>
 struct jit_avx512_core_bf16_1x1_convolution_bwd_data_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_data_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_data_pd_t(adesc, attr, hint_fwd_pd)
-            , jcp_()
-            , rtus_() {}
+        using cpu_convolution_bwd_data_pd_t::cpu_convolution_bwd_data_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit_bf16_1x1:", jcp_.isa, ""),
                 jit_avx512_core_bf16_1x1_convolution_bwd_data_t);
@@ -397,25 +395,25 @@ struct jit_avx512_core_bf16_1x1_convolution_bwd_data_t : public primitive_t {
 
             const convolution_desc_t *conv_d = desc();
             const memory_desc_t *diff_src_d = diff_src_md();
+            // TODO: make `rtus_prepare` assign initialized object to `rtus_`
             rtus_prepare(this, conv_d, diff_src_d, diff_dst_md(), weights_md());
 
-            status_t status = jit_avx512_core_bf16_1x1_conv_kernel::init_conf(
-                    jcp_, *conv_d, *diff_src_d, *weights_md(), *diff_dst_md(),
-                    attr_, dnnl_get_max_threads(), rtus_.reduce_src_);
-            if (status != status::success) return status;
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_avx512_core_bf16_1x1_conv_kernel_t::init_conf(jcp_,
+                    *conv_d, *diff_src_d, *weights_md(), *diff_dst_md(), attr_,
+                    dnnl_get_max_threads(), rtus_.reduce_src_));
 
             auto scratchpad = scratchpad_registry().registrar();
-            status = jit_avx512_core_bf16_1x1_conv_kernel::init_scratchpad(
-                    scratchpad, jcp_);
-            if (status != status::success) return status;
+            CHECK(jit_avx512_core_bf16_1x1_conv_kernel_t::init_scratchpad(
+                    scratchpad, jcp_));
             rtus_prepare_space_info(this, scratchpad, jcp_.nthr);
 
             return status::success;
         }
 
         // TODO (Roma): structs conf header cleanup
-        jit_1x1_conv_conf_t jcp_;
-        reduce_to_unit_stride_t rtus_;
+        jit_1x1_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
+        reduce_to_unit_stride_t rtus_ = utils::zero<decltype(rtus_)>();
 
     protected:
         bool set_default_formats() {
@@ -452,13 +450,13 @@ struct jit_avx512_core_bf16_1x1_convolution_bwd_data_t : public primitive_t {
     jit_avx512_core_bf16_1x1_convolution_bwd_data_t(const pd_t *apd)
         : primitive_t(apd) {}
 
-    typedef typename prec_traits<data_type::bf16>::type diff_dst_data_t;
-    typedef typename prec_traits<data_type::bf16>::type wei_data_t;
-    typedef typename prec_traits<diff_src_type>::type diff_src_data_t;
+    using diff_dst_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using wei_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using diff_src_data_t = typename prec_traits_t<diff_src_type>::type;
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
-                new jit_avx512_core_bf16_1x1_conv_kernel(
+                new jit_avx512_core_bf16_1x1_conv_kernel_t(
                         pd()->jcp_, *pd()->attr(), *pd()->dst_md(0))));
         CHECK(kernel_->create_kernel());
         CHECK(init_rtus_driver<avx512_core>(this));
@@ -477,7 +475,7 @@ private:
             const memory_tracking::grantor_t &scratchpad) const;
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
-    std::unique_ptr<jit_avx512_core_bf16_1x1_conv_kernel> kernel_;
+    std::unique_ptr<jit_avx512_core_bf16_1x1_conv_kernel_t> kernel_;
     /* reduction to unit stride */
     std::unique_ptr<rtus_driver_t<avx512_core>> rtus_driver_;
 };
@@ -485,11 +483,8 @@ private:
 template <impl::data_type_t diff_weights_type>
 struct jit_avx512_core_bf16_1x1_convolution_bwd_weights_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_weights_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_weights_pd_t(adesc, attr, hint_fwd_pd)
-            , jcp_()
-            , rtus_() {}
+        using cpu_convolution_bwd_weights_pd_t::
+                cpu_convolution_bwd_weights_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit_bf16_1x1:", jcp_.isa, ""),
                 jit_avx512_core_bf16_1x1_convolution_bwd_weights_t);
@@ -518,18 +513,18 @@ struct jit_avx512_core_bf16_1x1_convolution_bwd_weights_t : public primitive_t {
 
             const convolution_desc_t *conv_d = desc();
             const memory_desc_t *src_d = src_md();
-            rtus_prepare(
-                    this, conv_d, src_d, diff_dst_md(), diff_weights_md(0));
 
-            status_t status = jit_avx512_core_bf16_1x1_conv_kernel::init_conf(
-                    jcp_, *conv_d, *src_d, *diff_weights_md(0), *diff_dst_md(),
-                    attr_, dnnl_get_max_threads(), rtus_.reduce_src_);
-            if (status != status::success) return status;
+            // TODO: make `rtus_prepare` assign initialized object to `rtus_`
+            rtus_prepare(this, conv_d, src_d, diff_dst_md(), diff_weights_md());
+
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_avx512_core_bf16_1x1_conv_kernel_t::init_conf(jcp_,
+                    *conv_d, *src_d, *diff_weights_md(0), *diff_dst_md(), attr_,
+                    dnnl_get_max_threads(), rtus_.reduce_src_));
 
             auto scratchpad = scratchpad_registry().registrar();
-            status = jit_avx512_core_bf16_1x1_conv_kernel::init_scratchpad(
-                    scratchpad, jcp_);
-            if (status != status::success) return status;
+            CHECK(jit_avx512_core_bf16_1x1_conv_kernel_t::init_scratchpad(
+                    scratchpad, jcp_));
 
             rtus_prepare_space_info(this, scratchpad, jcp_.nthr);
 
@@ -537,8 +532,8 @@ struct jit_avx512_core_bf16_1x1_convolution_bwd_weights_t : public primitive_t {
         }
 
         // TODO (Roma): structs conf header cleanup
-        jit_1x1_conv_conf_t jcp_;
-        reduce_to_unit_stride_t rtus_;
+        jit_1x1_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
+        reduce_to_unit_stride_t rtus_ = utils::zero<decltype(rtus_)>();
 
     protected:
         bool set_default_formats() {
@@ -583,16 +578,16 @@ struct jit_avx512_core_bf16_1x1_convolution_bwd_weights_t : public primitive_t {
         return status::success;
     }
 
-    typedef typename prec_traits<data_type::bf16>::type src_data_t;
-    typedef typename prec_traits<data_type::bf16>::type diff_dst_data_t;
+    using src_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using diff_dst_data_t = typename prec_traits_t<data_type::bf16>::type;
 
-    typedef typename prec_traits<diff_weights_type>::type diff_wei_data_t;
+    using diff_wei_data_t = typename prec_traits_t<diff_weights_type>::type;
 
 private:
     void execute_backward_weights(const exec_ctx_t &ctx) const;
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
-    std::unique_ptr<jit_avx512_core_bf16_1x1_conv_kernel> kernel_;
+    std::unique_ptr<jit_avx512_core_bf16_1x1_conv_kernel_t> kernel_;
     std::unique_ptr<cpu_accumulator_1d_t<data_type::f32>> acc_ker_;
 
     /* reduction to unit stride */

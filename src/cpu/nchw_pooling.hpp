@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -70,10 +70,10 @@ struct nchw_pooling_fwd_t : public primitive_t {
                     VERBOSE_UNSUPPORTED_TAG);
             VDISPATCH_POOLING(
                     memory_desc_matches_tag(*src_md(), desired_fmt_tag),
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "src");
             VDISPATCH_POOLING(
                     memory_desc_matches_tag(*dst_md(), desired_fmt_tag),
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "dst");
             VDISPATCH_POOLING(
                     attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_POSTOP);
@@ -101,7 +101,7 @@ struct nchw_pooling_fwd_t : public primitive_t {
 
     nchw_pooling_fwd_t(const pd_t *apd) : primitive_t(apd) {}
 
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t init(engine_t *engine) override {
         ref_post_ops_
@@ -153,10 +153,10 @@ struct nchw_pooling_bwd_t : public primitive_t {
                     attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_POOLING(
                     memory_desc_matches_tag(*diff_dst_md(), desired_fmt_tag),
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "diff_dst");
             VDISPATCH_POOLING(
                     memory_desc_matches_tag(*diff_src_md(), desired_fmt_tag),
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "diff_src");
             VDISPATCH_POOLING(!is_dilated(), VERBOSE_UNSUPPORTED_FEATURE,
                     "does not support dilations");
 
@@ -174,8 +174,9 @@ struct nchw_pooling_bwd_t : public primitive_t {
             return status::success;
         }
 
-        dim_t channel_block_size_;
+        dim_t channel_block_size_ {1};
         int nthr_; // To not exceed the limit in execute used for set up.
+        int nbuf_ {0};
 
     private:
         void init_scratchpad() {
@@ -185,31 +186,39 @@ struct nchw_pooling_bwd_t : public primitive_t {
                 size_t src_sz_ = ID() * IH() * IW();
                 auto scratchpad = scratchpad_registry().registrar();
 
+                // The value of nbuf_ must be in compliance with arguments of
+                // parallel_nd_ext called from execute_backward for data_type!=f32
+                nbuf_ = nstl::min(static_cast<dim_t>(nthr_),
+                        MB() * utils::div_up(IC(), channel_block_size_));
+
                 scratchpad.template book<float>(key_pool_src_bf16cvt,
-                        src_sz_ * nthr_ * channel_block_size_);
+                        src_sz_ * nbuf_ * channel_block_size_);
                 scratchpad.template book<float>(key_pool_dst_bf16cvt,
-                        dst_sz_ * nthr_ * channel_block_size_);
+                        dst_sz_ * nbuf_ * channel_block_size_);
             }
         }
 
         void calculate_channel_block_size() {
-            // calculate channels block size at which the data fits into half
-            // of L1, it allows to improve performance for problems with small
-            // spatial
-            dim_t dst_sz_ = OD() * OH() * OW();
-            dim_t src_sz_ = ID() * IH() * IW();
-            dim_t C_per_thr = nstl::min(MB() * IC() / nthr_, IC());
-            const dim_t max_block_size
-                    = platform::get_per_core_cache_size(1) / 2;
-            dim_t data_size_per_ch = (dst_sz_ + src_sz_) * 6; // f32 + bf16
-            channel_block_size_ = nstl::max(
-                    nstl::min(C_per_thr, max_block_size / data_size_per_ch),
-                    (dim_t)1);
+            using namespace memory_tracking::names;
+            if (diff_dst_md()->data_type != data_type::f32) {
+                // calculate channels block size at which the data fits into half
+                // of L1, it allows to improve performance for problems with small
+                // spatial
+                dim_t dst_sz_ = OD() * OH() * OW();
+                dim_t src_sz_ = ID() * IH() * IW();
+                dim_t C_per_thr = nstl::min(MB() * IC() / nthr_, IC());
+                const dim_t max_block_size
+                        = platform::get_per_core_cache_size(1) / 2;
+                dim_t data_size_per_ch = (dst_sz_ + src_sz_) * 6; // f32 + bf16
+                channel_block_size_ = nstl::max(
+                        nstl::min(C_per_thr, max_block_size / data_size_per_ch),
+                        (dim_t)1);
+            }
         }
     };
 
     nchw_pooling_bwd_t(const pd_t *apd) : primitive_t(apd) {}
-    typedef typename prec_traits<d_type>::type data_t;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t execute(const exec_ctx_t &ctx) const override {
         return execute_backward(ctx);

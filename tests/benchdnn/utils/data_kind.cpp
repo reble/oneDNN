@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -35,6 +35,7 @@ static data_kind_entry_t data_kind_table[] = {
         // is the one that corresponts to the argument expected in comparison.
         {SRC, {DNNL_ARG_DIFF_SRC, DNNL_ARG_SRC}},
         {SRC_1, {DNNL_ARG_DIFF_SRC_1, DNNL_ARG_SRC_1}},
+        {SRC_2, {DNNL_ARG_DIFF_SRC_2, DNNL_ARG_SRC_2}},
         {SRC_ITER, {DNNL_ARG_DIFF_SRC_ITER, DNNL_ARG_SRC_ITER}},
         {SRC_ITER_C, {DNNL_ARG_DIFF_SRC_ITER_C, DNNL_ARG_SRC_ITER_C}},
         {WEI, {DNNL_ARG_DIFF_WEIGHTS, DNNL_ARG_WEIGHTS}},
@@ -55,6 +56,7 @@ static data_kind_entry_t data_kind_table[] = {
                 {DNNL_ARG_DIFF_WEIGHTS_PROJECTION,
                         DNNL_ARG_WEIGHTS_PROJECTION}},
         {DAT_TOTAL, {DNNL_ARG_SCRATCHPAD}},
+        {DROPOUT_MASK, {DNNL_ARG_ATTR_DROPOUT_MASK}},
 };
 
 data_kind_t exec_arg2data_kind(int arg) {
@@ -70,8 +72,11 @@ data_kind_t exec_arg2data_kind(int arg) {
     bool is_dw_post_op = (arg & DNNL_ARG_ATTR_POST_OP_DW);
     bool is_scales_arg = (arg & DNNL_ARG_ATTR_SCALES);
     bool is_zero_point_arg = (arg & DNNL_ARG_ATTR_ZERO_POINTS);
+    bool is_dropout_arg = (arg & DNNL_ARG_ATTR_DROPOUT_PROBABILITY)
+            || (arg & DNNL_ARG_ATTR_DROPOUT_MASK)
+            || (arg & DNNL_ARG_ATTR_DROPOUT_SEED);
     if (!is_post_ops_arg && !is_dw_post_op && !is_scales_arg
-            && !is_zero_point_arg)
+            && !is_zero_point_arg && !is_dropout_arg)
         BENCHDNN_PRINT(0, "Error: arg \'%d\' was not recognized\n", arg);
 
     const auto table_size = sizeof(data_kind_table) / sizeof(*data_kind_table);
@@ -86,13 +91,14 @@ int data_kind2exec_arg(data_kind_t dk) {
 
     BENCHDNN_PRINT(0, "Error: data_kind \'%s\' was not recognized\n",
             data_kind2str(dk));
-    return BENCHDNN_DNNL_ARG_UNDEF;
+    return DNNL_ARG_UNDEF;
 }
 
 const char *data_kind2str(data_kind_t kind) {
     switch (kind) {
         case SRC: return "SRC";
         case SRC_1: return "SRC_ADD";
+        case SRC_2: return "SRC_2";
         case WEI: return "WEI";
         case BIA: return "BIA";
         case DST: return "DST";
@@ -110,6 +116,7 @@ const char *data_kind2str(data_kind_t kind) {
         case WEI_ITER: return "WEI_ITER";
         case WEI_PEEPHOLE: return "WEI_PEEPHOLE";
         case WEI_PROJECTION: return "WEI_PROJECTION";
+        case DROPOUT_MASK: return "DROPOUT_MASK";
         default: assert(!"incorrect data kind");
     }
     return "incorrect data kind";

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,13 +23,13 @@
 #include <hip/hip_runtime.h>
 #include <rocblas/rocblas.h>
 
-#include "dnnl_sycl.hpp"
+#include "dnnl_sycl.h"
 
 #include "common/engine.hpp"
 #include "common/utils.hpp"
 #include "common/z_magic.hpp"
 
-#include "sycl/sycl_utils.hpp"
+#include "xpu/sycl/utils.hpp"
 
 #include "gpu/amd/sycl_hip_compat.hpp"
 
@@ -51,7 +51,7 @@ inline status_t check_device(dnnl::impl::engine_kind_t eng_kind) {
 
 inline void convert_dnnl_dims_array(
         const dnnl_dim_t *dims, int *new_dims, int n_dims) {
-    for (size_t i = 0; i < n_dims; i++) {
+    for (int i = 0; i < n_dims; i++) {
         new_dims[i] = static_cast<int>(dims[i]);
     }
 }
@@ -59,7 +59,7 @@ inline void convert_dnnl_dims_array(
 inline void convert_dims(const dnnl_dim_t *dims, int *new_dims, int n_dims,
         int adjustment_size = 4, int adjustment_value = 1) {
     convert_dnnl_dims_array(dims, new_dims, n_dims);
-    for (size_t i = n_dims; i < adjustment_size; i++) {
+    for (int i = n_dims; i < adjustment_size; i++) {
         new_dims[i] = adjustment_value;
     }
 }
@@ -110,7 +110,7 @@ inline bool adjust_stride_for_dnn(
 
 // Check if the dimensions contain any zeros, returns true if they do.
 inline bool has_zero_dims(const dnnl_dim_t *dims, int n_dims) {
-    for (size_t i = 0; i < n_dims; i++) {
+    for (int i = 0; i < n_dims; i++) {
         if (dims[i] == 0) { return true; }
     }
     return false;
@@ -131,14 +131,19 @@ inline status_t convert_data_type(const memory_desc_t *mem_desc,
         case data_type_t::dnnl_bf16:
             *miopen_data_type = miopenDataType_t::miopenBFloat16;
             break;
-        case data_type_t::dnnl_s8:
-            *miopen_data_type
-                    = ((vectorized
-                               && mem_desc->format_desc.blocking.inner_blks[0]
-                                       == 4)
-                                    ? miopenDataType_t::miopenInt8x4
-                                    : miopenDataType_t::miopenInt8);
+        case data_type_t::dnnl_s8: {
+            if (vectorized
+                    && mem_desc->format_desc.blocking.inner_blks[0] == 4) {
+#if defined(MIOPEN_HAS_INT8X4)
+                *miopen_data_type = miopenDataType_t::miopenInt8x4;
+#else
+                return status::unimplemented;
+#endif
+            } else {
+                *miopen_data_type = miopenDataType_t::miopenInt8;
+            }
             break;
+        }
         default: return status::unimplemented;
     }
     return status::success;

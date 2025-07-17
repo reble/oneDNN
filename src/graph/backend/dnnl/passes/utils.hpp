@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,6 +40,9 @@
 #include "graph/backend/dnnl/utils.hpp"
 
 #include "oneapi/dnnl/dnnl.hpp"
+
+#define VCHECK_UTILS(cond, status, msg, ...) \
+    VCONDCHECK(graph, create, check, utils, (cond), status, msg, ##__VA_ARGS__);
 
 namespace dnnl {
 namespace impl {
@@ -88,7 +91,8 @@ public:
         status_t ret;
         for (size_t i = 0; i < passes_.size(); i++) {
             ret = passes_[i](sg);
-            if (ret != status::success) { return ret; }
+            VCHECK_UTILS(ret == status::success, ret, "run pass %s failed",
+                    names_[i].c_str());
 
             // Dump the subgraph to dot file
             if (enable_visualizer_) {
@@ -97,8 +101,13 @@ public:
             }
 
             // Validate the subgraph after each pass
-            if (enable_validator_) { ret = validator_.run(sg); }
-            if (ret != status::success) { return ret; }
+            if (enable_validator_) {
+                ret = validator_.run(sg);
+                VCHECK_UTILS(ret == status::success, ret,
+                        "validation failed "
+                        "after run pass %s",
+                        names_[i].c_str());
+            }
         }
         return status::success;
     }
@@ -163,38 +172,75 @@ inline const std::map<op_kind_t, dnnl::algorithm> &get_eltwise_alg_map() {
             {graph::op_kind::Sigmoid, dnnl::algorithm::eltwise_logistic},
             {graph::op_kind::Sqrt, dnnl::algorithm::eltwise_sqrt},
             {graph::op_kind::Square, dnnl::algorithm::eltwise_square},
-            {graph::op_kind::Tanh, dnnl::algorithm::eltwise_tanh}};
+            {graph::op_kind::Tanh, dnnl::algorithm::eltwise_tanh},
+            {graph::op_kind::AbsBackward, dnnl::algorithm::eltwise_abs},
+            {graph::op_kind::ClampBackward, dnnl::algorithm::eltwise_clip_v2},
+            {graph::op_kind::EluBackward, dnnl::algorithm::eltwise_elu},
+            {graph::op_kind::GELUBackward, dnnl::algorithm::eltwise_gelu_erf},
+            {graph::op_kind::HardSigmoidBackward,
+                    dnnl::algorithm::eltwise_hardsigmoid},
+            {graph::op_kind::HardSwishBackward,
+                    dnnl::algorithm::eltwise_hardswish},
+            {graph::op_kind::MishBackward, dnnl::algorithm::eltwise_mish},
+            {graph::op_kind::ReLUBackward, dnnl::algorithm::eltwise_relu},
+            {graph::op_kind::SigmoidBackward,
+                    dnnl::algorithm::eltwise_logistic},
+            {graph::op_kind::ReLUBackward, dnnl::algorithm::eltwise_relu},
+            {graph::op_kind::SqrtBackward, dnnl::algorithm::eltwise_sqrt},
+            {graph::op_kind::TanhBackward, dnnl::algorithm::eltwise_tanh},
+    };
     return eltwise_alg_map;
 }
 
-inline dnnl::algorithm get_eltwise_bwd_alg(op_kind_t kind, bool use_dst) {
+inline dnnl::algorithm get_eltwise_alg(
+        const std::shared_ptr<op_t> &op, bool bwd) {
     using algo = dnnl::algorithm;
-    switch (kind) {
-        case graph::op_kind::AbsBackward: return algo::eltwise_abs;
-        case graph::op_kind::ClampBackward:
-            if (use_dst) return algo::eltwise_clip_v2_use_dst_for_bwd;
-            return algo::eltwise_clip_v2;
-        case graph::op_kind::EluBackward:
-            if (use_dst) return algo::eltwise_elu_use_dst_for_bwd;
-            return algo::eltwise_elu;
-        case graph::op_kind::GELUBackward: return algo::eltwise_gelu_erf;
-        case graph::op_kind::HardSigmoidBackward:
-            return algo::eltwise_hardsigmoid;
-        case graph::op_kind::HardSwishBackward: return algo::eltwise_hardswish;
-        case graph::op_kind::MishBackward: return algo::eltwise_mish;
-        case graph::op_kind::ReLUBackward:
-            if (use_dst) return algo::eltwise_relu_use_dst_for_bwd;
-            return algo::eltwise_relu;
-        case graph::op_kind::SigmoidBackward:
-            if (use_dst) return algo::eltwise_logistic_use_dst_for_bwd;
-            return algo::eltwise_logistic;
-        case graph::op_kind::SqrtBackward:
-            if (use_dst) return algo::eltwise_sqrt_use_dst_for_bwd;
-            return algo::eltwise_sqrt;
-        case graph::op_kind::TanhBackward:
-            if (use_dst) return algo::eltwise_tanh_use_dst_for_bwd;
-            return algo::eltwise_tanh;
-        default: return algo::undef;
+
+    const op_kind_t opk = op->get_kind();
+    const auto &map = get_eltwise_alg_map();
+
+    auto it = map.find(opk);
+    if (it == map.end()) {
+        assert(!"unexpected op kind");
+        return algo::undef;
+    } else {
+        auto alg = it->second;
+        // handle attributes
+        if (opk == graph::op_kind::GELU
+                || opk == graph::op_kind::GELUBackward) {
+            if (op->has_attr(graph::op_attr::mode)
+                    && op->get_attr<std::string>(graph::op_attr::mode)
+                            == "gelu_tanh") {
+                alg = algo::eltwise_gelu_tanh;
+            }
+        }
+
+        if (bwd && op->has_attr(graph::op_attr::use_dst)
+                && op->get_attr<bool>(graph::op_attr::use_dst)) {
+            switch (opk) {
+                case graph::op_kind::ClampBackward:
+                    alg = algo::eltwise_clip_v2_use_dst_for_bwd;
+                    break;
+                case graph::op_kind::EluBackward:
+                    alg = algo::eltwise_elu_use_dst_for_bwd;
+                    break;
+                case graph::op_kind::ReLUBackward:
+                    alg = algo::eltwise_relu_use_dst_for_bwd;
+                    break;
+                case graph::op_kind::SigmoidBackward:
+                    alg = algo::eltwise_logistic_use_dst_for_bwd;
+                    break;
+                case graph::op_kind::SqrtBackward:
+                    alg = algo::eltwise_sqrt_use_dst_for_bwd;
+                    break;
+                case graph::op_kind::TanhBackward:
+                    alg = algo::eltwise_tanh_use_dst_for_bwd;
+                    break;
+                default: break;
+            }
+        }
+
+        return alg;
     }
 }
 
@@ -307,7 +353,12 @@ std::pair<bool, std::pair<size_t, int64_t>> shuffle_fusible(
 // performance. So, we check the shape in this function and only make
 // per_tensor, per_channel, per_mb_w(MatMul) and full tensor broadcast
 // binary able to be fused.
-bool post_binary_fusible(const op_t *base_op, const op_t *bin_op);
+bool post_binary_fusible(const op_t *base_op, const op_t *bin_op,
+        engine_kind_t ekind = engine_kind::cpu);
+
+// binary + sqrt post-op fusion is unsupported on NVIDIA GPU
+bool post_eltwise_fusible(
+        const op_t *base_op, const op_t *elt_op, graph::engine_kind_t ekind);
 
 // oneDNN support post depthwise conv fusion. This function is used to check if
 // two conv ops can be fused as a conv + depthwise pattern.
@@ -328,13 +379,13 @@ std::string kind2str(op_kind_t kind);
 bool is_typecast(const op_t *op);
 
 bool with_runtime_scales(const std::shared_ptr<op_t> &op,
-        const fusion_info_mgr_t &mgr, bool is_input, size_t indice);
+        const fusion_info_mgr_t &mgr, bool is_input, size_t index);
 
 bool with_runtime_dst_scales(
         const std::shared_ptr<op_t> &op, const fusion_info_mgr_t &mgr);
 
 bool with_runtime_zps(const std::shared_ptr<op_t> &op,
-        const fusion_info_mgr_t &mgr, bool is_input, size_t indice);
+        const fusion_info_mgr_t &mgr, bool is_input, size_t index);
 
 // This function is used to check if a dnnl_reorder op is converted from or act
 // as a Reorder op. This function will only return true for a dnnl_reorder op
@@ -346,6 +397,9 @@ std::shared_ptr<op_t> clone_mul_scales(const std::shared_ptr<op_t> &scale_op);
 
 // This function is used to inverse scales of a dnnl_mul_scales op
 bool inverse_mul_scales(std::shared_ptr<op_t> &scale_op);
+
+bool need_broadcast_for_inputs(
+        const std::shared_ptr<op_t> &op, size_t index1, size_t index2);
 
 } // namespace dnnl_impl
 } // namespace graph

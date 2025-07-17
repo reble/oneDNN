@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -73,9 +73,11 @@ status_t jit_avx512_core_amx_1x1_convolution_fwd_t::execute_forward(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float *oscales = scale_utils::precompute_scales(
-            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->OC(),
-            pd()->attr(), jit_scale_precompute_.get());
+            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->IC(),
+            pd()->OC(), false, wei_scale_mask > 0, pd()->attr(),
+            jit_scale_precompute_.get());
 
     DEFINE_ZERO_POINTS_BUFFER(src_zero_point, DNNL_ARG_SRC);
     DEFINE_ZERO_POINTS_BUFFER(dst_zero_point, DNNL_ARG_DST);
@@ -133,7 +135,7 @@ status_t jit_avx512_core_amx_1x1_convolution_fwd_t::execute_forward(
         size_t start {0}, end {0};
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         p.tile_cfg = tcfg;
         p.tile_cfg_tail = tcfg + 64;
 

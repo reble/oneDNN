@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@
 #include "cpu/x64/injectors/jit_uni_eltwise_injector.hpp"
 #include "cpu/x64/jit_sse41_conv_kernel_f32.hpp"
 
-#define GET_OFF(field) offsetof(jit_conv_call_s, field)
+#define GET_OFF(field) offsetof(jit_conv_args_t, field)
 
 namespace dnnl {
 namespace impl {
@@ -38,12 +38,10 @@ using namespace dnnl::impl::utils;
 
 using namespace Xbyak;
 
-jit_sse41_conv_fwd_kernel_f32::jit_sse41_conv_fwd_kernel_f32(
+jit_sse41_conv_fwd_kernel_f32_t::jit_sse41_conv_fwd_kernel_f32_t(
         const jit_conv_conf_t &ajcp, const primitive_attr_t &attr,
         const memory_desc_t &dst_md)
-    : jit_generator(jit_name(), nullptr, MAX_CODE_SIZE, true, sse41)
-    , jcp(ajcp)
-    , attr_(attr) {
+    : jit_generator_t(jit_name(), sse41), jcp(ajcp), attr_(attr) {
     if (jcp.with_eltwise || jcp.with_binary) {
         static constexpr bool preserve_gpr = true;
         static constexpr bool preserve_vmm = false;
@@ -65,7 +63,7 @@ jit_sse41_conv_fwd_kernel_f32::jit_sse41_conv_fwd_kernel_f32(
     }
 }
 
-void jit_sse41_conv_fwd_kernel_f32::oh_step_unroll_kw(
+void jit_sse41_conv_fwd_kernel_f32_t::oh_step_unroll_kw(
         int ur_w, int pad_l, int pad_r, int oc_blocks) {
     int kw = jcp.kw;
     int stride_w = jcp.stride_w;
@@ -101,7 +99,7 @@ void jit_sse41_conv_fwd_kernel_f32::oh_step_unroll_kw(
     }
 }
 
-void jit_sse41_conv_fwd_kernel_f32::oh_step_nopad(
+void jit_sse41_conv_fwd_kernel_f32_t::oh_step_nopad(
         int ur_w, int pad_l, int pad_r, int oc_blocks) {
     Label kw_loop;
 
@@ -157,7 +155,7 @@ static void iterate(const int oc_blocks, const int ur_w, const F &f) {
             f(mask_flag, i, j);
     }
 }
-void jit_sse41_conv_fwd_kernel_f32::apply_postops(
+void jit_sse41_conv_fwd_kernel_f32_t::apply_postops(
         const int oc_blocks, const int ur_w) {
     injector_utils::vmm_index_set_t vmm_idxs;
     if (jcp.with_binary) {
@@ -185,7 +183,7 @@ void jit_sse41_conv_fwd_kernel_f32::apply_postops(
     }
 }
 
-void jit_sse41_conv_fwd_kernel_f32::width_blk_step(
+void jit_sse41_conv_fwd_kernel_f32_t::width_blk_step(
         int ur_w, int pad_l, int pad_r, int oc_blocks) {
     int kw = jcp.kw;
     int oc_blk = jcp.oc_block;
@@ -297,7 +295,7 @@ void jit_sse41_conv_fwd_kernel_f32::width_blk_step(
     sub(reg_bias, sizeof(float) * 8);
 }
 
-inline void jit_sse41_conv_fwd_kernel_f32::solve_common(int oc_blocks) {
+inline void jit_sse41_conv_fwd_kernel_f32_t::solve_common(int oc_blocks) {
     int ur_w = jcp.ur_w;
     int ur_w_tail = jcp.ur_w_tail;
     int n_oi = jcp.ow / ur_w;
@@ -346,7 +344,7 @@ inline void jit_sse41_conv_fwd_kernel_f32::solve_common(int oc_blocks) {
         width_blk_step(ur_w_tail, 0, r_pad, oc_blocks); // "tail"
 }
 
-void jit_sse41_conv_fwd_kernel_f32::generate() {
+void jit_sse41_conv_fwd_kernel_f32_t::generate() {
     this->preamble();
 
     mov(reg_input, ptr[this->param1 + GET_OFF(src)]);
@@ -377,15 +375,21 @@ void jit_sse41_conv_fwd_kernel_f32::generate() {
 
     this->postamble();
 
-    if (jcp.with_eltwise) postops_injector_->prepare_table();
+    if (jcp.with_eltwise)
+        postops_injector_->prepare_table(/* generate = */ true);
 }
 
-status_t jit_sse41_conv_fwd_kernel_f32::init_conf(jit_conv_conf_t &jcp,
+status_t jit_sse41_conv_fwd_kernel_f32_t::init_conf(jit_conv_conf_t &jcp,
         const convolution_desc_t &cd, const memory_desc_wrapper &src_d,
         const memory_desc_wrapper &weights_d, const memory_desc_wrapper &dst_d,
         const primitive_attr_t &attr, int nthreads) {
     // disabling verbose dispatch messages for unsupported isa for better readability
     if (!mayiuse(sse41)) return status::unimplemented;
+
+    // Big int (> INT_MAX) values are unsupported and jcp fields may overflow
+    // TODO: change data type of jcp fields to size_t
+    VDISPATCH_CONV_IC(!has_large_size(cd, src_d, weights_d, dst_d),
+            VERBOSE_BAD_PARAM, "Large size is not supported");
 
     jcp.nthr = nthreads;
 
@@ -427,8 +431,8 @@ status_t jit_sse41_conv_fwd_kernel_f32::init_conf(jit_conv_conf_t &jcp,
     bool kernel_outside_src = false || ext_kw <= jcp.l_pad
             || ext_kw <= jcp.r_pad || ext_kh <= jcp.t_pad
             || ext_kh <= jcp.b_pad;
-    VDISPATCH_CONV_IC(!kernel_outside_src,
-            "weights and src size mismatch due to padding");
+    VDISPATCH_CONV_IC(!kernel_outside_src, VERBOSE_UNSUPPORTED_PAD_FEATURE,
+            "weights and src size mismatch");
 
     const auto dat_tag_nxc = (ndims == 3 ? nwc : nhwc);
     const auto dat_tag_ncx = (ndims == 3 ? ncw : nchw);
@@ -439,10 +443,10 @@ status_t jit_sse41_conv_fwd_kernel_f32::init_conf(jit_conv_conf_t &jcp,
     const auto wei_tag_Oxio = with_groups ? pick(ndims - 3, gOwi8o, gOhwi8o)
                                           : pick(ndims - 3, Owi8o, Ohwi8o);
 
-    jcp.src_tag
-            = src_d.matches_one_of_tag(dat_tag_ncx, dat_tag_nxc, dat_tag_nCx8c);
+    jcp.src_tag = src_d.mb_stride_relaxed_match(
+            dat_tag_ncx, dat_tag_nxc, dat_tag_nCx8c);
     jcp.wei_tag = weights_d.matches_one_of_tag(wei_tag_OIxio, wei_tag_Oxio);
-    jcp.dst_tag = dst_d.matches_one_of_tag(dat_tag_nxc, dat_tag_nCx8c);
+    jcp.dst_tag = dst_d.mb_stride_relaxed_match(dat_tag_nxc, dat_tag_nCx8c);
 
     const bool is_data_layout_nxc
             = utils::everyone_is(dat_tag_nxc, jcp.src_tag, jcp.dst_tag);
@@ -464,9 +468,16 @@ status_t jit_sse41_conv_fwd_kernel_f32::init_conf(jit_conv_conf_t &jcp,
     static constexpr bool sum_at_pos_0_only = true;
     static constexpr bool sum_requires_scale_one = true;
     static constexpr bool sum_requires_zp_zero = true;
-    const bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(sse41,
+    bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(sse41,
             {eltwise, binary, sum}, jcp.post_ops, &dst_d, sum_at_pos_0_only,
             sum_requires_scale_one, sum_requires_zp_zero));
+    // temporary workaround that skips sse41 implementation for ternary
+    // post-ops with scalar broadcasting to avoid register collisions.
+    post_ops_ok_ = post_ops_ok_
+            && IMPLICATION(jcp.with_binary,
+                    !binary_injector::
+                            any_binary_postop_rhs_with_ternary_scalar_bcast(
+                                    post_ops, dst_d));
     VDISPATCH_CONV_IC(post_ops_ok_, VERBOSE_UNSUPPORTED_POSTOP);
 
     const bool flat = jcp.ic == 3;
@@ -489,8 +500,8 @@ status_t jit_sse41_conv_fwd_kernel_f32::init_conf(jit_conv_conf_t &jcp,
 
     const bool channel_pad_ok = true && jcp.ic <= src_d.padded_dims()[1]
             && jcp.oc <= dst_d.padded_dims()[1];
-    VDISPATCH_CONV_IC(channel_pad_ok,
-            "i/o channel size mismatch against padded channel dimension");
+    VDISPATCH_CONV_IC(channel_pad_ok, VERBOSE_UNSUPPORTED_PAD_FEATURE,
+            "i/o and padded channel size mismatch");
 
     const int simd_w = 8; // 2 SSE vectors processing at once
 
@@ -507,7 +518,7 @@ status_t jit_sse41_conv_fwd_kernel_f32::init_conf(jit_conv_conf_t &jcp,
                     (jcp.t_pad == 0 && jcp.l_pad == 0)
                             || (jcp.stride_w == 1 && jcp.stride_h == 1))
             && IMPLICATION(mimo, jcp.ic % simd_w == 0);
-    VDISPATCH_CONV_IC(args_ok, VERBOSE_BLOCKING_FAIL);
+    VDISPATCH_CONV_IC(args_ok, VERBOSE_BLOCKING_FAIL, "bad parameters");
 
     int r_pad_no_tail = nstl::max(0,
             calculate_end_padding(jcp.l_pad, jcp.ow - jcp.ur_w_tail, jcp.iw,
@@ -527,6 +538,7 @@ status_t jit_sse41_conv_fwd_kernel_f32::init_conf(jit_conv_conf_t &jcp,
                         jcp.stride_w, ext_kw));
 
         VDISPATCH_CONV_IC(jcp.ur_w >= nstl::max(jcp.l_pad, r_pad_no_tail),
+                VERBOSE_UNSUPPORTED_PAD_FEATURE,
                 "width unroll exceeds padding size");
     }
     assert(jcp.nb_oc_blocking > 0);

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -33,8 +33,8 @@ namespace x64 {
 
 enum class ver_t { undef, s8s8, s8u8, u8s8 };
 
-class jit_avx512_core_gemv_s8x8s32_kern : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_gemv_s8x8s32_kern);
+class jit_avx512_core_gemv_s8x8s32_kern_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_gemv_s8x8s32_kern_t);
 
     enum class vnni_op_t { add, sub };
 
@@ -44,7 +44,7 @@ class jit_avx512_core_gemv_s8x8s32_kern : public jit_generator {
     void shuffle_and_add(
             Xbyak::Zmm, Xbyak::Zmm, Xbyak::Zmm, Xbyak::Zmm, Xbyak::Zmm);
     void update_c(int, Xbyak::Reg64, int, Xbyak::Opmask);
-    void generate() override ATTRIBUTE_OPTIMIZE;
+    void generate() override;
 
     cpu_isa_t isa = isa_undef;
     ver_t ver = ver_t::undef;
@@ -78,8 +78,8 @@ class jit_avx512_core_gemv_s8x8s32_kern : public jit_generator {
     }
 
 public:
-    jit_avx512_core_gemv_s8x8s32_kern(ver_t ver)
-        : jit_generator(jit_name(), nullptr, 32 * 1024, true,
+    jit_avx512_core_gemv_s8x8s32_kern_t(ver_t ver)
+        : jit_generator_t(jit_name(),
                 mayiuse(avx512_core_vnni) ? avx512_core_vnni : avx512_core)
         , ver(ver) {}
 };

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -149,7 +149,7 @@ void jit_avx512_core_bf16_1x1_convolution_fwd_t<dst_type>::execute_forward_thr(
     const int stride_h = (ndims == 3) ? 1 : pd()->desc()->strides[ndims - 4];
     const int stride_w = pd()->desc()->strides[ndims - 3];
 
-    auto p = jit_1x1_conv_call_s();
+    auto p = jit_1x1_conv_args_t();
 
     auto rp = rtus_driver_t<avx512_core>::call_params_t();
 
@@ -178,6 +178,8 @@ void jit_avx512_core_bf16_1x1_convolution_fwd_t<dst_type>::execute_forward_thr(
             jcp.dst_tag, format_tag::nwc, format_tag::nhwc, format_tag::ndhwc);
     const bool is_src_layout_nxc = utils::one_of(
             jcp.src_tag, format_tag::nwc, format_tag::nhwc, format_tag::ndhwc);
+
+    auto start_off = dst_d.off_l(0);
 
     auto step = [](int default_step, int remaining, int tail_step) {
         assert(default_step <= tail_step);
@@ -267,7 +269,7 @@ void jit_avx512_core_bf16_1x1_convolution_fwd_t<dst_type>::execute_forward_thr(
                 : rnd_up((jcp.load_dim / grp_count), jcp.load_block);
         const size_t str_size = jcp.bcast_dim * max_load_per_thread;
         p.store_buffer = store_buffer + ithr * str_size
-                + data_blk_off(dst_d, 0, 0, od, oh, ow);
+                + data_blk_off(dst_d, 0, 0, od, oh, ow) - start_off;
 
         p.post_ops_binary_rhs_arg_vec = post_ops_binary_rhs_arg_vec;
         p.dst_orig = static_cast<const char *>(p.output_data)
@@ -354,7 +356,7 @@ void jit_avx512_core_bf16_1x1_convolution_fwd_t<dst_type>::execute_forward_thr(
 
             const int ow = 0;
             const int kw = 0;
-            jit_conv_call_s par_conv_dw;
+            jit_conv_args_t par_conv_dw;
 
             par_conv_dw.src = addrs.data();
 
@@ -500,7 +502,7 @@ void jit_avx512_core_bf16_1x1_convolution_bwd_data_t<
         return remaining < tail_step ? remaining : default_step;
     };
 
-    auto p = jit_1x1_conv_call_s();
+    auto p = jit_1x1_conv_args_t();
 
     auto rp = rtus_driver_t<avx512_core>::call_params_t();
     const int nb_ic = jcp.nb_load;
@@ -631,7 +633,7 @@ status_t
 jit_avx512_core_bf16_1x1_convolution_bwd_weights_t<diff_weights_type>::init(
         engine_t *engine) {
     CHECK(safe_ptr_assign(kernel_,
-            new jit_avx512_core_bf16_1x1_conv_kernel(
+            new jit_avx512_core_bf16_1x1_conv_kernel_t(
                     pd()->jcp_, *pd()->attr(), *pd()->dst_md(0))));
 
     CHECK(safe_ptr_assign(
@@ -840,7 +842,7 @@ void jit_avx512_core_bf16_1x1_convolution_bwd_weights_t<diff_weights_type>::
                                         img, oc_off_idx)];
                         const src_data_t *local_src = diff_src;
 
-                        auto p = jit_1x1_conv_call_s();
+                        auto p = jit_1x1_conv_args_t();
                         auto rp = rtus_driver_t<avx512_core>::call_params_t();
 
                         p.output_stride = utils::rnd_up(jcp.ic, jcp.oc_block)

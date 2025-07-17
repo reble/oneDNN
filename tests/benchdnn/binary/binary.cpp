@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 *******************************************************************************/
 
 #include <algorithm>
+#include <random>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,18 +50,40 @@ int fill_mem(
                 prb->alg, "binary");
         return fill_random_real(mem_dt, mem_fp, nullptr, fill_cfg);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
-    const auto dt = mem_dt.dt();
-    const int range = 16;
-    const int f_min = dt == dnnl_u8 ? 0 : -range / 2;
+    int min_val = static_cast<int>(MAX2(-8.f, lowest_dt(mem_dt.dt())));
+    // Tenrary op supports a third input which can't be negative so far.
+    if (input_idx == 2) min_val = 0;
 
-    benchdnn_parallel_nd(nelems, [&](int64_t i) {
-        const int64_t gen = (12 * i + 5 * input_idx + 16) % (range + 1);
-        const float scale = 1.25f;
-        float value = (f_min + gen) * scale;
-        // Remove zeroes in src1 to avoid division by zero
-        if (input_idx == 1 && value == 0.0f) value = 1.0f;
-        mem_fp.set_elem(i, round_to_nearest_representable(dt, value));
+    /* Do fixed partitioning to have same filling for any number of threads */
+    static constexpr int64_t chunk_size = 64;
+    const int64_t n_chunks = div_up(nelems, chunk_size);
+    benchdnn_parallel_nd(n_chunks, [&](int64_t idx_chunk) {
+        int64_t idx_start = idx_chunk * chunk_size;
+        int64_t idx_end = MIN2(idx_start + chunk_size, nelems);
+        // Note: we use a different seed for each chunk to avoid
+        // repeating patterns. We could use discard(idx_start) too but
+        // it has a complexity in O(idx_start). We also add 1 to avoid
+        // seeding with 0.
+        std::minstd_rand int_seed(idx_start + nelems * input_idx + 1);
+        int_seed.discard(1);
+
+        std::uniform_int_distribution<> gen(min_val, 8);
+
+        for (int64_t idx = idx_start; idx < idx_end; ++idx) {
+            float val = gen(int_seed);
+            // Make floating-point values only for src0 as src1 filling can be
+            // used in other drivers and preferred to be integer.
+            if (input_idx == 0) val *= 0.5f;
+            // Remove zeroes in src1 to avoid division by zero.
+            if (input_idx == 1 && val == 0.0f) val = 1.0f;
+            val = round_to_nearest_representable(mem_dt.dt(), val);
+            mem_fp.set_f32_elem(idx, val);
+        }
     });
 
     SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -87,12 +110,26 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     attr_args_t attr_args;
     attr_args.prepare_post_ops_mds(prb->attr, prb->ndims, prb->dst_dims.data());
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
-            create_dnnl_attr(prb->attr, attr_args));
+            create_dnnl_attr(prb->attr, attr_args, prb->ndims));
 
-    TIME_C_PD(DNN_SAFE_STATUS(dnnl_binary_primitive_desc_create(
+    // For the benchdnn binary driver in general, the shape and memory tag
+    // information for the src2 condition mirrors that of the src0 tensor and
+    // thus cannot be passed through cml.
+    // On the other hand, the prb descriptor from graph driver can contain
+    // shape information about the src2 input which is passed on to the
+    // src2_d descriptor. In this case, it complies with user input while
+    // creating the primitive descriptor.
+    auto src2_d = prb->is_ternary_op()
+            ? dnn_mem_t::init_md(prb->ndims,
+                    prb->vdims.size() > 2 ? prb->vdims[2].data()
+                                          : prb->vdims[0].data(),
+                    dnnl_s8, prb->stag.size() > 2 ? prb->stag[2] : prb->stag[0])
+            : nullptr;
+
+    TIME_C_PD(DNN_SAFE_STATUS(dnnl_binary_primitive_desc_create_v2(
             &init_pd_args.pd, init_pd_args.engine, alg,
-            init_pd_args.src_md ? init_pd_args.src_md : src0_d, src1_d, dst_d,
-            dnnl_attr)));
+            init_pd_args.src_md ? init_pd_args.src_md : src0_d, src1_d, src2_d,
+            dst_d, dnnl_attr)));
 
     return dnnl_success;
 }
@@ -101,6 +138,7 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
     std::vector<dnnl_data_type_t> dts = {prb->sdt[0], prb->sdt[1], prb->ddt};
     skip_unimplemented_data_type(dts, prb->dir, res);
     skip_unimplemented_arg_scale(prb->attr, res);
+    skip_unimplemented_binary_po(prb->attr, res);
     skip_unimplemented_prelu_po(prb->attr, res, dnnl_binary);
 
     if (is_gpu()) {
@@ -109,16 +147,10 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
         bool is_bf16u8 = (dts[0] == dnnl_bf16 && dts[1] == dnnl_bf16
                 && dts[2] == dnnl_u8);
         if (is_bf16u8 && have_post_ops) {
-            res->state = SKIPPED, res->reason = DATA_TYPE_NOT_SUPPORTED;
+            res->state = SKIPPED;
+            res->reason = skip_reason::data_type_not_supported;
             return;
         }
-
-        // gpu does not support s32
-        for (const auto &dt : dts)
-            if (dt == dnnl_s32) {
-                res->state = SKIPPED, res->reason = DATA_TYPE_NOT_SUPPORTED;
-                return;
-            }
     }
 }
 
@@ -134,14 +166,16 @@ void skip_invalid_prb(const prb_t *prb, res_t *res) {
     // In case src0 is broadcasted into src1, it means that src0 has smaller
     // memory footprint and doing sum post-op or in-place will cause a crash.
     if (bcast_src0 && (prb->inplace || is_sum)) {
-        res->state = SKIPPED, res->reason = INVALID_CASE;
+        res->state = SKIPPED;
+        res->reason = skip_reason::invalid_case;
         return;
     }
 
     // See `skip_invalid_inplace` for details.
     if (prb->inplace) {
         if (is_sum) {
-            res->state = SKIPPED, res->reason = INVALID_CASE;
+            res->state = SKIPPED;
+            res->reason = skip_reason::invalid_case;
             return;
         }
 
@@ -180,6 +214,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
     static const std::vector<int> exec_args = {
             DNNL_ARG_SRC_0,
             DNNL_ARG_SRC_1,
+            DNNL_ARG_SRC_2,
             DNNL_ARG_DST,
     };
     return exec_args;
@@ -188,7 +223,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     const auto &ref_engine = get_cpu_engine();
 
@@ -205,7 +240,8 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         // use switch below to define a memory desc for it.
         if (exec_arg != DNNL_ARG_SCRATCHPAD) {
             ref_mem_map.emplace(exec_arg,
-                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine,
+                            /* prefill = */ false));
         }
         auto &ref_mem = ref_mem_map[exec_arg];
 
@@ -223,9 +259,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
             case DNNL_ARG_SRC_1:
                 SAFE(fill_mem(prb, 1, mem, ref_mem), WARN);
                 break;
+            case DNNL_ARG_SRC_2:
+                SAFE(fill_mem(prb, 2, mem, ref_mem), WARN);
+                break;
             case DNNL_ARG_DST:
                 if (prb->attr.post_ops.find(alg_t::SUM) >= 0) {
-                    SAFE(fill_mem(prb, 2, mem, ref_mem), WARN);
+                    SAFE(fill_mem(prb, 3, mem, ref_mem), WARN);
 
                     // Bitwise mode for sum requires a copy due to data for
                     // post-op will be overwritten and it must be refreshed.
@@ -254,14 +293,21 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     return OK;
 }
 
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
-    return check_caches(v_prim[0], prb, res);
+    if (has_bench_mode_bit(mode_bit_t::exec)) {
+        SAFE(check_total_size(res), WARN);
+    }
+    if (has_bench_mode_bit(mode_bit_t::corr)) {
+        SAFE(check_caches(v_prim[0], prb, res), WARN);
+    }
+    return OK;
 }
 
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
+    set_zmalloc_max_expected_size(res->mem_size_args.zmalloc_expected_size);
+
     const auto &prim = v_prim[0];
 
     dnn_mem_map_t mem_map, ref_mem_map;
@@ -273,7 +319,7 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
+    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res, prb->dir);
     SAFE(check_bitwise(prim, {DST}, args, prb->attr, prb->inplace, res), WARN);
 
     return measure_perf(prb->ctx_exe, res, prim, args);

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,8 +24,8 @@
 #include "common/type_helpers.hpp"
 #include "gpu/nvidia/cudnn_conv_filter_adjustment_base.hpp"
 #include "gpu/nvidia/cudnn_inner_product_impl.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
-#include "gpu/nvidia/sycl_cuda_stream.hpp"
+#include "gpu/nvidia/engine.hpp"
+#include "gpu/nvidia/stream.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -115,9 +115,9 @@ struct cudnn_conv_inner_product_fwd_impl_t
                     cudnnDestroyActivationDescriptor, act_desc_no_relu_);
         }
     }
-    virtual status_t init(engine_t *engine, inner_product_pd_t *pd,
+    virtual status_t init(impl::engine_t *engine, inner_product_pd_t *pd,
             bool with_relu, bool with_eltwise, bool with_sum,
-            bool use_fuse_path_for_blocking) override {
+            bool use_fuse_path_for_blocking, bool /* use_f32_sum */) override {
         with_bias_ = pd->with_bias();
         with_relu_ = with_relu;
         with_eltwise_ = with_eltwise;
@@ -257,12 +257,11 @@ struct cudnn_conv_inner_product_fwd_impl_t
                 zero_padding.data(), unit_strides.data(), unit_dilation.data(),
                 CUDNN_CROSS_CORRELATION, data_types_[NUM_IO]));
 
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
-        stream_t *service_stream;
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
         // Inner product can choose whatever algorithm it prefers, although
@@ -320,6 +319,8 @@ struct cudnn_conv_inner_product_fwd_impl_t
 
     void execute(cudnnHandle_t handle, cublasHandle_t,
             const std::vector<void *> &args) const override {
+        cudaStream_t cuda_stream;
+        CUDNN_EXECUTE_FUNC(cudnnGetStream, handle, &cuda_stream);
         auto x = args[0], w = args[1], b = args[2], y = args[3],
              workspace = args[4], src_scale = args[7], wei_scale = args[8],
              dst_scale = args[9];
@@ -335,14 +336,14 @@ struct cudnn_conv_inner_product_fwd_impl_t
         if (src_scale || wei_scale) {
             if (src_scale) {
                 float host_src_scale = 1.0f;
-                CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_src_scale,
-                        (CUdeviceptr)src_scale, sizeof(float));
+                CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_src_scale,
+                        (CUdeviceptr)src_scale, sizeof(float), cuda_stream);
                 s *= host_src_scale;
             }
             if (wei_scale) {
                 float host_wei_scale = 1.0f;
-                CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_wei_scale,
-                        (CUdeviceptr)wei_scale, sizeof(float));
+                CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_wei_scale,
+                        (CUdeviceptr)wei_scale, sizeof(float), cuda_stream);
                 s *= host_wei_scale;
             }
         }
@@ -366,8 +367,8 @@ struct cudnn_conv_inner_product_fwd_impl_t
         }
         if (dst_scale) {
             float host_dst_scale = 1.0f;
-            CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_dst_scale,
-                    (CUdeviceptr)dst_scale, sizeof(float));
+            CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_dst_scale,
+                    (CUdeviceptr)dst_scale, sizeof(float), cuda_stream);
             float inv_scale = 1.0f / host_dst_scale;
             CUDNN_EXECUTE_FUNC(cudnnScaleTensor, handle, tensor_descs_[io::dst],
                     y, &inv_scale);
@@ -423,9 +424,10 @@ struct cudnn_conv_inner_product_bwd_data_impl_t
     // for nhwc filter the source must be nhwc as well.
     // So we use the src type for transforming the filter.
     cudnnTensorFormat_t diff_source_format_;
-    virtual status_t init(engine_t *engine, inner_product_pd_t *pd,
+    virtual status_t init(impl::engine_t *engine, inner_product_pd_t *pd,
             bool /*with_relu*/, bool /*with_eltwise*/, bool /*with_sum */,
-            bool /*using_fused_path_for_blocking*/) override {
+            bool /*using_fused_path_for_blocking*/,
+            bool /* use_f32_sum */) override {
         // Pad out the dimensions to 4
         if (pd->ndims() > CUDNN_DIM_MAX || pd->ndims() < 2) {
             return status::invalid_arguments;
@@ -505,12 +507,11 @@ struct cudnn_conv_inner_product_bwd_data_impl_t
         CHECK(create_and_set_conv_descriptor(&conv_desc_, conv_dims,
                 zero_padding.data(), unit_strides.data(), unit_dilation.data(),
                 CUDNN_CROSS_CORRELATION, data_types_[NUM_IO]));
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
-        stream_t *service_stream;
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
         // Inner product can choose whatever algorithm it prefers.
@@ -575,9 +576,10 @@ struct cudnn_conv_inner_product_bwd_weights_impl_t
     cudnnConvolutionBwdFilterAlgo_t algo_;
     cudnnTensorFormat_t source_format_;
 
-    virtual status_t init(engine_t *engine, inner_product_pd_t *pd,
+    virtual status_t init(impl::engine_t *engine, inner_product_pd_t *pd,
             bool /*with_relu*/, bool /*with_eltwise*/, bool /*with_sum */,
-            bool /*using_fused_path_for_blocking*/) override {
+            bool /*using_fused_path_for_blocking*/,
+            bool /* use_f32_sum */) override {
         // If any of the dimensions are 0 we should not continue with creating
         // cudnn descriptors
         with_bias_ = pd->with_bias();
@@ -678,12 +680,11 @@ struct cudnn_conv_inner_product_bwd_weights_impl_t
         CHECK(create_and_set_conv_descriptor(&conv_desc_, conv_dims,
                 zero_padding.data(), unit_strides.data(), unit_dilation.data(),
                 CUDNN_CROSS_CORRELATION, data_types_[NUM_IO]));
-        auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(engine);
-        stream_t *service_stream;
+        auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto cuda_stream
-                = utils::downcast<sycl_cuda_stream_t *>(service_stream);
+        auto cuda_stream = utils::downcast<nvidia::stream_t *>(service_stream);
         auto handle = cuda_stream->get_cudnn_handle();
 
         // Inner product can choose whatever algorithm it prefers.

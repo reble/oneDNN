@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ namespace cpu {
 using namespace alg_kind;
 using namespace math;
 
-float compute_binary_scalar(alg_kind_t alg, float x, float y) {
+float compute_binary_scalar(alg_kind_t alg, float x, float y, bool c) {
     switch (alg) {
         case binary_add: return x + y;
         case binary_div: return x / y;
@@ -40,7 +40,8 @@ float compute_binary_scalar(alg_kind_t alg, float x, float y) {
         case binary_lt: return x < y;
         case binary_eq: return x == y;
         case binary_ne: return x != y;
-        default: assert(!"not supported operation!"); return NAN;
+        case binary_select: return c ? x : y;
+        default: assert(!"unsupported operation!"); return NAN;
     }
 }
 
@@ -136,15 +137,16 @@ ref_binary_scalar_t::ref_binary_scalar_t(alg_kind_t alg) : alg_(alg) {
             alg_kind::binary_min, alg_kind::binary_mul, alg_kind::binary_div,
             alg_kind::binary_sub, alg_kind::binary_ge, alg_kind::binary_gt,
             alg_kind::binary_le, alg_kind::binary_lt, alg_kind::binary_eq,
-            alg_kind::binary_ne));
+            alg_kind::binary_ne, alg_kind::binary_select));
 }
 
 ref_binary_scalar_t::ref_binary_scalar_t(
         const post_ops_t::entry_t::binary_t &binary)
     : ref_binary_scalar_t(binary.alg) {}
 
-float ref_binary_scalar_t::compute_scalar(float src0, float src1) const {
-    return compute_binary_scalar(alg_, src0, src1);
+float ref_binary_scalar_t::compute_scalar(
+        float src0, float src1, bool src2) const {
+    return compute_binary_scalar(alg_, src0, src1, src2);
 }
 
 ref_eltwise_scalar_fwd_t::ref_eltwise_scalar_fwd_t(
@@ -233,14 +235,15 @@ dim_t get_prelu_weights_off(const memory_desc_t &weights_md,
             weights_md, l_offset, dst_dims, dst_ndims, weights_mask);
 }
 
-dim_t get_binary_src1_off(const memory_desc_t &src1_md, const dim_t l_offset,
+// Note: src_md is either src1_md or src2_md
+dim_t get_binary_src_off(const memory_desc_t &src_md, const dim_t l_offset,
         const dims_t &dst_dims, const int dst_ndims) {
 
     const int mask_binary_po
-            = utils::get_dims_mask(dst_dims, src1_md.dims, dst_ndims);
+            = utils::get_dims_mask(dst_dims, src_md.dims, dst_ndims);
 
     return get_po_tensor_off(
-            src1_md, l_offset, dst_dims, dst_ndims, mask_binary_po);
+            src_md, l_offset, dst_dims, dst_ndims, mask_binary_po);
 }
 
 } // namespace
@@ -258,6 +261,19 @@ status_t ref_post_ops_t::init(const memory_desc_t *dst_md) {
         }
     }
     return status::success;
+}
+
+float ref_dropout(
+        float src, uint8_t *mask, dim_t offset, float p, int64_t seed) {
+    // Note: as this is a reference implementation, it's not intended to be
+    // efficient. For optimized versions, `1/(1-p)` should be passed as a
+    // single value computed once to avoid division for every element.
+    float inv_q = (p != 1.f) ? 1.f / (1.f - p) : 0.f;
+    uint32_t r = philox4x32(offset, seed);
+    p = std::max(std::min(p, 1.f), 0.f);
+    uint8_t m = (r > double(std::numeric_limits<uint32_t>::max()) * p);
+    mask[offset] = m;
+    return (m) ? src * inv_q : 0;
 }
 
 void ref_post_ops_t::execute(float &res, const args_t &args) const {
@@ -289,13 +305,29 @@ void ref_post_ops_t::execute(float &res, const args_t &args) const {
                 const auto dst_d = ctx.memory_mdw(DNNL_ARG_DST, args.dst_md);
                 const auto &src1_desc = e.binary.src1_desc;
 
-                const auto off = get_binary_src1_off(
+                const auto off = get_binary_src_off(
                         src1_desc, args.l_offset, dst_d.dims(), dst_d.ndims());
+
                 const auto src1_binary_po = CTX_IN_MEM(const void *,
                         (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_SRC_1));
+                const auto src2_binary_po = CTX_IN_MEM(const void *,
+                        (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_SRC_2));
+
+                bool src2_val = false;
+                if (e.is_binary_with_ternary_op()
+                        && e.binary.alg
+                                == dnnl::impl::alg_kind::binary_select) {
+                    const auto &src2_desc = e.binary.src2_desc;
+                    const auto src2_off = get_binary_src_off(src2_desc,
+                            args.l_offset, dst_d.dims(), dst_d.ndims());
+                    src2_val = static_cast<bool>(io::load_int_value(
+                            src2_desc.data_type, src2_binary_po, src2_off));
+                }
+
                 const float val_po = io::load_float_value(
                         src1_desc.data_type, src1_binary_po, off);
-                res = it_binary_po->compute_scalar(res, val_po);
+
+                res = it_binary_po->compute_scalar(res, val_po, src2_val);
                 ++it_binary_po;
             } break;
             case primitive_kind::prelu: {

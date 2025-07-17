@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -43,13 +43,6 @@ struct inner_product_fwd_pd_t;
 
 struct inner_product_pd_t : public primitive_desc_t {
     static constexpr auto base_pkind = primitive_kind::inner_product;
-
-    inner_product_pd_t(const inner_product_desc_t *adesc,
-            const primitive_attr_t *attr,
-            const inner_product_fwd_pd_t *hint_fwd_pd)
-        : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
-        , hint_fwd_pd_(hint_fwd_pd) {}
 
     const inner_product_desc_t *desc() const { return &desc_; }
     const op_desc_t *op_desc() const override {
@@ -139,10 +132,16 @@ protected:
     inner_product_desc_t desc_;
     const inner_product_fwd_pd_t *hint_fwd_pd_;
 
+    inner_product_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
+            const inner_product_fwd_pd_t *hint_fwd_pd)
+        : primitive_desc_t(attr, base_pkind)
+        , desc_(*op_desc_t::to_desc<inner_product_desc_t>(adesc))
+        , hint_fwd_pd_(hint_fwd_pd) {}
+
     bool set_default_formats_common_template(memory_desc_t &src_md,
             format_tag_t src_tag, memory_desc_t &wei_md, format_tag_t wei_tag,
             memory_desc_t &dst_md, format_tag_t dst_tag,
-            memory_desc_t &bia_md) {
+            memory_desc_t &bia_md) const {
         using namespace format_tag;
 
 #define IS_OK(f) \
@@ -185,7 +184,9 @@ protected:
             = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST}) const {
         bool ok = attr()->scales_.has_default_values(supported_args);
         for (auto arg : supported_args) {
-            int mask = attr()->scales_.get(arg).mask_;
+            if (attr()->scales_.has_default_values(arg)) continue;
+
+            int mask = attr()->scales_.get_mask(arg);
             if (arg == DNNL_ARG_WEIGHTS)
                 ok = ok && (mask == 0 || mask == (1 << 0));
             else
@@ -195,24 +196,17 @@ protected:
     }
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct inner_product_fwd_pd_t : public inner_product_pd_t {
-    typedef inner_product_fwd_pd_t base_class;
-    typedef inner_product_fwd_pd_t hint_class;
-
-    inner_product_fwd_pd_t(const inner_product_desc_t *adesc,
-            const primitive_attr_t *attr,
-            const inner_product_fwd_pd_t *hint_fwd_pd)
-        : inner_product_pd_t(adesc, attr, hint_fwd_pd)
-        , src_md_(desc_.src_desc)
-        , weights_md_(desc_.weights_desc)
-        , bias_md_(desc_.bias_desc)
-        , dst_md_(desc_.dst_desc) {}
+    using base_class = inner_product_fwd_pd_t;
+    using hint_class = inner_product_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_WEIGHTS))
             return arg_usage_t::input;
 
-        if (arg == DNNL_ARG_BIAS && with_bias()) return arg_usage_t::input;
+        if (arg == DNNL_ARG_BIAS)
+            return with_bias() ? arg_usage_t::input : arg_usage_t::unused;
 
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
 
@@ -259,24 +253,26 @@ protected:
     memory_desc_t bias_md_;
     memory_desc_t dst_md_;
 
+    inner_product_fwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
+            const inner_product_fwd_pd_t *hint_fwd_pd)
+        : inner_product_pd_t(adesc, attr, hint_fwd_pd)
+        , src_md_(desc_.src_desc)
+        , weights_md_(desc_.weights_desc)
+        , bias_md_(desc_.bias_desc)
+        , dst_md_(desc_.dst_desc) {}
+
     bool set_default_formats_common(
             format_tag_t src_tag, format_tag_t wei_tag, format_tag_t dst_tag) {
         return set_default_formats_common_template(src_md_, src_tag,
                 weights_md_, wei_tag, dst_md_, dst_tag, bias_md_);
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct inner_product_bwd_data_pd_t : public inner_product_pd_t {
-    typedef inner_product_bwd_data_pd_t base_class;
-    typedef inner_product_fwd_pd_t hint_class;
-
-    inner_product_bwd_data_pd_t(const inner_product_desc_t *adesc,
-            const primitive_attr_t *attr,
-            const inner_product_fwd_pd_t *hint_fwd_pd)
-        : inner_product_pd_t(adesc, attr, hint_fwd_pd)
-        , diff_src_md_(desc_.diff_src_desc)
-        , weights_md_(desc_.weights_desc)
-        , diff_dst_md_(desc_.diff_dst_desc) {}
+    using base_class = inner_product_bwd_data_pd_t;
+    using hint_class = inner_product_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_WEIGHTS, DNNL_ARG_DIFF_DST))
@@ -324,6 +320,14 @@ protected:
     memory_desc_t weights_md_;
     memory_desc_t diff_dst_md_;
 
+    inner_product_bwd_data_pd_t(const op_desc_t *adesc,
+            const primitive_attr_t *attr,
+            const inner_product_fwd_pd_t *hint_fwd_pd)
+        : inner_product_pd_t(adesc, attr, hint_fwd_pd)
+        , diff_src_md_(desc_.diff_src_desc)
+        , weights_md_(desc_.weights_desc)
+        , diff_dst_md_(desc_.diff_dst_desc) {}
+
     bool set_default_formats_common(format_tag_t diff_src_tag,
             format_tag_t wei_tag, format_tag_t diff_dst_tag) {
         memory_desc_t dummy_md;
@@ -331,19 +335,12 @@ protected:
                 weights_md_, wei_tag, diff_dst_md_, diff_dst_tag, dummy_md);
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct inner_product_bwd_weights_pd_t : public inner_product_pd_t {
-    typedef inner_product_bwd_weights_pd_t base_class;
-    typedef inner_product_fwd_pd_t hint_class;
-
-    inner_product_bwd_weights_pd_t(const inner_product_desc_t *adesc,
-            const primitive_attr_t *attr,
-            const inner_product_fwd_pd_t *hint_fwd_pd)
-        : inner_product_pd_t(adesc, attr, hint_fwd_pd)
-        , src_md_(desc_.src_desc)
-        , diff_weights_md_(desc_.diff_weights_desc)
-        , diff_bias_md_(desc_.diff_bias_desc)
-        , diff_dst_md_(desc_.diff_dst_desc) {}
+    using base_class = inner_product_bwd_weights_pd_t;
+    using hint_class = inner_product_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_DIFF_DST))
@@ -351,8 +348,8 @@ struct inner_product_bwd_weights_pd_t : public inner_product_pd_t {
 
         if (arg == DNNL_ARG_DIFF_WEIGHTS) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_DIFF_BIAS && with_bias())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_DIFF_BIAS)
+            return with_bias() ? arg_usage_t::output : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -397,6 +394,15 @@ protected:
     memory_desc_t diff_bias_md_;
     memory_desc_t diff_dst_md_;
 
+    inner_product_bwd_weights_pd_t(const op_desc_t *adesc,
+            const primitive_attr_t *attr,
+            const inner_product_fwd_pd_t *hint_fwd_pd)
+        : inner_product_pd_t(adesc, attr, hint_fwd_pd)
+        , src_md_(desc_.src_desc)
+        , diff_weights_md_(desc_.diff_weights_desc)
+        , diff_bias_md_(desc_.diff_bias_desc)
+        , diff_dst_md_(desc_.diff_dst_desc) {}
+
     bool set_default_formats_common(format_tag_t src_tag,
             format_tag_t diff_wei_tag, format_tag_t diff_dst_tag) {
         return set_default_formats_common_template(src_md_, src_tag,
@@ -404,6 +410,7 @@ protected:
                 diff_bias_md_);
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

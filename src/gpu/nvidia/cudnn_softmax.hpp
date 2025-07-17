@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,10 +20,10 @@
 
 #include "cudnn.h"
 
-#include "common/primitive.hpp"
 #include "common/softmax_pd.hpp"
+#include "gpu/gpu_primitive.hpp"
 #include "gpu/nvidia/cudnn_softmax_impl.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/engine.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -31,32 +31,32 @@ namespace impl {
 namespace gpu {
 namespace nvidia {
 
-struct cudnn_softmax_fwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct cudnn_softmax_fwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public softmax_fwd_pd_t {
         using softmax_fwd_pd_t::softmax_fwd_pd_t;
 
         DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_softmax_fwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             const memory_desc_wrapper src_d(src_md());
             const memory_desc_wrapper dst_d(dst_md());
 
             auto sycl_dev
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine)
-                              ->device();
+                    = utils::downcast<nvidia::engine_t *>(engine)->device();
+
             bool ok = is_fwd()
                     && utils::one_of(src_d.data_type(), data_type::f32,
                             data_type::f16, data_type::bf16, data_type::s8)
                     && IMPLICATION(src_md()->data_type == data_type::bf16,
                             has_bf16_support(sycl_dev))
                     && attr()->has_default_values(
-                            primitive_attr_t::skip_mask_t::scales_runtime)
+                            primitive_attr_t::skip_mask_t::scales)
                     && set_default_formats() == status::success
                     && src_d.is_plain() && dst_d.is_plain() && dst_d == src_d
                     && IMPLICATION(!attr()->scales_.has_default_values(),
-                            check_scales_mask()
+                            attr_scales_ok()
                                     && dst_d.data_type() != data_type::s8);
             if (!ok) return status::unimplemented;
 
@@ -64,17 +64,11 @@ struct cudnn_softmax_fwd_t : public primitive_t {
 
             return softmax_impl_->init(this);
         }
-        bool check_scales_mask() const {
-            for (const auto &s : attr()->scales_.scales_) {
-                if (s.second.mask_ != 0) return false;
-            }
-            return true;
-        }
 
         std::shared_ptr<cudnn_softmax_impl_base_t> softmax_impl_;
     };
 
-    status_t init(engine_t *engine) override {
+    status_t init(impl::engine_t *engine) override {
         // Only single-element scale is supported
         host_scales_ = new float[3];
         if (!host_scales_) return status::out_of_memory;
@@ -94,22 +88,21 @@ private:
     float *host_scales_ = nullptr;
 };
 
-struct cudnn_softmax_bwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct cudnn_softmax_bwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public softmax_bwd_pd_t {
         using softmax_bwd_pd_t::softmax_bwd_pd_t;
 
         DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_softmax_bwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             const memory_desc_wrapper diff_src_d(diff_src_md());
             const memory_desc_wrapper diff_dst_d(diff_dst_md());
             const memory_desc_wrapper dst_d(dst_md());
 
             auto sycl_dev
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine)
-                              ->device();
+                    = utils::downcast<nvidia::engine_t *>(engine)->device();
 
             bool ok = !is_fwd()
                     && utils::one_of(dst_d.data_type(), data_type::f32,

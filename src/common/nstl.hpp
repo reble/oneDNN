@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,6 +21,7 @@
 #include <limits.h>
 #include <stdint.h>
 
+#include <array>
 #include <cassert>
 #include <cstdlib>
 #include <map>
@@ -28,6 +29,7 @@
 
 #include "bfloat16.hpp"
 #include "float16.hpp"
+#include "float4.hpp"
 #include "float8.hpp"
 #include "int4.hpp"
 #include "internal_defs.hpp"
@@ -53,7 +55,7 @@ void *malloc(size_t size, int alignment);
 #endif
 void free(void *p);
 
-struct c_compatible {
+struct c_compatible { // NOLINT(readability-identifier-naming)
     enum { default_alignment = 64 };
     static void *operator new(size_t sz) {
         return MALLOC(sz, default_alignment);
@@ -82,14 +84,14 @@ protected:
 namespace nstl {
 
 template <typename T>
-constexpr const T abs(const T &a) {
+constexpr T abs(const T &a) {
     return a >= 0 ? a : -a;
 }
 
 // Computes the modulus and returns the result as the least positive residue
 // when the divisor > 0.
 template <typename T>
-inline const T modulo(const T &dividend, const T &divisor) {
+inline T modulo(const T &dividend, const T &divisor) {
     static_assert(std::is_integral<T>::value, "T must be an integer type.");
     assert(divisor > 0);
     T result = dividend % divisor;
@@ -99,7 +101,7 @@ inline const T modulo(const T &dividend, const T &divisor) {
 // Computes the additive inverse modulus and returns the result as the least
 // positive residue when the divisor > 0.
 template <typename T>
-inline const T additive_inverse_modulo(const T &dividend, const T &divisor) {
+inline T additive_inverse_modulo(const T &dividend, const T &divisor) {
     static_assert(std::is_integral<T>::value, "T must be an integer type.");
     assert(divisor > 0);
     T result = modulo(dividend, divisor);
@@ -156,11 +158,59 @@ template <>
 struct numeric_limits<uint8_t> : public std::numeric_limits<uint8_t> {};
 
 template <>
+struct numeric_limits<float4_e3m0_t> {
+    static constexpr float4_e3m0_t lowest() { return float4_e3m0_t(0xf, true); }
+    // Min normal is equal to the value 1.0
+    static constexpr float4_e3m0_t min() { return float4_e3m0_t(0x1, true); }
+    // Max normal is equal to the value 6.0
+    static constexpr float4_e3m0_t max() { return float4_e3m0_t(0x7, true); }
+
+    static constexpr int bias = 0x3;
+    static constexpr int digits = 1; // 1 implicit bit
+
+    static constexpr float4_e3m0_t epsilon() {
+        return float4_e3m0_t(0x3, true);
+    }
+};
+
+template <>
+struct numeric_limits<float4_e2m1_t> {
+    static constexpr float4_e2m1_t lowest() { return float4_e2m1_t(0xf, true); }
+    // Min normal is equal to the value 1.0
+    static constexpr float4_e2m1_t min() { return float4_e2m1_t(0x2, true); }
+    // Max normal is equal to the value 6.0
+    static constexpr float4_e2m1_t max() { return float4_e2m1_t(0x7, true); }
+
+    static constexpr int bias = 0x1;
+    static constexpr int digits = 2; // 1+1 implicit bits
+
+    static constexpr float4_e2m1_t epsilon() {
+        return float4_e2m1_t(0x2, true);
+    }
+};
+
+template <>
+struct numeric_limits<float8_e8m0_t> {
+    static constexpr float8_e8m0_t lowest() {
+        return float8_e8m0_t(0x00, true);
+    }
+    static constexpr float8_e8m0_t min() { return float8_e8m0_t(0x7f, true); }
+    static constexpr float8_e8m0_t max() { return float8_e8m0_t(0xfe, true); }
+
+    static constexpr int bias = 0x7f;
+    static constexpr int digits = 1; // e8m0 -> 1 implicit bits
+
+    static constexpr float8_e8m0_t epsilon() {
+        return float8_e8m0_t(0x80, true);
+    }
+};
+
+template <>
 struct numeric_limits<float8_e5m2_t> {
     static constexpr float8_e5m2_t lowest() {
         return float8_e5m2_t(0xfb, true);
     }
-
+    static constexpr float8_e5m2_t min() { return float8_e5m2_t(0x04, true); }
     static constexpr float8_e5m2_t max() { return float8_e5m2_t(0x7b, true); }
 
     static constexpr int bias = 0xf;
@@ -176,7 +226,7 @@ struct numeric_limits<float8_e4m3_t> {
     static constexpr float8_e4m3_t lowest() {
         return float8_e4m3_t(0xfe, true);
     }
-
+    static constexpr float8_e4m3_t min() { return float8_e4m3_t(0x08, true); }
     static constexpr float8_e4m3_t max() { return float8_e4m3_t(0x7e, true); }
 
     static constexpr int bias = 0x7;
@@ -190,7 +240,7 @@ struct numeric_limits<float8_e4m3_t> {
 template <>
 struct numeric_limits<bfloat16_t> {
     static constexpr bfloat16_t lowest() { return bfloat16_t(0xff7f, true); }
-
+    static constexpr bfloat16_t min() { return bfloat16_t(0x0080, true); }
     static constexpr bfloat16_t max() { return bfloat16_t(0x7f7f, true); }
 
     static constexpr int digits = 8;
@@ -203,7 +253,7 @@ struct numeric_limits<bfloat16_t> {
 template <>
 struct numeric_limits<float16_t> {
     static constexpr float16_t lowest() { return float16_t(0xfbff, true); }
-
+    static constexpr float16_t min() { return float16_t(0x0400, true); }
     static constexpr float16_t max() { return float16_t(0x7bff, true); }
 
     static constexpr int digits = 11;
@@ -216,7 +266,7 @@ struct numeric_limits<float16_t> {
 template <>
 struct numeric_limits<uint4_t> {
     static constexpr uint4_t lowest() { return uint4_t(0); }
-
+    static constexpr uint4_t min() { return lowest(); }
     static constexpr uint4_t max() { return uint4_t(15); }
 
     static constexpr int digits = 4;
@@ -227,7 +277,7 @@ struct numeric_limits<uint4_t> {
 template <>
 struct numeric_limits<int4_t> {
     static constexpr int4_t lowest() { return int4_t(-8); }
-
+    static constexpr int4_t min() { return lowest(); }
     static constexpr int4_t max() { return int4_t(7); }
 
     static constexpr int digits = 4;
@@ -236,7 +286,7 @@ struct numeric_limits<int4_t> {
 };
 
 template <typename T>
-struct is_integral {
+struct is_integral { // NOLINT(readability-identifier-naming)
     static constexpr bool value = false;
 };
 template <>
@@ -255,9 +305,17 @@ template <>
 struct is_integral<uint8_t> {
     static constexpr bool value = true;
 };
+template <>
+struct is_integral<int4_t> {
+    static constexpr bool value = true;
+};
+template <>
+struct is_integral<uint4_t> {
+    static constexpr bool value = true;
+};
 
 template <typename T, typename U>
-struct is_same {
+struct is_same { // NOLINT(readability-identifier-naming)
     static constexpr bool value = false;
 };
 template <typename T>
@@ -285,20 +343,20 @@ struct is_same<T, T> {
 enum nstl_status_t { success = 0, out_of_memory };
 
 template <typename T>
-class vector : public c_compatible {
+class vector : public c_compatible { // NOLINT(readability-identifier-naming)
 private:
     std::vector<T> _impl;
 
 public:
-    typedef typename std::vector<T>::iterator iterator;
-    typedef typename std::vector<T>::const_iterator const_iterator;
-    typedef typename std::vector<T>::size_type size_type;
-    vector() {}
+    using iterator = typename std::vector<T>::iterator;
+    using const_iterator = typename std::vector<T>::const_iterator;
+    using size_type = typename std::vector<T>::size_type;
+    vector() = default;
     vector(size_type n) : _impl(n) {}
     vector(size_type n, const T &value) : _impl(n, value) {}
     template <typename input_iterator>
     vector(input_iterator first, input_iterator last) : _impl(first, last) {}
-    ~vector() {}
+    ~vector() = default;
     size_type size() const { return _impl.size(); }
     T &operator[](size_type i) { return _impl[i]; }
     const T &operator[](size_type i) const { return _impl[i]; }
@@ -319,16 +377,16 @@ public:
 };
 
 template <typename Key, typename T>
-class map : public c_compatible {
+class map : public c_compatible { // NOLINT(readability-identifier-naming)
 private:
     std::map<Key, T> _impl;
 
 public:
-    typedef typename std::map<Key, T>::iterator iterator;
-    typedef typename std::map<Key, T>::const_iterator const_iterator;
-    typedef typename std::map<Key, T>::size_type size_type;
-    map() {}
-    ~map() {}
+    using iterator = typename std::map<Key, T>::iterator;
+    using const_iterator = typename std::map<Key, T>::const_iterator;
+    using size_type = typename std::map<Key, T>::size_type;
+    map() = default;
+    ~map() = default;
     size_type size() const { return _impl.size(); }
     T &operator[](const Key &k) { return _impl[k]; }
     const T &operator[](const Key &k) const { return _impl[k]; }
@@ -344,10 +402,10 @@ public:
 
 // Compile-time sequence of indices (part of C++14)
 template <size_t... Ints>
-struct index_sequence {};
+struct index_sequence {}; // NOLINT(readability-identifier-naming)
 
 template <size_t N, size_t... Next>
-struct make_index_sequence_helper
+struct make_index_sequence_helper // NOLINT(readability-identifier-naming)
     : public make_index_sequence_helper<N - 1, N - 1, Next...> {};
 
 template <size_t... Next>
@@ -358,6 +416,30 @@ struct make_index_sequence_helper<0, Next...> {
 // Generator of compile-time sequence of indices
 template <size_t N>
 using make_index_sequence = typename make_index_sequence_helper<N>::type;
+
+template <class T, std::size_t N, std::size_t... I>
+constexpr std::array<typename std::remove_cv<T>::type, N> to_array_impl(
+        T (&a)[N], index_sequence<I...>) {
+    return {{a[I]...}};
+}
+
+// Creates a std::array from the one dimensional built-in array.
+template <class T, std::size_t N>
+constexpr std::array<typename std::remove_cv<T>::type, N> to_array(T (&a)[N]) {
+    return to_array_impl(a, make_index_sequence<N> {});
+}
+
+template <class T, std::size_t N, std::size_t... I>
+constexpr std::array<typename std::remove_cv<T>::type, N> to_array_impl(
+        T(&&a)[N], index_sequence<I...>) {
+    return {{std::move(a[I])...}};
+}
+
+template <class T, std::size_t N>
+constexpr std::array<typename std::remove_cv<T>::type, N> to_array(T(&&a)[N]) {
+    return to_array_impl(std::move(a), make_index_sequence<N> {});
+}
+
 } // namespace nstl
 } // namespace impl
 } // namespace dnnl

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -76,8 +76,9 @@ inline void dnnl_thr_barrier() {
 }
 
 #elif DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_TBB
-#include "tbb/parallel_for.h"
-#include "tbb/task_arena.h"
+
+#include "common/dnnl_thread_tbb_proxy.hpp"
+
 #define DNNL_THR_SYNC 0
 inline int dnnl_get_max_threads() {
     return tbb::this_task_arena::max_concurrency();
@@ -184,25 +185,13 @@ inline int dnnl_get_current_num_threads() {
 #define OMP_GET_NUM_THREADS() 1
 #endif
 
-// MSVC still supports omp 2.0 only
+// Disabling OMP SIMD feature for MSVC as it only supports OpenMP 2.0
 #if defined(_MSC_VER) && !defined(__clang__) && !defined(__INTEL_COMPILER)
 #define collapse(x)
 #define PRAGMA_OMP_SIMD(...)
 #else
 #define PRAGMA_OMP_SIMD(...) PRAGMA_MACRO(CHAIN2(omp, simd __VA_ARGS__))
 #endif // defined(_MSC_VER) && !defined(__clang__) && !defined(__INTEL_COMPILER)
-
-// process simdlen; it is supported for Clang >= 3.9; ICC >= 17.0; GCC >= 6.1
-// No support on Windows.
-#if (defined(__clang_major__) \
-        && (__clang_major__ < 3 \
-                || (__clang_major__ == 3 && __clang_minor__ < 9))) \
-        || (defined(__INTEL_COMPILER) && __INTEL_COMPILER < 1700) \
-        || (!defined(__INTEL_COMPILER) && !defined(__clang__) \
-                && (defined(_MSC_VER) || __GNUC__ < 6 \
-                        || (__GNUC__ == 6 && __GNUC_MINOR__ < 1)))
-#define simdlen(x)
-#endif // long simdlen if
 
 namespace dnnl {
 namespace impl {

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 * Copyright 2021 FUJITSU LIMITED
 * Copyright 2021 Arm Ltd. and affiliates
 *
@@ -92,7 +92,7 @@ int check_reorder_presence(
     /* Note for x64:
     Both data types of src and weight are s8, oneDNN addds 128 to one of the s8
     input to make it of type u8 instead, as explained in
-    https://oneapi-src.github.io/oneDNN/dev_guide_int8_computations.html or
+    https://uxlfoundation.github.io/oneDNN/dev_guide_int8_computations.html or
     doc/advanced/int8_computations.md
     It is because `VPDPBUSD` instruction uses the combination of s8 and u8 as
     input.
@@ -109,15 +109,34 @@ int check_reorder_presence(
             = prb->get_dt(WEI) == dnnl_s8 && prb->get_dt(SRC) == dt_check;
     const bool is_def_zp = prb->attr.zero_points.is_def(DNNL_ARG_SRC);
     if (wei_x8x8 || !is_def_zp) {
+        // A work around zmalloc registry checker: temporarily increase the
+        // capacity just for this check since there's no simple way to account
+        // for memory allocated here to verify an extra reorder.
+        size_t extra_reorder_mem_size
+                = (dnnl_memory_desc_get_size(mem_fp.md_) / 4)
+                + dnnl_memory_desc_get_size(mem_dt.md_);
+        res->mem_size_args.zmalloc_expected_size += extra_reorder_mem_size;
+        set_zmalloc_max_expected_size(res->mem_size_args.zmalloc_expected_size);
+
         // Check that s8 -> s8_comp exists in the library since users may have
         // already quantized data.
-        dnn_mem_t mem_fp_s8(mem_fp.md_, dnnl_s8, tag::abx, get_cpu_engine());
-        dnn_mem_t mem_dt_s8(mem_dt.md_, get_test_engine());
+        dnn_mem_t mem_fp_s8(mem_fp.md_, dnnl_s8, tag::abx, get_cpu_engine(),
+                /* prefill = */ true);
+        dnn_mem_t mem_dt_s8(
+                mem_dt.md_, get_test_engine(), /* prefill = */ true);
         SAFE(mem_fp_s8.reorder(mem_fp), WARN);
         SAFE(mem_dt_s8.reorder(mem_fp_s8), WARN);
         SAFE(mem_dt.size() == mem_dt_s8.size() ? OK : FAIL, WARN);
         int rc = std::memcmp((void *)mem_dt, (void *)mem_dt_s8, mem_dt.size());
         SAFE(rc == 0 ? OK : FAIL, WARN);
+
+        // Subtract to restore the original size.
+        res->mem_size_args.zmalloc_expected_size -= extra_reorder_mem_size;
+    }
+    // Must be done in a separate scope to have extra memory objects destroyed
+    // before updating the limit to an original value.
+    if (wei_x8x8 || !is_def_zp) {
+        set_zmalloc_max_expected_size(res->mem_size_args.zmalloc_expected_size);
     }
 
     return OK;
@@ -132,6 +151,10 @@ int fill_data(data_kind_t kind, const prb_t *prb, const cfg_t &cfg,
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, res);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, res, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     cfg_t::density_args_t density_args;
     density_args.data_kind = kind;
@@ -145,9 +168,18 @@ int fill_data(data_kind_t kind, const prb_t *prb, const cfg_t &cfg,
 
     const auto &e_zp_src = prb->attr.zero_points.get(DNNL_ARG_SRC);
     const bool has_src_zp = !e_zp_src.is_def();
-    const int src_zp_mask = attr_t::get_default_mask(e_zp_src.policy);
+    const int src_zp_mask
+            = attr_t::get_default_mask(e_zp_src.policy, prb->ndims);
     // Apply src_zp for source tensor only.
     int src_zp = kind == SRC && has_src_zp && src_zp_mask == 0 ? e_zp_src.value
+                                                               : 0;
+
+    const auto &e_zp_wei = prb->attr.zero_points.get(DNNL_ARG_WEIGHTS);
+    const bool has_wei_zp = !e_zp_wei.is_def();
+    const int wei_zp_mask
+            = attr_t::get_default_mask(e_zp_wei.policy, prb->ndims);
+    // Apply wei_zp for weights tensor only.
+    int wei_zp = kind == WEI && has_wei_zp && wei_zp_mask == 0 ? e_zp_wei.value
                                                                : 0;
 
     /* Do fixed partitioning to have same filling for any number of threads */
@@ -176,18 +208,21 @@ int fill_data(data_kind_t kind, const prb_t *prb, const cfg_t &cfg,
             while (gen_val <= 0)
                 gen_val = gen(int_seed);
             float val = gen_val * (1.f + is_s8s8);
-            val += src_zp; // Add zp so that it will be subtracted.
-            mem_fp.set_elem(
+            val += src_zp + wei_zp; // Add zp so that it will be subtracted.
+            mem_fp.set_f32_elem(
                     0, round_to_nearest_representable(cfg.get_dt(kind), val));
             idx_start += 1;
         }
 
         for (int64_t idx = idx_start; idx < idx_end; ++idx) {
             bool is_one = density == 1.f ? true : b_dist(b_seed);
-            float gen_val = gen(int_seed) * (1.f + is_s8s8);
-            float val = is_one * gen_val;
-            val += src_zp; // Add zp so that it will be subtracted.
-            mem_fp.set_elem(
+            if (!is_one) {
+                mem_fp.set_f32_elem(idx, 0.f);
+                continue;
+            }
+            float val = gen(int_seed) * (1.f + is_s8s8);
+            val += src_zp + wei_zp; // Add zp so that it will be subtracted.
+            mem_fp.set_f32_elem(
                     idx, round_to_nearest_representable(cfg.get_dt(kind), val));
         }
     });
@@ -206,16 +241,19 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     bool force_f32_dt = init_pd_args.force_f32_dt;
 
     auto src_d = dnn_mem_t::init_md(prb->ndims, prb->src_dims().data(),
-            force_f32_dt ? dnnl_f32 : prb->get_dt(SRC),
-            normalize_tag(prb->stag, prb->ndims));
+            force_f32_dt ? dnnl_f32 : prb->get_dt(SRC), prb->stag,
+            prb->strides[STRIDES_SRC]);
     auto wei_d = dnn_mem_t::init_md(prb->ndims + prb->has_groups,
             prb->wei_dims().data(), force_f32_dt ? dnnl_f32 : prb->get_dt(WEI),
-            normalize_tag(prb->wtag, prb->ndims + prb->has_groups));
-    auto bia_d = dnn_mem_t::init_md(1, prb->bia_dims().data(),
-            force_f32_dt ? dnnl_f32 : prb->get_dt(BIA), tag::any);
+            prb->wtag, prb->strides[STRIDES_WEI]);
+    benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> bia_d {};
+    if (prb->bia_dt() != dnnl_data_type_undef) {
+        bia_d = dnn_mem_t::init_md(1, prb->bia_dims().data(),
+                force_f32_dt ? dnnl_f32 : prb->get_dt(BIA), tag::any);
+    }
     auto dst_d = dnn_mem_t::init_md(prb->ndims, prb->dst_dims().data(),
-            force_f32_dt ? dnnl_f32 : prb->get_dt(DST),
-            normalize_tag(prb->dtag, prb->ndims));
+            force_f32_dt ? dnnl_f32 : prb->get_dt(DST), prb->dtag,
+            prb->strides[STRIDES_DST]);
 
     dnnl_alg_kind_t alg = dnnl_convolution_direct;
     if (prb->alg == WINO) alg = dnnl_convolution_winograd;
@@ -229,26 +267,27 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
         // oihw: per_oc: 1 << 0 -> 1
         // goihw: per_oc: 1 << 1 + 1 << 0 -> 3
         auto wei_mask = prb->has_groups ? 3 : 1;
-        attr_args.prepare_scales(prb->attr, DNNL_ARG_WEIGHTS, wei_mask);
+        attr_args.prepare_quant(
+                prb->attr, DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, wei_mask);
     }
     auto dw_wei_scale
             = prb->attr.scales.get(DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
     if (dw_wei_scale.policy == policy_t::PER_OC) {
         // dw fusion always has groups.
         auto wei_mask = 3;
-        attr_args.prepare_scales(prb->attr,
-                DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS, wei_mask);
+        attr_args.prepare_quant(prb->attr,
+                DNNL_ARG_ATTR_SCALES | DNNL_ARG_ATTR_POST_OP_DW
+                        | DNNL_ARG_WEIGHTS,
+                wei_mask);
     }
-    const auto dw_bia_dt = prb->dir == FWD_B ? dnnl_f32 : dnnl_data_type_undef;
-    attr_args.prepare_dw_post_op(prb->attr, prb->get_dt(WEI), dw_bia_dt);
+    attr_args.prepare_dw_post_op(prb->attr, prb->get_dt(WEI), prb->bia_dt());
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
-            create_dnnl_attr(prb->attr, attr_args));
+            create_dnnl_attr(prb->attr, attr_args, prb->ndims));
 
     switch (prb->dir) {
         case FWD_D:
         case FWD_B:
         case FWD_I:
-            if (prb->dir != FWD_B) bia_d.reset(nullptr);
             TIME_C_PD(DNN_SAFE_STATUS(
                     dnnl_convolution_forward_primitive_desc_create(
                             &init_pd_args.pd, init_pd_args.engine,
@@ -256,7 +295,7 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
                                               : dnnl_forward_training,
                             alg,
                             init_pd_args.src_md ? init_pd_args.src_md : src_d,
-                            wei_d, bia_d, dst_d, prb->strides().data(),
+                            wei_d, bia_d, dst_d, prb->kstrides().data(),
                             prb->dilations().data(), prb->padding().data(),
                             prb->padding_r().data(), dnnl_attr)));
             break;
@@ -264,18 +303,17 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
             TIME_C_PD(DNN_SAFE_STATUS(
                     dnnl_convolution_backward_data_primitive_desc_create(
                             &init_pd_args.pd, init_pd_args.engine, alg, src_d,
-                            wei_d, dst_d, prb->strides().data(),
+                            wei_d, dst_d, prb->kstrides().data(),
                             prb->dilations().data(), prb->padding().data(),
                             prb->padding_r().data(), init_pd_args.hint,
                             dnnl_attr)));
             break;
         case BWD_W:
         case BWD_WB:
-            if (prb->dir == BWD_W) bia_d.reset(nullptr);
             TIME_C_PD(DNN_SAFE_STATUS(
                     dnnl_convolution_backward_weights_primitive_desc_create(
                             &init_pd_args.pd, init_pd_args.engine, alg, src_d,
-                            wei_d, bia_d, dst_d, prb->strides().data(),
+                            wei_d, bia_d, dst_d, prb->kstrides().data(),
                             prb->dilations().data(), prb->padding().data(),
                             prb->padding_r().data(), init_pd_args.hint,
                             dnnl_attr)));
@@ -303,57 +341,46 @@ int init_prim_ref(benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &prim_ref,
     // Wino inputs doesn't suit optimized CPU implementation.
     if (prb->alg == WINO) return OK;
 
-    // Create a new copy of prb to avoid potentially corrupting the test by
-    // modifying prb in place.
-    // DIRECT algorithm is used to prevent fallback  to the slow benchdnn
-    // reference implementation.
-    auto cpu_attr = prb->attr;
-    update_cpu_ref_attrs(cpu_attr);
     std::vector<std::vector<dnnl_data_type_t>> prim_ref_dt {
             prb->dt, {dnnl_f32}};
-    if (is_cpu()) prim_ref_dt.erase(prim_ref_dt.begin());
-    dnnl_primitive_t prim_ref_ {};
-
-    for (const auto &prim_ref_dt_i : prim_ref_dt) {
-        prb_t prb_cpu {*prb, prb->dir, prim_ref_dt_i, tag::any, tag::any,
-                tag::any, DIRECT, cpu_attr, prb->ctx_init, prb->ctx_exe,
-                prb->mb};
-
-        init_pd_args_t<prb_t> init_pd_args(
-                /* res = */ nullptr, get_cpu_engine(), &prb_cpu, prb->dir,
-                /* hint = */ nullptr, /* src_md = */ nullptr);
-        init_pd(init_pd_args);
-
-        benchdnn_dnnl_wrapper_t<dnnl_primitive_desc_t> pdw;
-        fetch_impl(pdw, init_pd_args, /* res = */ nullptr,
-                /* is_service_prim = */ true);
-
-        // Prim desc wasn't created - try the next set...
-        if (!pdw) continue;
-        // Reference impl was fetched - try the next set...
-        if (query_impl_info(pdw) == "ref:any") continue;
-
-        auto st = dnnl_primitive_create(&prim_ref_, pdw);
-        // Primitive wan't created - try the next set...
-        if (st != dnnl_success) continue;
-
-        BENCHDNN_PRINT(5, "CPU reference oneDNN implementation: %s\n",
-                query_impl_info(pdw).c_str());
-        res->prim_ref_repro = prb_cpu.str();
-        prim_ref.reset(prim_ref_);
-        return OK;
+    // If there's no bias, undef data type should be used for prim_ref as well.
+    dnnl_data_type_t cpu_bia_dt
+            = prb->bia_dt() == dnnl_data_type_undef ? prb->bia_dt() : dnnl_f32;
+    std::vector<dnnl_data_type_t> prim_ref_bia_dt {prb->bia_dt(), cpu_bia_dt};
+    if (is_cpu()) {
+        prim_ref_dt.erase(prim_ref_dt.begin());
+        prim_ref_bia_dt.erase(prim_ref_bia_dt.begin());
     }
 
-    prim_ref.reset(prim_ref_);
+    for_(const auto &prim_ref_dt_i : prim_ref_dt)
+    for (const auto &prim_ref_bia_dt_i : prim_ref_bia_dt) {
+        auto cpu_attr = prb->attr;
+        update_cpu_ref_attrs(cpu_attr, prim_ref_dt_i.back());
+
+        // Create a new copy of prb to avoid potentially corrupting the test by
+        // modifying prb in place.
+        // `DIRECT` algorithm is used to prevent fallback to the slow benchdnn
+        // reference implementation.
+        prb_t prb_cpu {*prb, prb->dir, prim_ref_dt_i, prim_ref_bia_dt_i,
+                tag::any, tag::any, tag::any, {vdims_t(STRIDES_SIZE)}, DIRECT,
+                prb->mb, cpu_attr, prb->ctx_init, prb->ctx_exe,
+                prb->impl_filter};
+
+        auto st = init_prim_ref_common(prim_ref, &prb_cpu, res);
+        if (st == OK) return OK;
+    }
+
+    prim_ref.reset(nullptr);
     return OK;
 }
 
 void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
-    skip_unimplemented_data_type(
-            {prb->get_dt(SRC), prb->get_dt(WEI), prb->get_dt(DST)}, prb->dir,
-            res);
+    skip_unimplemented_data_type({prb->get_dt(SRC), prb->get_dt(WEI),
+                                         prb->get_dt(BIA), prb->get_dt(DST)},
+            prb->dir, res);
     skip_unimplemented_sum_po(prb->attr, res, dnnl_convolution,
             prb->get_dt(SRC), prb->get_dt(DST));
+    skip_unimplemented_binary_po(prb->attr, res);
     skip_unimplemented_prelu_po(prb->attr, res, dnnl_convolution);
 
     if (is_cpu()) {
@@ -375,9 +402,18 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
                 = prb->get_dt(WEI) == dnnl_s8 || prb->get_dt(WEI) == dnnl_u8;
         const bool is_f16_dst = prb->get_dt(DST) == dnnl_f16;
         const bool is_x8x8f16 = is_int8_src && is_int8_wei && is_f16_dst;
+        const bool is_wei_zp = !prb->attr.zero_points.is_def(DNNL_ARG_WEIGHTS);
+        const bool is_non_s32_src_zp
+                = prb->attr.zero_points.get(DNNL_ARG_SRC).dt != dnnl_s32;
+        const bool is_non_unit_dst_scale
+                = !prb->attr.scales.is_def(DNNL_ARG_DST)
+                && prb->attr.scales.get_mask(DNNL_ARG_DST, dnnl_convolution)
+                        > 0;
 
-        if (is_f32f32x8 || is_bf16bf16x8 || is_x8x8f16 || !is_valid_f16) {
-            res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+        if (is_f32f32x8 || is_bf16bf16x8 || is_x8x8f16 || !is_valid_f16
+                || is_wei_zp || is_non_s32_src_zp || is_non_unit_dst_scale) {
+            res->state = SKIPPED;
+            res->reason = skip_reason::case_not_supported;
             return;
         }
     }
@@ -386,13 +422,15 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
     // make sense to list all of them, just convert all unimplemented Winograd
     // problems into not supported.
     if (prb->alg == WINO) {
-        res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+        res->state = SKIPPED;
+        res->reason = skip_reason::case_not_supported;
         return;
     }
 
     // GPU does not support depthwise fusion
     if (is_gpu() && prb->attr.post_ops.convolution_index() != -1) {
-        res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+        res->state = SKIPPED;
+        res->reason = skip_reason::case_not_supported;
         return;
     }
 }
@@ -449,7 +487,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     const auto &ref_engine = get_cpu_engine();
 
@@ -473,7 +511,8 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         // use switch below to define a memory desc for it.
         if (exec_arg != DNNL_ARG_SCRATCHPAD) {
             ref_mem_map.emplace(exec_arg,
-                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine,
+                            /* prefill = */ false));
         }
         auto &ref_mem = ref_mem_map[exec_arg];
 
@@ -526,7 +565,7 @@ std::vector<data_kind_t> get_kinds_to_check(const prb_t *prb) {
         check_kinds = {SRC};
     } else if (prb->dir & FLAG_BWD && prb->dir & FLAG_WEI) {
         check_kinds = {WEI};
-        if (prb->dir & FLAG_BIA) check_kinds.push_back(BIA);
+        if (prb->bia_dt() != dnnl_data_type_undef) check_kinds.push_back(BIA);
     } else {
         assert(!"unexpected!");
         SAFE_V(FAIL);
@@ -544,16 +583,43 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     return OK;
 }
 
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
-    SAFE(check_caches(v_prim[0], prb, res), WARN);
-    // Don't check caches for CPU prim as the reference.
+    if (has_bench_mode_bit(mode_bit_t::exec)) {
+        const auto &prim_ref = v_prim[1];
+        if (prim_ref) {
+            // Copy res to avoid save/restore state and reason.
+            res_t res_copy = *res;
+            SAFE(check_total_size(&res_copy, prim_ref), WARN);
+            if (res_copy.state == SKIPPED) {
+                v_prim[1].reset(nullptr);
+                SAFE(check_total_size(res), WARN);
+            } else {
+                // Copy estimations back to original `res`.
+                *res = res_copy;
+            }
+        } else {
+            SAFE(check_total_size(res), WARN);
+        }
+    }
+    if (has_bench_mode_bit(mode_bit_t::corr)) {
+        SAFE(check_caches(v_prim[0], prb, res), WARN);
+        // Don't check caches for CPU prim as the reference.
+    }
     return OK;
 }
 
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
+    set_zmalloc_max_expected_size(res->mem_size_args.zmalloc_expected_size);
+    // TODO: move Winograd's reference implementation scratchpad to a dedicated
+    // class for ability to query sizes.
+    // So far, just increase the size twice and let it roll.
+    if (prb->alg == WINO) {
+        set_zmalloc_max_expected_size(
+                2 * res->mem_size_args.zmalloc_expected_size);
+    }
+
     const auto &prim = v_prim[0];
     const auto &prim_ref = v_prim[1];
 
@@ -568,7 +634,7 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     SAFE(execute_and_wait(prim, args, res), WARN);
 
     check_correctness(prb, get_kinds_to_check(prb), args, ref_args, setup_cmp,
-            res, prim_ref);
+            res, prb->dir, prim_ref);
     SAFE(check_bitwise(prim, get_kinds_to_check(prb), args, prb->attr,
                  prb->inplace, res),
             WARN);

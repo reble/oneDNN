@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,7 +16,25 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/ocl/ref_deconvolution.hpp"
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/convolution_deconvolution.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+#include "gpu/generic/sycl/ref_convolution.hpp"
+#include "gpu/generic/sycl/ref_deconvolution.hpp"
+#include "gpu/nvidia/cudnn_deconvolution.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_AMD
+#include "gpu/amd/miopen_deconvolution.hpp"
+#endif
+
+#ifdef GENERIC_SYCL_KERNELS_ENABLED
+#include "gpu/generic/sycl/ref_deconvolution.hpp"
+#endif
+
+#include "gpu/generic/convolution_deconvolution.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -29,12 +47,19 @@ using namespace dnnl::impl::prop_kind;
 const std::map<pk_impl_key_t, std::vector<impl_list_item_t>>
         impl_list_map REG_DECONV_P({
     {{forward}, {
-        INSTANCE(ocl::ref_deconvolution_fwd_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_deconvolution_fwd_t)
+        GPU_INSTANCE_AMD(amd::miopen_deconvolution_fwd_t)
+        GPU_INSTANCE_GENERIC(generic::convolution_deconvolution_fwd_t)
         nullptr,
     }},
     {{backward}, REG_BWD_PK({
-        INSTANCE(ocl::ref_deconvolution_bwd_data_t)
-        INSTANCE(ocl::ref_deconvolution_bwd_weights_t)
+        GPU_INSTANCE_INTEL(intel::convolution_deconvolution_bwd_weights_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_deconvolution_bwd_data_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_deconvolution_bwd_weights_t)
+        GPU_INSTANCE_AMD(amd::miopen_deconvolution_bwd_data_t)
+        GPU_INSTANCE_AMD(amd::miopen_deconvolution_bwd_weights_t)
+        GPU_INSTANCE_GENERIC(generic::convolution_deconvolution_bwd_data_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_deconvolution_bwd_weights_t)
         nullptr,
     })},
 });

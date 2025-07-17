@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -130,18 +130,17 @@ struct jit_uni_softmax_fwd_t : public primitive_t {
                                     || is_superset(isa_, avx2_vnni_2));
             VDISPATCH_SOFTMAX(f16_isa_ok, VERBOSE_ISA_DT_MISMATCH);
 
-            VDISPATCH_SOFTMAX(
-                    attr()->has_default_values(skip_mask_t::scales_runtime
-                            | skip_mask_t::post_ops),
+            VDISPATCH_SOFTMAX(attr()->has_default_values(skip_mask_t::scales
+                                      | skip_mask_t::post_ops),
                     VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_SOFTMAX(attr_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
-            VDISPATCH_SOFTMAX(post_ops_ok(), VERBOSE_UNSUPPORTED_POSTOP);
 
             VDISPATCH_SOFTMAX(set_default_formats() == status::success,
                     VERBOSE_UNSUPPORTED_TAG);
             VDISPATCH_SOFTMAX(
                     attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_TAG);
+            VDISPATCH_SOFTMAX(post_ops_ok(), VERBOSE_UNSUPPORTED_POSTOP);
             VDISPATCH_SOFTMAX(
                     memory_desc_wrapper(src_md()).similar_to(
                             memory_desc_wrapper(dst_md()), true, false, 0),
@@ -171,7 +170,17 @@ struct jit_uni_softmax_fwd_t : public primitive_t {
 
     private:
         void init_scratchpad() {
-            if (dst_md()->data_type != data_type::f32) {
+            const auto src_dt = src_md()->data_type;
+            const auto dst_dt = dst_md()->data_type;
+            // Relaxed accumulation allows to downconvert intermediate results
+            // directly from xf16 or xf8 to dst avoiding scratchpad memory.
+            const bool relaxed_acc = src_dt == dst_dt
+                    && !types::is_integral_dt(dst_dt)
+                    && utils::one_of(attr()->acc_mode_,
+                            accumulation_mode::relaxed, accumulation_mode::any);
+            const bool need_scratchpad
+                    = dst_dt != data_type::f32 && !relaxed_acc;
+            if (need_scratchpad) {
                 auto scratchpad = scratchpad_registry().registrar();
                 // When stride != 1, then each thread operates over simd at a
                 // time, thus, increased scratchpad size.

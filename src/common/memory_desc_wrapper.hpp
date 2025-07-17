@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -22,14 +22,19 @@
 #include "c_types_map.hpp"
 #include "nstl.hpp"
 #include "utils.hpp"
+#include "verbose.hpp"
 
 #include "type_helpers.hpp"
+
+#define VCHECK_MEMORY(cond, stat, msg, ...) \
+    VCONDCHECK(common, create, check, memory, (cond), stat, msg, ##__VA_ARGS__)
 
 namespace dnnl {
 namespace impl {
 
 /** thin wrapper class over \struct memory_desc_t which allows easy
  * manipulations with underlying C structure, which is taken by reference */
+// NOLINTNEXTLINE(readability-identifier-naming)
 struct memory_desc_wrapper : public c_compatible {
     const memory_desc_t *md_;
 
@@ -63,6 +68,9 @@ struct memory_desc_wrapper : public c_compatible {
     bool is_rnn_packed_desc() const {
         return format_kind() == format_kind::rnn_packed;
     }
+    bool is_cublaslt_blocked_desc() const {
+        return format_kind() == format_kind::cublaslt_blocked;
+    }
     bool is_sparse_desc() const { return format_kind() == format_kind::sparse; }
 
     const blocking_desc_t &blocking_desc() const {
@@ -77,6 +85,10 @@ struct memory_desc_wrapper : public c_compatible {
     const rnn_packed_desc_t &rnn_packed_desc() const {
         assert(is_rnn_packed_desc());
         return md_->format_desc.rnn_packed_desc;
+    }
+    const cublaslt_blocked_desc_t &cublaslt_blocked_desc() const {
+        assert(is_cublaslt_blocked_desc());
+        return md_->format_desc.cublaslt_blocked_desc;
     }
 
     const sparse_desc_t &sparse_desc() const {
@@ -138,10 +150,10 @@ struct memory_desc_wrapper : public c_compatible {
     size_t additional_buffer_data_size(uint64_t flag_select) const {
         using namespace memory_extra_flags;
         if (flag_select & compensation_conv_s8s8) return sizeof(int32_t);
-        if ((flag_select & rnn_u8s8_compensation)
-                && !types::extra_flag_rnn_s8s8_compensation_is_set(flag_select))
-            return sizeof(float);
+        if (flag_select & rnn_u8s8_compensation) return sizeof(float);
         if (flag_select & compensation_conv_asymmetric_src)
+            return sizeof(int32_t);
+        if (flag_select & compensation_gpu_conv_asymmetric_src)
             return sizeof(int32_t);
         return 0;
     }
@@ -149,19 +161,17 @@ struct memory_desc_wrapper : public c_compatible {
     /** return true if memory format has additional buffer */
     bool is_additional_buffer() const {
         using namespace memory_extra_flags;
-        // Currently compensation is not required for rnn_s8s8_compensation,
-        // but it has common bit with rnn_u8s8_compensation constant so we have
-        // to exclude rnn_s8s8_compensation case explicitly
-        return ((extra().flags
-                        & (compensation_conv_s8s8 | rnn_u8s8_compensation
-                                | compensation_conv_asymmetric_src))
-                && !types::extra_flag_rnn_s8s8_compensation_is_set(
-                        extra().flags));
+        return extra().flags
+                & (compensation_conv_s8s8 | rnn_u8s8_compensation
+                        | compensation_gpu_conv_asymmetric_src
+                        | compensation_conv_asymmetric_src);
     }
 
     /** returns the size required for a particular extra memory buffer */
     size_t additional_buffer_size(memory_extra_flags_t flag) const {
         using namespace memory_extra_flags;
+        const auto flags = extra().flags;
+        if (!(flags & flag)) return 0;
 
         const auto ndims = this->ndims();
         const auto &pdims = padded_dims();
@@ -175,26 +185,26 @@ struct memory_desc_wrapper : public c_compatible {
                       return (size_t)prod * buff_data_size;
                   };
 
-        if (extra().flags & compensation_conv_s8s8) {
+        if (flag == compensation_conv_s8s8) {
             return calculate_size(extra().compensation_mask,
                     additional_buffer_data_size(flag));
         }
-
-        if ((extra().flags & rnn_u8s8_compensation)
-                && !types::extra_flag_rnn_s8s8_compensation_is_set(
-                        extra().flags)) {
+        if (flag == rnn_u8s8_compensation) {
             return calculate_size(extra().compensation_mask,
                     additional_buffer_data_size(flag));
         }
-        if (extra().flags & compensation_conv_asymmetric_src) {
+        if (flag == compensation_conv_asymmetric_src) {
             return calculate_size(extra().asymm_compensation_mask,
                     additional_buffer_data_size(flag));
+        }
+        if (flag == compensation_gpu_conv_asymmetric_src) {
+            return extra().dst_size;
         }
 
         return 0;
     }
 
-    int blk_size() const {
+    dim_t blk_size() const {
         assert(is_blocking_desc() || is_sparse_packed_desc());
         const auto &bd = blocking_desc();
         return utils::array_product(bd.inner_blks, bd.inner_nblks);
@@ -209,18 +219,22 @@ struct memory_desc_wrapper : public c_compatible {
         buff_size += additional_buffer_size(compensation_conv_s8s8);
         buff_size += additional_buffer_size(rnn_u8s8_compensation);
         buff_size += additional_buffer_size(compensation_conv_asymmetric_src);
+        buff_size
+                += additional_buffer_size(compensation_gpu_conv_asymmetric_src);
         return buff_size;
     }
 
-    /** returns the size required to store described memory
-     * note: if offset0 != 0 returns 0 (need to specify the behavior) */
-    size_t size(int index = 0, bool include_additional_size = true) const {
+    /** returns the size required to store described memory note: does not
+        include offset0 by default */
+    size_t size(int index = 0, bool include_additional_size = true,
+            bool include_offset0 = false) const {
         if (utils::one_of(format_kind(), format_kind::undef, format_kind::any)
                 || is_zero() || has_zero_dim())
             return 0;
 
         if (utils::one_of(format_kind(), format_kind::blocked,
-                    format_kind::wino, format_kind::rnn_packed)
+                    format_kind::wino, format_kind::rnn_packed,
+                    format_kind::cublaslt_blocked)
                 && index != 0) {
             return 0;
         }
@@ -231,9 +245,9 @@ struct memory_desc_wrapper : public c_compatible {
             return wino_desc().size;
         } else if (is_rnn_packed_desc()) {
             return rnn_packed_desc().size;
+        } else if (is_cublaslt_blocked_desc()) {
+            return cublaslt_blocked_desc().size;
         } else if (is_blocking_desc()) {
-            if (offset0() != 0) return 0;
-
             dims_t blocks = {0};
             compute_blocks(blocks);
 
@@ -248,11 +262,13 @@ struct memory_desc_wrapper : public c_compatible {
             }
 
             if (max_size == 1 && bd.inner_nblks != 0) {
-                max_size = utils::array_product(bd.inner_blks, bd.inner_nblks);
+                max_size = static_cast<size_t>(blk_size());
             }
 
-            size_t data_size = max_size * data_type_size()
-                    / sub_byte_data_type_multiplier();
+            // `div_up` guarantees a spot in memory for odd number of half-byte
+            // elements. Crucial case is `1` when simple division returns 0.
+            size_t data_size = utils::div_up(max_size * data_type_size(),
+                    sub_byte_data_type_multiplier());
             if (is_additional_buffer()) {
                 // The additional buffers, typically of data type int32_t, float
                 // are stored at the end of data. Pad the data, so that the
@@ -261,7 +277,8 @@ struct memory_desc_wrapper : public c_compatible {
                 data_size = utils::rnd_up(data_size, alignment_in_bytes);
             }
             return data_size
-                    + (include_additional_size ? additional_buffer_size() : 0);
+                    + (include_additional_size ? additional_buffer_size() : 0)
+                    + (include_offset0 ? data_type_size() * offset0() : 0);
         } else if (is_sparse_desc()) {
             if (sparse_desc().encoding == sparse_encoding::csr) {
                 switch (index) {
@@ -278,6 +295,18 @@ struct memory_desc_wrapper : public c_compatible {
                         return (dims()[0] + 1) * types::data_type_size(ptr_dt);
                     }
                     default: assert(!"unknown index"); return 0;
+                }
+            } else if (sparse_desc().encoding == sparse_encoding::coo) {
+                // Return size for values.
+                if (index == 0) {
+                    return nnz() * data_type_size();
+                } else if (index > 0 && index <= ndims()) {
+                    // Return size for index buffers.
+                    const auto idx_dt = metadata_type(0);
+                    return nnz() * types::data_type_size(idx_dt);
+                } else {
+                    assert(!"unknown index");
+                    return 0;
                 }
             } else if (sparse_desc().encoding == sparse_encoding::packed) {
                 // If the size if queried from a user-created memory descriptor.
@@ -421,8 +450,8 @@ struct memory_desc_wrapper : public c_compatible {
 
     /** returns true if the memory desc corresponds to the given format tag.
      * @sa memory_desc_matches_tag */
-    bool matches_tag(format_tag_t tag) const {
-        return memory_desc_matches_tag(*md_, tag);
+    bool matches_tag(format_tag_t tag, const dims_t strides = nullptr) const {
+        return memory_desc_matches_tag(*md_, tag, strides);
     }
 
     /** returns matching tag (or undef if match is not found)
@@ -432,6 +461,16 @@ struct memory_desc_wrapper : public c_compatible {
         for (const auto tag : {tags...}) {
             if (memory_desc_matches_tag(*md_, tag)) return tag;
         }
+        return format_tag::undef;
+    }
+
+    template <typename... Tags>
+    format_tag_t mb_stride_relaxed_match(Tags... tags) const {
+        dims_t skip_mb_stride {};
+        // See `memory_desc_matches_tag` comment.
+        skip_mb_stride[0] = -1;
+        for (const auto &tag : {tags...})
+            if (matches_tag(tag, skip_mb_stride)) return tag;
         return format_tag::undef;
     }
 
@@ -485,6 +524,7 @@ struct memory_desc_wrapper : public c_compatible {
      * a scalar \param l_offset. if \param is_pos_padded is true, \param
      * l_offset represents logical offset in already padded area */
     dim_t off_l(dim_t l_offset, bool is_pos_padded = false) const {
+        if (l_offset == 0) return offset0();
         dims_t dims_pos;
         const auto &cur_dims = is_pos_padded ? padded_dims() : dims();
         utils::l_dims_by_l_offset(dims_pos, l_offset, cur_dims, ndims());
@@ -522,6 +562,16 @@ struct memory_desc_wrapper : public c_compatible {
     dim_t blk_off(T xn, Args... args) const {
         return skip_first ? blk_off<Args...>(args...)
                           : blk_off<T, Args...>(xn, args...);
+    }
+
+    /** returns physical offset by logical one. Logical offset is represented by
+     * a tuple of block indices (\param bn, ..., \param b1, \param b0). It is a
+     * user responsibility to adjust the result to get offset within blocks.
+     * If @tparam sub_off0 is true, then offset0() will be subtracted
+     * from result.*/
+    template <bool skip_first, bool sub_off0, typename T, typename... Args>
+    dim_t blk_off(T xn, Args... args) const {
+        return blk_off<skip_first, Args...>(xn, args...) - sub_off0 * offset0();
     }
 
     /* static functions section */
@@ -564,7 +614,8 @@ inline bool memory_desc_wrapper::similar_to(const memory_desc_wrapper &rhs,
 
     if (one_of(format_kind(), format_kind::undef, format_kind::any))
         return false;
-    if (is_wino_desc() || is_rnn_packed_desc()) return false;
+    if (is_wino_desc() || is_rnn_packed_desc() || is_cublaslt_blocked_desc())
+        return false;
 
     const int ds = dim_start;
     const auto &blk = blocking_desc();

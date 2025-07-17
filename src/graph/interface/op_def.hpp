@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -53,14 +53,21 @@ DNNL_GRAPH_OP_SCHEMA(Add, 1,
         op_schema_t()
                 .set_num_inputs(2)
                 .set_num_outputs(1)
-                .set_commutative_inputs()
-                .set_input(0, "src_0", "T")
-                .set_input(1, "src_1", "T")
-                .set_output(0, "dst", "T")
+                .set_commutative_inputs({0, 1})
+                .set_input(0, "src_0", "T1")
+                .set_input(1, "src_1", "T2")
+                .set_output(0, "dst", "T3")
                 .set_attr(op_attr::auto_broadcast, false, attribute_kind::s,
                         "numpy", {"none", "numpy"})
-                .set_type_constraints(
-                        "T", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_type_constraints("T1",
+                        {data_type::f32, data_type::bf16, data_type::f16,
+                                data_type::s32})
+                .set_type_constraints("T2",
+                        {data_type::f32, data_type::bf16, data_type::f16,
+                                data_type::s32})
+                .set_type_constraints("T3",
+                        {data_type::f32, data_type::bf16, data_type::f16,
+                                data_type::s32})
                 .set_shape_inference_function(
                         infer_elemwise_arithmetic_output_shape))
 
@@ -421,6 +428,8 @@ DNNL_GRAPH_OP_SCHEMA(GELU, 1,
                 .set_num_outputs(1)
                 .set_input(0, "src", "T")
                 .set_output(0, "dst", "T")
+                .set_attr(op_attr::mode, false, attribute_kind::s, "gelu_erf",
+                        {"gelu_erf", "gelu_tanh"})
                 .set_type_constraints(
                         "T", {data_type::f32, data_type::bf16, data_type::f16})
                 .set_shape_inference_function(infer_identity_output_shape))
@@ -432,9 +441,64 @@ DNNL_GRAPH_OP_SCHEMA(GELUBackward, 1,
                 .set_input(0, "src", "T")
                 .set_input(1, "diff_dst", "T")
                 .set_output(0, "diff_src", "T")
+                .set_attr(op_attr::mode, false, attribute_kind::s, "gelu_erf",
+                        {"gelu_erf", "gelu_tanh"})
                 .set_type_constraints(
                         "T", {data_type::f32, data_type::bf16, data_type::f16})
                 .set_shape_inference_function(infer_identity_output_shape))
+
+DNNL_GRAPH_OP_SCHEMA(GenIndex, 1,
+        op_schema_t()
+                .set_num_inputs(1)
+                .set_num_outputs(1)
+                .set_input(0, "src", "T1")
+                .set_output(0, "dst", "T2")
+                .set_attr(op_attr::axis, true, attribute_kind::i)
+                .set_type_constraints(
+                        "T1", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_type_constraints("T2", {data_type::s32})
+                .set_shape_inference_function(infer_identity_output_shape))
+
+DNNL_GRAPH_OP_SCHEMA(GreaterEqual, 1,
+        op_schema_t()
+                .set_num_inputs(2)
+                .set_num_outputs(1)
+                .set_input(0, "src_0", "T1")
+                .set_input(1, "src_1", "T1")
+                .set_output(0, "dst", "T2")
+                .set_attr(op_attr::auto_broadcast, false, attribute_kind::s,
+                        "numpy", {"none", "numpy"})
+                .set_type_constraints("T1",
+                        {data_type::f32, data_type::bf16, data_type::f16,
+                                data_type::s32})
+                .set_type_constraints("T2", {data_type::boolean})
+                .set_shape_inference_function(
+                        infer_elemwise_arithmetic_output_shape))
+
+DNNL_GRAPH_OP_SCHEMA(GroupNorm, 1,
+        op_schema_t()
+                .set_inputs_option(op_schema_t::param_num_option::optional)
+                .set_num_inputs(std::set<size_t>({1, 3}))
+                .set_outputs_option(op_schema_t::param_num_option::optional)
+                .set_num_outputs(std::set<size_t>({1, 3}))
+                .set_input(0, "src", "T1")
+                .set_input(1, "gamma", "T2")
+                .set_input(2, "beta", "T2")
+                .set_output(0, "dst", "T1")
+                .set_output(1, "mean", "T2")
+                .set_output(2, "variance", "T2")
+                .set_attr(op_attr::keep_stats, false, attribute_kind::b, true)
+                .set_attr(op_attr::groups, true, attribute_kind::i)
+                .set_attr(op_attr::use_affine, false, attribute_kind::b, true)
+                .set_attr(op_attr::epsilon, false, attribute_kind::f, 1e-5f)
+                .set_attr(op_attr::data_format, false, attribute_kind::s, "NXC",
+                        {"NCX", "NXC"})
+                .set_type_constraints(
+                        "T1", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_type_constraints("T2", {data_type::f32, data_type::bf16})
+                .set_shape_inference_function(infer_groupnorm_output_shape)
+                .set_op_def_constraint_function(check_ln_gn_data_type)
+                .set_op_def_constraint_function(check_ln_gn_fwd_outputs_num))
 
 DNNL_GRAPH_OP_SCHEMA(HardSigmoid, 1,
         op_schema_t()
@@ -550,8 +614,8 @@ DNNL_GRAPH_OP_SCHEMA(LayerNorm, 1,
                         "T1", {data_type::f32, data_type::bf16, data_type::f16})
                 .set_type_constraints("T2", {data_type::f32, data_type::bf16})
                 .set_shape_inference_function(infer_norm_output_shape)
-                .set_op_def_constraint_function(check_ln_data_type)
-                .set_op_def_constraint_function(check_ln_fwd_outputs_num))
+                .set_op_def_constraint_function(check_ln_gn_data_type)
+                .set_op_def_constraint_function(check_ln_gn_fwd_outputs_num))
 
 DNNL_GRAPH_OP_SCHEMA(LayerNormBackward, 1,
         op_schema_t()
@@ -576,7 +640,7 @@ DNNL_GRAPH_OP_SCHEMA(LayerNormBackward, 1,
                         "T1", {data_type::f32, data_type::bf16, data_type::f16})
                 .set_type_constraints("T2", {data_type::f32, data_type::bf16})
                 .set_shape_inference_function(infer_norm_bprop_output_shape)
-                .set_op_def_constraint_function(check_ln_data_type)
+                .set_op_def_constraint_function(check_ln_gn_data_type)
                 .set_op_def_constraint_function(check_ln_bwd_use_affine))
 
 DNNL_GRAPH_OP_SCHEMA(LeakyReLU, 1,
@@ -631,17 +695,20 @@ DNNL_GRAPH_OP_SCHEMA(MatMul, 1,
                 .set_input(0, "src", "T")
                 .set_input(1, "weights", "T")
                 .set_input(2, "bias", "T")
-                .set_output(0, "dst", "T")
+                .set_output(0, "dst", "T1")
                 .set_type_constraints(
                         "T", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_type_constraints(
+                        "T1", {data_type::f32, data_type::bf16, data_type::f16})
                 .set_shape_inference_function(infer_matmul_output_shape)
+                .set_op_def_constraint_function(check_matmul_dtype)
                 .SET_MATMUL_COMMON_ATTRS)
 
 DNNL_GRAPH_OP_SCHEMA(Maximum, 1,
         op_schema_t()
                 .set_num_inputs(2)
                 .set_num_outputs(1)
-                .set_commutative_inputs()
+                .set_commutative_inputs({0, 1})
                 .set_input(0, "src_0", "T")
                 .set_input(1, "src_1", "T")
                 .set_output(0, "dst", "T")
@@ -703,7 +770,7 @@ DNNL_GRAPH_OP_SCHEMA(Minimum, 1,
         op_schema_t()
                 .set_num_inputs(2)
                 .set_num_outputs(1)
-                .set_commutative_inputs()
+                .set_commutative_inputs({0, 1})
                 .set_input(0, "src_0", "T")
                 .set_input(1, "src_1", "T")
                 .set_output(0, "dst", "T")
@@ -735,14 +802,11 @@ DNNL_GRAPH_OP_SCHEMA(MishBackward, 1,
                         "T", {data_type::f32, data_type::bf16, data_type::f16})
                 .set_shape_inference_function(infer_identity_output_shape))
 
-// TODO(Yixin): for Multiply. input and output needs to have the same dtypes
-// But in current pytorch bridge's type promotion system, there's no
-// such constraints. So this feature is postponed.
 DNNL_GRAPH_OP_SCHEMA(Multiply, 1,
         op_schema_t()
                 .set_num_inputs(2)
                 .set_num_outputs(1)
-                .set_commutative_inputs()
+                .set_commutative_inputs({0, 1})
                 .set_input(0, "src_0", "T1")
                 .set_input(1, "src_1", "T2")
                 .set_output(0, "dst", "T3")
@@ -939,6 +1003,7 @@ DNNL_GRAPH_OP_SCHEMA(Select, 1,
         op_schema_t()
                 .set_num_inputs(3)
                 .set_num_outputs(1)
+                .set_commutative_inputs({1, 2})
                 .set_input(0, "cond", "T1")
                 .set_input(1, "src_0", "T2")
                 .set_input(2, "src_1", "T2")
@@ -974,26 +1039,37 @@ DNNL_GRAPH_OP_SCHEMA(SigmoidBackward, 1,
 
 DNNL_GRAPH_OP_SCHEMA(SoftMax, 1,
         op_schema_t()
+                .set_outputs_option(op_schema_t::param_num_option::optional)
                 .set_num_inputs(1)
-                .set_num_outputs(1)
-                .set_input(0, "src", "T")
-                .set_output(0, "dst", "T")
+                .set_num_outputs(std::set<size_t>({1, 2}))
+                .set_input(0, "src", "T1")
+                .set_output(0, "dst", "T2")
+                .set_output(1, "stats", "T3")
                 .set_attr(op_attr::axis, false, attribute_kind::i, (int64_t)1)
+                .set_attr(op_attr::mode, false, attribute_kind::s, "none",
+                        {"none", "inf_as_zero"})
                 .set_type_constraints(
-                        "T", {data_type::f32, data_type::bf16, data_type::f16})
-                .set_shape_inference_function(infer_identity_output_shape))
+                        "T1", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_type_constraints(
+                        "T2", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_type_constraints("T3", {data_type::f32})
+                .set_shape_inference_function(infer_softmax_output_shape)
+                .set_op_def_constraint_function(check_softmax_dtype))
 
 DNNL_GRAPH_OP_SCHEMA(SoftMaxBackward, 1,
         op_schema_t()
                 .set_num_inputs(2)
                 .set_num_outputs(1)
-                .set_input(0, "diff_dst", "T")
-                .set_input(1, "dst", "T")
-                .set_output(0, "diff_src", "T")
+                .set_input(0, "diff_dst", "T1")
+                .set_input(1, "dst", "T1")
+                .set_output(0, "diff_src", "T2")
                 .set_attr(op_attr::axis, false, attribute_kind::i, (int64_t)1)
                 .set_type_constraints(
-                        "T", {data_type::f32, data_type::bf16, data_type::f16})
-                .set_shape_inference_function(infer_identity_output_shape))
+                        "T1", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_type_constraints(
+                        "T2", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_shape_inference_function(infer_identity_output_shape)
+                .set_op_def_constraint_function(check_softmax_bwd_output_dtype))
 
 DNNL_GRAPH_OP_SCHEMA(SoftPlus, 1,
         op_schema_t()
@@ -1068,13 +1144,20 @@ DNNL_GRAPH_OP_SCHEMA(Subtract, 1,
         op_schema_t()
                 .set_num_inputs(2)
                 .set_num_outputs(1)
-                .set_input(0, "src_0", "T")
-                .set_input(1, "src_1", "T")
-                .set_output(0, "dst", "T")
+                .set_input(0, "src_0", "T1")
+                .set_input(1, "src_1", "T2")
+                .set_output(0, "dst", "T3")
                 .set_attr(op_attr::auto_broadcast, false, attribute_kind::s,
                         "numpy", {"none", "numpy"})
-                .set_type_constraints(
-                        "T", {data_type::f32, data_type::bf16, data_type::f16})
+                .set_type_constraints("T1",
+                        {data_type::f32, data_type::bf16, data_type::f16,
+                                data_type::s32})
+                .set_type_constraints("T2",
+                        {data_type::f32, data_type::bf16, data_type::f16,
+                                data_type::s32})
+                .set_type_constraints("T3",
+                        {data_type::f32, data_type::bf16, data_type::f16,
+                                data_type::s32})
                 .set_shape_inference_function(
                         infer_elemwise_arithmetic_output_shape))
 
@@ -1230,10 +1313,15 @@ DNNL_GRAPH_OP_SCHEMA(DynamicDequantize, 1,
                 .set_attr(
                         op_attr::qtype, false, attribute_kind::s, "per_tensor")
                 .set_attr(op_attr::axis, false, attribute_kind::i, int64_t(1))
-                .set_type_constraints("T1", {data_type::u8, data_type::s8})
-                .set_type_constraints("T2", {data_type::f32})
+                .set_attr(op_attr::group_shape, false, attribute_kind::is)
+                .set_type_constraints("T1",
+                        {data_type::u8, data_type::s8, data_type::s4,
+                                data_type::u4})
                 .set_type_constraints(
-                        "T3", {data_type::u8, data_type::s8, data_type::s32})
+                        "T2", {data_type::bf16, data_type::f16, data_type::f32})
+                .set_type_constraints("T3",
+                        {data_type::u4, data_type::s4, data_type::u8,
+                                data_type::s8, data_type::s32})
                 .set_shape_inference_function(infer_identity_output_shape)
                 .set_op_def_constraint_function(
                         check_dyn_quant_dequant_scales_zps))

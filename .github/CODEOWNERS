@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2019-2024 Intel Corporation
+# Copyright 2019-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,34 +15,48 @@
 #===============================================================================
 
 # Default
-* @intel-innersource/dnn-arch
+* @uxlfoundation/onednn-arch
 
-# Documentation
-*.md  @intel-innersource/dnn-doc @intel-innersource/dnn-mgmt @intel-innersource/dnn-arch
-/doc/ @intel-innersource/dnn-doc @intel-innersource/dnn-arch
+# Github automation
+/.github/ @uxlfoundation/onednn-devops
 
-# CPU-specific optimizations
-/src/cpu/ @intel-innersource/dnn-cpu
+# CPU Engine
+/src/cpu/aarch64/ @uxlfoundation/onednn-cpu-aarch64
+/src/cpu/x64/ @uxlfoundation/onednn-cpu-x64
+/src/cpu/rnn/ @uxlfoundation/onednn-cpu-x64
 
-# CPU BLAS
-/src/cpu/gemm/ @intel-innersource/dnn-blas @intel-innersource/dnn-arch
-
-# GPU-specific optimizations
-/src/gpu/ @intel-innersource/dnn-gpu
-
-# NVIDIA and AMD backends
-/src/gpu/nvidia @intel-innersource/dnn-gpu @intel-innersource/dnn-arch
-/src/gpu/amd @intel-innersource/dnn-gpu @intel-innersource/dnn-arch
+# GPU Engine
+/src/gpu/amd/ @uxlfoundation/onednn-gpu-amd
+/src/gpu/intel/ @uxlfoundation/onednn-gpu-intel
+/src/gpu/nvidia/ @uxlfoundation/onednn-gpu-nvidia
+/src/gpu/generic/ @uxlfoundation/onednn-arch
+/src/gpu/generic/sycl/ @uxlfoundation/onednn-gpu-generic
 
 # Tests
-/tests/benchdnn/inputs/ @intel-innersource/dnn-arch @intel-innersource/dnn-cpu @intel-innersource/dnn-gpu
+/tests/benchdnn/inputs/ @uxlfoundation/onednn-maintain
+/tests/benchdnn/graph/ @uxlfoundation/onednn-graph @uxlfoundation/onednn-arch
+/tests/benchdnn/inputs/graph/ @uxlfoundation/onednn-graph @uxlfoundation/onednn-arch
+/tests/gtests/graph/ @uxlfoundation/onednn-graph
 
-# Graph
-/src/graph/ @intel-innersource/dnn-graph
-/tests/benchdnn/graph/ @intel-innersource/dnn-arch @intel-innersource/dnn-graph
-/tests/benchdnn/inputs/graph/ @intel-innersource/dnn-arch @intel-innersource/dnn-graph
-/tests/gtests/graph/ @intel-innersource/dnn-graph
+# Graph API
+/src/graph/ @uxlfoundation/onednn-graph
 
-# Graph compiler
-/src/graph/backend/graph_compiler/ @intel-innersource/dnn-compiler
-/tests/gtests/graph/unit/backend/graph_compiler/ @intel-innersource/dnn-compiler
+# Documentation
+*.md  @uxlfoundation/onednn-doc @uxlfoundation/onednn-arch
+/doc/ @uxlfoundation/onednn-doc @uxlfoundation/onednn-arch
+
+# Third party components
+/third-party/ @uxlfoundation/onednn-arch
+/third_party/level_zero/ @uxlfoundation/onednn-gpu-intel
+/third_party/mdapi/ @uxlfoundation/onednn-gpu-intel
+/third_party/ngen/ @uxlfoundation/onednn-gpu-intel
+/third_party/xbyak/ @uxlfoundation/onednn-cpu-x64
+/third_party/xbyak_aarch64/ @uxlfoundation/onednn-cpu-aarch64
+
+# Governance and process
+/.github/CODEOWNERS @uxlfoundation/onednn-maintain
+/SECURITY.md @uxlfoundation/onednn-maintain
+/MAINTAINERS.md @uxlfoundation/onednn-maintain
+/CONTRIBUTING.md @uxlfoundation/onednn-maintain
+/CODING_STANDARDS.md @uxlfoundation/onednn-maintain
+/CODE_OF_CONDUCT.md @uxlfoundation/onednn-maintain

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2024 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,13 +18,19 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/jit/binary_format.hpp"
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/jit/binary_format.hpp"
 
-#include "gpu/jit/gemm/gen_gemm.hpp"
-#include "gpu/jit/gemm/xe_hp_systolic_gemm.hpp"
-#include "gpu/ocl/gemm/conv_gemm.hpp"
-#include "gpu/ocl/gemm/gemm_with_post_ops.hpp"
-#include "gpu/ocl/gemm/ref_gemm.hpp"
+#include "gpu/intel/gemm/gemm_with_post_ops.hpp"
+#include "gpu/intel/gemm/ref_gemm.hpp"
+#include "gpu/intel/jit/gemm/gen_gemm.hpp"
+#include "gpu/intel/jit/gemm/xe_hp_systolic_gemm.hpp"
+
+#ifdef DNNL_DEV_MODE
+#include "gpu/intel/gemm/conv_gemm.hpp"
+#endif
+
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -34,13 +40,11 @@ namespace {
 
 // clang-format off
 constexpr impl_list_item_t impl_list[] = {
-#ifdef DNNL_DEV_MODE
-        INSTANCE(ocl::conv_gemm_t)
-#endif
-        INSTANCE(jit::xe_hp_systolic_gemm_t)
-        INSTANCE(ocl::gemm_with_post_ops_t)
-        INSTANCE(jit::gen_gemm_t)
-        INSTANCE(ocl::ref_gemm_t)
+        GPU_INSTANCE_INTEL_DEVMODE(intel::conv_gemm_t)
+        GPU_INSTANCE_INTEL(intel::jit::xe_hp_systolic_gemm_t)
+        GPU_INSTANCE_INTEL(intel::gemm_with_post_ops_t)
+        GPU_INSTANCE_INTEL(intel::jit::gen_gemm_t)
+        GPU_INSTANCE_INTEL_REF(intel::ref_gemm_t)
         nullptr,
 };
 // clang-format on

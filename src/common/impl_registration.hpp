@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -173,6 +173,13 @@
     {}
 #endif
 
+#if BUILD_PRIMITIVE_ALL || BUILD_SDPA
+#define REG_SDPA_P(...) __VA_ARGS__
+#else
+#define REG_SDPA_P(...) \
+    { nullptr }
+#endif
+
 #if BUILD_PRIMITIVE_ALL || BUILD_SHUFFLE
 #define REG_SHUFFLE_P(...) __VA_ARGS__
 #else
@@ -195,18 +202,6 @@
 #endif
 
 // Primitive CPU ISA section is in src/cpu/platform.hpp
-
-#if BUILD_PRIMITIVE_GPU_ISA_ALL || BUILD_GEN9
-#define REG_GEN9_ISA(...) __VA_ARGS__
-#else
-#define REG_GEN9_ISA(...)
-#endif
-
-#if BUILD_PRIMITIVE_GPU_ISA_ALL || BUILD_GEN11
-#define REG_GEN11_ISA(...) __VA_ARGS__
-#else
-#define REG_GEN11_ISA(...)
-#endif
 
 #if BUILD_PRIMITIVE_GPU_ISA_ALL || BUILD_XELP
 #define REG_XELP_ISA(...) __VA_ARGS__
@@ -232,10 +227,16 @@
 #define REG_XEHPC_ISA(...)
 #endif
 
-#if BUILD_PRIMITIVE_GPU_ISA_ALL || BUILD_XEHPC
+#if BUILD_PRIMITIVE_GPU_ISA_ALL || BUILD_XE2
 #define REG_XE2_ISA(...) __VA_ARGS__
 #else
 #define REG_XE2_ISA(...)
+#endif
+
+#if BUILD_PRIMITIVE_GPU_ISA_ALL || BUILD_XE3
+#define REG_XE3_ISA(...) __VA_ARGS__
+#else
+#define REG_XE3_ISA(...)
 #endif
 
 #endif

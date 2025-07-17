@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -35,63 +35,9 @@ struct jit_uni_group_normalization_fwd_t : public primitive_t {
         using cpu_group_normalization_fwd_pd_t::
                 cpu_group_normalization_fwd_pd_t;
 
-        DECLARE_COMMON_PD_T("jit:uni", jit_uni_group_normalization_fwd_t);
+        DECLARE_COMMON_PD_T("jit_group:uni", jit_uni_group_normalization_fwd_t);
 
-        status_t init(engine_t *engine) {
-            using namespace data_type;
-            using namespace format_tag;
-            using skip_mask_t = primitive_attr_t::skip_mask_t;
-
-            const memory_desc_wrapper src_d(src_md());
-
-            VDISPATCH_GNORM(is_fwd(), VERBOSE_BAD_PROPKIND);
-            VDISPATCH_GNORM(mayiuse(avx2), VERBOSE_UNSUPPORTED_ISA);
-            VDISPATCH_GNORM(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
-            VDISPATCH_GNORM(
-                    utils::one_of(src_md()->data_type, f32, bf16, f16, s8, u8)
-                            && IMPLICATION(utils::one_of(src_md()->data_type,
-                                                   bf16, f16),
-                                    mayiuse(avx512_core)),
-                    VERBOSE_UNSUPPORTED_DT);
-            VDISPATCH_GNORM(
-                    utils::one_of(dst_md()->data_type, f32, bf16, f16, s8, u8)
-                            && IMPLICATION(utils::one_of(dst_md()->data_type,
-                                                   bf16, f16),
-                                    mayiuse(avx512_core)),
-                    VERBOSE_UNSUPPORTED_DT);
-            VDISPATCH_GNORM(
-                    attr()->has_default_values(skip_mask_t::scales_runtime)
-                            && attr_scales_ok(),
-                    VERBOSE_UNSUPPORTED_ATTR);
-            VDISPATCH_GNORM(memory_desc_matches_one_of_tag(
-                                    *src_md(), ndhwc, nhwc, nwc, nc),
-                    VERBOSE_UNSUPPORTED_TAG);
-            VDISPATCH_GNORM(memory_desc_matches_one_of_tag(
-                                    *dst_md(), ndhwc, nhwc, nwc, nc),
-                    VERBOSE_UNSUPPORTED_TAG);
-            VDISPATCH_GNORM(
-                    set_default_formats_common(), VERBOSE_UNSUPPORTED_TAG);
-            VDISPATCH_GNORM(C() == desc()->groups, VERBOSE_INCONSISTENT_DIM,
-                    "C", (int)C(), "groups", (int)desc()->groups);
-
-            nthr_ = dnnl_get_max_threads();
-            auto scratchpad = scratchpad_registry().registrar();
-            if (!stats_is_src()) {
-                using namespace memory_tracking::names;
-                const size_t stats_reduction_buf_sz = MB() * C() * nthr_;
-                scratchpad.template book<float>(
-                        key_gnorm_reduction, stats_reduction_buf_sz);
-                if (!is_training()) {
-                    const size_t stats_buf_sz = MB() * C();
-                    scratchpad.template book<float>(
-                            key_gnorm_tmp_mean, stats_buf_sz);
-                    scratchpad.template book<float>(
-                            key_gnorm_tmp_var, stats_buf_sz);
-                }
-            }
-
-            return status::success;
-        }
+        status_t init(engine_t *engine);
 
         int nthr_; // To not exceed the limit in execute used for set up.
     };
@@ -113,12 +59,20 @@ struct jit_uni_group_normalization_fwd_t : public primitive_t {
 
     struct kernel_base_t {
         virtual void operator()(const void *src, void *dst, const float *scale,
-                const float *shift, float *mean, float *var,
+                const float *shift, const float *mean, const float *var,
                 const float *src_scales, const float *dst_scales,
+                const void *post_ops_binary_rhs_arg_vec,
                 const size_t block_size) const = 0;
         static kernel_base_t *create(const group_normalization_pd_t *pd);
         virtual status_t create_kernel() = 0;
         virtual ~kernel_base_t() = default;
+
+    protected:
+        kernel_base_t(const group_normalization_pd_t *pd) : pd_(pd) {}
+
+        // `pd_` is needed to access its members (such as `attr()`) in
+        // `generate()` call.
+        const group_normalization_pd_t *pd_;
     };
 
     struct kernel_stat_base_t {

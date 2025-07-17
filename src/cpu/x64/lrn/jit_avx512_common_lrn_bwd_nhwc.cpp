@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,10 +28,9 @@ using acc_data_t = float;
 template <data_type_t d_type>
 jit_avx512_common_lrn_kernel_bwd_nhwc_t<
         d_type>::jit_avx512_common_lrn_kernel_bwd_nhwc_t(unsigned C,
-        float alpha, float beta, int local_size, void *code_ptr,
-        size_t code_size)
+        float alpha, float beta, int local_size)
     : jit_avx512_common_lrn_kernel_bwd_t<d_type>(
-            alpha, beta, local_size, code_ptr, code_size, jit_name())
+            alpha, beta, local_size, jit_name())
     , tmp_mask_prev_ {[this]() {
         std::vector<int> v(this->local_size_ / 2);
         std::iota(v.begin(), v.end(), this->zdiffsrc_ + 2);
@@ -125,16 +124,20 @@ void jit_avx512_common_lrn_kernel_bwd_nhwc_t<d_type>::load_data_to_stack(
             = tail_proc == tail_mode::NextTail ? this->vlen_ : 0;
     this->load_tail(C_tail, this->diffdst_, tail_src_mem_offset,
             get_stack_offset(this->diffdst_, tail_mode::CurrentTail),
-            this->tmp_load_to_stack_idx_tail_);
+            jit_avx512_common_lrn_kernel_bwd_nhwc_t<
+                    d_type>::tmp_load_to_stack_idx_tail_);
     this->load_tail(C_tail, this->workspace0_, tail_src_mem_offset,
             get_stack_offset(this->workspace0_, tail_mode::CurrentTail),
-            this->tmp_load_to_stack_idx_tail_);
+            jit_avx512_common_lrn_kernel_bwd_nhwc_t<
+                    d_type>::tmp_load_to_stack_idx_tail_);
     this->load_tail(C_tail, this->workspace1_, tail_src_mem_offset,
             get_stack_offset(this->workspace1_, tail_mode::CurrentTail),
-            this->tmp_load_to_stack_idx_tail_);
+            jit_avx512_common_lrn_kernel_bwd_nhwc_t<
+                    d_type>::tmp_load_to_stack_idx_tail_);
     this->load_tail(C_tail, this->src_, tail_src_mem_offset,
             get_stack_offset(this->src_, tail_mode::CurrentTail),
-            this->tmp_load_to_stack_idx_tail_);
+            jit_avx512_common_lrn_kernel_bwd_nhwc_t<
+                    d_type>::tmp_load_to_stack_idx_tail_);
 }
 
 template <data_type_t d_type>
@@ -170,7 +173,7 @@ void jit_avx512_common_lrn_kernel_bwd_nhwc_t<d_type>::execute_compute_loop(
         const int begin_end = C_tail ? 1 : 2;
         int middle_16_c_blocks = num_full_16c_blocks == 1
                 ? 0
-                : num_full_16c_blocks - begin_end;
+                : static_cast<int>(num_full_16c_blocks) - begin_end;
         int LTAIL = 0;
         if (C_tail && middle_16_c_blocks) {
             middle_16_c_blocks -= 1;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Arm Ltd. and affiliates
+* Copyright 2021-2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ struct acl_ip_conf_t {
     bool with_bias;
     // If this is true, the result of the inner product goes into a temporarily
     // allocated ACL tensor to be accumulated into the oneDNN dst during postops
-    bool use_dst_acc;
+    bool use_dst_acc_for_sum;
     arm_compute::TensorInfo src_tensor_info;
     arm_compute::TensorInfo wei_tensor_info;
     arm_compute::TensorInfo bia_tensor_info;
@@ -85,10 +85,6 @@ struct acl_inner_product_fwd_t : public primitive_t {
     struct pd_t : public cpu_inner_product_fwd_pd_t {
         using cpu_inner_product_fwd_pd_t::cpu_inner_product_fwd_pd_t;
 
-        pd_t(const inner_product_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_inner_product_fwd_pd_t(adesc, attr, hint_fwd_pd), aip() {}
-
         DECLARE_COMMON_PD_T("acl", acl_inner_product_fwd_t);
 
         status_t init(engine_t *engine) {
@@ -101,6 +97,9 @@ struct acl_inner_product_fwd_t : public primitive_t {
             const bool is_fp32_ok = expect_data_types(f32, f32, f32, f32, undef)
                     && attr()->has_default_values(
                             smask_t::post_ops | smask_t::fpmath_mode, f32);
+            const bool is_bf16_ok
+                    = expect_data_types(bf16, bf16, bf16, bf16, undef)
+                    && attr()->has_default_values(smask_t::post_ops, bf16);
             const bool is_fp32_bf16_ok
                     = expect_data_types(f32, bf16, f32, f32, undef)
                     && attr()->has_default_values(
@@ -109,8 +108,8 @@ struct acl_inner_product_fwd_t : public primitive_t {
                     = utils::one_of(weights_format_kind_received,
                             format_kind::any, format_kind::blocked);
             const bool ok = is_fwd() && !has_zero_dim_memory()
-                    && utils::one_of(
-                            true, is_fp16_ok, is_fp32_ok, is_fp32_bf16_ok)
+                    && utils::one_of(true, is_fp16_ok, is_fp32_ok,
+                            is_fp32_bf16_ok, is_bf16_ok)
                     && is_weights_md_format_ok
                     && set_default_params(true) == status::success;
 
@@ -118,10 +117,17 @@ struct acl_inner_product_fwd_t : public primitive_t {
 
             CHECK(init_conf_ip(engine, weights_format_kind_received));
 
+            if (aip.use_dst_acc_for_sum) {
+                const memory_desc_wrapper dst_d(&dst_md_);
+                auto scratchpad = scratchpad_registry().registrar();
+                scratchpad.book(memory_tracking::names::key_generic_acc,
+                        dst_d.nelems(), dst_d.data_type_size());
+            }
+
             return status::success;
         }
 
-        acl_ip_conf_t aip;
+        acl_ip_conf_t aip = utils::zero<decltype(aip)>();
 
         acl_post_ops_t post_ops;
 
@@ -185,7 +191,7 @@ struct acl_inner_product_fwd_t : public primitive_t {
 
             CHECK(post_ops.init(engine, attr_.post_ops_, dst_md_,
                     aip.fc_info.activation_info));
-            aip.use_dst_acc = post_ops.has_sum();
+            aip.use_dst_acc_for_sum = post_ops.has_sum();
 
             // WeightFormat::ANY tells ACL we can handle any format
             aip.weights_info = arm_compute::WeightsInfo(false, 1, 1, ic_total,
@@ -250,8 +256,11 @@ struct acl_inner_product_fwd_t : public primitive_t {
 
             // Fallback
             int block_by = arm_compute::block_by(expected_weight_format);
+            bool is_bf16 = src_md()->data_type == data_type::bf16
+                    && weights_md()->data_type == data_type::bf16
+                    && dst_md()->data_type == data_type::bf16;
             if (is_4d && weights_md_.dims[inner_dim] % block_by != 0
-                    && aip.fc_info.enable_fast_math) {
+                    && (aip.fc_info.enable_fast_math || is_bf16)) {
                 aip.fc_info.enable_fast_math = false;
                 aip.weights_info.set_weight_format(
                         arm_compute::WeightFormat::ANY);
@@ -309,8 +318,6 @@ struct acl_inner_product_fwd_t : public primitive_t {
         // Configure the resource based on information from primitive descriptor
         CHECK(r->configure(pd()->aip));
         mapper.add(this, std::move(r));
-
-        CHECK(pd()->post_ops.create_resource(engine, mapper));
 
         return status::success;
     }

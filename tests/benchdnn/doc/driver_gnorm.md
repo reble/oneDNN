@@ -19,13 +19,7 @@ where *gnorm-knobs* are:
             `G` is dnnl_use_global_stats;
             `C` is dnnl_use_scale;
             `H` is dnnl_use_shift;
-            Refer to [group normalization primitive](https://oneapi-src.github.io/oneDNN/dev_guide_group_normalization.html)
-            for details.
- - `--attr-scales=STRING` -- per argument scales primitive attribute. No
-            scales are set by default. Refer to [attributes](knobs_attr.md) for
-            details.
- - `--attr-post-ops=STRING` -- post operation primitive attribute. No post
-            operations are set by default. Refer to [attributes](knobs_attr.md)
+            Refer to [group normalization primitive](https://uxlfoundation.github.io/oneDNN/dev_guide_group_normalization.html)
             for details.
  - `--inplace=BOOL` -- memory mode for the primitive. If `true`, it uses input
             memory as output, otherwise, input and output are separate.
@@ -34,6 +28,7 @@ where *gnorm-knobs* are:
             `REGEX`. By default no pattern is applied (run everything).
             Note: Windows may interpret only string arguments surrounded by
             double quotation marks.
+ - Any attributes options. Refer to [attributes](knobs_attr.md) for details.
 
 and *gnorm-desc* is a problem descriptor. The canonical form is:
 ```

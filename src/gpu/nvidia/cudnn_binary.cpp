@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020-2022 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,12 +16,12 @@
 *******************************************************************************/
 
 #include "gpu/nvidia/cudnn_binary.hpp"
+#include "gpu/nvidia/stream.hpp"
 #include "gpu/nvidia/sycl_cuda_scoped_context.hpp"
-#include "gpu/nvidia/sycl_cuda_stream.hpp"
 #include "gpu/nvidia/sycl_cuda_stream_utils.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
-#include "sycl/sycl_buffer_memory_storage.hpp"
-#include "sycl/sycl_memory_storage_helper.hpp"
+#include "xpu/sycl/buffer_memory_storage.hpp"
+#include "xpu/sycl/memory_storage_helper.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -32,14 +32,14 @@ status_t cudnn_binary_t::execute(const exec_ctx_t &ctx) const {
     if (memory_desc_wrapper(pd()->src_md(0)).has_zero_dim())
         return status::success;
 
-    nvidia::sycl_cuda_stream_t *cuda_stream
-            = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
+    nvidia::stream_t *cuda_stream
+            = utils::downcast<nvidia::stream_t *>(ctx.stream());
 
-    if (!pd()->attr()->scales_.get(DNNL_ARG_SRC_0).defined())
+    if (!pd()->attr()->scales_.has_default_values(DNNL_ARG_SRC_0))
         CHECK(stream_utils::copy_input_arg_to_host(ctx, cuda_stream,
                 &host_scales_[0], DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC_0,
                 sizeof(float)));
-    if (!pd()->attr()->scales_.get(DNNL_ARG_SRC_1).defined())
+    if (!pd()->attr()->scales_.has_default_values(DNNL_ARG_SRC_1))
         CHECK(stream_utils::copy_input_arg_to_host(ctx, cuda_stream,
                 &host_scales_[1], DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC_1,
                 sizeof(float)));
@@ -50,7 +50,7 @@ status_t cudnn_binary_t::execute(const exec_ctx_t &ctx) const {
         auto arg_dst = CTX_OUT_SYCL_MEMORY(DNNL_ARG_DST);
 
         compat::host_task(cgh, [=, this](const compat::interop_handle &ih) {
-            auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
+            auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(
                     cuda_stream->engine());
             auto sc = cuda_sycl_scoped_context_handler_t(sycl_engine);
             auto handle = cuda_stream->get_cudnn_handle();

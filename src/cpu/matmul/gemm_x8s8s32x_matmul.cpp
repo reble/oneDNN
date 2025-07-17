@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -61,17 +61,27 @@ status_t gemm_x8s8s32x_matmul_t::pd_t::init(engine_t *engine) {
 
     auto check_attr_scales = [&]() -> bool {
         bool ok = attr_scales_ok();
-        if (!attr()->scales_.get(DNNL_ARG_SRC).has_default_values()
-                && !attr()->scales_.get(DNNL_ARG_WEIGHTS).has_default_values()
-                && attr()->scales_.get(DNNL_ARG_WEIGHTS).mask_ != 0) {
+        if (!attr()->scales_.has_default_values(DNNL_ARG_SRC)
+                && !attr()->scales_.has_default_values(DNNL_ARG_WEIGHTS)
+                && attr()->scales_.get_mask(DNNL_ARG_WEIGHTS) > 0) {
             // This case requires scratchpad with unknown size
             if (N() == DNNL_RUNTIME_DIM_VAL) ok = false;
         }
         return ok;
     };
 
-    auto check_attr_zero_points
-            = [&]() -> bool { return attr()->zero_points_.common(); };
+    auto check_attr_zero_points = [&]() -> bool {
+        const auto &zp = attr()->zero_points_;
+        static const std::vector<int> supported_args {
+                DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST};
+        for (int arg : supported_args) {
+            if (!zp.has_default_values(arg)) {
+                const int mask = zp.get_mask(arg);
+                if (mask > 0) return false;
+            }
+        }
+        return true;
+    };
 
     auto check_attr_post_ops = [&]() -> bool {
         using namespace primitive_kind;
@@ -117,9 +127,8 @@ status_t gemm_x8s8s32x_matmul_t::pd_t::init(engine_t *engine) {
     VDISPATCH_MATMUL(check_attr_scales(), VERBOSE_UNSUPPORTED_SCALES_CFG);
     VDISPATCH_MATMUL(check_attr_zero_points(), VERBOSE_UNSUPPORTED_ATTR);
     VDISPATCH_MATMUL(
-            attr()->has_default_values(
-                    primitive_attr_t::skip_mask_t::scales_runtime
-                            | primitive_attr_t::skip_mask_t::zero_points_runtime
+            attr()->has_default_values(primitive_attr_t::skip_mask_t::scales
+                            | primitive_attr_t::skip_mask_t::zero_points
                             | primitive_attr_t::skip_mask_t::post_ops
                             | primitive_attr_t::skip_mask_t::sum_dt,
                     dst_md()->data_type),
@@ -203,8 +212,10 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
     auto &scratchpad = ctx.get_scratchpad_grantor();
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float *scales = precompute_scales(scratchpad, src_scales, wei_scales,
-            dst_d.dims()[ndims - 1], pd()->attr());
+            src_d.dims()[ndims - 1], dst_d.dims()[ndims - 1], false,
+            wei_scale_mask > 0, pd()->attr());
 
     DEFINE_ZERO_POINT_VALUE(src_zero_point, DNNL_ARG_SRC);
     DEFINE_ZERO_POINT_VALUE(weights_zero_point, DNNL_ARG_WEIGHTS);
@@ -242,7 +253,9 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
     const char transB = helper.transB();
     const dim_t lda = helper.lda();
     const dim_t ldb = helper.ldb();
-    const dim_t ldc = helper.ldc();
+    const dim_t ldc = dst_d.ndims() == 2 && dst_d.count_non_unit_dims(1)
+            ? N
+            : helper.ldc();
     const int ldx_dim_idx = pd()->ndims() - 2;
     const dim_t *src_strides = &src_d.blocking_desc().strides[ldx_dim_idx];
     const dim_t *weights_strides
@@ -252,7 +265,8 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
     const gemm_based::params_t &params = pd()->params();
     const bool use_single_gemm_call = pd()->has_runtime_dims_or_strides()
             ? helper.use_single_gemm_call_optimization(po)
-            : params.use_single_gemm_call_optimization_;
+            : ((platform::is_ppc64() && ndims == 2)
+                    || params.use_single_gemm_call_optimization_);
     bool dst_is_acc = params.dst_is_acc_;
     int32_t *acc = dst_is_acc
             ? reinterpret_cast<int32_t *>(dst)
@@ -273,10 +287,11 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
     const float beta = params.gemm_beta_;
     const dim_t acc_ldc = dst_is_acc ? ldc : N;
     const int scale_idx_mult
-            = this->pd()->attr()->scales_.get(DNNL_ARG_WEIGHTS).mask_
+            = this->pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS)
             == (1 << (ndims - 1));
 
     std::atomic<status_t> st(status::success);
+
     if (!use_single_gemm_call) {
         const int src_mask
                 = utils::get_dims_mask(dst_d.dims(), src_d.dims(), ndims);
@@ -294,11 +309,7 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
         bool postops_in_matmul = need_post_processing(pd(), dst_zero_point_f32);
         assert(IMPLICATION(postops_in_matmul, params.has_pp_kernel_));
 
-#ifdef GCC_WA_LAMBDA_C_CAST
-        parallel(nthr, [= WA_THIS_COPY_CAPTURE, &st](int ithr, int nthr) {
-#else
         parallel(nthr, [&](int ithr, int nthr) {
-#endif
             size_t t_work_start {0}, t_work_end {0};
             balance211(work_amount, nthr, ithr, t_work_start, t_work_end);
 
@@ -366,7 +377,7 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
                     case data_type::s8: {
                         const int8_t *curr_src_ptr
                                 = reinterpret_cast<const int8_t *>(curr_src);
-                        st_thr = gemm_s8x8s32(&transB, &transA, "F", &gemm_N,
+                        st_thr = gemm_s8s8s32(&transB, &transA, "F", &gemm_N,
                                 &gemm_M, &K, &alpha, curr_weights, &ldb,
                                 &gemm_off_b, curr_src_ptr, &lda,
                                 &gemm_off_a_int8, &beta, curr_acc, &acc_ldc,
@@ -392,7 +403,7 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
                     case data_type::u8: {
                         const uint8_t *curr_src_ptr
                                 = reinterpret_cast<const uint8_t *>(curr_src);
-                        st_thr = gemm_s8x8s32(&transB, &transA, "F", &gemm_N,
+                        st_thr = gemm_s8u8s32(&transB, &transA, "F", &gemm_N,
                                 &gemm_M, &K, &alpha, curr_weights, &ldb,
                                 &gemm_off_b, curr_src_ptr, &lda,
                                 &gemm_off_a_uint8, &beta, curr_acc, &acc_ldc,
@@ -452,13 +463,13 @@ status_t gemm_x8s8s32x_matmul_t::execute_ref(const exec_ctx_t &ctx) const {
         switch (src_d.data_type()) {
             case data_type::s8: {
                 const int8_t *src_ = reinterpret_cast<const int8_t *>(src);
-                st = gemm_s8x8s32(&transB, &transA, "F", &N, &M, &K, &alpha,
+                st = gemm_s8s8s32(&transB, &transA, "F", &N, &M, &K, &alpha,
                         weights, &ldb, &gemm_off_b, src_, &lda,
                         &gemm_off_a_int8, &beta, acc, &acc_ldc, &gemm_off_c);
             } break;
             case data_type::u8: {
                 const uint8_t *src_ = reinterpret_cast<const uint8_t *>(src);
-                st = gemm_s8x8s32(&transB, &transA, "F", &N, &M, &K, &alpha,
+                st = gemm_s8u8s32(&transB, &transA, "F", &N, &M, &K, &alpha,
                         weights, &ldb, &gemm_off_b, src_, &lda,
                         &gemm_off_a_uint8, &beta, acc, &acc_ldc, &gemm_off_c);
             } break;

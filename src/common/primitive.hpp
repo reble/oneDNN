@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 #include "c_types_map.hpp"
 #include "cache_blob.hpp"
+#include "cache_hit_types.hpp"
 #include "memory_storage.hpp"
 #include "memory_tracking.hpp"
 #include "primitive_desc.hpp"
@@ -45,7 +46,7 @@ struct primitive_t : public c_compatible {
     primitive_t(const primitive_desc_t *pd) : pd_(pd->clone()) {}
     virtual ~primitive_t() = default;
 
-    virtual status_t init(engine_t *engine) { return status::success; }
+    virtual status_t init(impl::engine_t *engine) { return status::success; }
 
     status_t init(engine_t *engine, bool use_global_scratchpad,
             const cache_blob_t &cache_blob) {
@@ -73,19 +74,22 @@ struct primitive_t : public c_compatible {
     }
 
     virtual status_t create_resource(
-            engine_t *engine, resource_mapper_t &mapper) const {
+            impl::engine_t *engine, resource_mapper_t &mapper) const {
         return status::success;
     }
 
     bool use_global_scratchpad() const { return use_global_scratchpad_; }
     cache_blob_t cache_blob() const { return cache_blob_; }
+    cache_state_t creation_cache_state() const {
+        return creation_cached_state_;
+    }
 
 protected:
     template <typename impl_type, typename pd_t>
     static status_t create_primitive_common(
-            std::pair<std::shared_ptr<primitive_t>, bool> &primitive,
+            std::pair<std::shared_ptr<primitive_t>, cache_state_t> &primitive,
             const pd_t *pd, engine_t *engine, bool use_global_scratchpad,
-            const cache_blob_t &cache_blob) {
+            const cache_blob_t &cache_blob, bool force_create_from_blob) {
 
         auto global_primitive_cache = primitive_cache();
         primitive_hashing::key_t key(pd, engine);
@@ -95,28 +99,33 @@ protected:
             const pd_t *pd;
             const cache_blob_t &cache_blob;
             bool use_global_scratchpad;
-            bool is_create_called;
+            cache_state_t cache_status;
         };
+
         create_context_t context {
-                engine, pd, cache_blob, use_global_scratchpad, false};
+                // default to primitive_cache_hit, create() will flag partial/complete cache miss
+                engine, pd, cache_blob, use_global_scratchpad,
+                force_create_from_blob ? cache_state_t::persistent_hit
+                                       : cache_state_t::primitive_hit};
 
         primitive_cache_iface_t::create_func_ptr_t create = [](void *context) {
             auto &c = *static_cast<create_context_t *>(context);
             std::shared_ptr<primitive_t> p = std::make_shared<impl_type>(c.pd);
             status_t status
                     = p->init(c.engine, c.use_global_scratchpad, c.cache_blob);
-            c.is_create_called = true;
+            c.cache_status = p->creation_cache_state();
             return primitive_cache_iface_t::result_t {std::move(p), status};
         };
-        auto result
-                = global_primitive_cache.get_or_create(key, *create, &context);
-        primitive = {std::move(result.value), !context.is_create_called};
+        auto result = global_primitive_cache.get_or_create(
+                key, *create, &context, force_create_from_blob);
+        primitive = {std::move(result.value), context.cache_status};
         return result.status;
     }
 
     std::shared_ptr<primitive_desc_t> pd_;
     bool use_global_scratchpad_ = false;
     cache_blob_t cache_blob_;
+    cache_state_t creation_cached_state_ = cache_state_t::miss;
 
 private:
     primitive_t() = delete;
@@ -142,25 +151,25 @@ private:
 } // namespace impl
 } // namespace dnnl
 
-#define ARG_TYPE(t) \
-    typename std::remove_cv<typename std::remove_pointer<t>::type>::type
+#define ARG_PTR_TYPE(t) \
+    typename std::remove_cv<typename std::remove_pointer<t>::type>::type *
 
 // Returns destination memory which has been zero pad initialized. This macro
 // may result in a failure returned via the `status` input since zero pad
 // may fail.
 #define CTX_OUT_CLEAN_MEM(type, arg, status) \
-    static_cast<ARG_TYPE(type) *>(ctx.host_ptr(arg, true, &status))
+    static_cast<ARG_PTR_TYPE(type)>(ctx.host_ptr(arg, true, &(status)))
 
 // Returns destination memory which may not have been zero pad initialized.
 #define CTX_OUT_MEM_COMMON(type, arg, index) \
-    static_cast<ARG_TYPE(type) *>(ctx.host_ptr(arg, false, nullptr, index))
+    static_cast<ARG_PTR_TYPE(type)>(ctx.host_ptr(arg, false, nullptr, index))
 #define CTX_OUT_MEm(type, arg) CTX_OUT_MEM_COMMON(type, arg, 0)
 #define CTX_OUT_MEm0(type, arg) CTX_OUT_MEM_COMMON(type, arg, 0)
 #define CTX_OUT_MEm1(type, arg) CTX_OUT_MEM_COMMON(type, arg, 1)
 #define CTX_OUT_MEm2(type, arg) CTX_OUT_MEM_COMMON(type, arg, 2)
 
 #define CTX_IN_MEM_COMMON(type, arg, index) \
-    static_cast<const ARG_TYPE(type) *>( \
+    static_cast<const ARG_PTR_TYPE(type)>( \
             ctx.host_ptr(arg, false, nullptr, index))
 #define CTX_IN_MEm(type, arg) CTX_IN_MEM_COMMON(type, arg, 0)
 #define CTX_IN_MEm0(type, arg) CTX_IN_MEM_COMMON(type, arg, 0)

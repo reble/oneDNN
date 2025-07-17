@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2024 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,9 +21,11 @@
 #include <vector>
 #include <unordered_map>
 
+#include "allocator.hpp"
 #include "dnnl_common.hpp"
 #include "graph.hpp"
 #include "ref_partition.hpp"
+#include "utils/stream_kind.hpp"
 
 namespace {
 
@@ -32,7 +34,7 @@ namespace {
 /// @param partitions a list of partitions
 /// @param id_to_set_any_layout a set of ids of logical tensors with any layout
 ///     type
-void set_any_layout(const graph::deserialized_graph &dg,
+void set_any_layout(const graph::deserialized_graph_t &dg,
         const std::vector<dnnl::graph::partition> &partitions,
         std::unordered_set<size_t> &id_to_set_any_layout) {
     // mapping from output tensor id to the all supported flags of
@@ -174,7 +176,7 @@ void record_queried_logical_tensors(
 /// @param alt a deserialized logical tensor to be updated
 /// @param is_input a boolean flag to indicate to search input or output lts
 int find_logical_tensor(size_t lt_id, const graph::op_ref_list_t &ops,
-        graph::deserialized_op &aop, graph::deserialized_lt &alt,
+        graph::deserialized_op_t &aop, graph::deserialized_lt_t &alt,
         const bool is_input) {
 
     for (const auto &op : ops) {
@@ -200,6 +202,10 @@ int find_logical_tensor(size_t lt_id, const graph::op_ref_list_t &ops,
 int map_unmap_partition_mem(graph::partition_mem_map_t &partition_mem_map,
         const std::vector<dnnl::graph::logical_tensor> &lts,
         const int &map_flag, res_t *res) {
+
+    // Not map or unmap the reference primitive memories for `no_ref_memory`
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
+
     // In case one logical tensor is used for multiple inputs, record the
     // processed logical tensor ids to avoid duplicate processing
     std::unordered_set<size_t> processed_ids;
@@ -242,8 +248,8 @@ int make_input_tensors(std::vector<dnnl::graph::tensor> &input_ts,
         // find the op id of the input logical tensor
         const auto &in = ins[idx];
         const auto &lt_id = in.get_id();
-        graph::deserialized_lt lt;
-        graph::deserialized_op op;
+        graph::deserialized_lt_t lt;
+        graph::deserialized_op_t op;
         if (find_logical_tensor(lt_id, ops, op, lt, true) != OK) {
             BENCHDNN_PRINT(0,
                     "FAIL: Cannot find logical tensor with id %zu! \n", lt_id);
@@ -251,7 +257,6 @@ int make_input_tensors(std::vector<dnnl::graph::tensor> &input_ts,
         }
 
         // generate tensor for graph path
-
         const auto iter = partition_mem_map.find(lt_id);
         if (iter != partition_mem_map.end()) {
             const auto &graph_mem = iter->second;
@@ -282,8 +287,8 @@ int make_output_tensors(std::vector<dnnl::graph::tensor> &output_ts,
         // find the op id of the output logical tensor
         const auto &out = outs[idx];
         const auto &lt_id = out.get_id();
-        graph::deserialized_op op;
-        graph::deserialized_lt lt;
+        graph::deserialized_op_t op;
+        graph::deserialized_lt_t lt;
         if (find_logical_tensor(lt_id, ops, op, lt, false) != OK) {
             BENCHDNN_PRINT(0,
                     "FAIL: Cannot find logical tensor with id %zu! \n", lt_id);
@@ -340,11 +345,40 @@ using namespace dnnl::graph;
 
 std::string case_to_str(const std::string &json_file,
         const std::map<size_t, std::string> &in_shapes,
-        const std::map<size_t, std::string> &op_attrs, const int64_t mb) {
-    std::stringstream s;
+        const std::map<size_t, std::string> &op_attrs,
+        const graph_fpmath_mode_t &fpmath_mode,
+        const size_t expected_n_partitions, const int64_t mb,
+        const dnnl_data_type_t dt,
+        const std::map<size_t, dnnl_data_type_t> &dt_map,
+        const std::map<size_t, std::string> &op_kind_map) {
+    dnnl::impl::stringstream_t s;
     dump_global_params(s);
 
     if (mb != 0) { s << "--mb=" << mb << " "; }
+
+    if (dt != dnnl_data_type_undef) { s << "--dt=" << dt << " "; }
+
+    const bool skip_dts = dt_map.empty()
+            || (dt_map.size() == 1 && dt_map.count(SIZE_MAX) == 1);
+    if (!skip_dts) {
+        s << "--dt=";
+        std::string tmp;
+        for (const auto &v : dt_map) {
+            tmp += (std::to_string(v.first) + ":" + dt2str(v.second) + "+");
+        }
+        s << tmp.substr(0, tmp.length() - 1) << " ";
+    }
+
+    if (!(op_kind_map.size() == 1 && op_kind_map.count(SIZE_MAX) == 1
+                && op_kind_map.at(SIZE_MAX) == "default")) {
+        s << "--op-kind=";
+        std::string tmp;
+        for (const auto &v : op_kind_map) {
+            tmp += (std::to_string(v.first) + ":" + v.second + "+");
+        }
+        // Remove dangling '+'.
+        s << tmp.substr(0, tmp.size() - 1) << " ";
+    }
 
     if (!(in_shapes.size() == 1 && in_shapes.count(0)
                 && in_shapes.at(0) == "default")) {
@@ -369,18 +403,31 @@ std::string case_to_str(const std::string &json_file,
         s << " ";
     }
 
+    if (fpmath_mode.override_json_value_) {
+        s << "--attr-fpmath=" << fpmath_mode.mode_.c_str();
+        if (fpmath_mode.apply_to_int_) { s << ":true"; }
+        s << " ";
+    }
+
+    if (expected_n_partitions != 1) {
+        s << "--expected-n-partitions=" << std::to_string(expected_n_partitions)
+          << " ";
+    }
+
     s << "--case=" << json_file;
     return s.str();
 }
 
-void skip_unimplemented_ops(const dnnl::graph::partition &partition,
-        const deserialized_graph &dg, res_t *res) {
+int skip_unimplemented_ops(const dnnl::graph::partition &partition,
+        const deserialized_graph_t &dg, res_t *res) {
     // A list of ops that don't have DNNL backend support so far.
-    static const std::vector<std::string> unimplemented_ops {
-            "Pow", "Select", "StaticReshape", "StaticTranspose"};
-
+    static const std::vector<std::string> unimplemented_ops {"Pow"};
+    // A list of ops that don't have DNNL backend support so far on GPU.
+    static const std::vector<std::string> unimplemented_ops_gpu {};
+    const auto &eng = get_graph_engine();
+    bool is_gpu = eng.get_kind() == dnnl::engine::kind::gpu;
     // For an unsupported partition, retrieve all operation IDs, find a
-    // correspondent operation kind in a deserialized_graph and match it against
+    // correspondent operation kind in a deserialized_graph_t and match it against
     // a list of known unsupported ops.
     const std::vector<size_t> &partition_op_ids = partition.get_ops();
     for (const size_t op_id : partition_op_ids) {
@@ -391,59 +438,49 @@ void skip_unimplemented_ops(const dnnl::graph::partition &partition,
                     return dg_op_kind == kind;
                 });
         if (has_unimplemented_op) {
+            BENCHDNN_PRINT(
+                    2, "[INFO]: Unimplemented op: %s.\n", dg_op_kind.c_str());
             res->state = SKIPPED;
-            res->reason = CASE_NOT_SUPPORTED;
-            return;
+            res->reason = skip_reason::case_not_supported;
+            return OK;
+        }
+
+        if (is_gpu) {
+            const bool has_unimplemented_op_gpu = std::any_of(
+                    unimplemented_ops_gpu.begin(), unimplemented_ops_gpu.end(),
+                    [&dg_op_kind](const std::string &kind) {
+                        return dg_op_kind == kind;
+                    });
+            if (has_unimplemented_op_gpu) {
+                BENCHDNN_PRINT(2, "[INFO]: Unimplemented op on GPU: %s.\n",
+                        dg_op_kind.c_str());
+                res->state = SKIPPED;
+                res->reason = skip_reason::case_not_supported;
+                return OK;
+            }
         }
     }
+    return OK;
 }
 
-/// @brief check if the current partition is actually an End op
-/// @param parti the current partition
-/// @param end_op_ids a collection of End op's ids
-/// @return return true, when current partition is an End op
-bool is_single_end_op_partition(const dnnl::graph::partition &parti,
-        const std::vector<size_t> &end_op_ids) {
-    const auto parti_op_ids = parti.get_ops();
-    if (!end_op_ids.empty() && parti_op_ids.size() == 1
-            && std::count(end_op_ids.begin(), end_op_ids.end(),
-                    parti_op_ids.front())) {
-        return true;
-    }
-    return false;
-}
-
-int doit(const prb_t *prb, res_t *res) {
-    if (bench_mode == bench_mode_t::list) return res->state = LISTED, OK;
-
-    skip_start(res);
-    if (res->state == SKIPPED) return OK;
-
-    const auto &dg = prb->dg;
-    const auto graph_in_ports = dg.get_input_ports();
-    auto ograph = dg.to_graph(prb->fpmath_mode);
-    DNN_GRAPH_SAFE(ograph.finalize(), WARN, res);
-    const auto partitions = ograph.get_partitions();
-    // a collection of End op's id in this graph
-    std::vector<size_t> end_opid_v {};
-    for (const auto &aop : dg.ops_) {
-        if (aop.kind_ == "End") { end_opid_v.emplace_back(aop.id_); }
-    }
+int skip_unimplemented_partitions(const std::vector<partition> &partitions,
+        const deserialized_graph_t &dg, const prb_t *prb, res_t *res) {
 
     if (partitions.empty()) {
         BENCHDNN_PRINT(0, "%s\n", "Error: partitions are empty");
-        return res->state = FAILED, FAIL;
+        SAFE(FAIL, WARN);
     }
 
     BENCHDNN_PRINT(3, "[INFO]: n_partitions:%zd; ops_in_partitions:%s\n",
             partitions.size(), verbose_partitions_n_ops(partitions).c_str());
 
-    for (size_t i = 0; i < partitions.size(); ++i) {
-        if (partitions[i].is_supported()) continue;
+    const bool partition_num_mismatch = (prb->expected_n_partition > 0
+            && partitions.size() != prb->expected_n_partition);
 
-        // End operation is not supported in the library, and it's fine to
-        // continue validation as it's a knob without functional meaning.
-        if (is_single_end_op_partition(partitions[i], end_opid_v)) continue;
+    for (size_t i = 0; i < partitions.size(); ++i) {
+        // If the partition number mismatches the requirement, check whether
+        // there are unsupported data types.
+        if (partitions[i].is_supported() && !partition_num_mismatch) continue;
 
         skip_unimplemented_ops(partitions[i], dg, res);
         if (res->state == SKIPPED) return OK;
@@ -466,6 +503,11 @@ int doit(const prb_t *prb, res_t *res) {
                 case logical_tensor::data_type::f8_e4m3:
                     in_out_dt.emplace_back(dnnl_f8_e4m3);
                     break;
+                case logical_tensor::data_type::s4:
+                    in_out_dt.emplace_back(dnnl_s4);
+                    break;
+                case logical_tensor::data_type::u4:
+                    in_out_dt.emplace_back(dnnl_u4);
                 default: break;
             }
         }
@@ -486,18 +528,49 @@ int doit(const prb_t *prb, res_t *res) {
                 }
             }
         }
+        if (in_out_dt.empty()) continue;
         skip_unimplemented_data_type(in_out_dt, dir, res);
         if (res->state == SKIPPED) return OK;
 
         BENCHDNN_PRINT(3, "[INFO]: partition #%zd is unsupported!\n", i);
-        res->state = UNIMPLEMENTED;
-        return FAIL;
+        return res->state = UNIMPLEMENTED, FAIL;
     }
 
-    if (res->state == SKIPPED || res->state == UNIMPLEMENTED) return OK;
+    if (partition_num_mismatch) {
+        BENCHDNN_PRINT(0,
+                "Error: the expected number of partitions (%zu) doesn't "
+                "coincide with the actual number of partitions returned "
+                "(%zu).\n ",
+                prb->expected_n_partition, partitions.size());
+        SAFE(FAIL, WARN);
+    }
+    return OK;
+}
+
+int doit(const prb_t *prb, res_t *res) {
+    if (bench_mode == bench_mode_t::list) return res->state = LISTED, OK;
+
+    skip_start(res);
+    if (res->state == SKIPPED) return OK;
+
+    const auto &dg = prb->dg;
+    const auto &graph_in_ports = dg.get_input_ports();
+    auto ograph = dg.to_graph(prb->fpmath_mode);
+    DNN_GRAPH_SAFE(ograph.finalize(), WARN, res);
+
+    const auto &partitions = ograph.get_partitions();
+    SAFE(skip_unimplemented_partitions(partitions, dg, prb, res), WARN);
+    if (res->state == SKIPPED) return OK;
 
     const auto &eng = get_graph_engine();
-    cpp_stream_t strm {eng};
+    const dnnl::engine &dnnl_eng = static_cast<const dnnl::engine>(eng);
+
+    const bool use_profiling = has_bench_mode_bit(mode_bit_t::perf)
+            && is_gpu(dnnl_eng.get()) && !is_nvidia_gpu(dnnl_eng.get())
+            && !is_amd_gpu(dnnl_eng.get());
+    dnnl_stream_flags_t flags
+            = stream_kind2stream_flags(stream_kind, use_profiling);
+    cpp_stream_t strm {eng, static_cast<dnnl::stream::flags>(flags)};
 
     // mark the output logical tensors of partition as ANY layout enabled
     std::unordered_set<size_t> id_to_set_any_layout;
@@ -522,8 +595,6 @@ int doit(const prb_t *prb, res_t *res) {
     }
 
     for (size_t i = 0; i < partitions.size(); ++i) {
-        if (is_single_end_op_partition(partitions[i], end_opid_v)) { continue; }
-
         auto inputs = partitions[i].get_input_ports();
         auto outputs = partitions[i].get_output_ports();
 
@@ -550,11 +621,6 @@ int doit(const prb_t *prb, res_t *res) {
     // of `partitions` were skipped expectedly and not compiled.
     size_t idx_offset = 0;
     for (size_t i = 0; i < partitions.size(); ++i) {
-        if (is_single_end_op_partition(partitions[i], end_opid_v)) {
-            idx_offset += 1;
-            continue;
-        }
-
         auto inputs = partitions[i].get_input_ports();
         auto outputs = partitions[i].get_output_ports();
         // replace input logical tensor with the queried one
@@ -565,10 +631,13 @@ int doit(const prb_t *prb, res_t *res) {
         std::vector<dnnl::graph::tensor> output_ts(outputs.size());
 
         ref_partition_t ref_partition(dg, partitions[i], inputs, outputs);
+
         // Construct memory for both perf & corr modes
-        SAFE(ref_partition.init_ref(
-                     graph_in_ports, partition_mem_map_v[i], res),
-                WARN);
+        SAFE(ref_partition.init_ref(graph_in_ports, res), WARN);
+        if (res->state == SKIPPED) return OK;
+
+        SAFE(ref_partition.init_graph_mem(partition_mem_map_v[i], res), WARN);
+        if (res->state == SKIPPED) return OK;
 
         if (has_bench_mode_bit(mode_bit_t::corr)) {
             // correctness mode, run ref partition
@@ -584,15 +653,12 @@ int doit(const prb_t *prb, res_t *res) {
         }
 
         // unmap memory from host to device
-        map_unmap_partition_mem(partition_mem_map_v[i], inputs, UNMAP, res);
-        map_unmap_partition_mem(partition_mem_map_v[i], outputs, UNMAP, res);
-        if (res->state == FAIL) {
-            BENCHDNN_PRINT(0,
-                    "FAIL: Fail to unmap memories to host for partition "
-                    "%zu.\n",
-                    i);
-            return FAIL;
-        }
+        SAFE(map_unmap_partition_mem(
+                     partition_mem_map_v[i], inputs, UNMAP, res),
+                WARN);
+        SAFE(map_unmap_partition_mem(
+                     partition_mem_map_v[i], outputs, UNMAP, res),
+                WARN);
 
         const op_ref_list_t &op_list = ref_partition.get_partition_ops();
         const auto &inplace_ports
@@ -615,18 +681,31 @@ int doit(const prb_t *prb, res_t *res) {
                     i);
             return res->state = FAILED, FAIL;
         }
-
         if (res->state == SKIPPED || res->state == UNIMPLEMENTED) return OK;
 
         input_ts_all.emplace_back(input_ts);
         output_ts_all.emplace_back(output_ts);
 
-        c_partitions[i - idx_offset].execute(strm, input_ts, output_ts);
-        strm.wait();
+        auto &graph_mem_mgr = graph_mem_manager_t::get_instance();
+        graph_mem_mgr.start_graph_mem_check();
+        BENCHDNN_PRINT(3, "[INFO]: Start execution of partition #%zd.\n", i);
+        // Need following clean-up steps as the memories have been mappped to
+        // device. Otherwise the deconstruction will fail.
+        DNN_GRAPH_SAFE(
+                c_partitions[i - idx_offset].execute(strm, input_ts, output_ts),
+                (WARN | NEED_CLEANUP), res);
+        DNN_GRAPH_SAFE(strm.wait(), WARN, res);
+        graph_mem_mgr.stop_graph_mem_check();
 
         // map memory from device back to host
-        map_unmap_partition_mem(partition_mem_map_v[i], inputs, MAP, res);
-        map_unmap_partition_mem(partition_mem_map_v[i], outputs, MAP, res);
+        SAFE(map_unmap_partition_mem(partition_mem_map_v[i], inputs, MAP, res),
+                WARN);
+        SAFE(map_unmap_partition_mem(partition_mem_map_v[i], outputs, MAP, res),
+                WARN);
+
+        // If the device is out-of-memory due to graph path execution, skip the
+        // case.
+        if (res->state == SKIPPED) return OK;
         if (res->state == FAIL) {
             BENCHDNN_PRINT(0,
                     "FAIL: Fail to map memories back to host for partition "
@@ -634,7 +713,6 @@ int doit(const prb_t *prb, res_t *res) {
                     i);
             return FAIL;
         }
-
         res->state = EXECUTED;
 
         if (has_bench_mode_bit(mode_bit_t::corr)) {
@@ -643,6 +721,15 @@ int doit(const prb_t *prb, res_t *res) {
                          partition_mem_map_v[i], res),
                     WARN);
         }
+
+        auto &graph_mem_req = graph_memory_req_args_t::get_instance();
+        // release the memory assigned for the reference path of the partition,
+        // while the memory for the graph path needs to be kept for the
+        // performance mode if needed.
+        graph_mem_req.reset_path(REF);
+        if (!has_bench_mode_bit(mode_bit_t::perf)) {
+            graph_mem_req.reset_path(GRAPH_USER);
+        }
     }
 
     if (has_bench_mode_bit(mode_bit_t::perf)) {
@@ -650,6 +737,7 @@ int doit(const prb_t *prb, res_t *res) {
                      input_ts_all, output_ts_all, res),
                 WARN);
     }
+
     return OK;
 }
 } // namespace graph

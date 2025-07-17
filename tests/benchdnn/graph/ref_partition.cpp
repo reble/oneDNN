@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,53 +17,32 @@
 #include "ref_partition.hpp"
 #include "cpu/platform.hpp"
 #include "dnnl_common.hpp"
+
 #include "utils/compare.hpp"
 
 namespace graph {
 
-class driver_hash_t {
-public:
-    std::size_t operator()(const dnnl_driver_t dnnl_driver) const {
-        return std::hash<int>()(static_cast<int>(dnnl_driver));
+namespace {
+
+void check_memory_fit(
+        bool fits_ram, size_t mem_req, size_t mem_limit, res_t *res) {
+    if (!fits_ram) {
+        BENCHDNN_PRINT(2,
+                "[CHECK_MEM]: Not enough %s RAM for a problem. Allocation of "
+                "size %g GB doesn't fit allocation limit of %g GB. \n",
+                (is_cpu() ? "CPU" : "GPU"), GB(mem_req), GB(mem_limit));
+        res->state = SKIPPED;
+        res->reason = skip_reason::not_enough_ram;
     }
-};
-
-// ops support bf16 in f32 out.
-const std::unordered_set<dnnl_driver_t, driver_hash_t> &
-valid_driver_in_bf16_mixed_dt() {
-    static const std::unordered_set<dnnl_driver_t, driver_hash_t> set = {
-            dnnl_driver_t::reorder,
-            dnnl_driver_t::binary,
-            dnnl_driver_t::conv,
-            dnnl_driver_t::deconv,
-            dnnl_driver_t::matmul,
-            dnnl_driver_t::resampling,
-            dnnl_driver_t::reduction,
-    };
-    return set;
 }
 
-// ops support f32 in bf16 out rewrite.
-const std::unordered_set<dnnl_driver_t, driver_hash_t> &
-valid_driver_out_bf16_mixed_dt() {
-    static const std::unordered_set<dnnl_driver_t, driver_hash_t> set {
-            dnnl_driver_t::reorder,
-            dnnl_driver_t::binary,
-            dnnl_driver_t::resampling,
-            dnnl_driver_t::reduction,
-            dnnl_driver_t::softmax,
-            dnnl_driver_t::bnorm,
-            dnnl_driver_t::eltwise,
-            dnnl_driver_t::lnorm,
-    };
-    return set;
-}
+} // namespace
 
-ref_partition_t::ref_partition_t(const deserialized_graph &dg,
+ref_partition_t::ref_partition_t(const deserialized_graph_t &dg,
         const dnnl::graph::partition &par,
         const std::vector<dnnl::graph::logical_tensor> &ins,
         const std::vector<dnnl::graph::logical_tensor> &outs)
-    : data_displacer(dg, par) {
+    : dg_(&dg), data_displacer(dg, par) {
     const auto &op_ids = par.get_ops();
     const std::unordered_set<size_t> op_ids_set(op_ids.begin(), op_ids.end());
 
@@ -91,10 +70,13 @@ ref_partition_t::ref_partition_t(const deserialized_graph &dg,
     }
 };
 
-int ref_partition_t::init_ref(const std::vector<size_t> &graph_in_ports,
-        partition_mem_map_t &partition_mem_map, res_t *res) {
-    handle_typecast_x16();
-    handle_special_case_bf16(res);
+int ref_partition_t::init_ref(
+        const std::vector<size_t> &graph_in_ports, res_t *res) {
+
+    // Not create reference primitives and filling data with pre-designed
+    // strategies if reference memories are not required.
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
+
     for (const auto &par_op_ref : partition_ops_ref_) {
         // res should be independent from op to op
         res->state = UNTESTED;
@@ -102,9 +84,35 @@ int ref_partition_t::init_ref(const std::vector<size_t> &graph_in_ports,
         auto ref_prim = ::std::make_shared<ref_primitive_t>(par_op_ref.get());
 
         ref_prims_.emplace(par_op_ref.get().id_, ref_prim);
-        SAFE(ref_prim->init_prb(bf16_to_f32_rewrite_lt_id_, res), WARN);
+        SAFE(ref_prim->init_prb(res), WARN);
 
         SAFE_V(ref_prim->init_prim(::get_test_engine(), res));
+
+        // Softmax with stats is a special case, where primitive creation
+        // is failed and returns SKIPPED state, but it still can be executed
+        // with a reference primitive later. So in this case we ignore the
+        // SKIPPED state and continue the rest part.
+        // TODO: try to make a general logic when to reset the state.
+        bool reuse_driver_for_ref_compute = (par_op_ref.get().kind_ == "SoftMax"
+                && par_op_ref.get().out_lts_.size() == 2);
+        if (reuse_driver_for_ref_compute && res->state == SKIPPED) {
+            // reset res to avoid a skipped state from init_prim() to affect the rest part.
+            res->state = UNTESTED;
+            res->reason.clear();
+        }
+
+        // Check whether the op has any output logical tensor that is the
+        // output of the partition. If so, the driver need to allocate memory
+        // for correctness check.
+        const auto &check_mem_sizes_args = res->mem_size_args;
+        const auto is_output = is_output_op(par_op_ref.get());
+        SAFE_V(check_partition_total_size(
+                check_mem_sizes_args, is_output, res));
+        if (res->state == SKIPPED) return OK;
+
+        SAFE_V(check_partition_total_size(par_op_ref.get(), res));
+        if (res->state == SKIPPED) return OK;
+
         ref_prim->init_memory_args(::get_test_engine());
         SAFE_V(ref_prim->init_ref_memory_args(::get_test_engine(), res));
 
@@ -129,6 +137,11 @@ int ref_partition_t::init_ref(const std::vector<size_t> &graph_in_ports,
             }
         }
 
+        // Displace the data generated by the driver filling functions with
+        // values supplied from the dg object. Otherwise, the values for
+        // reference would diverge from the values passed to the Graph API.
+        SAFE(ref_prim->displace_scales(), WARN);
+
         // Initialze the rest ops if current status is UNTESTED or EXECUTED
         // otherwise there is no need to init memory for the rest ops.
         if (res->state != UNTESTED && res->state != EXECUTED) {
@@ -149,44 +162,85 @@ int ref_partition_t::init_ref(const std::vector<size_t> &graph_in_ports,
         }
     }
 
-    // displace data if needed
-    for (const auto &entry : lt_id_2_mems_) {
-        SAFE_V(data_displacer.displace_input_data(
-                entry.first, const_cast<dnn_mem_t &>(entry.second), res));
+    // displace data if needed, with topo order
+    for (const auto &par_op_ref : partition_ops_ref_) {
+        for (size_t i = 0; i < par_op_ref.get().in_lts_.size(); i++) {
+            size_t lt_id = par_op_ref.get().in_lts_[i].id_;
+            if (lt_id_2_mems_.find(lt_id) == lt_id_2_mems_.end()) continue;
+            if (data_displacer.get_filling_type(lt_id)
+                    == filling_type_t::softmax_stats) {
+                res_t temp_res;
+                exec_ops(&temp_res);
+            }
+            const dnn_mem_t &mem = lt_id_2_mems_.at(lt_id);
+            SAFE_V(data_displacer.displace_input_data(
+                    lt_id, const_cast<dnn_mem_t &>(mem), lt_id_2_mems_, res));
+        }
     }
+
+    return OK;
+}
+
+int ref_partition_t::init_graph_mem(
+        partition_mem_map_t &partition_mem_map, res_t *res) {
 
     // init graph input/oputput memory from lt_id_2_mems_
     for (const auto &id : partition_in_ids_) {
-        if (lt_id_2_mems_.find(id) == lt_id_2_mems_.end()) {
+        if (!has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) {
+            if (lt_id_2_mems_.find(id) == lt_id_2_mems_.end()) {
+                BENCHDNN_PRINT(0, "Fail: cannot find memory for %zu\n", id);
+                res->state = FAILED;
+                return FAIL;
+            }
+            partition_mem_map.emplace(id,
+                    dnn_graph_mem_t(lt_id_2_mems_.at(id), lt_id_2_lt_.at(id),
+                            /*is_op_input=*/true));
+        } else
+            partition_mem_map.emplace(id,
+                    dnn_graph_mem_t({}, lt_id_2_lt_.at(id),
+                            /*is_op_input=*/true));
+    }
+
+    for (const auto &id : partition_out_ids_) {
+
+        if (fake_lt_ids_.find(id) != fake_lt_ids_.end()
+                || has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) {
+            partition_mem_map.emplace(id,
+                    dnn_graph_mem_t({}, lt_id_2_lt_.at(id),
+                            /*is_op_input=*/false, /*use_graph_layout=*/true));
+        } else if (lt_id_2_mems_.find(id) != lt_id_2_mems_.end()) {
+            // For output memories of graph, they need to be in compliance with
+            // the reference memories regarding the shapes and memory tags, as
+            // the memories of both paths will be reordered to abx for
+            // comparison.
+            partition_mem_map.emplace(id,
+                    dnn_graph_mem_t(lt_id_2_mems_.at(id), lt_id_2_lt_.at(id),
+                            /*is_op_input=*/false));
+        } else {
             BENCHDNN_PRINT(0, "Fail: cannot find memory for %zu\n", id);
             res->state = FAILED;
             return FAIL;
         }
-        partition_mem_map.emplace(id,
-                dnn_graph_mem_t(
-                        lt_id_2_mems_.at(id), lt_id_2_lt_.at(id), true));
-    }
-    for (const auto &id : partition_out_ids_) {
-        if (fake_lt_ids_.find(id) != fake_lt_ids_.end()) {
-            partition_mem_map.emplace(
-                    id, dnn_graph_mem_t({}, lt_id_2_lt_.at(id), false, true));
-        } else if (lt_id_2_mems_.find(id) == lt_id_2_mems_.end()) {
-            BENCHDNN_PRINT(0, "Fail: cannot find memory for %zu\n", id);
-            res->state = FAILED;
-            return FAIL;
-        } else
-            partition_mem_map.emplace(id,
-                    dnn_graph_mem_t(
-                            lt_id_2_mems_.at(id), lt_id_2_lt_.at(id), false));
     }
 
     return OK;
 }
 
 void ref_partition_t::exec_ops(res_t *res) {
+    // check if there's softmax backward op in the partition,
+    // which will be a candidate for sdpa training backward pattern
+    bool has_softmax_backward = std::any_of(partition_ops_ref_.begin(),
+            partition_ops_ref_.end(), [](const op_ref_t &op_ref) {
+                return op_ref.get().kind_ == "SoftMaxBackward";
+            });
+
     for (const auto &par_op_ref : partition_ops_ref_) {
         const auto &op = par_op_ref.get();
         auto ref_prim = ref_prims_.at(op.id_);
+        // check if the condition input of Select op is from the parent op.
+        bool select_op_cond_has_parent
+                = ref_prim->get_kind() == dnnl::graph::op::kind::Select
+                && get_parent_op(op.in_lts_[0].id_);
 
         // link args && replace the memory before execution
         bool use_dst = ::graph::eltwise::get_flag_use_dst_for_bwd_compute(
@@ -195,6 +249,16 @@ void ref_partition_t::exec_ops(res_t *res) {
             const auto &lt = op.in_lts_[i];
             int arg = get_prim_arg_name_from_graph_op_input_offset(
                     ref_prim->get_kind(), i, use_dst);
+            if (select_op_cond_has_parent && i == 0) {
+                // Since select primitive implementation only support s8 data
+                // type for the condition input, need to transfer the f32
+                // results from the previous op to s8.
+                dnn_mem_t &dst_i
+                        = const_cast<dnn_mem_t &>(ref_prim->get_arg(arg));
+                const auto &src_i = lt_id_2_mems_.at(lt.id_);
+                SAFE_V(dst_i.reorder(src_i));
+                continue;
+            }
             ref_prim->replace_arg(arg, lt_id_2_mems_.at(lt.id_));
         }
         for (size_t i = 0; i < op.out_lts_.size(); i++) {
@@ -205,7 +269,105 @@ void ref_partition_t::exec_ops(res_t *res) {
                     ref_prim->get_kind(), i);
             ref_prim->replace_arg(arg, lt_id_2_mems_.at(lt.id_));
         }
-        ref_prim->execute_prim(res);
+
+        // There are unfusable operations inside complex fusion partitions
+        // (such as Softmax in SDPA or chains of MatMuls in MLP) that are
+        // executed with user-requested data type. To have correctness
+        // validation working as expected, the data for such operations should
+        // be adjusted accordingly in case of low precision data types. E.g.,
+        // if pattern is bfloat16 only, the output of a matmul op is bfloat16.
+        // Having a float reference implies that is should use "same" bfloat16
+        // data, otherwise, the output from bfloat16 softmax inside the library
+        // and float softmax inside the reference will mismatch, which happens
+        // due to the property of softmax, and exponent part in particular.
+        //
+        // However, this practice of data conversion to a lower precision and
+        // back must be limited to the cases when it's necessary.
+        //
+        // For SDPA, it is limited for a Softmax with a parent op presented, as
+        // it's assumed Softmax is unfusable.
+        const bool is_softmax_in_sdpa_pattern
+                = ref_prim->get_kind() == dnnl::graph::op::kind::SoftMax
+                && has_parent_op(op, /* check_all_in_lts = */ true);
+
+        // For SDPA training backward, it is limited for MatMuls used to compute
+        // dQ, dK, dV.
+        const bool is_matmul
+                = ref_prim->get_kind() == dnnl::graph::op::kind::MatMul;
+        bool is_matmul_in_sdpa_bwd_pattern = false;
+        if (is_matmul && has_softmax_backward) {
+            const deserialized_op_t *child_op = nullptr;
+            if (!has_child_op(op, &child_op))
+                is_matmul_in_sdpa_bwd_pattern = true;
+        }
+
+        // For gated-MLP, it is complicated - the Swish op is decomposed into
+        // Sigmoid and Multiply which has inputs from MatMul0 and Sigmoid. Its
+        // output is passed to another Multiply which is the target for the
+        // reorder, both input and output (since its input is down-converted
+        // by MatMul0, and its output would be a down-converted output of
+        // MatMul1). The variable below carefully checks which Multiply it is
+        // there - Swish's one or not.
+        const bool is_child_multiply
+                = ref_prim->get_kind() == dnnl::graph::op::kind::Multiply
+                && has_parent_op(op, /* check_all_in_lts */ true);
+        bool is_multiply_in_gated_mlp_pattern = false;
+        if (is_child_multiply && op.in_lts_.size() == 2) {
+            const auto &parent0 = get_parent_op(op.in_lts_[0].id_)->kind_;
+            const auto &parent1 = get_parent_op(op.in_lts_[1].id_)->kind_;
+            is_multiply_in_gated_mlp_pattern
+                    = (parent0 == "MatMul" && parent1 == "Multiply")
+                    || (parent0 == "Multiply" && parent1 == "MatMul");
+        }
+
+        if (is_softmax_in_sdpa_pattern || is_matmul_in_sdpa_bwd_pattern
+                || is_multiply_in_gated_mlp_pattern) {
+            for (size_t i = 0; i < op.in_lts_.size(); i++) {
+                const auto dt = ref_prim->get_lt_dt(op.in_lts_[i].id_);
+                // There's no need to reorder data for f32 tensors.
+                if (dt == dnnl_f32 || dt == dnnl_data_type_undef) continue;
+
+                // MLP pattern requires reorder only for an input coming from
+                // MatMul0 directly, not from Swish.
+                if (is_multiply_in_gated_mlp_pattern) {
+                    const auto parent_op = get_parent_op(op.in_lts_[i].id_);
+                    if (!parent_op) continue;
+                    if (parent_op->kind_ != "MatMul") continue;
+                }
+
+                int arg = get_prim_arg_name_from_graph_op_input_offset(
+                        ref_prim->get_kind(), i, use_dst);
+                dnn_mem_t &src_i
+                        = const_cast<dnn_mem_t &>(ref_prim->get_arg(arg));
+                dnn_mem_t src_low_dt(src_i, dt, tag::abx, src_i.engine());
+                SAFE_V(src_i.reorder(src_low_dt));
+            }
+        }
+
+        SAFE_V(ref_prim->execute_prim(res));
+
+        // For an output, because of various graph compositions, there's a more
+        // detailed guide when data adjustment should happen. It's covered by
+        // `need_unfusable_output_crop` function.
+        //
+        // A data type to where transform the data will also be provided by the
+        // same function since there are corner cases.
+        if (is_softmax_in_sdpa_pattern || is_matmul_in_sdpa_bwd_pattern
+                || is_multiply_in_gated_mlp_pattern) {
+            for (size_t i = 0; i < op.out_lts_.size(); i++) {
+                dnnl_data_type_t dt = dnnl_data_type_undef;
+                if (!need_unfusable_output_crop(op, i, dt)) continue;
+                // There's no need to reorder data for f32 tensors.
+                if (dt == dnnl_f32) continue;
+
+                int arg = get_prim_arg_name_from_graph_op_output_offset(
+                        ref_prim->get_kind(), i);
+                dnn_mem_t &dst_i
+                        = const_cast<dnn_mem_t &>(ref_prim->get_arg(arg));
+                dnn_mem_t dst_low_dt(dst_i, dt, tag::abx, dst_i.engine());
+                SAFE_V(dst_i.reorder(dst_low_dt));
+            }
+        }
     }
 }
 
@@ -217,19 +379,21 @@ int ref_partition_t::check_partition_correctness(
 
     for (const auto &op : partition_ops_ref_) {
         size_t op_id = op.get().id_;
-        const auto op_kind = op.get().kind_;
-        const auto ref_prim = ref_prims_.at(op_id);
+        const auto &op_kind = op.get().kind_;
+        const auto &ref_prim = ref_prims_.at(op_id);
 
         // if there is eltwise post-ops or binary div post-ops (GPU test), need
         // to relax compare critria.
         // Currently, both cases use set_has_eltwise_post_op flag in benchdnn
         // compare function.
         // The flag name is not very accurate, add this note to avoid confusion
-        const auto op_driver = opkind2driver(ref_prim->get_kind());
+        const auto op_driver = op.get().opkind2driver();
         has_eltwise = has_eltwise
-                || ((op_driver == dnnl_driver_t::eltwise
-                        || (opstr2kind(op_kind) == dnnl::graph::op::kind::Divide
-                                && engine_tgt_kind == dnnl_gpu)));
+                || (op_driver == dnnl_driver_t::eltwise
+                        || ((opstr2kind(op_kind)
+                                            == dnnl::graph::op::kind::Divide
+                                    || op_driver == dnnl_driver_t::softmax)
+                                && engine_tgt_kind == dnnl_gpu));
         output_has_nans = output_has_nans
                 || ((map_kind_to_alg.find(op_kind) != map_kind_to_alg.end())
                         && ::eltwise::eltwise_alg_returns_nan_or_inf(
@@ -263,6 +427,18 @@ int ref_partition_t::check_partition_correctness(
         // reset the state
         res->state = EXECUTED;
 
+        // TODO(zhitao): need to check whether the operation that produces the
+        // output args is the children of the operations that affect
+        // output_has_nans, such as:
+        //
+        //             |
+        //       _____MatMul_______
+        //      |                  |
+        //      |                  |
+        //     SQRT              ReLU
+        //      |                  |
+        // The graph driver allows nans from the branch of Sqrt, but for the
+        // other branch, the driver should not tolerate that.
         ref_prim->check_correctness(
                 output_args, has_eltwise, output_has_nans, res);
         if (res->state == FAILED) {
@@ -284,146 +460,236 @@ int ref_partition_t::check_partition_correctness(
     return OK;
 }
 
-bool ref_partition_t::check_valid_bf16_in() const {
-    std::unordered_set<size_t> rewritable_in_ops, input_ops;
-    for (const auto &lt_id : partition_in_ids_) {
-        const auto iter = in_lt_2_ops_.find(lt_id);
-        const auto &consumer_ops = iter->second;
-        for (const auto &op : consumer_ops) {
-            // if the op already meets the requirement, skip the check
-            if (rewritable_in_ops.find(op.get().id_) != rewritable_in_ops.end())
-                continue;
-            // record all input ops for comparison
-            if (input_ops.find(op.get().id_) == input_ops.end())
-                input_ops.emplace(op.get().id_);
+bool ref_partition_t::has_parent_op(
+        const deserialized_op_t &op, bool check_all_in_lts) const {
+    if (partition_ops_ref_.size() < 2) return false;
 
-            const dnnl_driver_t driver_kind
-                    = opkind2driver(opstr2kind(op.get().kind_));
-            // exclude ops which doesn't support bf16 in f32 out
-            // if one input op is not supported, this feature will not be enabled
-            if (valid_driver_in_bf16_mixed_dt().find(driver_kind)
-                    == valid_driver_in_bf16_mixed_dt().end())
-                return false;
-            for (const auto &lt : op.get().in_lts_) {
-                if (lt.id_ == lt_id && lt.data_type_ == "bf16") {
-                    // if current op has a bf16 input and support bf16 to f32,
-                    // add it to rewritable ops
-                    rewritable_in_ops.emplace(op.get().id_);
-                }
+    for (const auto &in_lt : op.in_lts_) {
+        const auto *parent_op = get_parent_op(in_lt.id_);
+        if (!parent_op) {
+            if (check_all_in_lts) return false;
+            continue;
+        } else {
+            if (check_all_in_lts) continue;
+            return true;
+        }
+    }
+
+    // The logic for `check_all_in_lts=true` is exclusive along the
+    // verification. If it made till the end, all lts had a parent. The logic
+    // for `check_all_in_lts=false` would return during the verification, and if
+    // reached the end, it means no parent was met.
+    return check_all_in_lts;
+}
+
+// TODO: add get_child and remove the second arg.
+bool ref_partition_t::has_child_op(const deserialized_op_t &op,
+        const deserialized_op_t **child_op_ptr) const {
+    if (partition_ops_ref_.size() < 2) return false;
+
+    for (const auto &out_lt : op.out_lts_) {
+        // Check if child op exist for an `op`.
+        const auto &child_op = dg_->get_op_by_in_lt(out_lt.id_);
+        if (child_op.empty()) continue;
+
+        // If it does, check its ID presents in a partition.
+        for (const auto &op_ref : partition_ops_ref_) {
+            const auto &cur_op = op_ref.get();
+            if (child_op.id_ == cur_op.id_) {
+                if (child_op_ptr) *child_op_ptr = &child_op;
+                return true;
             }
         }
     }
-    // at least one input op support bf16 to f32 transformation
-    return !rewritable_in_ops.empty();
+
+    return false;
 }
 
-bool ref_partition_t::check_valid_bf16_out() const {
-    for (const auto &lt_id : partition_out_ids_) {
-        const auto iter = out_lt_2_op_.find(lt_id);
-        const auto &producer_op = iter->second;
-        // check if the op which produces the partition output supports f32 in bf16 out.
-        const dnnl_driver_t driver_kind
-                = opkind2driver(opstr2kind(producer_op.get().kind_));
-        if (valid_driver_out_bf16_mixed_dt().find(driver_kind)
-                == valid_driver_out_bf16_mixed_dt().end())
-            return false;
-        for (const auto &lt : producer_op.get().out_lts_) {
-            // all output lts should be bf16
-            if (lt.id_ == lt_id && lt.data_type_ != "bf16") { return false; }
-        }
+const deserialized_op_t *ref_partition_t::get_parent_op(size_t in_lt_id) const {
+    if (partition_ops_ref_.size() < 2) return nullptr;
+
+    // Check if a parent op exists for an `op`.
+    const auto &parent_op = dg_->get_op_by_out_lt(in_lt_id);
+    if (parent_op.empty()) return nullptr;
+
+    // If it does, check its ID presents in a partition.
+    for (const auto &op_ref : partition_ops_ref_) {
+        const auto &cur_op = op_ref.get();
+        if (parent_op.id_ == cur_op.id_) { return &parent_op; }
     }
+
+    return nullptr;
+}
+
+// This function decides when unfusable transcendental op output should be
+// reordered to lower data type and back to f32 for a reference path.
+bool ref_partition_t::need_unfusable_output_crop(const deserialized_op_t &op,
+        size_t output_offset, dnnl_data_type_t &dt) const {
+    const deserialized_op_t *child_op = nullptr;
+    // First of all, the output should have a child op...
+    if (!has_child_op(op, &child_op)) return false;
+    // If the child op is not a TypeCast, it's safe to crop.
+    if (child_op->kind_ != "TypeCast") {
+        // Target dt in this case is the output dt of input `op`.
+        dt = convert_dt(op.out_lts_[output_offset].get_data_type());
+        return true;
+    }
+    // When it is a TypeCast (it always changes `cur_dt` <-> f32, both ways are
+    // possible), there are options:
+    // * If it's the last one, no crop, as f32 will happen on the other end.
+    const deserialized_op_t *next_child_op = nullptr;
+    if (!has_child_op(*child_op, &next_child_op)) return false;
+    // * If there's a child Quantize, no crop either, since output would
+    //   perform a reorder with a proper scale value to match the other end.
+    if (next_child_op->kind_ == "Quantize") return false;
+    // * However, a second TypeCast would negate an effect of the previous...
+    if (next_child_op->kind_ == "TypeCast") {
+        // Target dt in this case is the output dt of the last TypeCast.
+        dt = convert_dt(next_child_op->out_lts_[output_offset].get_data_type());
+        return true;
+    }
+
+    // Rest potential outcomes are default to make a crop. The target dt in
+    // this case is the output dt of the child op.
+    dt = convert_dt(child_op->out_lts_[output_offset].get_data_type());
     return true;
 }
 
-// dnnl partition with at least one bf16 in and one bf16 out
-bool ref_partition_t::is_bf16_partition_support_f32_intermediate_result()
-        const {
-
-    // only rewrite the parition with at least one validate op with bf16 in and
-    // all ops with bf16 out
-    if (partition_ops_ref_.size() <= 1 || !check_valid_bf16_in()
-            || !check_valid_bf16_out()) {
-        return false;
-    }
-
-    // only works for one leading op situations
-    size_t leading_op_num = 0;
-    for (const auto &aop : partition_ops_ref_) {
-        const dnnl_driver_t driver = opkind2driver(opstr2kind(aop.get().kind_));
-        if (driver != dnnl_driver_t::binary && driver != dnnl_driver_t::eltwise
-                && driver != dnnl_driver_t::reorder) {
-            leading_op_num++;
-            // currently only support one leading op
-            if (leading_op_num > 1) { return false; }
-        }
-    }
-
-    return true;
+bool ref_partition_t::is_output_op(const deserialized_op_t &op) const {
+    return std::any_of(op.out_lts_.begin(), op.out_lts_.end(),
+            [this](const deserialized_lt_t &lt) {
+                return std::find(partition_out_ids_.begin(),
+                               partition_out_ids_.end(), lt.id_)
+                        != partition_out_ids_.end();
+            });
 }
 
-//     TypeCast (f32->x16)
-//        |    ->
-//       OP     change all tensors to f32
-//        |    ->
-//     TypeCast (x16->f32) Stop if find x16->f32 Typecast
-void ref_partition_t::handle_typecast_x16() {
+// check the partition memory footprint of the graph path
+int ref_partition_t::check_partition_total_size(
+        const deserialized_op_t &op, res_t *res) {
 
-    for (const auto &par_op_ref : partition_ops_ref_) {
-        bool fail = false;
-        const auto &op = par_op_ref.get();
-        // check all input/output tensor is bf16 & connected with typecast
-        for (const auto &in : op.in_lts_) {
-            // ensure:
-            // 1. the input is bf16
-            // 2. the producer op is typecast
-            // 3. current op is the only one consumer
-            if (in.data_type_ != "bf16"
-                    || out_lt_2_op_.find(in.id_) == out_lt_2_op_.end()
-                    || out_lt_2_op_.at(in.id_).get().kind_ != "TypeCast"
-                    || in_lt_2_ops_.at(in.id_).size() != 1) {
-                fail = true;
-                break;
-            }
-        }
-        for (const auto &out : op.out_lts_) {
-            // ensure:
-            // 1. the output is bf16
-            // 2. the consumer op is typecast
-            // 3. typecast op is the only one consumer
-            if (out.data_type_ != "bf16"
-                    || in_lt_2_ops_.find(out.id_) == in_lt_2_ops_.end()
-                    || in_lt_2_ops_.at(out.id_).size() != 1
-                    || in_lt_2_ops_.at(out.id_).front().get().kind_
-                            != "TypeCast") {
-                fail = true;
-                break;
-            }
-        }
-        if (!fail) {
-            for (const auto &in : op.in_lts_) {
-                bf16_to_f32_rewrite_lt_id_.insert(in.id_);
-            }
-            for (const auto &out : op.out_lts_) {
-                bf16_to_f32_rewrite_lt_id_.insert(out.id_);
-            }
-        }
+    // Prepare the memory limit for benchdnn graph
+    static size_t benchdnn_cpu_limit = get_benchdnn_cpu_limit();
+    static size_t benchdnn_device_limit = get_benchdnn_device_limit();
+    auto &graph_mem_req = graph_memory_req_args_t::get_instance();
+
+    size_t new_mem_req = 0;
+    // Step 1. Add input/output tensors if they are partition input/outputs.
+    const auto partition_in_out_lts = get_in_out_lt_ids(op);
+    for (const auto &lt_id : partition_in_out_lts) {
+        if (lt_id_2_lt_.find(lt_id) == lt_id_2_lt_.end()) return FAIL;
+        new_mem_req += lt_id_2_lt_.at(lt_id).create().get_mem_size();
     }
+
+    // Step 2. Check whether the memory is enough
+    if (is_gpu()) {
+        size_t total_gpu_req = graph_mem_req.get_mem_req(GPU_REQ) + new_mem_req;
+        const bool fits_device_ram = total_gpu_req <= benchdnn_device_limit;
+        check_memory_fit(
+                fits_device_ram, total_gpu_req, benchdnn_device_limit, res);
+
+        graph_mem_req.increase_mem_req(GPU_REQ, GRAPH_USER, new_mem_req);
+    } else {
+        size_t total_cpu_req = graph_mem_req.get_mem_req(CPU_REQ) + new_mem_req;
+        bool fits_cpu_ram = total_cpu_req <= benchdnn_cpu_limit;
+        check_memory_fit(fits_cpu_ram, total_cpu_req, benchdnn_cpu_limit, res);
+
+        graph_mem_req.increase_mem_req(CPU_REQ, GRAPH_USER, new_mem_req);
+    }
+
+    return res->state == FAILED ? FAIL : OK;
 }
 
-void ref_partition_t::handle_special_case_bf16(res_t *res) {
-    if (!is_bf16_partition_support_f32_intermediate_result()) return;
+// check the partition memory footprint of the reference path
+int ref_partition_t::check_partition_total_size(
+        const check_mem_size_args_t &check_mem_size_args, bool is_output_op,
+        res_t *res) {
 
-    // 1. find lt which is intermediate lt;
-    // 2. check producer supports bf16 output and comsumer supports bf16 input
-    // 3. set the logical tensor as f32
-    for_(const auto &par_op_ref : partition_ops_ref_)
-    for (const auto &out_lt : par_op_ref.get().out_lts_) {
-        auto iter_consumers = in_lt_2_ops_.find(out_lt.id_);
-        if (iter_consumers != in_lt_2_ops_.end()) {
-            // record the id of logical tensors that need rewriting
-            bf16_to_f32_rewrite_lt_id_.insert(out_lt.id_);
+    // Prepare the memory limit for benchdnn graph
+    static size_t benchdnn_cpu_limit = get_benchdnn_cpu_limit();
+    static size_t benchdnn_device_limit = get_benchdnn_device_limit();
+    auto &graph_mem_req = graph_memory_req_args_t::get_instance();
+
+    const bool is_corr = has_bench_mode_bit(mode_bit_t::corr);
+    const bool is_bitwise = has_bench_mode_bit(mode_bit_t::bitwise);
+
+    // The size of reference memory with tag abx and f32.
+    size_t input_ref_mem_size = 0, output_ref_mem_size = 0;
+    if (is_corr || is_bitwise) {
+        input_ref_mem_size = check_mem_size_args.total_ref_md_size[0];
+        output_ref_mem_size = check_mem_size_args.total_ref_md_size[1];
+    }
+
+    // total size cpu includes:
+    // 1. Memory allocated for a test obj( such as the memory for input and outputs, saved in total_size_device )
+    // 2. Memory allocated for reference computation, which will be released
+    // after reference path data filling(`C` mode only)
+    // 3. Memory to be allocated for comparing results(`C` mode only)
+    // 4. Memory to be allocated for mapping device memory(GPU backend only)
+    size_t new_cpu_req = check_mem_size_args.total_size_ref
+            + check_mem_size_args.total_size_compare
+            + check_mem_size_args.total_size_mapped;
+    size_t new_gpu_req = check_mem_size_args.total_size_device;
+
+    // STEP 1: Memory allocation stage for the reference path
+    if (is_cpu()) new_cpu_req += check_mem_size_args.total_size_device;
+    if (is_corr) {
+        // If the op is not output, no need to allocate memory for correctness
+        // check.
+        if (!is_output_op) {
+            new_cpu_req -= output_ref_mem_size;
+            if (is_bitwise) new_cpu_req -= output_ref_mem_size;
         }
     }
+
+    // STEP 2: Check whether the memory is enough
+    size_t total_cpu_req = graph_mem_req.get_mem_req(CPU_REQ) + new_cpu_req;
+    bool fits_cpu_ram = total_cpu_req <= benchdnn_cpu_limit;
+    check_memory_fit(fits_cpu_ram, total_cpu_req, benchdnn_cpu_limit, res);
+
+    // GPU mem size check.
+    if (is_gpu()) {
+        size_t total_gpu_req = graph_mem_req.get_mem_req(GPU_REQ) + new_gpu_req;
+
+        const bool fits_device_ram = total_gpu_req <= benchdnn_device_limit;
+        check_memory_fit(
+                fits_device_ram, total_gpu_req, benchdnn_device_limit, res);
+        graph_mem_req.increase_mem_req(GPU_REQ, REF, new_gpu_req);
+    }
+
+    // STEP 3: Temprorary memory release stage
+    if (is_corr) {
+        // Release reference path memory for `C` mode
+        total_cpu_req -= input_ref_mem_size;
+        total_cpu_req -= output_ref_mem_size;
+    }
+
+    // Update the required memory size
+    graph_mem_req.increase_mem_req(CPU_REQ, REF, new_cpu_req);
+
+    return res->state == FAILED ? FAIL : OK;
+}
+
+// Return the logical tensor ids of the given op which is the input/output of
+// the partition.
+std::vector<size_t> ref_partition_t::get_in_out_lt_ids(
+        const deserialized_op_t &op) const {
+    std::vector<size_t> in_out_lt_ids;
+    std::for_each(op.in_lts_.begin(), op.in_lts_.end(),
+            [&in_out_lt_ids, this](const deserialized_lt_t &lt) {
+                if (std::find(partition_in_ids_.begin(),
+                            partition_in_ids_.end(), lt.id_)
+                        != partition_in_ids_.end())
+                    in_out_lt_ids.emplace_back(lt.id_);
+            });
+    std::for_each(op.out_lts_.begin(), op.out_lts_.end(),
+            [&in_out_lt_ids, this](const deserialized_lt_t &lt) {
+                if (std::find(partition_out_ids_.begin(),
+                            partition_out_ids_.end(), lt.id_)
+                        != partition_out_ids_.end())
+                    in_out_lt_ids.emplace_back(lt.id_);
+            });
+    return in_out_lt_ids;
 }
 
 } // namespace graph

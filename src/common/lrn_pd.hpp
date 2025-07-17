@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -89,26 +89,27 @@ protected:
     memory_desc_t src_md_;
     memory_desc_t ws_md_;
 
-    lrn_pd_t(const lrn_desc_t *adesc, const primitive_attr_t *attr,
+    lrn_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const lrn_fwd_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<lrn_desc_t>(adesc))
         , hint_fwd_pd_(hint_fwd_pd)
-        , src_md_(desc_.src_desc)
-        , ws_md_() {}
+        , src_md_(desc_.src_desc) {}
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct lrn_fwd_pd_t : public lrn_pd_t {
-    typedef lrn_fwd_pd_t base_class;
-    typedef lrn_fwd_pd_t hint_class;
+    using base_class = lrn_fwd_pd_t;
+    using hint_class = lrn_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg == DNNL_ARG_SRC) return arg_usage_t::input;
 
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_WORKSPACE && (!types::is_zero_md(workspace_md())))
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return !types::is_zero_md(workspace_md()) ? arg_usage_t::output
+                                                      : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -145,7 +146,7 @@ struct lrn_fwd_pd_t : public lrn_pd_t {
 protected:
     memory_desc_t dst_md_;
 
-    lrn_fwd_pd_t(const lrn_desc_t *adesc, const primitive_attr_t *attr,
+    lrn_fwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const lrn_fwd_pd_t *hint_fwd_pd)
         : lrn_pd_t(adesc, attr, hint_fwd_pd), dst_md_(desc_.dst_desc) {}
 
@@ -156,10 +157,12 @@ protected:
                         == status::success);
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct lrn_bwd_pd_t : public lrn_pd_t {
-    typedef lrn_bwd_pd_t base_class;
-    typedef lrn_fwd_pd_t hint_class;
+    using base_class = lrn_bwd_pd_t;
+    using hint_class = lrn_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_DIFF_DST))
@@ -167,8 +170,9 @@ struct lrn_bwd_pd_t : public lrn_pd_t {
 
         if (arg == DNNL_ARG_DIFF_SRC) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_WORKSPACE && (!types::is_zero_md(workspace_md())))
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return !types::is_zero_md(workspace_md()) ? arg_usage_t::input
+                                                      : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -214,7 +218,7 @@ protected:
     memory_desc_t diff_src_md_;
     memory_desc_t diff_dst_md_;
 
-    lrn_bwd_pd_t(const lrn_desc_t *adesc, const primitive_attr_t *attr,
+    lrn_bwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const lrn_fwd_pd_t *hint_fwd_pd)
         : lrn_pd_t(adesc, attr, hint_fwd_pd)
         , diff_src_md_(desc_.diff_src_desc)
@@ -231,6 +235,7 @@ protected:
                                 == status::success);
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

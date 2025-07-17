@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2024 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -34,11 +34,12 @@
 namespace dnnl {
 namespace impl {
 
+// NOLINTBEGIN(google-default-arguments)
 struct shuffle_pd_t : public primitive_desc_t {
     static constexpr auto base_pkind = primitive_kind::shuffle;
 
-    typedef shuffle_pd_t base_class;
-    typedef shuffle_pd_t hint_class;
+    using base_class = shuffle_pd_t;
+    using hint_class = shuffle_pd_t;
 
     const shuffle_desc_t *desc() const { return &desc_; }
     const op_desc_t *op_desc() const override {
@@ -145,10 +146,10 @@ protected:
     memory_desc_t src_md_;
     memory_desc_t dst_md_;
 
-    shuffle_pd_t(const shuffle_desc_t *adesc, const primitive_attr_t *attr,
+    shuffle_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const shuffle_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<shuffle_desc_t>(adesc))
         , hint_fwd_pd_(hint_fwd_pd)
         , src_md_(desc_.src_desc)
         , dst_md_(desc_.dst_desc) {
@@ -179,6 +180,7 @@ private:
         return is_fwd() ? src_md() : diff_src_md();
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

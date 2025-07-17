@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -40,26 +40,20 @@ flag_t str2flag(const char *str);
 std::string flag2str(flag_bit_t flag);
 std::ostream &operator<<(std::ostream &s, const std::vector<flag_t> &oflag);
 
-struct dt_conf_s {
+struct dt_conf_t {
     dnnl_data_type_t dt;
     float min;
     float max;
 };
-typedef const dt_conf_s *dt_conf_t;
-dt_conf_t dt2cfg(dnnl_data_type_t dt);
-dnnl_data_type_t cfg2dt(dt_conf_t cfg);
+const dt_conf_t *dt2cfg(dnnl_data_type_t dt);
+dnnl_data_type_t cfg2dt(const dt_conf_t *cfg);
 
 enum cross_engine_t { NONE, CPU2GPU, GPU2CPU };
 cross_engine_t str2cross_engine(const char *str);
 const char *cross_engine2str(cross_engine_t cross_engine);
 
 struct settings_t : public base_settings_t {
-    settings_t() = default;
-
-    // ctor to save certain fields from resetting
-    settings_t(const char *perf_template) : settings_t() {
-        this->perf_template = perf_template;
-    }
+    using base_settings_t::base_settings_t;
 
     prb_dims_t prb_dims;
 
@@ -69,9 +63,6 @@ struct settings_t : public base_settings_t {
     std::vector<std::vector<flag_t>> oflag {{{FLAG_NONE, 0}}};
     std::vector<unsigned> runtime_dim_mask {0};
     std::vector<cross_engine_t> cross_engine {NONE};
-
-    // Just to increase the coverage, doesn't participate in prb construction.
-    std::vector<float> def_scale {0.125, 0.25, 0.5, 1, 2, 4, 8};
 
     const char *perf_template_csv() const {
         static const std::string args = "%sdt%,%ddt%,%stag%,%dtag%,%flags%";
@@ -92,32 +83,32 @@ struct prb_t : public prb_dims_t {
     // A ctor with common interface across all drivers.
     prb_t(const settings_t &s)
         : prb_t(s.prb_dims, s.sdt[0], s.ddt[0], s.stag[0], s.dtag[0],
-                s.strides[0],
-                settings_t::get_attr(s.scales[0], s.zero_points[0],
-                        s.post_ops[0], s.scratchpad_mode[0], s.fpmath_mode[0]),
-                s.ctx_init[0], s.ctx_exe[0], s.oflag[0], s.cross_engine[0],
-                s.runtime_dim_mask[0]) {
+                s.strides[0], s.oflag[0], s.cross_engine[0],
+                s.runtime_dim_mask[0], s.attributes.front(), s.ctx_init[0],
+                s.ctx_exe[0], s.impl_filter) {
         SAFE_V(s.has_single_setup() ? OK : FAIL);
     }
 
     prb_t(const prb_dims_t &prb_dims, dnnl_data_type_t sdt,
             dnnl_data_type_t ddt, const std::string &stag,
-            const std::string &dtag, const vdims_t &strides, const attr_t &attr,
-            const thr_ctx_t &ctx_init, const thr_ctx_t &ctx_exe,
+            const std::string &dtag, const vdims_t &strides,
             const std::vector<flag_t> &oflag, cross_engine_t cross_engine,
-            unsigned runtime_dim_mask)
+            unsigned runtime_dim_mask, const attr_t &attr,
+            const thr_ctx_t &ctx_init, const thr_ctx_t &ctx_exe,
+            const impl_filter_t &impl_filter)
         : prb_dims_t(prb_dims)
         , sdt(sdt)
         , ddt(ddt)
         , stag(stag)
         , dtag(dtag)
         , strides(strides)
+        , oflag(oflag)
+        , cross_engine(cross_engine)
+        , runtime_dim_mask(runtime_dim_mask)
         , attr(attr)
         , ctx_init(ctx_init)
         , ctx_exe(ctx_exe)
-        , oflag(oflag)
-        , cross_engine(cross_engine)
-        , runtime_dim_mask(runtime_dim_mask) {
+        , impl_filter(impl_filter) {
         repro = set_repro_line(); // must be last in ctor to collect right info
     }
 
@@ -125,17 +116,18 @@ struct prb_t : public prb_dims_t {
     dnnl_data_type_t sdt, ddt;
     std::string stag, dtag;
     vdims_t strides;
-    bool inplace = false; // Lacks placement, always considered `false`.
-    attr_t attr;
-    thr_ctx_t ctx_init, ctx_exe;
     std::vector<flag_t> oflag;
     cross_engine_t cross_engine;
     unsigned runtime_dim_mask;
+    bool inplace = false; // Lacks placement, always considered `false`.
+    attr_t attr;
+    thr_ctx_t ctx_init, ctx_exe;
+    impl_filter_t impl_filter;
 
     bool is_reorder_with_compensation(flag_bit_t flag) const;
     dims_t get_compensation_dims(flag_bit_t flag) const;
     int get_compensation_mask(flag_bit_t flag) const;
-    dt_conf_t get_conf(data_kind_t kind) const;
+    const dt_conf_t *get_conf(data_kind_t kind) const;
 
     // Used to construct memory desc when dimensions are runtime since such mds
     // can't be used directly from query and memory objects can't be constructed.
@@ -203,13 +195,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
 void skip_unimplemented_prb(const prb_t *prb, res_t *res);
 void skip_invalid_prb(const prb_t *prb, res_t *res);
-void compute_ref(const prb_t *prb, const args_t &args,
+void compute_ref(const prb_t *prb, dir_t dir, const args_t &args,
         dnnl_primitive_t prim_ref = nullptr);
 
 int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);

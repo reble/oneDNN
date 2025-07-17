@@ -1,5 +1,5 @@
 /******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2024-2025 Intel Corporation
 * Copyright 2023 KNS Group LLC (YADRO)
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +15,10 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef RV64_NCHW_POOLING_HPP
-#define RV64_NCHW_POOLING_HPP
+#ifndef CPU_RV64_RVV_NCHW_POOLING_HPP
+#define CPU_RV64_RVV_NCHW_POOLING_HPP
 
+#include "common/primitive.hpp"
 #include "cpu/cpu_pooling_pd.hpp"
 
 namespace dnnl {
@@ -42,7 +43,9 @@ struct riscv_nchw_pooling_fwd_t : public primitive_t {
                     = desc_.prop_kind == prop_kind::forward_training;
 
             const bool ok = is_fwd()
-                    && utils::one_of(desc()->alg_kind, alg_kind::pooling_max)
+                    && utils::one_of(desc()->alg_kind, alg_kind::pooling_max,
+                            alg_kind::pooling_avg_include_padding,
+                            alg_kind::pooling_avg_exclude_padding)
                     && memory_desc_wrapper(dst_md()).is_dense(false)
                     && utils::everyone_is(
                             d_type, src_md()->data_type, dst_md()->data_type)
@@ -65,7 +68,7 @@ struct riscv_nchw_pooling_fwd_t : public primitive_t {
 
     riscv_nchw_pooling_fwd_t(const pd_t *apd);
 
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     status_t execute(const exec_ctx_t &ctx) const override {
         return execute_forward(ctx);

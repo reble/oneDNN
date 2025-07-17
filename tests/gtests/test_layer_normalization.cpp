@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -64,6 +64,7 @@ private:
 protected:
     void SetUp() override {
         SKIP_IF_CUDA(true, "Layer normalization not supported by CUDA.");
+        SKIP_IF_HIP(true, "Layer normalization not supported by HIP.");
         p = ::testing::TestWithParam<decltype(p)>::GetParam();
 
         SKIP_IF(unsupported_data_type(p.src_dt)
@@ -99,9 +100,32 @@ protected:
         Forward(training, flags::use_scale | flags::use_shift);
         Forward(training,
                 flags::use_scale | flags::use_shift | flags::use_global_stats);
+
+        // RMS normalization on GPU is currently limited to Intel GPUs only
+        // todo: remove the vendor check once supported
+        if (!is_nvidia_gpu(eng) && !is_amd_gpu(eng)) {
+            Forward(training, flags::rms_norm);
+            Forward(training,
+                    flags::rms_norm | flags::use_scale | flags::use_shift);
+            Forward(training,
+                    flags::rms_norm | flags::use_scale | flags::use_shift
+                            | flags::use_global_stats);
+        }
+
         Forward(inference);
         Forward(inference, flags::use_global_stats);
         Forward(inference, flags::use_scale | flags::use_shift);
+
+        // RMS normalization on GPU is currently limited to Intel GPUs only
+        // todo: remove the vendor check once supported
+        if (!is_nvidia_gpu(eng) && !is_amd_gpu(eng)) {
+            Forward(inference, flags::rms_norm);
+            Forward(inference,
+                    flags::rms_norm | flags::use_scale | flags::use_shift);
+            Forward(inference,
+                    flags::rms_norm | flags::use_scale | flags::use_shift
+                            | flags::use_global_stats);
+        }
 
         if (!impl::utils::one_of(p.dst_dt, memory::data_type::f16,
                     memory::data_type::s8, memory::data_type::u8)) {
@@ -116,6 +140,17 @@ protected:
             Backward(prop_kind::backward,
                     flags::use_scale | flags::use_shift
                             | flags::use_global_stats);
+
+            // RMS normalization on GPU is currently limited to Intel GPUs only
+            // todo: remove the vendor check once supported
+            if (!is_nvidia_gpu(eng) && !is_amd_gpu(eng)) {
+                Backward(prop_kind::backward, flags::rms_norm);
+                Backward(prop_kind::backward,
+                        flags::rms_norm | flags::use_scale | flags::use_shift);
+                Backward(prop_kind::backward,
+                        flags::rms_norm | flags::use_scale | flags::use_shift
+                                | flags::use_global_stats);
+            }
         }
     }
 
@@ -134,7 +169,12 @@ protected:
                 || impl::utils::one_of(dst_md->get_data_type(),
                         memory::data_type::s8, memory::data_type::u8);
 
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
+        const bool is_cpu = get_test_engine_kind() == engine::kind::cpu;
+        aa.po_eltwise = is_cpu;
+        aa.po_binary = is_cpu;
+        aa.po_sum = is_cpu;
+
         if (is_int8) aa.scales = true;
 
         // test all pd ctors
@@ -147,6 +187,7 @@ protected:
         bool useShift = (bool)(flags & normalization_flags::use_shift);
         bool useGlobalStats
                 = (bool)(flags & normalization_flags::use_global_stats);
+        bool skipMean = (bool)(flags & normalization_flags::rms_norm);
         bool isTraining = pk == prop_kind::forward_training;
 
         ASSERT_TRUE(lnorm_fwd_pd.query_md(query::exec_arg_md, DNNL_ARG_SRC)
@@ -192,7 +233,7 @@ protected:
             fill<float>(variance);
         }
 
-        execlnormFwd(isTraining, useGlobalStats, useScale, useShift);
+        execlnormFwd(isTraining, useGlobalStats, useScale, useShift, skipMean);
     }
 
     void Backward(prop_kind pk,
@@ -201,6 +242,7 @@ protected:
 
         bool useScale = (bool)(flags & normalization_flags::use_scale);
         bool useShift = (bool)(flags & normalization_flags::use_shift);
+        bool skipMean = (bool)(flags & normalization_flags::rms_norm);
 
         lnorm_fwd_pd = layer_normalization_forward::primitive_desc(eng,
                 prop_kind::forward_training, *src_md, *dst_md, *stat_d, epsilon,
@@ -272,11 +314,11 @@ protected:
         fill<float>(mean);
         fill<float>(variance);
 
-        execlnormBwd(useScale, useShift, pk);
+        execlnormBwd(useScale, useShift, skipMean, pk);
     }
 
     void execlnormFwd(bool isTraining, bool useGlobalStats, bool useScale,
-            bool useShift) {
+            bool useShift, bool skipMean) {
         std::unordered_map<int, memory> args = {
                 {DNNL_ARG_SRC, src->get()},
                 {DNNL_ARG_DST, dst->get()},
@@ -286,7 +328,7 @@ protected:
         if (useShift) args.insert({DNNL_ARG_SHIFT, bias});
 
         if (isTraining || useGlobalStats) {
-            args.insert({DNNL_ARG_MEAN, mean});
+            if (!skipMean) args.insert({DNNL_ARG_MEAN, mean});
             args.insert({DNNL_ARG_VARIANCE, variance});
         }
 
@@ -295,14 +337,16 @@ protected:
         strm.wait();
     }
 
-    void execlnormBwd(bool useScale, bool useShift, prop_kind pk) {
+    void execlnormBwd(
+            bool useScale, bool useShift, bool skipMean, prop_kind pk) {
         std::unordered_map<int, memory> args = {
                 {DNNL_ARG_SRC, src->get()},
                 {DNNL_ARG_DIFF_DST, dst->get()},
-                {DNNL_ARG_MEAN, mean},
                 {DNNL_ARG_VARIANCE, variance},
                 {DNNL_ARG_DIFF_SRC, diff_src->get()},
         };
+
+        if (!skipMean) { args.insert({DNNL_ARG_MEAN, mean}); }
 
         if (useScale) {
             args.insert({DNNL_ARG_SCALE, weights});

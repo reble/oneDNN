@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,7 @@
 #include "cudnn.h"
 
 #include "common/type_helpers.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/engine.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -125,6 +125,9 @@ struct cudnn_inner_product_impl_base_t {
     bool with_relu_ = false, with_eltwise_ = false, with_sum_ = false;
     bool filter_using_spatial_format_ = false;
 
+    cudnnTensorDescriptor_t bias_f32_desc_;
+    bool with_f32_sum_ = false;
+
     virtual bool need_to_transform_filter() const {
         return filter_using_spatial_format_;
     }
@@ -135,7 +138,7 @@ struct cudnn_inner_product_impl_base_t {
         // of filter should be equal, as cuDNN always stores dimensions in
         // NCDHW order. The first dimension of filter must be equal to the
         // second dimension of bias
-        for (size_t i = 0; i < ndims; ++i) {
+        for (int i = 0; i < ndims; ++i) {
             dims_[io::bia][i] = 1;
             strides_[io::bia][i] = (format != CUDNN_TENSOR_NHWC ? 1 : bias_dim);
         }
@@ -143,14 +146,22 @@ struct cudnn_inner_product_impl_base_t {
         strides_[io::bia][1] = 1;
         strides_[io::bia][0] = bias_dim;
     }
-    virtual status_t init(engine_t * /*engine*/, inner_product_pd_t * /*pd*/,
-            bool /*with_relu*/, bool /*with_eltwise*/, bool /*with_sum */,
-            bool /*using_fused_path_for_blocking*/)
+    virtual status_t init(impl::engine_t * /*engine*/,
+            inner_product_pd_t * /*pd*/, bool /*with_relu*/,
+            bool /*with_eltwise*/, bool /*with_sum */,
+            bool /*using_fused_path_for_blocking*/, bool /* use_f32_sum */)
             = 0;
 
     virtual void execute(cudnnHandle_t /*handle*/,
             cublasHandle_t /*cublas_handle*/,
             const std::vector<void *> & /*args*/) const = 0;
+
+    virtual ~cudnn_inner_product_impl_base_t() {
+        for (int i = 0; i < NUM_IO; ++i) {
+            cudnnDestroyTensorDescriptor(tensor_descs_[i]);
+        }
+        if (with_f32_sum_) { cudnnDestroyTensorDescriptor(bias_f32_desc_); }
+    }
 };
 
 struct cudnn_inner_product_fwd_base_t : public cudnn_inner_product_impl_base_t {

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -36,11 +36,12 @@ namespace impl {
     VCHECK(primitive, create, dispatch, gemm, (f), "%s," msg, \
             this->info(engine), ##__VA_ARGS__)
 
+// NOLINTBEGIN(google-default-arguments)
 struct gemm_pd_t : public primitive_desc_t {
     static constexpr auto base_pkind = primitive_kind::gemm;
 
-    typedef gemm_pd_t base_class;
-    typedef gemm_pd_t hint_class;
+    using base_class = gemm_pd_t;
+    using hint_class = gemm_pd_t;
 
     const gemm_desc_t *desc() const { return &desc_; }
     const op_desc_t *op_desc() const override {
@@ -84,6 +85,9 @@ struct gemm_pd_t : public primitive_desc_t {
 
     int n_inputs() const override { return 2; }
     int n_outputs() const override { return 1; }
+    int ndims() const { return desc_.c_desc.ndims; }
+
+    int full_tensor_mask() const { return (1 << ndims()) - 1; }
 
 protected:
     // Note: we do not copy memory desc locally to avoid
@@ -91,9 +95,10 @@ protected:
     // resolve the 'any' tags.
     gemm_desc_t desc_;
 
-    gemm_pd_t(const gemm_desc_t *adesc, const primitive_attr_t *attr,
+    gemm_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const hint_class *hint_fwd_pd)
-        : primitive_desc_t(attr, base_pkind), desc_(*adesc) {}
+        : primitive_desc_t(attr, base_pkind)
+        , desc_(*op_desc_t::to_desc<gemm_desc_t>(adesc)) {}
 
     // By default, we just resolve 'any' with blocked layout and trivial strides
     bool set_default_format(memory_desc_t *md) {
@@ -121,6 +126,7 @@ protected:
         return ok;
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

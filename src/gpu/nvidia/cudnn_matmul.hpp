@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,8 +20,12 @@
 
 #include "gpu/gpu_matmul_pd.hpp"
 
+#include "common/primitive.hpp"
+#include "common/primitive_desc_iterator.hpp"
+#include "gpu/gpu_primitive.hpp"
 #include "gpu/nvidia/cudnn_matmul_executor.hpp"
 #include "gpu/nvidia/cudnn_matmul_impl.hpp"
+#include "gpu/nvidia/cudnn_matmul_lt_impl.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -29,7 +33,7 @@ namespace impl {
 namespace gpu {
 namespace nvidia {
 
-struct cudnn_matmul_t : public primitive_t {
+struct cudnn_matmul_t : public gpu::primitive_t {
     using primitive_t::primitive_t;
 
     struct pd_t : public gpu_matmul_pd_t {
@@ -37,7 +41,7 @@ struct cudnn_matmul_t : public primitive_t {
 
         DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_matmul_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
             using smask_t = primitive_attr_t::skip_mask_t;
 
@@ -53,15 +57,16 @@ struct cudnn_matmul_t : public primitive_t {
             bool s8_case = utils::everyone_is(s8, src_dt, wei_dt)
                     && utils::one_of(dst_dt, s8, f32);
 
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+            auto *sycl_engine_impl
+                    = utils::downcast<const xpu::sycl::engine_impl_t *>(
+                            engine->impl());
 
             bool ok = is_dense_format_kind() && blocking_ok()
                     && attr()->has_default_values(
-                            smask_t::scales_runtime | smask_t::post_ops)
+                            smask_t::scales | smask_t::post_ops)
                     && scales_ok() && attr_post_ops_ok(attr())
-                    && IMPLICATION(
-                            bf16_case, has_bf16_support(sycl_engine->device()))
+                    && IMPLICATION(bf16_case,
+                            has_bf16_support(sycl_engine_impl->device()))
                     && set_default_formats()
                     && (f32_case || f16_case || bf16_case || s8_case)
                     && IMPLICATION(with_bias(),
@@ -77,45 +82,32 @@ struct cudnn_matmul_t : public primitive_t {
 
             if (src_md()->ndims > 3) return status::unimplemented;
 
-            init_scratchpad();
+            params_ = std::make_shared<cublas_params>();
+            CHECK(params_->init(src_md(), weights_md(), dst_md(), weights_md(1),
+                    attr(), batched(), with_bias()));
 
+            if (!params_->has_runtime_params_) {
+                auto scratchpad = scratchpad_registry().registrar();
+                params_->init_scratchpad(dst_md(), scratchpad);
+            }
             return status::success;
         }
 
-        // Use scratchpad memory and reorder from it in two scenarios:
-        // * Bias dt is different from dst dt.
-        // * Dst dt is not f32. cuBLAS only supports s8s8f32.
-        bool reorder_required() const {
-            return dst_md()->data_type != data_type::f32
-                    || (with_bias()
-                            && (weights_md(1)->data_type
-                                    != dst_md()->data_type));
-        }
-
-        size_t scratchpad_size(const memory_desc_t *dst_md) const {
-            const auto dst_nelems = memory_desc_wrapper(dst_md).nelems(true);
-            return dst_nelems * sizeof(float);
-        }
-
-    private:
-        void init_scratchpad() {
-            // Runtime dimensions allocate memory at execute.
-            if (has_runtime_dims_or_strides()) return;
-            if (!reorder_required()) return;
-
-            auto scratchpad = scratchpad_registry().registrar();
-            scratchpad.book(memory_tracking::names::key_matmul_dst_in_acc_dt,
-                    scratchpad_size(dst_md()), 1);
-        }
-
         bool scales_ok() const {
+            using namespace data_type;
             const auto &scales = attr()->scales_;
             const auto &supported_args
                     = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST};
             if (!scales.has_default_values(supported_args)) return false;
             // cuDNN does not support scaling per dimension.
-            for (auto arg : supported_args)
-                if (scales.get(arg).mask_ != 0) return false;
+            for (auto arg : supported_args) {
+                if (scales.has_default_values(arg)) continue;
+
+                if (scales.get_mask(arg) > 0) return false;
+                if (!utils::one_of(
+                            scales.get_data_type(arg), s8, s32, f32, f16, bf16))
+                    return false;
+            }
             return true;
         }
 
@@ -131,44 +123,28 @@ struct cudnn_matmul_t : public primitive_t {
             }
             return true;
         }
+
+        std::shared_ptr<cublas_params> params_;
     };
 
-    status_t init(engine_t *engine) override {
+    status_t init(impl::engine_t *engine) override {
         matmul_impl_.reset(new cudnn_matmul_impl_t());
-        const auto status = matmul_impl_->init((matmul_pd_t *)pd());
-        if (status != status::success) return status;
 
-        const bool with_bias = matmul_impl_->with_bias();
-        const bool has_runtime_args = matmul_impl_->has_runtime_params();
-        const bool with_scratchpad = pd()->reorder_required();
+        bool has_runtime_args = pd()->params_->has_runtime_params_;
 
-        if (with_scratchpad && has_runtime_args && with_bias) {
-            executor_.reset(new cudnn_matmul_scratch_runtime_args_bias_exec_t);
-        } else if (with_scratchpad && has_runtime_args) {
-            executor_.reset(new cudnn_matmul_runtime_args_scratch_exec_t);
-        } else if (has_runtime_args && with_bias) {
-            executor_.reset(new cudnn_matmul_runtime_args_bias_exec_t);
-        } else if (has_runtime_args) {
+        if (has_runtime_args) {
             executor_.reset(new cudnn_matmul_runtime_args_exec_t);
-        } else if (with_bias && with_scratchpad) {
-            executor_.reset(new cudnn_matmul_bias_scratch_exec_t);
-        } else if (with_scratchpad) {
-            executor_.reset(new cudnn_matmul_scratch_exec_t);
-        } else if (with_bias) {
-            executor_.reset(new cudnn_matmul_bias_exec_t);
-        } else if (!with_scratchpad && !has_runtime_args && !with_bias) {
-            executor_.reset(new cudnn_matmul_exec_t);
         } else {
-            return status::unimplemented;
+            executor_.reset(new cudnn_matmul_exec_t);
+            matmul_impl_->set_non_runtime_params(pd()->params_);
         }
-
-        return status;
+        return status::success;
     }
 
     status_t execute(const exec_ctx_t &ctx) const override;
 
     std::shared_ptr<cudnn_matmul_impl_t> matmul_impl_;
-    std::shared_ptr<cudnn_matmul_exec_base_t> executor_;
+    std::shared_ptr<cudnn_matmul_base_exec_t> executor_;
 
 private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }

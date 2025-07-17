@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,11 +25,11 @@ namespace impl {
 namespace cpu {
 namespace x64 {
 
-class jit_avx512_core_gemv_bf16bf16f32_kern : public jit_generator {
+class jit_avx512_core_gemv_bf16bf16f32_kern_t : public jit_generator_t {
 public:
-    jit_avx512_core_gemv_bf16bf16f32_kern(bool trans);
-    ~jit_avx512_core_gemv_bf16bf16f32_kern();
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_gemv_bf16bf16f32_kern);
+    jit_avx512_core_gemv_bf16bf16f32_kern_t(bool trans);
+    ~jit_avx512_core_gemv_bf16bf16f32_kern_t() override;
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_gemv_bf16bf16f32_kern_t);
 
 protected:
     bool trans_;
@@ -52,7 +52,7 @@ protected:
     void outerloop(int unroll_y, Xbyak::Label *&cur_outerloop_label,
             Xbyak::Label *&outerloop_end_label);
 
-    void generate() override ATTRIBUTE_OPTIMIZE;
+    void generate() override;
 
 private:
     static const int UNROLL_M_ = 64;

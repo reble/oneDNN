@@ -19,6 +19,7 @@
 #define CPU_AARCH64_JIT_SVE_512_CORE_X8S8S32X_DECONVOLUTION_HPP
 
 #include <functional>
+#include <memory>
 #include <vector>
 
 #include "common/c_types_map.hpp"
@@ -227,16 +228,19 @@ struct _jit_sve_512_core_x8s8s32x_deconv_fwd_kernel {
         int ch_block = ajcp.is_depthwise ? ajcp.ch_block : ajcp.ic_block;
         switch (ch_block) {
             case 16:
-                kernel_ = new jit_sve_512_core_x8s8s32x_deconv_fwd_kernel<
-                        sve_512>(ajcp, attr, dst_md);
+                kernel_ = utils::make_unique<
+                        jit_sve_512_core_x8s8s32x_deconv_fwd_kernel<sve_512>>(
+                        ajcp, attr, dst_md);
                 return;
             case 8:
-                kernel_ = new jit_sve_512_core_x8s8s32x_deconv_fwd_kernel<
-                        sve_256>(ajcp, attr, dst_md);
+                kernel_ = utils::make_unique<
+                        jit_sve_512_core_x8s8s32x_deconv_fwd_kernel<sve_256>>(
+                        ajcp, attr, dst_md);
                 return;
             case 4:
-                kernel_ = new jit_sve_512_core_x8s8s32x_deconv_fwd_kernel<
-                        sve_128>(ajcp, attr, dst_md);
+                kernel_ = utils::make_unique<
+                        jit_sve_512_core_x8s8s32x_deconv_fwd_kernel<sve_128>>(
+                        ajcp, attr, dst_md);
                 return;
             default: assert(!"invalid channel blocking");
         }
@@ -244,9 +248,9 @@ struct _jit_sve_512_core_x8s8s32x_deconv_fwd_kernel {
 
     status_t create_kernel() { return kernel_->create_kernel(); }
 
-    ~_jit_sve_512_core_x8s8s32x_deconv_fwd_kernel() { delete kernel_; }
+    ~_jit_sve_512_core_x8s8s32x_deconv_fwd_kernel() = default;
 
-    void operator()(const jit_deconv_call_s *p) const { (*kernel_)(p); }
+    void operator()(const jit_deconv_args_t *p) const { (*kernel_)(p); }
 
     static status_t init_conf(jit_conv_conf_t &jcp,
             const deconvolution_desc_t &cd, memory_desc_t &src_md,
@@ -259,7 +263,7 @@ struct _jit_sve_512_core_x8s8s32x_deconv_fwd_kernel {
 
 private:
     DNNL_DISALLOW_COPY_AND_ASSIGN(_jit_sve_512_core_x8s8s32x_deconv_fwd_kernel);
-    jit_generator *kernel_;
+    std::unique_ptr<jit_generator> kernel_;
 };
 
 struct jit_sve_512_core_x8s8s32x_deconvolution_fwd_t : public primitive_t {
@@ -282,9 +286,8 @@ struct jit_sve_512_core_x8s8s32x_deconvolution_fwd_t : public primitive_t {
                                     weights_md(1)->data_type, f32, s32, s8, u8))
                     && utils::one_of(dst_md(0)->data_type, f32, s32, s8, u8)
                     && desc()->accum_data_type == s32
-                    && attr()->has_default_values(skip_mask_t::oscale_runtime
-                            | skip_mask_t::post_ops
-                            | skip_mask_t::zero_points_runtime);
+                    && attr()->has_default_values(
+                            skip_mask_t::post_ops | skip_mask_t::zero_points);
             if (!ok) return status::unimplemented;
 
             CHECK(_jit_sve_512_core_x8s8s32x_deconv_fwd_kernel::init_conf(jcp_,
@@ -298,7 +301,7 @@ struct jit_sve_512_core_x8s8s32x_deconvolution_fwd_t : public primitive_t {
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     jit_sve_512_core_x8s8s32x_deconvolution_fwd_t(const pd_t *apd)

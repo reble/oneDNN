@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2017-2024 Intel Corporation
+# Copyright 2017-2025 Intel Corporation
 # Copyright 2021 FUJITSU LIMITED
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,16 +30,11 @@ macro(sdl_unix_common_ccxx_flags var)
     append(${var} "-fPIC -Wformat -Wformat-security")
 endmacro()
 
-macro(sdl_gnu_common_ccxx_flags var)
-    if(DPCPP_HOST_COMPILER_KIND STREQUAL "GNU")
-        # GNU compiler 7.4 or newer is required for host compiler
-        append(${var} "-fstack-protector-strong")
-    else()
-        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 4.9)
-            append(${var} "-fstack-protector-all")
-        else()
-            append(${var} "-fstack-protector-strong")
-        endif()
+macro(sdl_gnu_common_ccxx_flags var gnu_version)
+    append(${var} "-fstack-protector-strong")
+    if(NOT (${gnu_version} VERSION_LESS 8.0) 
+       AND (DNNL_TARGET_ARCH STREQUAL "X64"))
+        append(${var} "-fcf-protection=full")
     endif()
 endmacro()
 
@@ -49,44 +44,84 @@ endmacro()
 # only. To prevent warnings on users' side who use the library and turn
 # this warning on, let's use it too. Applicable for the library sources
 # and interfaces only (tests currently rely on that fact heavily)
-macro(sdl_gnu_src_ccxx_flags var)
-    append(CMAKE_SRC_CCXX_FLAGS "-Wmissing-field-initializers")
+macro(sdl_unix_src_ccxx_flags var)
+    append(${var} "-Wmissing-field-initializers")
 endmacro()
 
-macro(sdl_gnu_example_ccxx_flags var)
+macro(sdl_unix_example_ccxx_flags var)
     # At this point the flags for src and examples are the same
-    sdl_gnu_src_ccxx_flags(${var})
+    sdl_unix_src_ccxx_flags(${var})
 endmacro()
+
+set(ONEDNN_SDL_COMPILER_FLAGS)
+set(ONEDNN_SDL_LINKER_FLAGS)
 
 if(UNIX)
-    set(CMAKE_CCXX_FLAGS)
-
-    sdl_unix_common_ccxx_flags(CMAKE_CCXX_FLAGS)
-    append(CMAKE_CXX_FLAGS_RELEASE "-D_FORTIFY_SOURCE=2")
-    append(CMAKE_C_FLAGS_RELEASE "-D_FORTIFY_SOURCE=2")
+    sdl_unix_common_ccxx_flags(ONEDNN_SDL_COMPILER_FLAGS)
+    sdl_unix_src_ccxx_flags(CMAKE_SRC_CCXX_FLAGS)
+    sdl_unix_example_ccxx_flags(CMAKE_EXAMPLE_CCXX_FLAGS)
+    if(UPPERCASE_CMAKE_BUILD_TYPE STREQUAL "RELEASE")
+        append(ONEDNN_SDL_COMPILER_FLAGS "-D_FORTIFY_SOURCE=2")
+    endif()
     if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
-        sdl_gnu_common_ccxx_flags(CMAKE_CCXX_FLAGS)
-        sdl_gnu_src_ccxx_flags(CMAKE_SRC_CCXX_FLAGS)
-        sdl_gnu_example_ccxx_flags(CMAKE_EXAMPLE_CCXX_FLAGS)
-    elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+        sdl_gnu_common_ccxx_flags(ONEDNN_SDL_COMPILER_FLAGS
+                                  CMAKE_CXX_COMPILER_VERSION)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "(Apple)?[Cc]lang")
         get_filename_component(CXX_CMD_NAME ${CMAKE_CXX_COMPILER} NAME)
         # Fujitsu CXX compiler does not support "-fstack-protector-all".
         if(NOT CXX_CMD_NAME STREQUAL "FCC")
-            append(CMAKE_CCXX_FLAGS "-fstack-protector-all")
+            append(ONEDNN_SDL_COMPILER_FLAGS "-fstack-protector-all")
         endif()
     elseif("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Intel")
-        append(CMAKE_CXX_FLAGS "-fstack-protector")
+        append(ONEDNN_SDL_COMPILER_FLAGS "-fstack-protector")
     endif()
-    append(CMAKE_C_FLAGS "${CMAKE_CCXX_FLAGS}")
-    append(CMAKE_CXX_FLAGS "${CMAKE_CCXX_FLAGS}")
     if(APPLE)
-        append(CMAKE_SHARED_LINKER_FLAGS "-Wl,-bind_at_load")
-        append(CMAKE_EXE_LINKER_FLAGS "-Wl,-bind_at_load")
+        append(ONEDNN_SDL_LINKER_FLAGS "-Wl,-bind_at_load")
     else()
+        # Only applies to executables.
         append(CMAKE_EXE_LINKER_FLAGS "-pie")
-        append(CMAKE_SHARED_LINKER_FLAGS "-Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now")
-        append(CMAKE_EXE_LINKER_FLAGS "-Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now")
+        append(ONEDNN_SDL_LINKER_FLAGS "-Wl,-z,noexecstack -Wl,-z,relro -Wl,-z,now")
     endif()
-elseif(MSVC AND ${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
-    set(CMAKE_CCXX_FLAGS "/guard:cf")
+elseif(WIN32)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+        append(ONEDNN_SDL_COMPILER_FLAGS "/GS /Gy /guard:cf /DYNAMICBASE /sdl")
+        append(ONEDNN_SDL_LINKER_FLAGS "/NXCOMPAT /LTCG")
+    elseif(CMAKE_BASE_NAME STREQUAL "icx")
+        append(ONEDNN_SDL_COMPILER_FLAGS "/GS /Gy /guard:cf /Wformat /Wformat-security")
+        append(ONEDNN_SDL_LINKER_FLAGS "/link /NXCOMPAT")
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        append(ONEDNN_SDL_COMPILER_FLAGS "-Wformat -Wformat-security")
+        if(UPPERCASE_CMAKE_BUILD_TYPE STREQUAL "RELEASE")
+            append(ONEDNN_SDL_COMPILER_FLAGS "-D_FORTIFY_SOURCE=2")
+        endif()
+        get_filename_component(CXX_CMD_NAME ${CMAKE_CXX_COMPILER} NAME)
+        # Fujitsu CXX compiler does not support "-fstack-protector-all".
+        if(NOT CXX_CMD_NAME STREQUAL "FCC")
+            append(ONEDNN_SDL_COMPILER_FLAGS "-fstack-protector-all")
+        endif()
+        append(ONEDNN_SDL_LINKER_FLAGS "-Xlinker /NXCOMPAT -Xlinker /LTCG")
+    endif()
+
+    if(NOT MINGW)
+        # For a Windows build, a malicious DLL can be injected because of the
+        # uncontrolled search order for load-time linked libraries defined for a
+        # Windows setting. The following cmake flags change the search order so that
+        # DLLs are loaded from the current working directory only if it is under a path
+        # in the Safe Load List.
+        if(CMAKE_BASE_NAME STREQUAL "icx")
+            # add ICX-style linker flags
+            append(ONEDNN_SDL_LINKER_FLAGS "/link /DEPENDENTLOADFLAG:0x2000")
+        elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+            # add Clang-style linker flags
+            append(ONEDNN_SDL_LINKER_FLAGS "-Xlinker /DEPENDENTLOADFLAG:0x2000")
+        else()
+            # Default to MSVC-style definition
+            append(ONEDNN_SDL_LINKER_FLAGS "/DEPENDENTLOADFLAG:0x2000")
+        endif()
+    endif()
 endif()
+
+append(CMAKE_C_FLAGS "${ONEDNN_SDL_COMPILER_FLAGS}")
+append(CMAKE_CXX_FLAGS "${ONEDNN_SDL_COMPILER_FLAGS}")
+append(CMAKE_SHARED_LINKER_FLAGS "${ONEDNN_SDL_LINKER_FLAGS}")
+append(CMAKE_EXE_LINKER_FLAGS "${ONEDNN_SDL_LINKER_FLAGS}")

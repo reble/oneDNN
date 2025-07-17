@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 * Copyright 2024 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -31,12 +31,22 @@
 #include "dnnl_common.hpp"
 #include "dnnl_memory.hpp"
 
+#include "eltwise/eltwise.hpp"
 #include "softmax/softmax.hpp"
+
+// Here only for internal `softmax_accurate_inf_as_zero` alg_kind. Must be
+// removed once alg_kind gets converted to a public value.
+#include "src/common/c_types_map.hpp"
 
 namespace softmax {
 
 dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     const prb_t *prb = init_pd_args.prb;
+    if (prb->has_stats) {
+        // softmax primitive doesn't support stats output
+        return dnnl_unimplemented;
+    }
+
     res_t *res = init_pd_args.res;
     bool force_f32_dt = init_pd_args.force_f32_dt;
 
@@ -44,12 +54,16 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
             force_f32_dt ? dnnl_f32 : prb->ddt, prb->dtag);
 
     dnnl_alg_kind_t alg_kind = dnnl_softmax_accurate;
-    if (prb->alg == LOGSOFTMAX) alg_kind = dnnl_softmax_log;
+    if (prb->alg == LOGSOFTMAX)
+        alg_kind = dnnl_softmax_log;
+    else if (prb->alg == SOFTMAX_INF_AS_ZERO)
+        alg_kind = static_cast<dnnl_alg_kind_t>(
+                dnnl::impl::alg_kind::softmax_accurate_inf_as_zero);
 
     attr_args_t attr_args;
     attr_args.prepare_post_ops_mds(prb->attr, prb->ndims, prb->dims.data());
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
-            create_dnnl_attr(prb->attr, attr_args));
+            create_dnnl_attr(prb->attr, attr_args, prb->ndims));
 
     if (prb->dir & FLAG_FWD) {
         auto src_d = dnn_mem_t::init_md(prb->ndims, prb->dims.data(),
@@ -90,6 +104,10 @@ int fill_data_fwd(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     // Refer to modes documentation for filling principles.
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, nullptr);
+    }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
     }
 
     int64_t outer_size = 0, inner_size = 0, axis_size = 0;
@@ -160,7 +178,7 @@ int fill_data_fwd(const prb_t *prb, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
                     n_top[i]--;
                     if (n_top[i] == 0) i++;
                 }
-                mem_fp.set_elem(offset,
+                mem_fp.set_f32_elem(offset,
                         round_to_nearest_representable(mem_dt.dt(), value));
             }
         }
@@ -180,6 +198,10 @@ int fill_data_bwd(data_kind_t data_kind, const prb_t *prb, dnn_mem_t &mem_dt,
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, nullptr);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     // TODO: replace with some better filling mechanism.
     const int range = ((seed % 2 == 0) || mem_dt.dt() == dnnl_f16) ? 8 : 128;
@@ -195,7 +217,7 @@ int fill_data_bwd(data_kind_t data_kind, const prb_t *prb, dnn_mem_t &mem_dt,
         const float gen = ((11 * i) + 37 + 19 * seed) % range;
         float coeff = data_kind == DIFF_DST ? sign * 1.f : sign * (1.f / range);
         float value = coeff * gen;
-        mem_fp.set_elem(i, value);
+        mem_fp.set_f32_elem(i, value);
     });
 
     SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -206,10 +228,22 @@ int fill_data_bwd(data_kind_t data_kind, const prb_t *prb, dnn_mem_t &mem_dt,
 void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
     skip_unimplemented_data_type({prb->sdt, prb->ddt}, prb->dir, res);
     skip_unimplemented_sum_po(prb->attr, res, dnnl_softmax, prb->sdt);
+    skip_unimplemented_binary_po(prb->attr, res);
     skip_unimplemented_prelu_po(prb->attr, res, dnnl_softmax);
 
     if (prb->attr.post_ops.find(attr_t::post_ops_t::kind_t::SUM) != -1) {
-        res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+        res->state = SKIPPED;
+        res->reason = skip_reason::case_not_supported;
+        return;
+    }
+    // Softmax with stats is not supported in the primitive implementation
+    // so skip it. It is supported in the graph driver, we will handle it
+    // separately.
+    // TODO: Change it to a dedicated status so that graph driver knows
+    // where the skipped case is coming from.
+    if (prb->has_stats) {
+        res->state = SKIPPED;
+        res->reason = skip_reason::case_not_supported;
         return;
     }
 }
@@ -231,20 +265,30 @@ void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
     const float trh_coeff_bwd = (prb->dir & FLAG_FWD) ? 1.f : 4.f;
     const float trh_f32 = trh_coeff_log * trh_coeff_bwd * trh_coeff_f32
             * epsilon_dt(trh_dt);
-#if DNNL_AARCH64_USE_ACL
-    // ACL softmax accumulates in F16, but oneDNN now expects accumulation in
-    // F32, this partially reverts 6727bbe8. For more information, see
-    // https://github.com/oneapi-src/oneDNN/issues/1819
+#if defined(DNNL_AARCH64) || defined(DNNL_SYCL_HIP) || defined(DNNL_SYCL_CUDA)
+    // MIOpen and ACL softmax accumulate in F16, but oneDNN now expects accumulation in
+    // F32, this partially reverts 6727bbe8. For more information on ACL softmax, see
+    // https://github.com/uxlfoundation/oneDNN/issues/1819
+    // Similarly, for bf16 on AArch64, the relaxed threshold is necessary due to
+    // minor accuracy drops observed compared to f32
     const float trh = trh_f32;
 #else
-    const float trh = is_flt_or_dbl ? trh_f32 : 0.f;
+    const bool is_strict_acc
+            = prb->attr.acc_mode == dnnl_accumulation_mode_strict
+            || prb->attr.acc_mode == dnnl_accumulation_mode_f32;
+    const bool is_relaxed_xf16
+            = !is_strict_acc && (trh_dt == dnnl_f16 || trh_dt == dnnl_bf16);
+    // Relaxed xf16 computation can get an ulp difference with f32 ref values.
+    const float trh = is_flt_or_dbl || is_relaxed_xf16 ? trh_f32 : 0.f;
 #endif
     cmp.set_threshold(trh);
-
-    // LogSoftMax is unstable enough when there are attributes on top.
-    const bool compare_with_norm
-            = (prb->alg == alg_t::LOGSOFTMAX && !prb->attr.is_def());
-    cmp.set_norm_validation_mode(compare_with_norm);
+    if (driver_name == "graph" && kind == DST_1) {
+        // softmax stats is computed with eltwise-log, which has a different
+        // and larger threshold than softmax. So we need to adjust the threshold
+        // for this case.
+        cmp.set_threshold(::eltwise::get_eltwise_threshold(
+                dnnl_f32, ::eltwise::alg_t::LOG));
+    }
 
     const int64_t axis_size = prb->dims[prb->axis];
     const int64_t n_zeros = (prb->ddt == dnnl_s8 || prb->ddt == dnnl_u8)
@@ -261,7 +305,7 @@ void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
 
     const auto softmax_add_check
             = [&](const compare::compare_t::driver_check_func_args_t &args) {
-#if DNNL_AARCH64_USE_ACL
+#if defined(DNNL_AARCH64_USE_ACL)
                   auto diff_trh = epsilon_dt(args.dt);
 #else
                   auto diff_trh = epsilon_dt(dnnl_f32);
@@ -281,15 +325,21 @@ std::vector<int> supported_exec_args(dir_t dir) {
             DNNL_ARG_SRC,
             DNNL_ARG_DST,
     };
+    static const std::vector<int> exec_fwd_args_graph = {
+            DNNL_ARG_SRC, DNNL_ARG_DST,
+            DNNL_ARG_DST_1, // For Graph to compute softmax stats
+    };
     static const std::vector<int> exec_bwd_args = {
             DNNL_ARG_DST,
             DNNL_ARG_DIFF_SRC,
             DNNL_ARG_DIFF_DST,
     };
-    return (dir & FLAG_FWD) ? exec_fwd_args : exec_bwd_args;
+    return (dir & FLAG_FWD)
+            ? (driver_name == "graph" ? exec_fwd_args_graph : exec_fwd_args)
+            : exec_bwd_args;
 };
 
-fill_cfg_t binary_po_fill_cfg(
+void binary_po_fill_cfg(std::unordered_map<int, fill_cfg_t> &fill_cfg_map,
         int exec_arg, const dnn_mem_t &mem, const attr_t &attr) {
     fill_cfg_t cfg;
     const int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
@@ -303,16 +353,22 @@ fill_cfg_t binary_po_fill_cfg(
                 = exec_arg / DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE - 1;
         assert(bin_po_idx < attr.post_ops.len());
         const auto alg = attr.post_ops.entry[bin_po_idx].kind;
-        cfg = fill_cfg_t(mem.dt(), 0.f, 16.f, /* int = */ true, alg,
-                "softmax_binary_post_op");
+        const bool is_src1_arg = !(exec_arg
+                ^ (DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_po_idx)
+                        | DNNL_ARG_SRC_1));
+
+        if (is_src1_arg) {
+            cfg = fill_cfg_t(mem.dt(), 0.f, 16.f, /* int = */ true, alg,
+                    "softmax_binary_post_op");
+            fill_cfg_map.insert({DNNL_ARG_SRC_1, cfg});
+        }
     }
-    return cfg;
 }
 
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     const auto &ref_engine = get_cpu_engine();
     const bool is_fwd_prim = is_fwd_prop_kind(query_prop_kind(query_pd(prim)));
@@ -330,7 +386,8 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         // use switch below to define a memory desc for it.
         if (exec_arg != DNNL_ARG_SCRATCHPAD) {
             ref_mem_map.emplace(exec_arg,
-                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine,
+                            /* prefill = */ false));
         }
         auto &ref_mem = ref_mem_map[exec_arg];
 
@@ -347,12 +404,14 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 break;
             case DNNL_ARG_DST:
                 if (!is_fwd_prim) {
-                    const bool neg_sign = prb->alg == SOFTMAX ? true : false;
+                    const bool neg_sign = prb->alg == SOFTMAX
+                            || prb->alg == SOFTMAX_INF_AS_ZERO;
                     SAFE(fill_data_bwd(DST, prb, mem, ref_mem, neg_sign), WARN);
                 }
                 break;
             case DNNL_ARG_DIFF_DST: {
-                const bool neg_sign = prb->alg == SOFTMAX ? true : false;
+                const bool neg_sign = prb->alg == SOFTMAX
+                        || prb->alg == SOFTMAX_INF_AS_ZERO;
                 SAFE(fill_data_bwd(DIFF_DST, prb, mem, ref_mem, !neg_sign),
                         WARN);
                 // Need a copy of source data for inplace mode for bitwise
@@ -364,10 +423,8 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
                 }
             } break;
             default: {
-                const auto &binary_fill_cfg
-                        = binary_po_fill_cfg(exec_arg, mem, prb->attr);
-                std::unordered_map<int, fill_cfg_t> fill_cfg_map {
-                        {DNNL_ARG_SRC_1, binary_fill_cfg}};
+                std::unordered_map<int, fill_cfg_t> fill_cfg_map;
+                binary_po_fill_cfg(fill_cfg_map, exec_arg, mem, prb->attr);
                 SAFE(init_ref_memory_args_default_case(exec_arg, mem, ref_mem,
                              prb->attr, res, fill_cfg_map),
                         WARN);
@@ -401,14 +458,21 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     return OK;
 }
 
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
-    return check_caches(v_prim[0], prb, res);
+    if (has_bench_mode_bit(mode_bit_t::exec)) {
+        SAFE(check_total_size(res), WARN);
+    }
+    if (has_bench_mode_bit(mode_bit_t::corr)) {
+        SAFE(check_caches(v_prim[0], prb, res), WARN);
+    }
+    return OK;
 }
 
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
+    set_zmalloc_max_expected_size(res->mem_size_args.zmalloc_expected_size);
+
     const auto &prim = v_prim[0];
 
     dnn_mem_map_t mem_map, ref_mem_map;
@@ -420,8 +484,8 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    check_correctness(
-            prb, get_kinds_to_check(prb), args, ref_args, setup_cmp, res);
+    check_correctness(prb, get_kinds_to_check(prb), args, ref_args, setup_cmp,
+            res, prb->dir);
     SAFE(check_bitwise(prim, get_kinds_to_check(prb), args, prb->attr,
                  prb->inplace, res),
             WARN);

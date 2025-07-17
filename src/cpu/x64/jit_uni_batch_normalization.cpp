@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -135,7 +135,8 @@ struct jit_bnorm_conf_t {
     // given nthr and shape of problem, choose the thread partition
     // to use (ie set N_nthr, C_nthr, and S_nthr)
     bool thread_partition(bool spatial_thr_allowed, int nthr, dim_t N,
-            dim_t C_blks, dim_t SP, int &C_nthr, int &N_nthr, int &S_nthr) {
+            dim_t C_blks, dim_t SP, int &C_nthr, int &N_nthr,
+            int &S_nthr) const {
         if (((nthr <= C_blks) && IMPLICATION(is_nspc_, N == 1))
                 || !dnnl_thr_syncable()) {
             C_nthr = nthr;
@@ -214,7 +215,7 @@ struct jit_bnorm_conf_t {
 };
 
 template <cpu_isa_t isa>
-struct jit_bnorm_t : public jit_generator {
+struct jit_bnorm_t : public jit_generator_t {
     struct call_params_t {
         // keep all sizes at 8 bytes -- jit code expects this
         size_t N_ithr, N_nthr;
@@ -244,7 +245,7 @@ struct jit_bnorm_t : public jit_generator {
             : (isa == avx2)                      ? yword
                                                  : zword;
 
-    const int vlen = isa == sse41 ? 32 : cpu_isa_traits<isa>::vlen;
+    const int vlen = isa == sse41 ? 32 : cpu_isa_traits_t<isa>::vlen;
 
     const batch_normalization_pd_t *pd_ = nullptr;
     const jit_bnorm_conf_t *jbp_ = nullptr;
@@ -623,9 +624,7 @@ struct jit_bnorm_t : public jit_generator {
 
                 // convert f32 output to bf16
                 if (!use_bf16_emulation())
-                    vcvtneps2bf16(dst_reg, src_reg,
-                            mayiuse(avx512_core) ? Xbyak::EvexEncoding
-                                                 : Xbyak::VexEncoding);
+                    vcvtneps2bf16(dst_reg, src_reg, get_encoding());
                 else
                     bf16_emu_->vcvtneps2bf16(dst_reg, src_reg);
 
@@ -637,7 +636,7 @@ struct jit_bnorm_t : public jit_generator {
             } else if (is_f16_) {
                 auto src_reg = Vmm(src.getIdx());
                 auto dst_reg =
-                        typename vreg_traits<Vmm>::Vmm_lower_t(src.getIdx());
+                        typename vreg_traits_t<Vmm>::Vmm_lower_t(src.getIdx());
                 if (is_nt_store) {
                     if (mayiuse(avx512_core_fp16))
                         vcvtps2phx(dst_reg, src_reg);
@@ -2075,7 +2074,7 @@ struct jit_bnorm_t : public jit_generator {
     }
 
     jit_bnorm_t(const batch_normalization_pd_t *pd, const jit_bnorm_conf_t *jbp)
-        : jit_generator(jit_name())
+        : jit_generator_t(jit_name())
         , pd_(pd)
         , jbp_(jbp)
         , is_bf16_(pd_->src_md()->data_type == data_type::bf16)
@@ -2122,7 +2121,7 @@ struct jit_bnorm_t : public jit_generator {
         postamble();
     }
 
-    void operator()(const call_params_t *p) { jit_generator::operator()(p); }
+    void operator()(const call_params_t *p) { jit_generator_t::operator()(p); }
 
     ~jit_bnorm_t() override { delete bf16_emu_; }
 };
@@ -2314,7 +2313,7 @@ struct driver_t : public c_compatible {
 private:
     enum {
         simd_w = isa == sse41 ? 8
-                              : cpu_isa_traits<isa>::vlen
+                              : cpu_isa_traits_t<isa>::vlen
                         / sizeof(acc_data_t) // BF16 will expand to FP32
     };
 
@@ -2383,6 +2382,8 @@ status_t jit_uni_batch_normalization_fwd_t<isa>::pd_t::init(engine_t *engine) {
     VDISPATCH_BNORM(
             memory_desc_wrapper(src_md()) == memory_desc_wrapper(dst_md()),
             VERBOSE_INCONSISTENT_MDS, "src", "dst");
+    VDISPATCH_BNORM(impl::is_dense_format_kind({src_md(), dst_md()}),
+            VERBOSE_UNSUPPORTED_SPARSE_CFG);
 
     // BN+Add+Relu fusion is not currently implemented
     VDISPATCH_BNORM(!fuse_norm_add_relu(), VERBOSE_UNSUPPORTED_FEATURE,
@@ -2417,13 +2418,14 @@ status_t jit_uni_batch_normalization_fwd_t<isa>::pd_t::init(engine_t *engine) {
 
     VDISPATCH_BNORM(!(memory_desc_wrapper(src_md()).padded_dims()[1] != C()
                             && !isa_supports_avx2),
-            VERBOSE_PADDING_ERROR, "bad padded dimensions for current isa");
+            VERBOSE_UNSUPPORTED_PAD_FEATURE,
+            "bad padded dimensions for current isa");
 
     // Only IC % simd_w == 0 is supported for now
-    const int simd_w = cpu_isa_traits<isa>::vlen / sizeof(acc_data_t);
+    const int simd_w = cpu_isa_traits_t<isa>::vlen / sizeof(acc_data_t);
     VDISPATCH_BNORM(!(src_d.matches_one_of_tag(nc, nwc, nhwc, ndhwc)
                             && src_d.padded_dims()[1] % simd_w != 0),
-            VERBOSE_PADDING_ERROR,
+            VERBOSE_UNSUPPORTED_PAD_FEATURE,
             "bad padded dimensions for current format tag");
 
     nthr_ = dnnl_get_max_threads();
@@ -2518,6 +2520,10 @@ status_t jit_uni_batch_normalization_bwd_t<isa>::pd_t::init(engine_t *engine) {
                     == memory_desc_wrapper(diff_dst_md()),
             VERBOSE_INCONSISTENT_MDS, "diff_src", "diff_dst");
 
+    VDISPATCH_BNORM(impl::is_dense_format_kind(
+                            {src_md(), diff_src_md(), dst_md(), diff_dst_md()}),
+            VERBOSE_UNSUPPORTED_SPARSE_CFG);
+
     // BN+Add+Relu fusion is not currently implemented
     VDISPATCH_BNORM(!(fuse_norm_add_relu()), VERBOSE_UNSUPPORTED_FEATURE,
             "sum+relu post-ops configuration is not supported");
@@ -2542,12 +2548,13 @@ status_t jit_uni_batch_normalization_bwd_t<isa>::pd_t::init(engine_t *engine) {
     const bool isa_supports_avx2 = is_superset(isa, avx2);
     VDISPATCH_BNORM(!(memory_desc_wrapper(src_md()).padded_dims()[1] != C()
                             && !isa_supports_avx2),
-            VERBOSE_PADDING_ERROR, "bad padded dimensions for current isa");
+            VERBOSE_UNSUPPORTED_PAD_FEATURE,
+            "bad padded dimensions for current isa");
 
     // Only IC % 16 == 0 is supported for now
     VDISPATCH_BNORM(!(src_d.matches_one_of_tag(nc, nwc, nhwc, ndhwc)
                             && src_d.padded_dims()[1] % 16 != 0),
-            VERBOSE_PADDING_ERROR,
+            VERBOSE_UNSUPPORTED_PAD_FEATURE,
             "bad padded dimensions for current format tag");
 
     if (fuse_norm_relu()) {

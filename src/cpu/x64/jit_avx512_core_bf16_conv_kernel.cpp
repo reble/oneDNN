@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #include "common/bfloat16.hpp"
 #include "common/c_types_map.hpp"
+#include "common/convolution_pd.hpp"
 #include "common/dnnl_thread.hpp"
 #include "common/math_utils.hpp"
 #include "common/nstl.hpp"
@@ -29,7 +30,7 @@
 #include "cpu/x64/injectors/jit_uni_eltwise_injector.hpp"
 #include "cpu/x64/jit_avx512_core_bf16_conv_kernel.hpp"
 
-#define GET_OFF(field) offsetof(jit_conv_call_s, field)
+#define GET_OFF(field) offsetof(jit_conv_args_t, field)
 
 namespace dnnl {
 namespace impl {
@@ -96,12 +97,10 @@ inline bool is_1stconv(const jit_conv_conf_t &jcp) {
 } // namespace
 
 template <typename Vmm>
-_jit_avx512_core_bf16_fwd_kernel<Vmm>::_jit_avx512_core_bf16_fwd_kernel(
-        const jit_conv_conf_t &ajcp, const primitive_attr_t &attr,
-        const memory_desc_t &dst_md)
-    : jit_generator(jit_name(), nullptr, ker_code_size, true, avx512_core_bf16)
-    , jcp(ajcp)
-    , attr_(attr) {
+jit_avx512_core_bf16_fwd_kernel_vmm_t<
+        Vmm>::jit_avx512_core_bf16_fwd_kernel_vmm_t(const jit_conv_conf_t &ajcp,
+        const primitive_attr_t &attr, const memory_desc_t &dst_md)
+    : jit_generator_t(jit_name(), avx512_core_bf16), jcp(ajcp), attr_(attr) {
     if (jcp.with_eltwise || jcp.with_binary) {
         using namespace binary_injector;
         static constexpr bool preserve_gpr = true;
@@ -132,7 +131,7 @@ _jit_avx512_core_bf16_fwd_kernel<Vmm>::_jit_avx512_core_bf16_fwd_kernel(
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_fwd_kernel<Vmm>::prepare_dst(int ur_w) {
+void jit_avx512_core_bf16_fwd_kernel_vmm_t<Vmm>::prepare_dst(int ur_w) {
     for (int k = 0; k < jcp.nb_oc_blocking; k++)
         for (int j = 0; j < ur_w; j++) {
             Vmm vmm = vmm_dst(j, k);
@@ -141,7 +140,7 @@ void _jit_avx512_core_bf16_fwd_kernel<Vmm>::prepare_dst(int ur_w) {
 }
 
 template <typename Vmm>
-int _jit_avx512_core_bf16_fwd_kernel<Vmm>::vmm_dst_idx(
+int jit_avx512_core_bf16_fwd_kernel_vmm_t<Vmm>::vmm_dst_idx(
         int i_ur, int i_oc) const {
     const int idx = i_ur * jcp.nb_oc_blocking + i_oc;
     assert(idx < ker_reg_base_idx);
@@ -149,7 +148,8 @@ int _jit_avx512_core_bf16_fwd_kernel<Vmm>::vmm_dst_idx(
 }
 
 template <typename Vmm>
-Vmm _jit_avx512_core_bf16_fwd_kernel<Vmm>::vmm_dst(int i_ur, int i_oc) const {
+Vmm jit_avx512_core_bf16_fwd_kernel_vmm_t<Vmm>::vmm_dst(
+        int i_ur, int i_oc) const {
     return Vmm(vmm_dst_idx(i_ur, i_oc));
 }
 
@@ -169,7 +169,7 @@ static void iterate(const int nb_oc_block, const int ur_w, const F &f) {
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_fwd_kernel<Vmm>::apply_postops(int ur_w) {
+void jit_avx512_core_bf16_fwd_kernel_vmm_t<Vmm>::apply_postops(int ur_w) {
     if (jcp.with_eltwise || jcp.with_binary) {
         injector_utils::vmm_index_set_t vmm_idxs;
         if (jcp.with_binary) {
@@ -221,7 +221,7 @@ void _jit_avx512_core_bf16_fwd_kernel<Vmm>::apply_postops(int ur_w) {
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_fwd_kernel<Vmm>::store_dst(int ur_w) {
+void jit_avx512_core_bf16_fwd_kernel_vmm_t<Vmm>::store_dst(int ur_w) {
     Label store_label;
     const int oc_tail = jcp.oc_tail;
     if (!isa_has_bf16(jcp.isa)) bf16_emu_->init_vcvtneps2bf16();
@@ -358,7 +358,7 @@ void _jit_avx512_core_bf16_fwd_kernel<Vmm>::store_dst(int ur_w) {
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_fwd_kernel<Vmm>::compute_loop(
+void jit_avx512_core_bf16_fwd_kernel_vmm_t<Vmm>::compute_loop(
         int ur_w, int pad_l, int pad_r) {
     Label kh_label, kd_label;
     const int ic_tail = jcp.ic_tail;
@@ -571,7 +571,7 @@ void _jit_avx512_core_bf16_fwd_kernel<Vmm>::compute_loop(
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_fwd_kernel<Vmm>::generate() {
+void jit_avx512_core_bf16_fwd_kernel_vmm_t<Vmm>::generate() {
     int iw = jcp.iw;
     int ow = jcp.ow;
     int ow_block = jcp.ow_block;
@@ -629,7 +629,13 @@ void _jit_avx512_core_bf16_fwd_kernel<Vmm>::generate() {
         kmovd(k_oc_tail_mask, reg_tail_32);
         kmovd(postops_mask, reg_tail_32);
         if (need_extended_mask) {
-            mov(reg_tail_32, (1 << (jcp.oc_tail + jcp.simd_w)) - 1);
+            // Computing the mask the other way around overflows int32_t for
+            // `jcp.oc_tail + jcp.simd_w == 31`.
+            // Note: just "-1U" causes CL's warning:
+            // C4146: unary minus operator applied to unsigned type
+            auto zmm_32b_mask = static_cast<uint32_t>(-1)
+                    >> (32 - (jcp.oc_tail + jcp.simd_w));
+            mov(reg_tail_32, zmm_32b_mask);
             kmovd(k_oc_tail_mask_extended, reg_tail_32);
         }
         L(done);
@@ -805,10 +811,11 @@ void _jit_avx512_core_bf16_fwd_kernel<Vmm>::generate() {
     if (jcp.ndims == 5) add(rsp, stack_space_needed_);
     postamble();
 
-    if (jcp.with_eltwise) postops_injector_->prepare_table();
+    if (jcp.with_eltwise)
+        postops_injector_->prepare_table(/* generate = */ true);
 }
 
-void jit_avx512_core_bf16_fwd_kernel::init_scratchpad(
+void jit_avx512_core_bf16_fwd_kernel_t::init_scratchpad(
         memory_tracking::registrar_t &scratchpad, const jit_conv_conf_t &jcp) {
     using namespace memory_tracking::names;
     if (jcp.with_bias && jcp.oc != jcp.oc_without_padding) {
@@ -817,7 +824,7 @@ void jit_avx512_core_bf16_fwd_kernel::init_scratchpad(
     }
 }
 
-status_t jit_avx512_core_bf16_fwd_kernel::init_conf(jit_conv_conf_t &jcp,
+status_t jit_avx512_core_bf16_fwd_kernel_t::init_conf(jit_conv_conf_t &jcp,
         const convolution_desc_t &cd, memory_desc_t &src_md,
         memory_desc_t &weights_md, memory_desc_t &dst_md,
         memory_desc_t &bias_md, primitive_attr_t &attr, int nthreads) {
@@ -828,6 +835,11 @@ status_t jit_avx512_core_bf16_fwd_kernel::init_conf(jit_conv_conf_t &jcp,
     const memory_desc_wrapper weights_d(&weights_md);
     const memory_desc_wrapper dst_d(&dst_md);
     const memory_desc_wrapper bias_d(&bias_md);
+
+    // Big int (> INT_MAX) values are unsupported and jcp fields may overflow
+    // TODO: change data type of jcp fields to size_t
+    VDISPATCH_CONV_IC(!has_large_size(cd, src_d, weights_d, dst_d),
+            VERBOSE_BAD_PARAM, "Large size is not supported");
 
     const bool with_groups = weights_d.ndims() == src_d.ndims() + 1;
     int ndims = src_d.ndims();
@@ -892,9 +904,9 @@ status_t jit_avx512_core_bf16_fwd_kernel::init_conf(jit_conv_conf_t &jcp,
     const auto dat_tag_nCx4c = pick(ndims - 3, nCw4c, nChw4c, nCdhw4c);
     const auto dat_tag_nCx8c = pick(ndims - 3, nCw8c, nChw8c, nCdhw8c);
     const auto dat_tag_nCx16c = pick(ndims - 3, nCw16c, nChw16c, nCdhw16c);
-    auto curr_src_tag = src_d.matches_one_of_tag(dat_tag_nxc, dat_tag_nCx16c,
-            dat_tag_nCx8c, dat_tag_nCx4c, dat_tag_ncx);
-    auto curr_dst_tag = dst_d.matches_one_of_tag(
+    auto curr_src_tag = src_d.mb_stride_relaxed_match(dat_tag_nxc,
+            dat_tag_nCx16c, dat_tag_nCx8c, dat_tag_nCx4c, dat_tag_ncx);
+    auto curr_dst_tag = dst_d.mb_stride_relaxed_match(
             dat_tag_nxc, dat_tag_nCx16c, dat_tag_nCx8c, dat_tag_nCx4c);
     bool is_data_layout_nxc = IMPLICATION(curr_src_tag != dat_tag_nxc,
                                       src_d.format_kind() == format_kind::any)
@@ -906,7 +918,7 @@ status_t jit_avx512_core_bf16_fwd_kernel::init_conf(jit_conv_conf_t &jcp,
     const int regs = isa_has_bf16(jcp.isa) ? 31 /* expl_bcast case */ : 26;
     const bool ok_to_pad_channels = jcp.ngroups == 1 && !is_data_layout_nxc;
 
-    jcp.simd_w = cpu_isa_traits<avx512_core>::vlen / sizeof(float);
+    jcp.simd_w = cpu_isa_traits_t<avx512_core>::vlen / sizeof(float);
 
     const bool ok_to_try_lower_zmm = true
             && IMPLICATION(is_data_layout_nxc,
@@ -1017,9 +1029,16 @@ status_t jit_avx512_core_bf16_fwd_kernel::init_conf(jit_conv_conf_t &jcp,
     static constexpr bool sum_at_pos_0_only = true;
     static constexpr bool sum_requires_scale_one = true;
     static constexpr bool sum_requires_zp_zero = true;
-    const bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(avx512_core,
+    bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(avx512_core,
             {eltwise, binary, sum}, jcp.post_ops, &dst_d, sum_at_pos_0_only,
             sum_requires_scale_one, sum_requires_zp_zero));
+    // temporary workaround that skips avx512 implementation for ternary
+    // post-ops with scalar broadcasting to avoid register collisions.
+    post_ops_ok_ = post_ops_ok_
+            && IMPLICATION(jcp.with_binary,
+                    !binary_injector::
+                            any_binary_postop_rhs_with_ternary_scalar_bcast(
+                                    post_ops, dst_d));
     if (!post_ops_ok_) return status::unimplemented;
 
     jcp.nb_ic = utils::div_up(jcp.ic, jcp.ic_block);
@@ -1088,7 +1107,7 @@ status_t jit_avx512_core_bf16_fwd_kernel::init_conf(jit_conv_conf_t &jcp,
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_bwd_data_kernel<Vmm>::prepare_output(int ur_w) {
+void jit_avx512_core_bf16_bwd_data_kernel_vmm_t<Vmm>::prepare_output(int ur_w) {
     for (int k = 0; k < jcp.nb_ic_blocking; k++) {
         for (int j = 0; j < ur_w; j++) {
             Vmm vmm = vmm_dsrc(j, k);
@@ -1098,7 +1117,7 @@ void _jit_avx512_core_bf16_bwd_data_kernel<Vmm>::prepare_output(int ur_w) {
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_bwd_data_kernel<Vmm>::store_output(int ur_w) {
+void jit_avx512_core_bf16_bwd_data_kernel_vmm_t<Vmm>::store_output(int ur_w) {
     if (!isa_has_bf16(jcp.isa)) bf16_emu_->init_vcvtneps2bf16();
     const int ic_tail = jcp.ic_tail;
 
@@ -1204,7 +1223,7 @@ void _jit_avx512_core_bf16_bwd_data_kernel<Vmm>::store_output(int ur_w) {
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_bwd_data_kernel<Vmm>::compute_loop(
+void jit_avx512_core_bf16_bwd_data_kernel_vmm_t<Vmm>::compute_loop(
         int ur_w, int l_overflow, int r_overflow) {
     int kw = jcp.kw;
     int dilate_w = jcp.dilate_w + 1;
@@ -1345,7 +1364,7 @@ void _jit_avx512_core_bf16_bwd_data_kernel<Vmm>::compute_loop(
 }
 
 template <typename Vmm>
-void _jit_avx512_core_bf16_bwd_data_kernel<Vmm>::generate() {
+void jit_avx512_core_bf16_bwd_data_kernel_vmm_t<Vmm>::generate() {
     int iw = jcp.iw;
     int kw = jcp.kw;
     int ur_w = jcp.ur_w;
@@ -1532,13 +1551,18 @@ void _jit_avx512_core_bf16_bwd_data_kernel<Vmm>::generate() {
     postamble();
 }
 
-status_t jit_avx512_core_bf16_bwd_data_kernel::init_conf(jit_conv_conf_t &jcp,
+status_t jit_avx512_core_bf16_bwd_data_kernel_t::init_conf(jit_conv_conf_t &jcp,
         const convolution_desc_t &cd, memory_desc_t &diff_src_md,
         memory_desc_t &weights_md, memory_desc_t &diff_dst_md, int nthreads) {
 
     const memory_desc_wrapper diff_src_d(&diff_src_md);
     const memory_desc_wrapper weights_d(&weights_md);
     const memory_desc_wrapper diff_dst_d(&diff_dst_md);
+
+    // Big int (> INT_MAX) values are unsupported and jcp fields may overflow
+    // TODO: change data type of jcp fields to size_t
+    VDISPATCH_CONV_IC(!has_large_size(cd, diff_src_d, weights_d, diff_dst_d),
+            VERBOSE_BAD_PARAM, "Large size is not supported");
 
     const bool with_groups = weights_d.ndims() == diff_src_d.ndims() + 1;
     int ndims = diff_src_d.ndims();
@@ -1609,9 +1633,9 @@ status_t jit_avx512_core_bf16_bwd_data_kernel::init_conf(jit_conv_conf_t &jcp,
     const auto dat_tag_nCx4c = pick(ndims - 3, nCw4c, nChw4c, nCdhw4c);
     const auto dat_tag_nCx8c = pick(ndims - 3, nCw8c, nChw8c, nCdhw8c);
     const auto dat_tag_nCx16c = pick(ndims - 3, nCw16c, nChw16c, nCdhw16c);
-    auto curr_src_tag = diff_src_d.matches_one_of_tag(
+    auto curr_src_tag = diff_src_d.mb_stride_relaxed_match(
             dat_tag_nxc, dat_tag_nCx16c, dat_tag_nCx8c, dat_tag_nCx4c);
-    auto curr_dst_tag = diff_dst_d.matches_one_of_tag(
+    auto curr_dst_tag = diff_dst_d.mb_stride_relaxed_match(
             dat_tag_nxc, dat_tag_nCx16c, dat_tag_nCx8c, dat_tag_nCx4c);
     bool is_data_layout_nxc
             = IMPLICATION(curr_src_tag != dat_tag_nxc,
@@ -1622,7 +1646,7 @@ status_t jit_avx512_core_bf16_bwd_data_kernel::init_conf(jit_conv_conf_t &jcp,
 
     bool ok_to_pad_channels = jcp.ngroups == 1 && !is_data_layout_nxc;
 
-    jcp.simd_w = cpu_isa_traits<avx512_core>::vlen / sizeof(float);
+    jcp.simd_w = cpu_isa_traits_t<avx512_core>::vlen / sizeof(float);
 
     const bool ok_to_try_lower_zmm = true
             && IMPLICATION(is_data_layout_nxc,
@@ -1820,9 +1844,9 @@ status_t jit_avx512_core_bf16_bwd_data_kernel::init_conf(jit_conv_conf_t &jcp,
     return status::success;
 }
 
-const int jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::max_ur_w = 28;
+const int jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::max_ur_w = 28;
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         od_step_comeback_pointers() {
     Label kd_comeback_label;
     mov(kj, reg_kd_count);
@@ -1835,7 +1859,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
         jg(kd_comeback_label, T_NEAR);
     }
 }
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         oh_step_comeback_pointers() {
     Label kh_comeback_label;
     mov(kj, reg_kh);
@@ -1849,7 +1873,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         compute_ic_block_step_extern(int ur_w, int pad_l, int pad_r,
                 int ic_block_step, int src_offset, int kernel_offset,
                 int ddst_offset, bool is_tail) {
@@ -1959,20 +1983,20 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     }
 }
 
-int jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::interleave_w_reorder_size(
-        int ur_w) const {
+int jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
+        interleave_w_reorder_size(int ur_w) const {
     const int reorder_block = 16;
     return rnd_up(jcp.stride_w * (ur_w - 1) + jcp.kw, reorder_block);
 }
-int jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+int jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         interleave_w_reorder_bytes(int ur_w) {
     return 2 * jcp.typesize_in * interleave_w_reorder_size(ur_w);
 }
-int jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::interleave_stack_size(
+int jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::interleave_stack_size(
         int ur_w, int ic_block_step) {
     return ic_block_step * interleave_w_reorder_bytes(ur_w);
 }
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         compute_ic_block_step_interleave(int ur_w, int pad_l, int pad_r,
                 int ic_block_step, int src_offset, int kernel_offset,
                 int ddst_offset, bool is_tail) {
@@ -2209,7 +2233,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         convert_src_to_vnni_format(
                 int ur_w, int pad_l, int pad_r, int src_offset) {
     Reg64 reg_trans_tmp = r11;
@@ -2279,7 +2303,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         may_be_set_oc_tail_mask() {
     if (jcp.oc_tail) {
         Label skip_tail_mask;
@@ -2291,7 +2315,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         may_be_reset_oc_tail_mask() {
     if (jcp.oc_tail) {
         // Reset-back the masks
@@ -2300,7 +2324,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         compute_ic_block_step_vpermw_expl(int ur_w, int pad_l, int pad_r,
                 int ic_block_step, int src_offset, int kernel_offset,
                 int ddst_offset, bool is_tail) {
@@ -2426,7 +2450,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     may_be_reset_oc_tail_mask();
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         compute_ic_block_step_vpermw(int ur_w, int pad_l, int pad_r,
                 int ic_block_step, int src_offset, int kernel_offset,
                 int ddst_offset, bool is_tail) {
@@ -2511,7 +2535,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     may_be_reset_oc_tail_mask();
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         compute_diff_bias_init() {
     auto reg_unit_val = reg_tmp.cvt16();
     mov(reg_unit_val, 0x3f80); // bf16 value of 1.
@@ -2526,7 +2550,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::compute_diff_bias_row(
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::compute_diff_bias_row(
         bool is_partial) {
     if (!jcp.with_bias) return;
     mov(reg_tmp, ptr[param + GET_OFF(flags)]);
@@ -2583,7 +2607,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::compute_diff_bias_row(
 
     L(skip_label);
 }
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         maybe_compute_diff_bias() {
     // In harness_3d_reduction case calculation of diff_bias is called
     // for every ow row separately to be aligned with od loop in
@@ -2629,7 +2653,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     L(skip_label);
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::compute_ic_block_step(
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::compute_ic_block_step(
         int ur_w, int pad_l, int pad_r, int ic_block_step, int src_offset,
         int kernel_offset, int ddst_offset, bool is_tail) {
 
@@ -2648,8 +2672,8 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::compute_ic_block_step(
                 src_offset, kernel_offset, ddst_offset, is_tail);
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::get_ur_w(
-        int &ur_w, int &ur_w_tail, int &ur_w_trips) {
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::get_ur_w(
+        int &ur_w, int &ur_w_tail, int &ur_w_trips) const {
     if (jcp.tr_ow <= max_ur_w) {
         ur_w = jcp.tr_ow;
         ur_w_tail = 0;
@@ -2689,7 +2713,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::get_ur_w(
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t ::
         compute_oh_step_unroll_ow_icblock(int ic_block_step) {
     Label kh_label, kd_label;
 
@@ -2789,7 +2813,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t ::
         compute_oh_step_unroll_ow(int ic_block_step) {
     Label kh_label, ic_block_label, kd_label;
 
@@ -2919,7 +2943,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::compute_oh_step_common(
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::compute_oh_step_common(
         int ic_block_step) {
     Label kh_label, ic_block_label, ow_block_label, kd_label;
 
@@ -3199,7 +3223,8 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::compute_oh_step_common(
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::compute_oh_step_disp() {
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
+        compute_oh_step_disp() {
     int ic_block_step = jcp.ic_block_step;
 
     bool too_large_to_unroll = (jcp.kw > 1 || jcp.kh > 1 || jcp.kd > 1)
@@ -3236,7 +3261,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::compute_oh_step_disp() {
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::maybe_zero_kernel() {
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::maybe_zero_kernel() {
     if (jcp.harness == harness_compute_full_spatial && !jcp.with_bias) return;
     Label skip_zeroing, zeroing_loop;
 
@@ -3277,7 +3302,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::maybe_zero_kernel() {
     xor_(reg_tmp, reg_tmp);
     L(zeroing_loop);
     {
-        assert(get_kernel_offset(1, 0) == cpu_isa_traits<avx512_core>::vlen);
+        assert(get_kernel_offset(1, 0) == cpu_isa_traits_t<avx512_core>::vlen);
         for (int ic1 = 0; ic1 < jcp.ic_block; ic1++)
             vmovups(ptr[reg_kernel + reg_tmp + get_kernel_offset(ic1, 0)],
                     zero);
@@ -3298,8 +3323,8 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::maybe_zero_kernel() {
     L(skip_zeroing);
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::compute_oh_loop_common(
-        bool is_partial) {
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t ::
+        compute_oh_loop_common(bool is_partial) {
     int b_pad = jcp.b_pad;
     int t_pad = jcp.t_pad;
     bool is_dilated = jcp.dilate_h != 0;
@@ -3555,8 +3580,8 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::compute_oh_loop_common(
     L(oh_bpad_label_end);
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::compute_od_loop_common(
-        bool is_partial) {
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t ::
+        compute_od_loop_common(bool is_partial) {
     assert(jcp.harness == harness_3d_reduction);
 
     const int src_backpad_overlap
@@ -3686,7 +3711,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::compute_od_loop_common(
     L(loop_end_label);
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::
         compute_full_spat_loop() {
     // General code layout:
     //
@@ -4014,7 +4039,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::compute_loop() {
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t ::compute_loop() {
     Reg64 reg_mask_load = r11;
     if (jcp.uses_permw_transposition) {
 
@@ -4066,7 +4091,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32 ::compute_loop() {
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::setup_stack_space() {
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::setup_stack_space() {
 
     if ((jcp.is_1stconv && !jcp.transpose_src && jcp.stride_w > 1)
             || jcp.uses_permw_transposition) {
@@ -4091,7 +4116,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::setup_stack_space() {
     stack_space_needed = ic_block_step_stack_size + 64;
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::generate() {
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::generate() {
     preamble();
 
     setup_stack_space();
@@ -4116,16 +4141,21 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::generate() {
     }
 }
 
-status_t jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_conf(
+status_t jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::init_conf(
         jit_conv_conf_t &jcp, const convolution_desc_t &cd,
         memory_desc_t &src_md, memory_desc_t &diff_weights_md,
         memory_desc_t &diff_bias_md, memory_desc_t &diff_dst_md, int nthreads) {
-    const int simd_w = cpu_isa_traits<avx512_core>::vlen / sizeof(float);
+    const int simd_w = cpu_isa_traits_t<avx512_core>::vlen / sizeof(float);
 
     const memory_desc_wrapper src_d(&src_md);
     const memory_desc_wrapper diff_weights_d(&diff_weights_md);
     const memory_desc_wrapper diff_dst_d(&diff_dst_md);
     const memory_desc_wrapper diff_bias_d(&diff_bias_md);
+
+    // Big int (> INT_MAX) values are unsupported and jcp fields may overflow
+    // TODO: change data type of jcp fields to size_t
+    VDISPATCH_CONV_IC(!has_large_size(cd, src_d, diff_weights_d, diff_dst_d),
+            VERBOSE_BAD_PARAM, "Large size is not supported");
 
     const bool with_groups = diff_weights_d.ndims() == src_d.ndims() + 1;
     int ndims = src_d.ndims();
@@ -4442,11 +4472,13 @@ status_t jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_conf(
             && jcp.oc <= diff_weights_d.padded_dims()[with_groups + 0];
     if (!args_ok) return status::unimplemented;
 
-    int inp_row_size = jcp.ic_block * jcp.tr_iw * jcp.typesize_in;
-    int out_row_size = jcp.oc_block * jcp.tr_ow * jcp.typesize_in;
-    int full_spat_min_h_block_size
+    const auto inp_row_size
+            = static_cast<size_t>(jcp.ic_block) * jcp.tr_iw * jcp.typesize_in;
+    const auto out_row_size
+            = static_cast<size_t>(jcp.oc_block) * jcp.tr_ow * jcp.typesize_in;
+    const auto full_spat_min_h_block_size
             = nstl::max(1, nstl::max(jcp.b_pad, jcp.t_pad));
-    int full_spat_working_set_size
+    const auto full_spat_working_set_size
             = (inp_row_size + out_row_size) * full_spat_min_h_block_size;
     bool use_full_spat_loop = isa_has_bf16(jcp.isa) && jcp.ndims < 5
             && jcp.ih == jcp.oh && jcp.iw == jcp.ow
@@ -4482,14 +4514,15 @@ status_t jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_conf(
 
         // TODO: Optimize memory allocation when threaded on height and depth
         if (jcp.transpose_src) {
-            jcp.tr_src_buf_size = jcp.tr_iw * jcp.ic_block * jcp.ih * jcp.id;
+            jcp.tr_src_buf_size = static_cast<size_t>(jcp.tr_iw) * jcp.ic_block
+                    * jcp.ih * jcp.id;
             jcp.tr_src_buf_count = jcp.global_transpose
                     ? jcp.nthr_mb * jcp.nb_ic * jcp.ngroups
                     : jcp.nthr;
         }
         if (jcp.transpose_dst) {
-            jcp.tr_diff_dst_buf_size
-                    = jcp.tr_ow * jcp.oc_block * jcp.oh * jcp.od;
+            jcp.tr_diff_dst_buf_size = static_cast<size_t>(jcp.tr_ow)
+                    * jcp.oc_block * jcp.oh * jcp.od;
             jcp.tr_diff_dst_buf_count = jcp.global_transpose
                     ? jcp.nthr_mb * jcp.nb_oc * jcp.ngroups
                     : jcp.nthr;
@@ -4503,12 +4536,12 @@ status_t jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_conf(
     return status::success;
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_scratchpad(
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::init_scratchpad(
         memory_tracking::registrar_t &scratchpad, const jit_conv_conf_t &jcp) {
 
     if (!jcp.uses_permw_transposition) {
         // XXX: See the comment about tr_iw and guarding elements in
-        // jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_conf()
+        // jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::init_conf()
         const size_t tr_src_size = jcp.tr_src_buf_count * jcp.tr_src_buf_size
                 + jcp.tr_src_num_guard_elems;
         scratchpad.book(key_conv_tr_src, tr_src_size, jcp.typesize_in);
@@ -4570,7 +4603,7 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_scratchpad(
     }
 }
 
-void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::balance(
+void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::balance(
         const jit_conv_conf_t &j, int &nthr_, int &nthr_mb_, int &nthr_g_,
         int &nthr_oc_b_, int &nthr_ic_b_) {
     nthr_ = nthr_mb_ = nthr_g_ = nthr_oc_b_ = nthr_ic_b_ = 1;
@@ -4671,12 +4704,12 @@ void jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::balance(
     assert(nthr_ <= max_threads);
 }
 
-template struct _jit_avx512_core_bf16_fwd_kernel<Xbyak::Zmm>;
-template struct _jit_avx512_core_bf16_fwd_kernel<Xbyak::Ymm>;
-template struct _jit_avx512_core_bf16_fwd_kernel<Xbyak::Xmm>;
-template struct _jit_avx512_core_bf16_bwd_data_kernel<Xbyak::Zmm>;
-template struct _jit_avx512_core_bf16_bwd_data_kernel<Xbyak::Ymm>;
-template struct _jit_avx512_core_bf16_bwd_data_kernel<Xbyak::Xmm>;
+template struct jit_avx512_core_bf16_fwd_kernel_vmm_t<Xbyak::Zmm>;
+template struct jit_avx512_core_bf16_fwd_kernel_vmm_t<Xbyak::Ymm>;
+template struct jit_avx512_core_bf16_fwd_kernel_vmm_t<Xbyak::Xmm>;
+template struct jit_avx512_core_bf16_bwd_data_kernel_vmm_t<Xbyak::Zmm>;
+template struct jit_avx512_core_bf16_bwd_data_kernel_vmm_t<Xbyak::Ymm>;
+template struct jit_avx512_core_bf16_bwd_data_kernel_vmm_t<Xbyak::Xmm>;
 } // namespace x64
 } // namespace cpu
 } // namespace impl

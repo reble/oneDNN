@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@
 #include <type_traits>
 
 #include "cpu/x64/jit_avx512_core_bf16cvt.hpp"
+#include "cpu/x64/jit_avx512_core_fp8cvt.hpp"
 #include "cpu/x64/utils/jit_io_helper.hpp"
 
 namespace dnnl {
@@ -66,6 +67,30 @@ io_emu_bf16_conf_t::io_emu_bf16_conf_t(int bf16_emu_reserv_1_idx,
     , reg_tmp_(reg_tmp)
     , bf16_emu_reserv_4_(Xbyak::Zmm(bf16_emu_reserv_4_idx)) {}
 
+io_emu_fp8_conf_t::io_emu_fp8_conf_t(const Xbyak::Zmm &fp8_emu_reserv_1,
+        const Xbyak::Zmm &fp8_emu_reserv_2, const Xbyak::Zmm &fp8_emu_reserv_3,
+        const Xbyak::Zmm &fp8_emu_reserv_4, const Xbyak::Zmm &fp8_emu_reserv_5,
+        const Xbyak::Opmask &kmask_aux, const Xbyak::Reg64 &reg_tmp)
+    : fp8_emu_reserv_1_(fp8_emu_reserv_1)
+    , fp8_emu_reserv_2_(fp8_emu_reserv_2)
+    , fp8_emu_reserv_3_(fp8_emu_reserv_3)
+    , fp8_emu_reserv_4_(fp8_emu_reserv_4)
+    , fp8_emu_reserv_5_(fp8_emu_reserv_5)
+    , kmask_aux_(kmask_aux)
+    , reg_tmp_(reg_tmp) {}
+
+io_emu_fp8_conf_t::io_emu_fp8_conf_t(int fp8_emu_reserv_1_idx,
+        int fp8_emu_reserv_2_idx, int fp8_emu_reserv_3_idx,
+        int fp8_emu_reserv_4_idx, int fp8_emu_reserv_5_idx,
+        int fp8_cvt_kmask_aux_idx, const Xbyak::Reg64 &reg_tmp)
+    : fp8_emu_reserv_1_(Xbyak::Zmm(fp8_emu_reserv_1_idx))
+    , fp8_emu_reserv_2_(Xbyak::Zmm(fp8_emu_reserv_2_idx))
+    , fp8_emu_reserv_3_(Xbyak::Zmm(fp8_emu_reserv_3_idx))
+    , fp8_emu_reserv_4_(Xbyak::Zmm(fp8_emu_reserv_4_idx))
+    , fp8_emu_reserv_5_(Xbyak::Zmm(fp8_emu_reserv_5_idx))
+    , kmask_aux_(Xbyak::Opmask(fp8_cvt_kmask_aux_idx))
+    , reg_tmp_(reg_tmp) {}
+
 io_saturation_conf_t::io_saturation_conf_t(const int vreg_zero_saturation_idx,
         const int vreg_saturation_ubound_idx, const Xbyak::Reg64 &reg_tmp)
     : vreg_zero_saturation_idx_(vreg_zero_saturation_idx)
@@ -84,23 +109,29 @@ io_gather_conf_t::io_gather_conf_t(const std::size_t simd_w,
     , vmm_tmp_idx_(vmm_tmp_idx) {}
 
 template <typename Vmm>
-jit_io_helper_t<Vmm>::jit_io_helper_t(jit_generator *host, const cpu_isa_t &isa,
-        const data_type_t &data_type, const io_conf_t &io_conf,
+jit_io_helper_t<Vmm>::jit_io_helper_t(jit_generator_t *host,
+        const cpu_isa_t &isa, const data_type_t &data_type,
+        const io_conf_t &io_conf,
         const utils::optional_t<io_tail_conf_t> &tail_conf,
         const utils::optional_t<io_emu_bf16_conf_t> &bf16_conf,
         const utils::optional_t<io_saturation_conf_t> &saturation_conf,
-        const utils::optional_t<io_gather_conf_t> &gather_conf)
+        const utils::optional_t<io_gather_conf_t> &gather_conf,
+        const utils::optional_t<io_emu_fp8_conf_t> &fp8_conf)
     : host_(host)
     , isa_(isa)
     , data_type_(data_type)
     , bf16_supported_(is_data_type_supported(data_type::bf16))
     , f16_supported_(is_data_type_supported(data_type::f16))
+    , fp8_supported_(
+              utils::one_of(true, is_data_type_supported(data_type::f8_e5m2),
+                      is_data_type_supported(data_type::f8_e4m3)))
     , bf16_emu_(nullptr)
     , io_conf_(io_conf)
     , tail_conf_(tail_conf)
     , bf16_conf_(bf16_conf)
     , saturation_conf_(saturation_conf)
-    , gather_conf_(gather_conf) {
+    , gather_conf_(gather_conf)
+    , fp8_conf_(fp8_conf) {
 
     if (data_type_ == data_type::bf16
             && !(is_superset(isa_, avx512_core_bf16)
@@ -113,10 +144,33 @@ jit_io_helper_t<Vmm>::jit_io_helper_t(jit_generator *host, const cpu_isa_t &isa,
                 bf16_conf->bf16_emu_reserv_4_);
     }
 
+    if (utils::one_of(data_type_, data_type::f8_e5m2, data_type::f8_e4m3)
+            && fp8_supported_) {
+        assert(fp8_conf.has_value() && "Config for fp8 emulation is not set.");
+        switch (data_type_) {
+            case data_type::f8_e5m2:
+                fp8_cvt_ = utils::make_unique<fp8_conversion_e5m2_t>(host_,
+                        fp8_conf->fp8_emu_reserv_1_,
+                        fp8_conf->fp8_emu_reserv_2_,
+                        fp8_conf->fp8_emu_reserv_3_, fp8_conf->kmask_aux_,
+                        fp8_conf->reg_tmp_);
+                break;
+            case data_type::f8_e4m3:
+                fp8_cvt_ = utils::make_unique<fp8_conversion_e4m3_t>(host_,
+                        fp8_conf->fp8_emu_reserv_1_,
+                        fp8_conf->fp8_emu_reserv_2_,
+                        fp8_conf->fp8_emu_reserv_3_,
+                        fp8_conf->fp8_emu_reserv_4_,
+                        fp8_conf->fp8_emu_reserv_5_, fp8_conf->reg_tmp_);
+                break;
+            default: assert(!"Unreachable.");
+        }
+    }
+
     assert(utils::one_of(data_type_, data_type::f16, data_type::bf16,
-                   data_type::f32, data_type::s8, data_type::u8, data_type::s32)
+                   data_type::f32, data_type::f8_e5m2, data_type::f8_e4m3, data_type::s8, data_type::u8, data_type::s32)
             && is_data_type_supported(data_type_)
-            && "Supported data types f16, bf16, f32, s8, u8, s32");
+            && "Supported data types f16, bf16, f32, f8_e5m2, f8_e4m3, s8, u8, s32");
 
     /*
      * vpmovsxbd, vpmovzxbd for AVX are defined only for XMM. Since AVX2
@@ -152,6 +206,8 @@ bool jit_io_helper_t<Vmm>::is_data_type_supported(const data_type_t dt) {
             return is_superset(isa_, avx512_core) || isa_ == avx2_vnni_2;
         case data_type::f16:
             return is_superset(isa_, avx512_core_fp16) || isa_ == avx2_vnni_2;
+        case data_type::f8_e4m3:
+        case data_type::f8_e5m2: return is_superset(isa_, avx512_core_fp16);
         default: assert(!"Unsupported data type");
     }
     return false;
@@ -189,7 +245,7 @@ void jit_io_helper_t<Vmm>::prepare_vmm_mask(
                 reinterpret_cast<size_t>(&mask_f32[7 - how_many_bits_to_set]));
         host_->uni_vmovups(mask, host_->ptr[reg_tmp]);
     } else if (how_many_bits_to_set == simd_w) {
-        host_->uni_vcmpps(mask, mask, mask, jit_generator::_cmp_eq_oq);
+        host_->uni_vcmpps(mask, mask, mask, jit_generator_t::_cmp_eq_oq);
     } else {
         assert(!"Can't set so many bits.");
     }
@@ -222,12 +278,11 @@ void jit_io_helper_t<Vmm>::prepare_i8_data_to_store(const Vmm &i8_vmm) {
 
 template <typename Vmm>
 void jit_io_helper_t<Vmm>::prepare_xf16_data_to_store(const Vmm &vmm) {
-    assert(!is_superset(isa_, avx512_core));
     const auto &cvt_lower_vmm =
-            typename vreg_traits<Vmm>::Vmm_lower_t(vmm.getIdx());
+            typename vreg_traits_t<Vmm>::Vmm_lower_t(vmm.getIdx());
 
     if (data_type_ == data_type::bf16)
-        host_->vcvtneps2bf16(cvt_lower_vmm, vmm, Xbyak::VexEncoding);
+        host_->vcvtneps2bf16(cvt_lower_vmm, vmm, host_->get_encoding());
     else
         host_->uni_vcvtps2phx(cvt_lower_vmm, vmm);
 }
@@ -272,17 +327,27 @@ void jit_io_helper_t<Xbyak::Zmm>::emu_gather(const Xbyak::Reg64 &src_reg,
             host_->add(src_reg, gather_conf_->reg_tmp_);
             switch (data_type_) {
                 case data_type::f16:
+                    assert(f16_supported_ && "Unsupported data type.");
                     host_->vpinsrw(xmm_dst, xmm_dst, host_->ptr[src_reg], j);
                     break;
                 case data_type::bf16:
+                    assert(bf16_supported_ && "Unsupported data type.");
                     host_->vpinsrw(
                             xmm_dst, xmm_dst, host_->ptr[src_reg], j * 2);
                     break;
                 case data_type::s8:
                 case data_type::u8:
+                case data_type::f8_e4m3:
+                case data_type::f8_e5m2: {
+                    assert(IMPLICATION(
+                                   utils::one_of(data_type_, data_type::f8_e4m3,
+                                           data_type::f8_e5m2),
+                                   fp8_supported_)
+                            && "Unsupported data type.");
                     host_->vpinsrb(xmm_dst, xmm_dst, host_->ptr[src_reg],
                             i * xmm_size_elem + j);
                     break;
+                }
                 default: assert(!"Unsupported data type.");
             }
             host_->mov(src_reg, gather_conf_->reg_tmp1_);
@@ -300,7 +365,8 @@ void jit_io_helper_t<Xbyak::Zmm>::emu_gather(const Xbyak::Reg64 &src_reg,
         convert_to_f32(dst_vmm, dst_vmm, data_type_);
     else if (data_type_ == data_type::f16)
         convert_to_f32(dst_vmm, dst_ymm, data_type_);
-    else if (data_type_ == data_type::s8 || data_type_ == data_type::u8)
+    else if (utils::one_of(data_type_, data_type::s8, data_type::u8,
+                     data_type::f8_e4m3, data_type::f8_e5m2))
         convert_to_f32(dst_vmm, xmm_dst, data_type_);
 }
 
@@ -355,7 +421,14 @@ void jit_io_helper_t<Xbyak::Ymm>::emu_gather(const Xbyak::Reg64 &src_reg,
                             xmm_dst, xmm_dst, host_->ptr[src_reg], j * 2);
                     break;
                 case data_type::s8:
-                case data_type::u8: {
+                case data_type::u8:
+                case data_type::f8_e4m3:
+                case data_type::f8_e5m2: {
+                    assert(IMPLICATION(
+                                   utils::one_of(data_type_, data_type::f8_e4m3,
+                                           data_type::f8_e5m2),
+                                   fp8_supported_)
+                            && "Unsupported data type.");
                     host_->vpinsrb(xmm_dst, xmm_dst, host_->ptr[src_reg],
                             i * xmm_size_elem + j);
                     break;
@@ -372,8 +445,8 @@ void jit_io_helper_t<Xbyak::Ymm>::emu_gather(const Xbyak::Reg64 &src_reg,
 
     if (data_type_ == data_type::s32 || data_type_ == data_type::bf16)
         convert_to_f32(dst_vmm, dst_vmm, data_type_);
-    else if (utils::one_of(
-                     data_type_, data_type::s8, data_type::u8, data_type::f16))
+    else if (utils::one_of(data_type_, data_type::s8, data_type::u8,
+                     data_type::f16, data_type::f8_e4m3, data_type::f8_e5m2))
         convert_to_f32(dst_vmm, xmm_dst, data_type_);
 }
 
@@ -409,7 +482,13 @@ void jit_io_helper_t<Xbyak::Xmm>::emu_gather(const Xbyak::Reg64 &src_reg,
                 host_->pinsrw(dst_vmm, host_->ptr[src_reg], j * 2);
                 break;
             case data_type::s8:
-            case data_type::u8: {
+            case data_type::u8:
+            case data_type::f8_e4m3:
+            case data_type::f8_e5m2: {
+                assert(IMPLICATION(utils::one_of(data_type_, data_type::f8_e4m3,
+                                           data_type::f8_e5m2),
+                               fp8_supported_)
+                        && "Unsupported data type.");
                 host_->pinsrb(dst_vmm, host_->ptr[src_reg], j);
                 break;
             }
@@ -441,7 +520,8 @@ void jit_io_helper_t<Vmm>::prepare_full_mask() {
     assert(gather_conf_.has_value() && "Config for loading with the use of gather instruction is not set.");
 
     if (utils::one_of(data_type_, data_type::f16, data_type::bf16,
-                data_type::s8, data_type::u8))
+                data_type::s8, data_type::u8, data_type::f8_e4m3,
+                data_type::f8_e5m2))
         return;
 
     if (is_superset(isa_, avx512_core))
@@ -470,7 +550,13 @@ void jit_io_helper_t<Vmm>::init_saturate_f32() const {
         host_->init_saturate_f32(
                 Vmm(saturation_conf_->vreg_zero_saturation_idx_),
                 Vmm(saturation_conf_->vreg_saturation_ubound_idx_),
-                saturation_conf_->reg_tmp_, data_type::f32, data_type_);
+                saturation_conf_->reg_tmp_, data_type::f32, data_type_, false,
+                isa_has_sat_cvt(isa_, data_type_));
+}
+
+template <typename Vmm>
+void jit_io_helper_t<Vmm>::prepare_table_fp8() {
+    if (fp8_cvt_) fp8_cvt_->prepare_table();
 }
 
 template <typename Vmm>
@@ -547,6 +633,8 @@ void jit_io_helper_t<Vmm>::load(const Xbyak::Address &src_addr,
             case data_type::s32: load_s32(src_addr, dst_vmm, tail); break;
             case data_type::bf16: load_bf16(src_addr, dst_vmm); break;
             case data_type::f16: load_f16(src_addr, dst_vmm); break;
+            case data_type::f8_e4m3:
+            case data_type::f8_e5m2: load_f8(src_addr, dst_vmm); break;
             case data_type::s8:
             case data_type::u8: load_i8(src_addr, dst_vmm); break;
             default: assert(!"Unsupported data type.");
@@ -602,6 +690,14 @@ void jit_io_helper_t<Vmm>::load_f16(
         const Xbyak::Address &src_addr, const Vmm &dst_vmm) {
     assert(f16_supported_ && "Unsupported data type.");
     host_->uni_vcvtph2psx(dst_vmm, src_addr);
+}
+
+template <typename Vmm>
+void jit_io_helper_t<Vmm>::load_f8(
+        const Xbyak::Address &src_addr, const Vmm &dst_vmm) {
+    assert(fp8_supported_ && fp8_cvt_
+            && "Unsupported data type or emulation not available.");
+    if (fp8_cvt_) fp8_cvt_->vcvt_f8_to_f32(dst_vmm, src_addr);
 }
 
 template <typename Vmm>
@@ -671,15 +767,24 @@ void jit_io_helper_t<Vmm>::store(const Vmm &src_raw_vmm,
     const bool is_xf16
             = utils::one_of(data_type_, data_type::bf16, data_type::f16);
 
-    const bool can_store_byte_by_byte = tail
-            && (isa_ == sse41
-                    || (!is_store_tail_supported && (is_i8 || is_xf16)));
+    const bool can_store_byte_by_byte
+            = (tail
+                      && (isa_ == sse41
+                              || (!is_store_tail_supported
+                                      && (is_i8 || is_xf16))))
+            || (std::is_same<Vmm, Xbyak::Xmm>::value && is_xf16);
+    const bool use_sat_cvt = isa_has_sat_cvt(isa_, data_type_);
 
-    if (data_type_ == data_type::s32 || is_i8) saturate(src_raw_vmm);
+    if (data_type_ == data_type::s32 || is_i8)
+        saturate(src_raw_vmm, use_sat_cvt);
 
     if (can_store_byte_by_byte) {
-        const size_t store_size
-                = tail_conf_->tail_size_ * types::data_type_size(data_type_);
+        // TODO: Consider adding opmask to store xf16 data from Xmm.
+        // This could allow to use store_bf16/store_f16 functions for isa >= avx512_core.
+        const size_t xmm_length
+                = vreg_traits_t<Xbyak::Xmm>::vlen / sizeof(int32_t);
+        const size_t store_size = (tail ? tail_conf_->tail_size_ : xmm_length)
+                * types::data_type_size(data_type_);
         store_byte_by_byte(src_vmm, dst_addr, store_size);
     } else {
         switch (data_type_) {
@@ -687,20 +792,25 @@ void jit_io_helper_t<Vmm>::store(const Vmm &src_raw_vmm,
             case data_type::s32: store_f32(src_vmm, dst_addr, tail); break;
             case data_type::bf16: store_bf16(src_vmm, dst_addr); break;
             case data_type::f16: store_f16(src_vmm, dst_addr); break;
+            case data_type::f8_e4m3:
+            case data_type::f8_e5m2: store_f8(src_vmm, dst_addr); break;
             case data_type::s8:
-            case data_type::u8: store_i8(src_vmm, dst_raw_addr); break;
+            case data_type::u8:
+                store_i8(src_vmm, dst_raw_addr, use_sat_cvt);
+                break;
             default: assert(!"Unsupported data type.");
         }
     }
 }
 
 template <typename Vmm>
-void jit_io_helper_t<Vmm>::saturate(const Vmm &vmm) {
+void jit_io_helper_t<Vmm>::saturate(const Vmm &vmm, const bool use_sat_cvt) {
     assert(saturation_conf_.has_value() && "Config for saturation is not set.");
 
-    host_->saturate_f32(vmm, Vmm(saturation_conf_->vreg_zero_saturation_idx_),
-            Vmm(saturation_conf_->vreg_saturation_ubound_idx_), data_type_);
-    host_->uni_vcvtps2dq(vmm, vmm);
+    host_->saturate_cvt_f32(vmm,
+            Vmm(saturation_conf_->vreg_zero_saturation_idx_),
+            Vmm(saturation_conf_->vreg_saturation_ubound_idx_), data_type_,
+            false, use_sat_cvt);
 }
 
 template <typename Vmm>
@@ -714,7 +824,7 @@ void jit_io_helper_t<Vmm>::store_byte_by_byte(const Vmm &src_vmm,
     const bool is_xf16
             = utils::one_of(data_type_, data_type::bf16, data_type::f16);
     const auto &cvt_lower_vmm =
-            typename vreg_traits<Vmm>::Vmm_lower_t(src_vmm.getIdx());
+            typename vreg_traits_t<Vmm>::Vmm_lower_t(src_vmm.getIdx());
 
     if (is_i8) prepare_i8_data_to_store(src_vmm);
     if (is_xf16) prepare_xf16_data_to_store(src_vmm);
@@ -742,14 +852,12 @@ void jit_io_helper_t<Vmm>::store_bf16(
             && "Store operation for bf16 is not supported for Xmms.");
 
     const auto &cvt_lower_vmm =
-            typename vreg_traits<Vmm>::Vmm_lower_t(src_vmm.getIdx());
+            typename vreg_traits_t<Vmm>::Vmm_lower_t(src_vmm.getIdx());
 
     if (bf16_emu_)
         bf16_emu_->vcvtneps2bf16(cvt_lower_vmm, src_vmm);
     else
-        host_->vcvtneps2bf16(cvt_lower_vmm, src_vmm,
-                mayiuse(avx512_core) ? Xbyak::EvexEncoding
-                                     : Xbyak::VexEncoding);
+        host_->vcvtneps2bf16(cvt_lower_vmm, src_vmm, host_->get_encoding());
 
     if (io_conf_.nt_stores_enabled_)
         host_->uni_vmovntps(dst_addr, cvt_lower_vmm);
@@ -765,7 +873,7 @@ void jit_io_helper_t<Vmm>::store_f16(
             && "Store operation for f16 is not supported for Xmms.");
 
     const auto &cvt_lower_vmm =
-            typename vreg_traits<Vmm>::Vmm_lower_t(src_vmm.getIdx());
+            typename vreg_traits_t<Vmm>::Vmm_lower_t(src_vmm.getIdx());
 
     host_->uni_vcvtps2phx(cvt_lower_vmm, src_vmm);
 
@@ -776,9 +884,29 @@ void jit_io_helper_t<Vmm>::store_f16(
 }
 
 template <typename Vmm>
-void jit_io_helper_t<Vmm>::store_i8(
+void jit_io_helper_t<Vmm>::store_f8(
         const Vmm &src_vmm, const Xbyak::Address &dst_addr) {
-    if (!is_superset(isa_, avx512_core)) {
+    assert(fp8_supported_ && fp8_cvt_
+            && "Unsupported data type or emulation not available.");
+
+    const Xbyak::Xmm lower_xmm = Xbyak::Xmm(src_vmm.getIdx());
+
+    if (fp8_cvt_)
+        fp8_cvt_->vcvt_f32_to_f8(
+                lower_xmm | Xbyak::Opmask(src_vmm.getOpmaskIdx()), src_vmm);
+
+    if (io_conf_.nt_stores_enabled_)
+        host_->vmovntps(dst_addr, lower_xmm);
+    else
+        host_->vmovdqu8(dst_addr, lower_xmm);
+}
+
+template <typename Vmm>
+void jit_io_helper_t<Vmm>::store_i8(const Vmm &src_vmm,
+        const Xbyak::Address &dst_addr, const bool use_sat_cvt) {
+    if (use_sat_cvt && isa_has_sat_cvt(isa_, data_type_)) {
+        host_->vpmovusdb(dst_addr, src_vmm);
+    } else if (!is_superset(isa_, avx512_core)) {
         static constexpr bool is_ymm = std::is_same<Vmm, Xbyak::Ymm>::value;
 
         prepare_i8_data_to_store(src_vmm);
@@ -791,8 +919,8 @@ void jit_io_helper_t<Vmm>::store_i8(
         static constexpr bool is_zmm = std::is_same<Vmm, Xbyak::Zmm>::value;
 
         auto store_i8_fn = data_type_ == data_type::s8
-                ? std::bind(&jit_generator::vpmovsdb, host_, _1, _2)
-                : std::bind(&jit_generator::vpmovusdb, host_, _1, _2);
+                ? std::bind(&jit_generator_t::vpmovsdb, host_, _1, _2)
+                : std::bind(&jit_generator_t::vpmovusdb, host_, _1, _2);
 
         if (io_conf_.nt_stores_enabled_ && is_zmm) {
             Xbyak::Xmm src_xmm(src_vmm.getIdx());
@@ -820,6 +948,12 @@ void jit_io_helper_t<Vmm>::convert_to_f32(const Vmm &dst_vmm,
         case data_type::f16:
             assert(f16_supported_ && "Unsupported data type.");
             host_->vcvtph2ps(dst_vmm, src_vmm);
+            break;
+        case data_type::f8_e5m2:
+        case data_type::f8_e4m3:
+            assert(fp8_supported_ && fp8_cvt_
+                    && "Unsupported data type or emulation not available.");
+            if (fp8_cvt_) fp8_cvt_->vcvt_f8_to_f32(dst_vmm, src_vmm);
             break;
         case data_type::s8: {
             host_->uni_vpmovsxbd(dst_vmm, src_vmm);
@@ -867,6 +1001,14 @@ void jit_io_helper_t<Vmm>::broadcast(
             }
             break;
         }
+        case data_type::f8_e4m3:
+        case data_type::f8_e5m2:
+            assert(fp8_supported_ && fp8_cvt_
+                    && "Unsupported data type or emulation not available.");
+            if (fp8_cvt_)
+                fp8_cvt_->vcvt_f8_to_f32(
+                        dst_vmm, host_->ptr_b[src_addr.getRegExp()]);
+            break;
         case data_type::s8:
         case data_type::u8: {
             const Xbyak::Xmm dst_xmm {dst_vmm.getIdx()};
@@ -888,13 +1030,14 @@ template <typename Vmm>
 jit_io_multi_dt_helper_t<Vmm>::jit_io_multi_dt_helper_t() = default;
 
 template <typename Vmm>
-jit_io_multi_dt_helper_t<Vmm>::jit_io_multi_dt_helper_t(jit_generator *host,
+jit_io_multi_dt_helper_t<Vmm>::jit_io_multi_dt_helper_t(jit_generator_t *host,
         const cpu_isa_t &isa, const data_types_t &data_types,
         const io_conf_t &io_conf,
         const utils::optional_t<io_tail_conf_t> &tail_conf,
         const utils::optional_t<io_emu_bf16_conf_t> &bf16_conf,
         const std::map<data_type_t, io_saturation_conf_t> &saturation_confs,
-        const utils::optional_t<io_gather_conf_t> &gather_conf) {
+        const utils::optional_t<io_gather_conf_t> &gather_conf,
+        const utils::optional_t<io_emu_fp8_conf_t> &fp8_conf) {
     assert(!data_types.empty());
     for (const auto &dt : data_types) {
         // can be replaced by try_emplace from C++17
@@ -912,7 +1055,11 @@ jit_io_multi_dt_helper_t<Vmm>::jit_io_multi_dt_helper_t(jit_generator *host,
                                     io_saturation_conf_t> {saturation_conf
                                                                    ->second}
                                                     : utils::nullopt,
-                            gather_conf));
+                            gather_conf,
+                            utils::one_of(
+                                    dt, data_type::f8_e4m3, data_type::f8_e5m2)
+                                    ? fp8_conf
+                                    : utils::nullopt));
         }
     }
 }
@@ -923,6 +1070,11 @@ std::shared_ptr<jit_io_helper_t<Vmm>> jit_io_multi_dt_helper_t<Vmm>::at(
     const auto it = storage_.find(dt);
     if (it != storage_.cend()) return it->second;
     return nullptr;
+}
+
+template <typename Vmm>
+bool jit_io_multi_dt_helper_t<Vmm>::empty() const {
+    return storage_.empty();
 }
 
 template <typename Vmm>
@@ -964,6 +1116,14 @@ template <typename Vmm>
 void jit_io_multi_dt_helper_t<Vmm>::init_bf16() {
     const auto bf16_io_helper = at(data_type::bf16);
     if (bf16_io_helper) bf16_io_helper->init_bf16();
+}
+
+template <typename Vmm>
+void jit_io_multi_dt_helper_t<Vmm>::prepare_table_fp8() {
+    const auto f8_e5m2_io_helper = at(data_type::f8_e5m2);
+    if (f8_e5m2_io_helper) f8_e5m2_io_helper->prepare_table_fp8();
+    const auto f8_e4m3_io_helper = at(data_type::f8_e4m3);
+    if (f8_e4m3_io_helper) f8_e4m3_io_helper->prepare_table_fp8();
 }
 
 template <typename Vmm>

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include "dnnl_test_common.hpp"
 #include "gtest/gtest.h"
 
+#include "dnnl_test_macros.hpp"
 #include "oneapi/dnnl/dnnl.hpp"
 
 namespace dnnl {
@@ -37,6 +38,18 @@ struct prelu_test_params_t {
     dnnl_status_t expected_status;
 };
 
+bool generic_check_tag(memory::format_tag ft) {
+    return impl::utils::one_of(
+            ft, tag::ncdhw, tag::nchw, tag::ncw, tag::nhwc, tag::nwc, tag::any);
+}
+
+bool generic_reduce_diff_weights(
+        const memory::dims &src_dims, const memory::dims &diff_wei_dims) {
+    return impl::utils::array_product(src_dims.data(), src_dims.size())
+            != impl::utils::array_product(
+                    diff_wei_dims.data(), diff_wei_dims.size());
+}
+
 class prelu_test_t : public ::testing::TestWithParam<prelu_test_params_t> {
 private:
     prelu_test_params_t p;
@@ -48,9 +61,22 @@ protected:
         p = ::testing::TestWithParam<prelu_test_params_t>::GetParam();
 
         SKIP_IF_CUDA(true, "Prelu primitive not supported by CUDA");
+        SKIP_IF_HIP(true, "Prelu primitive not supported by HIP");
 
         SKIP_IF(unsupported_data_type(p.src_dt, p.wei_dt, p.dst_dt),
                 "Engine does not support this data type.");
+
+        SKIP_IF_GENERIC(
+                !generic_check_tag(p.src_tag), "Unsupported format tag");
+        SKIP_IF_GENERIC(
+                !generic_check_tag(p.dst_tag), "Unsupported format tag");
+        SKIP_IF_GENERIC(
+                !generic_check_tag(p.wei_tag), "Unsupported format tag");
+        // XXX: Enable these cases when generic reduction is implemented
+        SKIP_IF_GENERIC(generic_reduce_diff_weights(p.src_dims, p.wei_dims),
+                "Unsupported configuration");
+        SKIP_IF_GENERIC(p.expected_status == dnnl_unimplemented,
+                "Test case not supported");
 
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status);
@@ -63,7 +89,7 @@ protected:
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
 
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
 
         auto src_md = memory::desc(p.src_dims, p.src_dt, p.src_tag);
         auto wei_md = memory::desc(p.wei_dims, p.wei_dt, p.wei_tag);
@@ -125,7 +151,7 @@ protected:
         // prelu specific types and values
         using pd_t = prelu_backward::primitive_desc;
         using hint_pd_t = prelu_forward::primitive_desc;
-        allows_attr_t aa {false}; // doesn't support anything
+        allows_attr_t aa {}; // doesn't support anything
 
         auto eng = get_test_engine();
         auto strm = make_stream(eng);

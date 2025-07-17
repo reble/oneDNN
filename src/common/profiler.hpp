@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -90,8 +90,7 @@ static double get_msec() {
 // names are copied into long term storage.
 
 struct profiler_t {
-    profiler_t(const std::string &profile_name)
-        : _profile_name(profile_name), _run_data(), _data() {
+    profiler_t(const std::string &profile_name) : _profile_name(profile_name) {
         // Reserve data on construction to reduce chance of recording
         // reallocation
         _run_data.reserve(128);
@@ -109,14 +108,14 @@ struct profiler_t {
     // Recording data
     void stamp(const char *name) {
         optimization_barrier();
-        _run_data.emplace_back(record_t<const char *>(name, get_msec()));
+        _run_data.emplace_back(name, get_msec());
         assert(_state == RUNNING);
         optimization_barrier();
     }
 
     void stop(const char *name) {
         optimization_barrier();
-        _run_data.emplace_back(record_t<const char *>(name, get_msec()));
+        _run_data.emplace_back(name, get_msec());
         stop();
     }
 
@@ -132,7 +131,7 @@ struct profiler_t {
     }
 
     std::string str() const {
-        std::ostringstream oss;
+        dnnl::impl::ostringstream_t oss;
         std::vector<record_t<std::string>> print_data(
                 _data.begin(), _data.end());
 
@@ -172,7 +171,7 @@ private:
         T name;
         prof_time_t time;
         record_t(T name, prof_time_t time) : name(name), time(time) {}
-        record_t(std::pair<T, prof_time_t> record)
+        record_t(const std::pair<T, prof_time_t> &record)
             : name(record.first), time(record.second) {}
         // Reversed time ordering
         bool operator<(const record_t &b) const { return this->time > b.time; }

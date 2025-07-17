@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -117,15 +117,15 @@ status_t ip_attr_check(const inner_product_desc_t &desc, const engine_t *engine,
         const data_type_t src_dt = desc.src_desc.data_type;
         const data_type_t dst_dt = desc.dst_desc.data_type;
 
-        auto fwd_attr_mask
-                = smask_t::post_ops | smask_t::sum_dt | smask_t::fpmath_mode;
+        auto fwd_attr_mask = smask_t::post_ops | smask_t::sum_dt
+                | smask_t::fpmath_mode | smask_t::accumulation_mode;
 
         bool is_int8 = utils::one_of(src_dt, data_type::s8, data_type::u8);
         if (engine->kind() == engine_kind::gpu)
             is_int8 = is_int8
                     || utils::one_of(dst_dt, data_type::s8, data_type::u8,
                             data_type::s32);
-        if (is_int8) fwd_attr_mask |= smask_t::scales_runtime;
+        if (is_int8) fwd_attr_mask |= smask_t::scales;
 
         VCHECK_IP_UNIMPL(attr->has_default_values(fwd_attr_mask, dst_dt),
                 VERBOSE_UNSUPPORTED_ATTR);
@@ -133,12 +133,15 @@ status_t ip_attr_check(const inner_product_desc_t &desc, const engine_t *engine,
         // Check scales
         if (!attr->scales_.has_default_values()) {
             const auto &sc = attr->scales_;
-            const int mask_src = sc.get(DNNL_ARG_SRC).mask_;
-            const int mask_wei = sc.get(DNNL_ARG_WEIGHTS).mask_;
-            const int mask_dst = sc.get(DNNL_ARG_DST).mask_;
-
-            VCHECK_IP_UNIMPL(utils::everyone_is(0, mask_src, mask_dst)
-                            && utils::one_of(mask_wei, 0, 1),
+            VCHECK_IP_UNIMPL(IMPLICATION(!sc.has_default_values(DNNL_ARG_SRC),
+                                     sc.get_mask(DNNL_ARG_SRC) == 0),
+                    VERBOSE_UNSUPPORTED_SCALES_CFG);
+            VCHECK_IP_UNIMPL(
+                    IMPLICATION(!sc.has_default_values(DNNL_ARG_WEIGHTS),
+                            utils::one_of(sc.get_mask(DNNL_ARG_WEIGHTS), 0, 1)),
+                    VERBOSE_UNSUPPORTED_SCALES_CFG);
+            VCHECK_IP_UNIMPL(IMPLICATION(!sc.has_default_values(DNNL_ARG_DST),
+                                     sc.get_mask(DNNL_ARG_DST) == 0),
                     VERBOSE_UNSUPPORTED_SCALES_CFG);
         }
 
@@ -153,9 +156,12 @@ status_t ip_attr_check(const inner_product_desc_t &desc, const engine_t *engine,
             // Check sum
             VCHECK_IP_UNIMPL(po.check_sum_consistency(dst_dt, is_int8, true),
                     VERBOSE_UNSUPPORTED_POSTOP);
+
+            // Note: verbose support is inside the call.
+            CHECK(po.validate_binary(engine->kind(), &desc.dst_desc));
         }
     } else {
-        auto bwd_attr_mask = smask_t::fpmath_mode;
+        auto bwd_attr_mask = smask_t::fpmath_mode | smask_t::accumulation_mode;
         VCHECK_IP_UNIMPL(attr->has_default_values(bwd_attr_mask),
                 VERBOSE_UNSUPPORTED_ATTR);
     }

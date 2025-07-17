@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -34,10 +34,10 @@ namespace graph {
 namespace fake_impl {
 namespace pass {
 
-class transformation_pass_t : public graph::pass::pass_base {
+class transformation_pass_t : public graph::pass::pass_base_t {
 public:
     explicit transformation_pass_t(std::string pbackend, std::string pname)
-        : graph::pass::pass_base(std::move(pbackend), std::move(pname)) {}
+        : graph::pass::pass_base_t(std::move(pbackend), std::move(pname)) {}
 
     static graph::pass::pass_base_ptr create(
             std::string pbackend, std::string pname) {
@@ -53,15 +53,19 @@ public:
 
         // for each pattern. match it
         std::vector<op_t *> matched_op_list;
+        if (get_verbose(verbose_t::create_dispatch, component_t::graph)) {
+            verbose_printf(
+                    "graph,create:dispatch,pattern_matcher,%s,fake_backend\n",
+                    get_pass_name().c_str());
+        }
         pu.match(agraph, pgraph, matched_op_list);
         if (!matched_op_list.empty()) {
             // temporary solution here for showing which pattern matched
             if (getenv_int_user("GRAPH_DUMP", 0) > 0
                     || utils::check_verbose_string_user(
                             "GRAPH_DUMP", "pattern")) {
-                printf("onednn_graph_verbose,info,pattern,hit,%s\n",
-                        get_pass_name().c_str());
-                fflush(stdout);
+                verbose_printf(
+                        "graph,info,pattern,hit,%s\n", get_pass_name().c_str());
             }
 
             // Only fuse not rewrite. Will remove the fuse once dnnl

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -53,14 +53,19 @@ status_t ref_softmax_fwd_t::execute_forward_dense(const exec_ctx_t &ctx) const {
     const memory_desc_wrapper src_d(pd()->src_md());
     const memory_desc_wrapper dst_d(pd()->dst_md());
 
-    const auto interim_dt = data_type::f32;
-    const dim_t ou_stride = pd()->outer_stride();
+    const auto interim_dt = pd()->need_intermediate_scratchpad()
+            ? data_type::f32
+            : dst_d.data_type();
     const auto is_inplace = (src == dst);
     const auto has_padding = is_padding(dst_d);
     const auto zero_padding = has_padding && !is_inplace;
     const auto axis = pd()->axis();
     const auto axis_size = pd()->axis_size(true);
-    const auto axis_blk_size = src_d.padded_dims()[axis] - src_d.dims()[axis];
+    // Since dense implementation assumes `inner_size == 1`, and src is dense
+    // and identical to dst, outer_stride should coincide with axis_size. This
+    // allows to shuffle outer dimensions and not relying on a stride of a
+    // previous dimension.
+    const auto ou_stride = axis_size;
     const auto src_dt_size = types::data_type_size(pd()->src_md()->data_type);
     const auto dst_dt_size = types::data_type_size(pd()->dst_md()->data_type);
 
@@ -178,8 +183,9 @@ status_t ref_softmax_fwd_t::execute_forward_dense(const exec_ctx_t &ctx) const {
             io::store_float_value(dst_d.data_type(), val, dst_data, c);
         }
         if (zero_padding) {
+            const auto tail = src_d.padded_dims()[axis] - src_d.dims()[axis];
             PRAGMA_OMP_SIMD()
-            for (int i = 0; i < axis_blk_size; i++)
+            for (int i = 0; i < tail; i++)
                 io::store_float_value(
                         dst_d.data_type(), 0, dst_data, channels_ + i);
         }
@@ -206,7 +212,9 @@ status_t ref_softmax_fwd_t::execute_forward_generic(
 
     void *interim_ptr
             = pd()->need_intermediate_scratchpad() ? interim_scratchpad : dst;
-    const auto interim_dt = data_type::f32;
+    const auto interim_dt = pd()->need_intermediate_scratchpad()
+            ? data_type::f32
+            : dst_d.data_type();
     const auto is_inplace = (src == dst);
     const auto has_padding = is_padding(dst_d);
     if (has_padding && !is_inplace) {
@@ -281,10 +289,11 @@ status_t ref_softmax_fwd_t::execute_forward_generic(
                         : dst_off;
                 float d = io::load_float_value(
                         interim_dt, interim_ptr, interim_off);
-                float sd = space_denom[in];
                 if (pd()->is_softmax()) {
+                    float sd = space_denom[in] ? space_denom[in] : 1.f;
                     d /= sd;
                 } else if (pd()->is_logsoftmax()) {
+                    float sd = space_denom[in];
                     d -= sd;
                 }
                 d *= src_scales[0];
@@ -315,7 +324,11 @@ status_t ref_softmax_bwd_t::execute_backward_dense(
     const memory_desc_wrapper diff_dst_d(pd()->diff_dst_md());
     const memory_desc_wrapper diff_src_d(pd()->diff_src_md());
 
-    const auto ou_stride = pd()->outer_stride();
+    // Since dense implementation assumes `inner_size == 1`, and src is dense
+    // and identical to dst, outer_stride should coincide with axis_size. This
+    // allows to shuffle outer dimensions and not relying on a stride of a
+    // previous dimension.
+    const auto ou_stride = pd()->axis_size();
 
     parallel_nd(outer_size_, [&](dim_t ou) {
         float sbr = 0;

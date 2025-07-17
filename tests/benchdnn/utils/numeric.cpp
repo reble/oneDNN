@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #include "src/common/bfloat16.hpp"
 #include "src/common/float16.hpp"
+#include "src/common/float4.hpp"
 #include "src/common/float8.hpp"
 #include "src/common/nstl.hpp"
 
@@ -23,6 +24,18 @@
 
 #include "utils/numeric.hpp"
 
+template <>
+struct prec_traits<dnnl_f4_e2m1> {
+    using type = dnnl::impl::float4_e2m1_t;
+};
+template <>
+struct prec_traits<dnnl_f4_e3m0> {
+    using type = dnnl::impl::float4_e3m0_t;
+};
+template <>
+struct prec_traits<dnnl_e8m0> {
+    using type = dnnl::impl::float8_e8m0_t;
+};
 template <>
 struct prec_traits<dnnl_f8_e5m2> {
     using type = dnnl::impl::float8_e5m2_t;
@@ -74,6 +87,9 @@ struct prec_traits<dnnl_u4> {
 };
 #define CASE_ALL(dt) \
     switch (dt) { \
+        CASE(dnnl_f4_e2m1); \
+        CASE(dnnl_f4_e3m0); \
+        CASE(dnnl_e8m0); \
         CASE(dnnl_f8_e5m2); \
         CASE(dnnl_f8_e4m3); \
         CASE(dnnl_bf16); \
@@ -138,12 +154,13 @@ float max_dt(dnnl_data_type_t dt) {
 #undef CASE
     return 0;
 }
-#undef CASE_ALL
 
-float saturate_and_round(dnnl_data_type_t dt, float value) {
-    const float dt_max = max_dt(dt);
-    const float dt_min = lowest_dt(dt);
-    if (dt == dnnl_s32 && value >= max_dt(dnnl_s32)) return max_dt(dnnl_s32);
+template <dnnl_data_type_t dt>
+float saturate_and_round(float value) {
+    static const float dt_max = max_dt(dt);
+    static const float dt_min = lowest_dt(dt);
+    static const float max_dt_s32 = max_dt(dnnl_s32);
+    if (dt == dnnl_s32 && value >= max_dt_s32) return max_dt_s32;
     if (value > dt_max) value = dt_max;
     if (value < dt_min) value = dt_min;
     return mxcsr_cvt(value);
@@ -154,15 +171,33 @@ bool is_integral_dt(dnnl_data_type_t dt) {
             || dt == dnnl_u4;
 }
 
-float maybe_saturate(dnnl_data_type_t dt, float value) {
+template <dnnl_data_type_t dt>
+float maybe_saturate_templ(float value) {
     if (!is_integral_dt(dt)) return value;
-    return saturate_and_round(dt, value);
+    return saturate_and_round<dt>(value);
 }
 
-float round_to_nearest_representable(dnnl_data_type_t dt, float value) {
+float maybe_saturate(dnnl_data_type_t dt, float value) {
+#define CASE(dt) \
+    case dt: return maybe_saturate_templ<dt>(value)
+
+    CASE_ALL(dt)
+#undef CASE
+    return value;
+}
+
+template <dnnl_data_type_t dt>
+float round_to_nearest_representable_templ(float value) {
     switch (dt) {
         case dnnl_f32: break;
         case dnnl_f64: break;
+        case dnnl_f4_e2m1:
+            value = (float)dnnl::impl::float4_e2m1_t(value);
+            break;
+        case dnnl_f4_e3m0:
+            value = (float)dnnl::impl::float4_e3m0_t(value);
+            break;
+        case dnnl_e8m0: value = (float)dnnl::impl::float8_e8m0_t(value); break;
         case dnnl_f8_e5m2:
             value = (float)dnnl::impl::float8_e5m2_t(value);
             break;
@@ -175,9 +210,25 @@ float round_to_nearest_representable(dnnl_data_type_t dt, float value) {
         case dnnl_s8:
         case dnnl_u8:
         case dnnl_s4:
-        case dnnl_u4: value = maybe_saturate(dt, value); break;
+        case dnnl_u4: value = maybe_saturate_templ<dt>(value); break;
         default: SAFE_V(FAIL);
     }
 
     return value;
+}
+
+float round_to_nearest_representable(dnnl_data_type_t dt, float value) {
+#define CASE(dt) \
+    case dt: return round_to_nearest_representable_templ<dt>(value)
+
+    CASE_ALL(dt)
+#undef CASE
+    return value;
+}
+
+#undef CASE_ALL
+
+bool is_subbyte_type(const dnnl_data_type_t &type) {
+    return type == dnnl_f4_e2m1 || type == dnnl_f4_e3m0 || type == dnnl_u4
+            || type == dnnl_s4;
 }

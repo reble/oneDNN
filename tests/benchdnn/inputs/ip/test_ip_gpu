@@ -96,8 +96,17 @@
 # regression tests
 --batch=harness_ip_regression
 
+# ref smoke test
+--batch=harness_ip_smoke_ref
+
+# Test CI in Nightly
+--reset
+--batch=test_ip_ci
+
 # Test layers of some key and ext GPU DL Frameworks
 --reset
 --batch=option_set_fwks_key_gpu
 --reset
 --batch=option_set_fwks_ext_gpu
+--reset
+--batch=option_set_fwks_llm_gpu

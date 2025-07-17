@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -45,29 +45,33 @@ status_t brgemm_convolution_bwd_weights_t::pd_t::init(engine_t *engine) {
     const auto diff_bia_type = diff_weights_md(1)->data_type;
     const auto diff_dst_type = diff_dst_md(0)->data_type;
     VDISPATCH_CONV(is_bwd_w(), VERBOSE_BAD_PROPKIND);
-    VDISPATCH_CONV(utils::one_of(src_type, bf16, f16), VERBOSE_UNSUPPORTED_DT);
-    VDISPATCH_CONV(diff_dst_type == src_type, VERBOSE_UNSUPPORTED_DT);
-    VDISPATCH_CONV(utils::one_of(diff_wei_type, f32, src_type),
+    VDISPATCH_CONV(utils::one_of(src_type, bf16, f16, f8_e5m2, f8_e4m3),
             VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(diff_dst_type == src_type, VERBOSE_UNSUPPORTED_DT);
     VDISPATCH_CONV(
-            utils::one_of(diff_bia_type, data_type::undef, f32, src_type),
+            utils::one_of(diff_wei_type, f32, f8_e5m2, f8_e4m3, src_type),
+            VERBOSE_UNSUPPORTED_DT);
+    VDISPATCH_CONV(utils::one_of(diff_bia_type, data_type::undef, f32, f8_e5m2,
+                           f8_e4m3, src_type),
             VERBOSE_UNSUPPORTED_BIAS_CFG);
     VDISPATCH_CONV(set_default_alg_kind(alg_kind::convolution_direct),
             VERBOSE_BAD_ALGORITHM);
     VDISPATCH_CONV(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
     VDISPATCH_CONV(attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_CONV(impl::is_dense_format_kind({src_md(0), diff_weights_md(0),
+                           diff_weights_md(1), diff_dst_md(0)}),
+            VERBOSE_UNSUPPORTED_SPARSE_CFG);
 
     auto scratchpad = scratchpad_registry().registrar();
 
-    status_t status = brgemm_convolution_utils::init_conf_bwd_w(jcp_, *desc(),
-            src_md_, diff_weights_md_, diff_bias_md_, diff_dst_md_, attr_,
-            dnnl_get_max_threads());
-    if (status != status::success) return status;
+    // TODO: make `init_conf` assign initialized object to `jcp_`
+    CHECK(brgemm_convolution_utils::init_conf_bwd_w(jcp_, *desc(), src_md_,
+            diff_weights_md_, diff_bias_md_, diff_dst_md_, attr_,
+            dnnl_get_max_threads()));
 
-    status = brgemm_convolution_utils::init_scratchpad_bwd_w(
-            scratchpad, jcp_, src_md_, diff_weights_md_, diff_dst_md_);
+    CHECK(brgemm_convolution_utils::init_scratchpad_bwd_w(
+            scratchpad, jcp_, src_md_, diff_weights_md_, diff_dst_md_));
 
-    if (status != status::success) return status;
     copy2jit_jcp();
 
     bs_c = jcp_.var_bs ? 1 : (jcp_.max_batch + 1);
@@ -111,9 +115,9 @@ status_t brgemm_convolution_bwd_weights_t::pd_t::init(engine_t *engine) {
                 auto vK = (i_K) ? jcp_.K_tail : jcp_.K;
                 if (vN == 0 || vK == 0) continue;
                 auto brg_idx = get_brg_idx(bs, M, i_init, i_N, i_K);
-                // if brgemm_t already created then skip this iteration
+                // if brgemm_desc_t already created then skip this iteration
                 if ((*brgs_)[brg_idx] != nullptr) continue;
-                brgemm_t brg;
+                brgemm_desc_t brg;
                 CHECK(brgemm_desc_init(&brg, jcp_.isa, jcp_.brg_type, src_type,
                         wei_type, false, false, brgemm_row_major, alpha, vbeta,
                         jcp_.LDA, jcp_.LDB, jcp_.LDC, M, vN, vK, nullptr));
@@ -132,32 +136,46 @@ status_t brgemm_convolution_bwd_weights_t::pd_t::init(engine_t *engine) {
                 brgattr.hint_expected_B_size = 0;
                 brgattr.hint_expected_C_size = 0;
 
-                brgattr.wary_tail_read = false;
+                brgattr.wary_A_k_tail_read = false;
                 brgattr.bd_mask_level = jcp_.use_M_mask;
 
                 brgattr.max_top_vpad = 0;
                 brgattr.max_bottom_vpad = 0;
 
-                brgattr.LDA2 = jcp_.tr_iw * jcp_.ih_block * jcp_.id;
-                brgattr.LDB2
-                        = jcp_.tr_ow * jcp_.oc_block * jcp_.oh_block * jcp_.od;
+                const auto lda2_size = static_cast<size_t>(jcp_.tr_iw)
+                        * jcp_.ih_block * jcp_.id;
+                VDISPATCH_CONV_IC(lda2_size <= INT_MAX,
+                        VERBOSE_UNSUPPORTED_FEATURE,
+                        "lda2_size > INT_MAX is not supported");
+                brgattr.LDA2 = lda2_size;
+
+                const auto ldb2_size = static_cast<size_t>(jcp_.tr_ow)
+                        * jcp_.oc_block * jcp_.oh_block * jcp_.od;
+                VDISPATCH_CONV_IC(ldb2_size <= INT_MAX,
+                        VERBOSE_UNSUPPORTED_FEATURE,
+                        "ldb2_size > INT_MAX is not supported");
+                brgattr.LDB2 = ldb2_size;
+
                 brgattr.LDC2_M = jcp_.oc_block * jcp_.kd * jcp_.kh * jcp_.kw;
                 brgattr.LDC2_N = jcp_.nb_ic * jcp_.ic_block * jcp_.oc_block
                         * jcp_.kd * jcp_.kh * jcp_.kw;
 
                 CHECK(brgemm_desc_set_attr(&brg, brgattr));
+                CHECK(brgemm_desc_finalize(&brg));
 
                 brgs_->insert(brg_idx, brg);
             }
         }
     }
-    return status;
+    return status::success;
 }
 
 // jit_jcp used to initialize transpose kernels shared with jit implementation
 void brgemm_convolution_bwd_weights_t::pd_t::copy2jit_jcp() {
     jit_jcp_ = zero<decltype(jit_jcp_)>();
     jit_jcp_.prop_kind = jcp_.prop_kind;
+    jit_jcp_.src_dt = jcp_.src_dt;
+    jit_jcp_.dst_dt = jcp_.dst_dt;
     jit_jcp_.has_vnni = true; // Needed for transpose routines
     jit_jcp_.harness = jcp_.harness;
     jit_jcp_.simd_w = jcp_.simd_w;
@@ -258,7 +276,7 @@ status_t brgemm_convolution_bwd_weights_t::init(engine_t *engine) {
     if (jcp.transform_to_vnni) {
         CHECK(safe_ptr_assign(diff_wei_trans_kernel_,
                 new jit_diff_wei_trans_to_vnni_t(jcp.wei_dt, jcp.kd, jcp.kh,
-                        jcp.kw, jcp.ic_block, jcp.oc_block)));
+                        jcp.kw, jcp.ic_block, jcp.oc_block, jcp.nb_ic)));
         CHECK(diff_wei_trans_kernel_->create_kernel());
     }
 
@@ -292,16 +310,16 @@ status_t brgemm_convolution_bwd_weights_t::init(engine_t *engine) {
 }
 
 struct brgemm_convolution_bwd_weights_t::thread_info_t {
-    const src_data_t *src = nullptr;
-    const diff_dst_data_t *diff_dst = nullptr;
-    const void *diff_weights = nullptr;
-    const void *diff_bias = nullptr;
+    const char *const __restrict src = nullptr;
+    const char *const __restrict diff_dst = nullptr;
+    const char *diff_weights = nullptr;
+    const char *diff_bias = nullptr;
 
     const brgemm_convolution_bwd_weights_t *self;
     const memory_tracking::grantor_t scratchpad;
 
-    src_data_t *tr_src = nullptr;
-    diff_dst_data_t *tr_diff_dst = nullptr;
+    char *tr_src = nullptr;
+    char *tr_diff_dst = nullptr;
     simple_barrier::ctx_t *tr_src_bctx = nullptr;
     simple_barrier::ctx_t *tr_diff_dst_bctx = nullptr;
 
@@ -334,9 +352,9 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
 
     thread_info_t(const brgemm_convolution_bwd_weights_t *pcnv,
             const exec_ctx_t &ctx, int ithr)
-        : src(CTX_IN_MEM(const src_data_t *, DNNL_ARG_SRC))
-        , diff_dst(CTX_IN_MEM(const diff_dst_data_t *, DNNL_ARG_DIFF_DST))
-        , diff_weights(CTX_OUT_MEM(void *, DNNL_ARG_DIFF_WEIGHTS))
+        : src(CTX_IN_MEM(const char *, DNNL_ARG_SRC))
+        , diff_dst(CTX_IN_MEM(const char *, DNNL_ARG_DIFF_DST))
+        , diff_weights(CTX_OUT_MEM(char *, DNNL_ARG_DIFF_WEIGHTS))
         , self(pcnv)
         , scratchpad(ctx.get_scratchpad_grantor())
         , ithr(ithr)
@@ -348,16 +366,15 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
 
         diff_bias = self->pd()->with_bias() && (jcp.oc % jcp.oc_block != 0)
                         && self->pd()->jcp_.bia_dt == data_type::f32
-                ? (void *)scratchpad.template get<float>(key_conv_padded_bias)
-                : CTX_OUT_MEM(void *, DNNL_ARG_DIFF_BIAS);
+                ? (char *)scratchpad.template get<float>(key_conv_padded_bias)
+                : CTX_OUT_MEM(char *, DNNL_ARG_DIFF_BIAS);
 
-        tr_src = scratchpad.template get<src_data_t>(key_conv_tr_src);
+        tr_src = scratchpad.template get<char>(key_conv_tr_src);
         if (jcp.global_transpose)
             tr_src_bctx = scratchpad.template get<simple_barrier::ctx_t>(
                     key_conv_tr_src_bctx);
 
-        tr_diff_dst = scratchpad.template get<diff_dst_data_t>(
-                key_conv_tr_diff_dst);
+        tr_diff_dst = scratchpad.template get<char>(key_conv_tr_diff_dst);
         if (jcp.global_transpose)
             tr_diff_dst_bctx = scratchpad.template get<simple_barrier::ctx_t>(
                     key_conv_tr_diff_dst_bctx);
@@ -399,11 +416,23 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
         balance211(jcp.nb_oc, jcp.nthr_oc_b, ithr_oc_b, oc_b_start, oc_b_end);
         oc_b_work = oc_b_end - oc_b_start;
 
-        balance211(jcp.nb_ic, jcp.nthr_ic_b, ithr_ic_b, ic_b_start, ic_b_end);
         if (jcp.transform_to_vnni) {
-            if (ic_b_start % 2 != 0) ic_b_start++;
-            if (ic_b_end != jcp.nb_ic && ic_b_end % 2 != 0) ic_b_end++;
+            const int vnni_granularity = data_type_vnni_granularity(jcp.wei_dt);
+            if (vnni_granularity == 0) {
+                assert(!"Invalid vnni granularity.");
+                return;
+            }
+
+            const auto icb_work = div_up(jcp.nb_ic, vnni_granularity);
+            balance211(
+                    icb_work, jcp.nthr_ic_b, ithr_ic_b, ic_b_start, ic_b_end);
+            ic_b_start = nstl::min(jcp.nb_ic, ic_b_start * vnni_granularity);
+            ic_b_end = nstl::min(jcp.nb_ic, ic_b_end * vnni_granularity);
+        } else {
+            balance211(
+                    jcp.nb_ic, jcp.nthr_ic_b, ithr_ic_b, ic_b_start, ic_b_end);
         }
+
         ic_b_work = ic_b_end - ic_b_start;
 
         brgemm_batch_element_t *const __restrict brg_batch_global
@@ -468,30 +497,33 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
         const size_t tr_row_size = jcp.tr_iw * jcp.ic_block;
         const size_t tr_3d_size = tr_row_size * jcp.ih_block;
         // Aligned to buffer end to use guard elements
-        return tr_src_buf_number(g, icb) * jcp.tr_src_buf_size + id * tr_3d_size
-                + ih * tr_row_size;
+        return (tr_src_buf_number(g, icb) * jcp.tr_src_buf_size
+                       + id * tr_3d_size + ih * tr_row_size)
+                * jcp.src_dsz;
     }
 
     inline size_t tr_ic_block_src_off(int g, int tr_icb, int id, int ih) const {
         const int nb_tr_icb = jcp.ic_block / jcp.tr_ic_block;
         return tr_src_off(g, tr_icb / nb_tr_icb, id, ih)
-                + (tr_icb % nb_tr_icb) * jcp.tr_ic_block * jcp.tr_iw;
+                + (tr_icb % nb_tr_icb) * jcp.tr_ic_block * jcp.tr_iw
+                * jcp.src_dsz;
     }
 
     inline size_t tr_diff_dst_off(int g, int ocb, int od, int oh) const {
         const size_t tr_row_size = jcp.tr_ow * jcp.oc_block;
         const size_t tr_3d_size = tr_row_size * jcp.oh_block;
-        return tr_diff_dst_buf_number(g, ocb) * jcp.tr_diff_dst_buf_size
-                + od * tr_3d_size + oh * tr_row_size;
+        return (tr_diff_dst_buf_number(g, ocb) * jcp.tr_diff_dst_buf_size
+                       + od * tr_3d_size + oh * tr_row_size)
+                * jcp.dst_dsz;
     }
 
-    void trans_src_nxc(src_data_t *tr_src, const src_data_t *src_base,
-            int tr_icb, int row_count, int ih_s) const {
-        const int src_stride = jcp.iw * jcp.ngroups * jcp.ic;
-        const int tr_src_stride = jcp.tr_iw * jcp.ic_block;
+    void trans_src_nxc(char *tr_src, const char *src_base, int tr_icb,
+            int row_count, int ih_s) const {
+        const int src_stride = jcp.iw * jcp.ngroups * jcp.ic * jcp.src_dsz;
+        const int tr_src_stride = jcp.tr_iw * jcp.ic_block * jcp.src_dsz;
 
         int sp_work = row_count;
-        const src_data_t *src = src_base;
+        const char *src = src_base;
         const int tr_ic_tail_work
                 = jcp.tr_ic_tail ? jcp.tr_ic_tail : jcp.tr_ic_block;
         for (int iwork = 0; iwork < sp_work; iwork++) {
@@ -512,16 +544,16 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
         }
     }
 
-    void trans_dst_nxc(diff_dst_data_t *tr_diff_dst,
-            const diff_dst_data_t *diff_dst_base, int spatial_start,
-            dim_t spatial_start_offset, int ocb_start, dim_t chb_stride,
-            int row_count) const {
-        const int diff_dst_stride = jcp.ow * jcp.ngroups * jcp.oc;
-        const int tr_diff_dst_stride = jcp.tr_ow * jcp.oc_block;
+    void trans_dst_nxc(char *tr_diff_dst, const char *diff_dst_base,
+            int spatial_start, dim_t spatial_start_offset, int ocb_start,
+            dim_t chb_stride, int row_count) const {
+        const int diff_dst_stride = jcp.ow * jcp.ngroups * jcp.oc * jcp.dst_dsz;
+        const int tr_diff_dst_stride = jcp.tr_ow * jcp.oc_block * jcp.dst_dsz;
         int work_rest = row_count;
         int max_spatial_work = jcp.od * jcp.oh;
         int sp_work = nstl::min(work_rest, max_spatial_work - spatial_start);
-        const src_data_t *diff_dst = diff_dst_base + spatial_start_offset;
+        const char *diff_dst
+                = diff_dst_base + spatial_start_offset * jcp.dst_dsz;
         int ocb = 0;
         const int oc_tail_work = jcp.oc_tail ? jcp.oc_tail : jcp.oc_block;
         while (work_rest > 0) {
@@ -594,15 +626,17 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
 
                 const int ic_off_idx = g_ * jcp.ic + tr_ic_b_ * jcp.tr_ic_block;
 
-                const src_data_t *p_src {nullptr};
+                const char *p_src {nullptr};
                 if (jcp.harness == harness_2d_reduction) {
-                    p_src = &src[src_d.blk_off(img, ic_off_idx, jh_s)];
+                    p_src = &src[src_d.blk_off(img, ic_off_idx, jh_s)
+                            * jcp.src_dsz];
                 } else if (jcp.harness == harness_3d_reduction) {
-                    p_src = &src[src_d.blk_off(img, ic_off_idx, jd_s, jh_s)];
+                    p_src = &src[src_d.blk_off(img, ic_off_idx, jd_s, jh_s)
+                            * jcp.src_dsz];
                 } else
                     assert(!"Invalid harness type");
 
-                src_data_t *p_tr_src = &tr_src[tr_ic_block_src_off(
+                char *p_tr_src = &tr_src[tr_ic_block_src_off(
                         g_, tr_ic_b_, jd_s - id_s, jh_s - ih_s)];
                 trans_src_nxc(p_tr_src, p_src, tr_ic_b_, jh_e - jh_s, jh_s);
 
@@ -640,17 +674,19 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
                 int jh_e = jh_s + nstl::min(tr_end - tr_start, ohb_e - jh_s);
                 const int oc_off_idx = g_ * jcp.oc + oc_b_ * jcp.oc_block;
 
-                const diff_dst_data_t *p_diff_dst {nullptr};
+                const char *p_diff_dst {nullptr};
                 if (jcp.harness == harness_2d_reduction) {
                     p_diff_dst = &diff_dst[diff_dst_d.blk_off(
-                            img, oc_off_idx, jh_s)];
+                                                   img, oc_off_idx, jh_s)
+                            * jcp.dst_dsz];
                 } else if (jcp.harness == harness_3d_reduction) {
                     p_diff_dst = &diff_dst[diff_dst_d.blk_off(
-                            img, oc_off_idx, jd_s, jh_s)];
+                                                   img, oc_off_idx, jd_s, jh_s)
+                            * jcp.dst_dsz];
                 } else
                     assert(!"Invalid harness type");
 
-                diff_dst_data_t *p_tr_diff_dst = &tr_diff_dst[tr_diff_dst_off(
+                char *p_tr_diff_dst = &tr_diff_dst[tr_diff_dst_off(
                         g_, oc_b_, jd_s - od_s, jh_s - oh_s)];
                 trans_dst_nxc(
                         p_tr_diff_dst, p_diff_dst, 0, 0, oc_b_, 0, jh_e - jh_s);
@@ -663,7 +699,7 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
             barrier(&tr_diff_dst_bctx[ithr_but_ic], jcp.nthr_ic_b);
     }
 
-    void maybe_local_traspose(void *&p_src, void *&p_dst, int img, int g,
+    void maybe_local_traspose(char *&p_src, char *&p_dst, int img, int g,
             int ic_b, int oc_b, int od_s, int odb_s, int odb_e, int oh_s,
             int ohb_s, int ohb_e) const {
 
@@ -693,16 +729,18 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
         for_(int idb = idb_s; idb < idb_e; idb++)
         for (int icb = 0; icb < nb_ic_blocks; icb++) {
             const int ic_off_idx = g * jcp.ic + (ic_b + icb) * jcp.ic_block;
-            src_data_t *p_tr_src
+            char *p_tr_src
                     = &tr_src[tr_src_off(0, 0, idb - id_s, ihb_s - ih_s)];
-            src_data_t *tr_src_local = p_tr_src + icb * jcp.tr_src_block_size;
-            const src_data_t *p_raw_src {nullptr};
+            char *tr_src_local
+                    = p_tr_src + icb * jcp.tr_src_block_size * jcp.src_dsz;
+            const char *p_raw_src {nullptr};
             if (jcp.harness == harness_2d_reduction) {
-                p_raw_src = (src_data_t
-                                *)&src[src_d.blk_off(img, ic_off_idx, ihb_s)];
+                p_raw_src = (char *)&src[src_d.blk_off(img, ic_off_idx, ihb_s)
+                        * jcp.src_dsz];
             } else if (jcp.harness == harness_3d_reduction) {
-                p_raw_src = (src_data_t *)&src[src_d.blk_off(
-                        img, ic_off_idx, idb, ihb_s)];
+                p_raw_src = (char *)&src[src_d.blk_off(
+                                                 img, ic_off_idx, idb, ihb_s)
+                        * jcp.src_dsz];
             } else
                 assert(!"Invalid harness type");
             trans_src_nxc(tr_src_local, p_raw_src,
@@ -715,19 +753,21 @@ struct brgemm_convolution_bwd_weights_t::thread_info_t {
         for_(int odb = odb_s; odb < odb_e; odb++)
         for (int ocb = 0; ocb < nb_oc_blocks; ocb++) {
             const int oc_off_idx = g * jcp.oc + (oc_b + ocb) * jcp.oc_block;
-            const diff_dst_data_t *p_raw_diff_dst {nullptr};
+            const char *p_raw_diff_dst {nullptr};
             if (jcp.harness == harness_2d_reduction) {
                 p_raw_diff_dst
-                        = &diff_dst[diff_dst_d.blk_off(img, oc_off_idx, ohb_s)];
+                        = &diff_dst[diff_dst_d.blk_off(img, oc_off_idx, ohb_s)
+                                * jcp.dst_dsz];
             } else if (jcp.harness == harness_3d_reduction) {
                 p_raw_diff_dst = &diff_dst[diff_dst_d.blk_off(
-                        img, oc_off_idx, odb, ohb_s)];
+                                                   img, oc_off_idx, odb, ohb_s)
+                        * jcp.dst_dsz];
             } else
                 assert(!"Invalid harness type");
-            diff_dst_data_t *p_tr_diff_dst = &tr_diff_dst[tr_diff_dst_off(
+            char *p_tr_diff_dst = &tr_diff_dst[tr_diff_dst_off(
                     0, 0, odb - od_s, ohb_s - oh_s)];
-            diff_dst_data_t *tr_diff_dst_local
-                    = p_tr_diff_dst + ocb * jcp.tr_diff_dst_block_size;
+            char *tr_diff_dst_local = p_tr_diff_dst
+                    + ocb * jcp.tr_diff_dst_block_size * jcp.dst_dsz;
             trans_dst_nxc(tr_diff_dst_local, p_raw_diff_dst, 0, 0, (oc_b + ocb),
                     0, (ohb_e - ohb_s));
         }
@@ -853,8 +893,8 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_2d(
     img = img_s;
 
     auto do_brgemm_call = [&](int g, int bs, int ic_b, int oc_b, int ohb_s,
-                                  int bs_ih_s, const void *p_src,
-                                  const void *p_dst, int kh, int kw,
+                                  int bs_ih_s, const char *p_src,
+                                  const char *p_dst, int kh, int kw,
                                   bool do_init) {
         const int ihb_s = ti->get_ih_start(ohb_s);
 
@@ -864,12 +904,12 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_2d(
         auto ocb_end = get_end(oc_b, jcp.nb_oc_blocking, ti->oc_b_end);
         auto icb_end = get_end(ic_b, jcp.nb_ic_blocking, ti->ic_b_end);
         const int src_stride_w_shift = jcp.tr_iw / jcp.stride_w;
-        const void *ptr_A = ((src_data_t *)p_src)
-                + _pd->filter_w_to_src(kw) / jcp.stride_w
+        const auto a_off = _pd->filter_w_to_src(kw) / jcp.stride_w
                 + (kw % jcp.stride_w) * src_stride_w_shift
                 + (bs_ih_s - ihb_s) * jcp.tr_iw * jcp.ic_block;
-        const void *ptr_B = ((diff_dst_data_t *)p_dst)
-                + (bs_oh_s - ohb_s) * jcp.tr_ow * jcp.oc_block;
+        const char *ptr_A = p_src + a_off * jcp.src_dsz;
+        const auto b_off = (bs_oh_s - ohb_s) * jcp.tr_ow * jcp.oc_block;
+        const char *ptr_B = p_dst + b_off * jcp.dst_dsz;
 
         void *ptr_C = (jcp.transform_to_vnni)
                 ? diff_wei + wei_offset_int(g, oc_b, ic_b, 0, kh, kw)
@@ -886,10 +926,10 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_2d(
 
         for (int ohb = 0; ohb < bs; ohb++) {
             ti->brg_batch[ohb].ptr.A = (char *)ptr_A
-                    + ohb * jcp.typesize_in * jcp.tr_iw * jcp.ic_block
-                            * jcp.stride_h;
+                    + ohb * jcp.tr_iw * jcp.ic_block * jcp.stride_h
+                            * jcp.src_dsz;
             ti->brg_batch[ohb].ptr.B = (char *)ptr_B
-                    + ohb * jcp.typesize_in * jcp.tr_ow * jcp.oc_block;
+                    + ohb * jcp.tr_ow * jcp.oc_block * jcp.dst_dsz;
         }
 
         call_brgemm_kernel(*ti, brg_idx, bs, ptr_C);
@@ -935,13 +975,13 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_2d(
                         ti->maybe_global_transpose(img, 0, 0, ic_b, ic_b_e, 0,
                                 0, 1, oh_s, ohb_s, ohb_e);
 
-                    void *p_src {nullptr};
-                    void *p_dst {nullptr};
+                    char *p_src {nullptr};
+                    char *p_dst {nullptr};
                     ti->maybe_local_traspose(p_src, p_dst, img, g, ic_b, oc_b,
                             0, 0, 1, oh_s, ohb_s, ohb_e);
 
                     if (jcp.with_bias && ic_b == 0) {
-                        auto bp = jit_conv_call_s();
+                        auto bp = jit_conv_args_t();
 
                         bp.bias = diff_bias + g * rnd_up(jcp.oc, jcp.oc_block)
                                 + oc_b * jcp.oc_block;
@@ -1027,7 +1067,7 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_3d(
 
     auto do_brgemm_call = [&](int g, int bs_d, int bs_h, int ic_b, int oc_b,
                                   int od_s, int oh_s, int bs_id_s, int bs_ih_s,
-                                  const void *p_src, const void *p_dst, int kd,
+                                  const char *p_src, const char *p_dst, int kd,
                                   int kh, int kw, bool do_init) {
         const int id_s = ti->get_id_start(od_s);
         const int ih_s = ti->get_ih_start(oh_s);
@@ -1041,14 +1081,14 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_3d(
         auto ocb_end = get_end(oc_b, jcp.nb_oc_blocking, ti->oc_b_end);
         auto icb_end = get_end(ic_b, jcp.nb_ic_blocking, ti->ic_b_end);
         const int src_stride_w_shift = jcp.tr_iw / jcp.stride_w;
-        const void *ptr_A = ((src_data_t *)p_src)
-                + _pd->filter_w_to_src(kw) / jcp.stride_w
+        const auto a_off = _pd->filter_w_to_src(kw) / jcp.stride_w
                 + (kw % jcp.stride_w) * src_stride_w_shift
                 + (bs_ih_s - ih_s) * jcp.tr_iw * jcp.ic_block
                 + (bs_id_s - id_s) * jcp.ih_block * jcp.tr_iw * jcp.ic_block;
-        const void *ptr_B = ((diff_dst_data_t *)p_dst)
-                + (bs_oh_s - oh_s) * jcp.tr_ow * jcp.oc_block
+        const char *ptr_A = p_src + a_off * jcp.src_dsz;
+        const auto b_off = (bs_oh_s - oh_s) * jcp.tr_ow * jcp.oc_block
                 + (bs_od_s - od_s) * jcp.oh_block * jcp.tr_ow * jcp.oc_block;
+        const char *ptr_B = p_dst + b_off * jcp.dst_dsz;
         void *ptr_C = (jcp.transform_to_vnni)
                 ? diff_wei + wei_offset_int(g, oc_b, ic_b, kd, kh, kw)
                 : diff_wei
@@ -1063,15 +1103,15 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_3d(
 
         for (int odb = 0; odb < bs_d; odb++) {
             for (int ohb = 0; ohb < bs_h; ohb++) {
-                ti->brg_batch[odb * bs_h + ohb].ptr.A = (char *)ptr_A
-                        + ohb * jcp.typesize_in * jcp.tr_iw * jcp.ic_block
-                                * jcp.stride_h
-                        + odb * jcp.typesize_in * jcp.ih_block * jcp.tr_iw
-                                * jcp.ic_block * jcp.stride_d;
-                ti->brg_batch[odb * bs_h + ohb].ptr.B = (char *)ptr_B
-                        + ohb * jcp.typesize_in * jcp.tr_ow * jcp.oc_block
-                        + odb * jcp.typesize_in * jcp.oh_block * jcp.tr_ow
-                                * jcp.oc_block;
+                const auto a_off_batch = (odb * jcp.ih_block * jcp.stride_d
+                                                 + ohb * jcp.stride_h)
+                        * jcp.tr_iw * jcp.ic_block * jcp.src_dsz;
+                ti->brg_batch[odb * bs_h + ohb].ptr.A
+                        = (char *)ptr_A + a_off_batch;
+                const auto b_off_batch = (odb * jcp.oh_block + ohb) * jcp.tr_ow
+                        * jcp.oc_block * jcp.dst_dsz;
+                ti->brg_batch[odb * bs_h + ohb].ptr.B
+                        = (char *)ptr_B + b_off_batch;
             }
         }
 
@@ -1123,14 +1163,14 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_3d(
                             ti->maybe_global_transpose(img, 0, 0, ic_b, ic_b_e,
                                     od_s, odb_s, odb_e, oh_s, ohb_s, ohb_e);
 
-                        void *p_src {nullptr};
-                        void *p_dst {nullptr};
+                        char *p_src {nullptr};
+                        char *p_dst {nullptr};
                         ti->maybe_local_traspose(p_src, p_dst, img, g, ic_b,
                                 oc_b, od_s, odb_s, odb_e, oh_s, ohb_s, ohb_e);
 
                         if (jcp.with_bias && ic_b == 0) {
                             for (int iodb = odb_s; iodb < odb_e; iodb++) {
-                                auto bp = jit_conv_call_s();
+                                auto bp = jit_conv_args_t();
 
                                 bp.bias = diff_bias
                                         + g * rnd_up(jcp.oc, jcp.oc_block)
@@ -1147,11 +1187,11 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_3d(
                                 bp.channel = (start == ti->img_start)
                                         && (odb_s == od_s) && (iodb == odb_s)
                                         && (ohb_s == oh_s);
-                                bp.dst = ((diff_dst_data_t *)p_dst)
-                                        + (iodb - od_s) * jcp.oh_block
-                                                * jcp.tr_ow * jcp.oc_block
-                                        + (ohb_s - oh_s) * jcp.tr_ow
-                                                * jcp.oc_block;
+                                const auto dst_idx
+                                        = ((iodb - od_s) * jcp.oh_block
+                                                  + (ohb_s - oh_s))
+                                        * jcp.tr_ow * jcp.oc_block;
+                                bp.dst = p_dst + dst_idx * jcp.dst_dsz;
                                 (*diff_bias_kernel_)(&bp);
                             }
                         }
@@ -1203,8 +1243,15 @@ void brgemm_convolution_bwd_weights_t::compute_diff_weights_3d(
 void brgemm_convolution_bwd_weights_t::store_in_vnni_format(
         thread_info_t *ti) const {
     const auto &jcp = pd()->jcp_;
+    if (one_of(0, ti->g_work, ti->oc_b_work, ti->ic_b_work)) return;
 
-    const auto icb2_work = div_up(ti->ic_b_work, 2);
+    const int vnni_granularity = data_type_vnni_granularity(jcp.wei_dt);
+    if (vnni_granularity == 0) {
+        assert(!"Invalid vnni granularity.");
+        return;
+    }
+
+    const auto icb2_work = div_up(ti->ic_b_work, vnni_granularity);
     const auto work = ti->g_work * ti->oc_b_work * icb2_work;
 
     int start {0}, end {0};
@@ -1215,16 +1262,16 @@ void brgemm_convolution_bwd_weights_t::store_in_vnni_format(
     for (int w = start; w < end; w++) {
         const int g = ti->g_start + sub_g_start;
         const int oc_b = ti->oc_b_start + sub_oc_b_start;
-        const int ic_b = ti->ic_b_start + 2 * sub_icb2_start;
-        jit_conv_call_s p = jit_conv_call_s();
+        const int ic_b = ti->ic_b_start + vnni_granularity * sub_icb2_start;
+        jit_conv_args_t p = jit_conv_args_t();
 
-        bfloat16_t *output = (bfloat16_t *)ti->diff_weights
-                + wei_offset_ext(g, oc_b, (ic_b / 2), 0);
         float *input = ti->wei_bia_reduction + wei_offset_int(g, oc_b, ic_b, 0);
+        char *output = (char *)ti->diff_weights
+                + wei_offset_ext(g, oc_b, ic_b) * jcp.wei_dsz;
 
         p.src = (void *)input;
         p.dst = (void *)output;
-        p.last_ic_block = ((ic_b + 1) >= jcp.nb_ic) ? 1 : 0;
+        p.last_ic_block = ((ic_b + vnni_granularity) > jcp.nb_ic) ? 1 : 0;
         (*diff_wei_trans_kernel_)(&p);
         nd_iterator_step(sub_g_start, ti->g_work, sub_oc_b_start, ti->oc_b_work,
                 sub_icb2_start, icb2_work);
@@ -1259,8 +1306,7 @@ void brgemm_convolution_bwd_weights_t::reduce_and_convert_diff_weights_and_bias(
                     const size_t off = wht_blk_off(
                             diff_weights_d, g, oc_b, ti->ic_b_start);
                     types::cvt_from_float(wei_dt,
-                            (void *)((char *)ti->diff_weights
-                                    + off * types::data_type_size(wei_dt)),
+                            (void *)(ti->diff_weights + off * jcp.wei_dsz),
                             (ti->wei_bia_reduction + off), acc_size);
                 }
             }
@@ -1276,7 +1322,7 @@ void brgemm_convolution_bwd_weights_t::reduce_and_convert_diff_weights_and_bias(
                         = nstl::min(jcp.oc, ti->oc_b_end * jcp.oc_block)
                         - ti->oc_b_start * jcp.oc_block;
                 void *diff_bias = (char *)ti->diff_bias
-                        + result_start_idx * types::data_type_size(bia_dt);
+                        + result_start_idx * jcp.bia_dsz;
                 float *buffer = ti->bia_reduction + buffer_start_idx;
                 types::cvt_from_float(
                         bia_dt, diff_bias, (const float *)buffer, acc_size);
@@ -1349,6 +1395,14 @@ void brgemm_convolution_bwd_weights_t::reduce_and_convert_diff_weights_and_bias(
                     add_floats_and_cvt_to_float16(
                             (float16_t *)(ti->diff_weights) + off_ext,
                             wei_reduced, wei_to_reduce, acc_size);
+                else if (wei_dt == f8_e5m2)
+                    add_floats_and_cvt_to_f8_e5m2(
+                            (float8_e5m2_t *)(ti->diff_weights) + off_ext,
+                            wei_reduced, wei_to_reduce, acc_size);
+                else if (wei_dt == f8_e4m3)
+                    add_floats_and_cvt_to_f8_e4m3(
+                            (float8_e4m3_t *)(ti->diff_weights) + off_ext,
+                            wei_reduced, wei_to_reduce, acc_size);
             } else
                 acc_ker_->accumulate(wei_reduced, wei_to_reduce, acc_size);
 
@@ -1384,6 +1438,18 @@ void brgemm_convolution_bwd_weights_t::reduce_and_convert_diff_weights_and_bias(
                                 (float16_t *)(ti->diff_bias) + diff_bias_idx,
                                 &bias_reduced[idx], &bias_to_reduce[idx],
                                 acc_size);
+                    else if (bia_dt == f8_e5m2)
+                        add_floats_and_cvt_to_f8_e5m2(
+                                (float8_e5m2_t *)(ti->diff_bias)
+                                        + diff_bias_idx,
+                                &bias_reduced[idx], &bias_to_reduce[idx],
+                                acc_size);
+                    else if (bia_dt == f8_e4m3)
+                        add_floats_and_cvt_to_f8_e4m3(
+                                (float8_e4m3_t *)(ti->diff_bias)
+                                        + diff_bias_idx,
+                                &bias_reduced[idx], &bias_to_reduce[idx],
+                                acc_size);
                 } else {
                     acc_ker_->accumulate(
                             &bias_reduced[idx], &bias_to_reduce[idx], acc_size);
@@ -1404,7 +1470,7 @@ void brgemm_convolution_bwd_weights_t::prepare_scratchpad_data(
 
     const auto &jcp = pd()->jcp_;
 
-    auto tr_src = scratchpad.template get<src_data_t>(key_conv_tr_src);
+    auto tr_src = scratchpad.template get<char>(key_conv_tr_src);
     const auto bytes_to_zero = jcp.src_dsz * jcp.tr_src_num_guard_elems;
     if (jcp.oh_block < jcp.oh || jcp.id > 1) {
         // if (oh_block < oh) or (id > 1) then we zero end of each row because
@@ -1412,19 +1478,21 @@ void brgemm_convolution_bwd_weights_t::prepare_scratchpad_data(
         // oh_block, padding and kh
         parallel_nd(jcp.tr_src_buf_count, jcp.ih_block * jcp.id,
                 [&](size_t isb, size_t is) {
-                    src_data_t *ts = &tr_src[isb * jcp.tr_src_buf_size
-                            + (is + 1) * jcp.tr_iw * jcp.ic_block];
+                    const auto tr_src_idx = isb * jcp.tr_src_buf_size
+                            + (is + 1) * jcp.tr_iw * jcp.ic_block;
+                    char *ts = &tr_src[tr_src_idx * jcp.src_dsz];
                     std::memset(ts, 0, bytes_to_zero);
                 });
         // Zero out last guard elements
-        src_data_t *ts = &tr_src[jcp.tr_src_buf_count * jcp.tr_src_buf_size];
+        char *ts = &tr_src[jcp.tr_src_buf_count * jcp.tr_src_buf_size
+                * jcp.src_dsz];
         std::memset(ts, 0, bytes_to_zero);
     } else {
         // Zero out guard elements that cross a buffer boundary to prevent a
         // race condition due to buffer overflows from memory optimization where
         // buffers sharing padding
         parallel_nd(jcp.tr_src_buf_count, [&](size_t isb) {
-            src_data_t *ts = &tr_src[(isb + 1) * jcp.tr_src_buf_size];
+            char *ts = &tr_src[(isb + 1) * jcp.tr_src_buf_size * jcp.src_dsz];
             std::memset(ts, 0, bytes_to_zero);
         });
     }

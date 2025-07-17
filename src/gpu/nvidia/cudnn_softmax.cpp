@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020-2022 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,11 +16,11 @@
 *******************************************************************************/
 
 #include "gpu/nvidia/cudnn_softmax.hpp"
+#include "gpu/nvidia/stream.hpp"
 #include "gpu/nvidia/sycl_cuda_scoped_context.hpp"
-#include "gpu/nvidia/sycl_cuda_stream.hpp"
 #include "gpu/nvidia/sycl_cuda_stream_utils.hpp"
-#include "sycl/sycl_buffer_memory_storage.hpp"
-#include "sycl/sycl_memory_storage_helper.hpp"
+#include "xpu/sycl/buffer_memory_storage.hpp"
+#include "xpu/sycl/memory_storage_helper.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -30,15 +30,15 @@ namespace nvidia {
 status_t cudnn_softmax_fwd_t::execute(const exec_ctx_t &ctx) const {
     if (pd()->has_zero_dim_memory()) return status::success;
 
-    nvidia::sycl_cuda_stream_t *cuda_stream
-            = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
+    nvidia::stream_t *cuda_stream
+            = utils::downcast<nvidia::stream_t *>(ctx.stream());
 
-    if (!pd()->attr()->scales_.get(DNNL_ARG_SRC).has_default_values())
+    if (!pd()->attr()->scales_.has_default_values(DNNL_ARG_SRC))
         CHECK(stream_utils::copy_input_arg_to_host(ctx, cuda_stream,
                 &host_scales_[0], DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC,
                 sizeof(float)));
 
-    if (!pd()->attr()->scales_.get(DNNL_ARG_DST).has_default_values())
+    if (!pd()->attr()->scales_.has_default_values(DNNL_ARG_DST))
         CHECK(stream_utils::copy_input_arg_to_host(ctx, cuda_stream,
                 &host_scales_[1], DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST,
                 sizeof(float)));
@@ -57,7 +57,7 @@ status_t cudnn_softmax_fwd_t::execute(const exec_ctx_t &ctx) const {
 
         compat::host_task(cgh, [=, this](const compat::interop_handle &ih) {
             std::vector<void *> args;
-            auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
+            auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(
                     cuda_stream->engine());
             auto sc = cuda_sycl_scoped_context_handler_t(sycl_engine);
             auto handle = cuda_stream->get_cudnn_handle();
@@ -76,8 +76,8 @@ status_t cudnn_softmax_fwd_t::execute(const exec_ctx_t &ctx) const {
 status_t cudnn_softmax_bwd_t::execute(const exec_ctx_t &ctx) const {
     if (pd()->has_zero_dim_memory()) return status::success;
 
-    nvidia::sycl_cuda_stream_t *cuda_stream
-            = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
+    nvidia::stream_t *cuda_stream
+            = utils::downcast<nvidia::stream_t *>(ctx.stream());
 
     return cuda_stream->interop_task([&](::sycl::handler &cgh) {
         auto arg_dst = CTX_IN_SYCL_MEMORY(DNNL_ARG_DST);
@@ -86,7 +86,7 @@ status_t cudnn_softmax_bwd_t::execute(const exec_ctx_t &ctx) const {
 
         compat::host_task(cgh, [=, this](const compat::interop_handle &ih) {
             std::vector<void *> args;
-            auto &sycl_engine = *utils::downcast<sycl_cuda_engine_t *>(
+            auto &sycl_engine = *utils::downcast<nvidia::engine_t *>(
                     cuda_stream->engine());
             auto sc = cuda_sycl_scoped_context_handler_t(sycl_engine);
             auto handle = cuda_stream->get_cudnn_handle();

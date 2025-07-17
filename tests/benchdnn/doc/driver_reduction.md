@@ -16,19 +16,17 @@ where *reduction-knobs* are:
  - `--dtag={any [default], ...}` -- physical dst memory layout.
             Refer to [tags](knobs_tag.md) for details.
  - `--alg={sum [default], ...}` -- algorithm for reduction operations.
-            Refer to [reduction primitive](https://oneapi-src.github.io/oneDNN/dev_guide_reduction.html)
+            Refer to [reduction primitive](https://uxlfoundation.github.io/oneDNN/dev_guide_reduction.html)
             for details.
  - `--p=FLOAT` -- float value corresponding to algorithm operation.
             Refer to ``Floating point arguments`` below.
  - `--eps=FLOAT` -- float value corresponding to algorithm operation.
             Refer to ``Floating point arguments`` below.
- - `--attr-post-ops=STRING` -- post operation primitive attribute. No post
-            operations are set by default. Refer to [attributes](knobs_attr.md)
-            for details.
  - `--match=REGEX` -- skip problems not matching the regular expression in
             `REGEX`. By default no pattern is applied (run everything).
             Note: Windows may interpret only string arguments surrounded by
             double quotation marks.
+ - Any attributes options. Refer to [attributes](knobs_attr.md) for details.
 
 and *reduction-desc* is a problem descriptor. The canonical form is:
 ```

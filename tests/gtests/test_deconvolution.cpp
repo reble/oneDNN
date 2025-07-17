@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -135,11 +135,11 @@ private:
 
 protected:
     void SetUp() override {
-        memory::data_type data_type = data_traits<data_t>::data_type;
+        memory::data_type data_type = data_traits_t<data_t>::data_type;
         SKIP_IF(unsupported_data_type(data_type),
                 "Engine does not support this data type.");
 
-        auto p = ::testing::TestWithParam<
+        const auto &p = ::testing::TestWithParam<
                 deconvolution_test_params_t>::GetParam();
 
         SKIP_IF_CUDA(
@@ -156,6 +156,11 @@ protected:
                         && hip_check_src_wei_dst_format_tags(
                                 p.formats.src_format, p.formats.weights_format,
                                 p.formats.dst_format, p.sizes.ng > 1)),
+                "Format is not supported.");
+
+        SKIP_IF_GENERIC(
+                !(generic_check_format_tags(p.formats.src_format)
+                        && generic_check_format_tags(p.formats.dst_format)),
                 "Format is not supported.");
 
         catch_expected_failures(
@@ -204,6 +209,13 @@ protected:
         return false;
     }
 
+    bool generic_check_format_tags(memory::format_tag tag) {
+        return impl::utils::one_of(tag, memory::format_tag::ab,
+                memory::format_tag::abc, memory::format_tag::abcd,
+                memory::format_tag::abcde, memory::format_tag::abcdef,
+                memory::format_tag::any);
+    }
+
     void Test() {
         auto p = ::testing::TestWithParam<
                 deconvolution_test_params_t>::GetParam();
@@ -212,7 +224,7 @@ protected:
         strm = make_stream(eng);
 
         ASSERT_EQ(p.aalgorithm, algorithm::deconvolution_direct);
-        memory::data_type data_type = data_traits<data_t>::data_type;
+        memory::data_type data_type = data_traits_t<data_t>::data_type;
 
         test_convolution_sizes_t dd = p.sizes;
         with_bias = p.formats.bias_format != memory::format_tag::undef;
@@ -297,11 +309,21 @@ protected:
                         *dec_src_desc, *dec_weights_desc, *dec_dst_desc,
                         strides, padL, padR);
 
-        auto aa = allows_attr_t {false};
-        aa.po_binary = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
-        aa.po_eltwise = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
-        aa.po_prelu = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
-        aa.po_sum = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
+        allows_attr_t aa {};
+
+#ifndef DNNL_SYCL_GENERIC
+        aa.po_binary = !is_amd_gpu(eng);
+        aa.po_eltwise = !is_amd_gpu(eng);
+        aa.po_prelu = !is_amd_gpu(eng);
+        aa.po_sum = !is_amd_gpu(eng);
+#else
+        aa.po_eltwise = true;
+        aa.po_sum = true;
+        if (eng.get_kind() == dnnl::engine::kind::cpu) {
+            aa.po_binary = true;
+            aa.po_prelu = true;
+        }
+#endif
 
         bool is_int8 = impl::utils::one_of(dec_src_desc->get_data_type(),
                 memory::data_type::s8, memory::data_type::u8);
@@ -372,7 +394,7 @@ protected:
     }
 
     void BackwardData() {
-        auto p = ::testing::TestWithParam<
+        const auto &p = ::testing::TestWithParam<
                 deconvolution_test_params_t>::GetParam();
         // deconv specific types and values
         using pd_t = deconvolution_backward_data::primitive_desc;
@@ -398,7 +420,7 @@ protected:
                         *dec_weights_desc, *dec_dst_desc, strides, padL, padR,
                         deconv_primitive_desc);
 
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
         test_bwd_pd_constructors<pd_t, hint_pd_t>(
                 deconv_bwd_data_primitive_desc, deconv_primitive_desc, aa,
                 algorithm::deconvolution_direct, *dec_src_desc,
@@ -445,7 +467,7 @@ protected:
     }
 
     void BackwardWeights() {
-        auto p = ::testing::TestWithParam<
+        const auto &p = ::testing::TestWithParam<
                 deconvolution_test_params_t>::GetParam();
 
         // deconv specific types and values
@@ -471,7 +493,7 @@ protected:
                         *dec_weights_desc, *dec_bias_desc, *dec_dst_desc,
                         strides, padL, padR, deconv_primitive_desc);
 
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
         test_bwd_pd_constructors<pd_t, hint_pd_t>(
                 deconv_bwd_weights_primitive_desc, deconv_primitive_desc, aa,
                 algorithm::deconvolution_direct, *dec_src_desc,

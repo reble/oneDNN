@@ -1,7 +1,7 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
-* Copyright 2020 FUJITSU LIMITED
-* Copyright 2022 Arm Ltd. and affiliates
+* Copyright 2020-2025 Intel Corporation
+* Copyright 2020-2024 FUJITSU LIMITED
+* Copyright 2022-2024 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -34,11 +34,9 @@
 #include "cpu/x64/cpu_isa_traits.hpp"
 #elif DNNL_AARCH64
 #include "cpu/aarch64/cpu_isa_traits.hpp"
-#if DNNL_AARCH64_USE_ACL
+#if defined(DNNL_AARCH64_USE_ACL)
 // For checking if fp16 isa is supported on the platform
 #include "arm_compute/core/CPP/CPPTypes.h"
-// For setting the number of threads for ACL
-#include "src/common/cpuinfo/CpuInfo.h"
 #endif
 #endif
 
@@ -84,6 +82,8 @@ status_t set_max_cpu_isa(dnnl_cpu_isa_t isa) {
 status_t set_cpu_isa_hints(dnnl_cpu_isa_hints_t isa_hints) {
 #if DNNL_X64
     return x64::set_cpu_isa_hints(isa_hints);
+#elif DNNL_AARCH64
+    return status::success;
 #else
     return status::unimplemented;
 #endif
@@ -117,8 +117,8 @@ bool has_data_type_support(data_type_t data_type) {
 #if defined(USE_CBLAS) && defined(BLAS_HAS_SBGEMM) && defined(__MMA__)
             return true;
 #endif
-#elif DNNL_AARCH64_USE_ACL
-            return arm_compute::CPUInfo::get().has_bf16();
+#elif DNNL_AARCH64
+            return aarch64::mayiuse_bf16();
 #else
             return false;
 #endif
@@ -126,7 +126,7 @@ bool has_data_type_support(data_type_t data_type) {
 #if DNNL_X64
             return x64::mayiuse(x64::avx512_core_fp16)
                     || x64::mayiuse(x64::avx2_vnni_2);
-#elif DNNL_AARCH64_USE_ACL
+#elif defined(DNNL_AARCH64_USE_ACL)
             return arm_compute::CPUInfo::get().has_fp16();
 #else
             return false;
@@ -138,6 +138,8 @@ bool has_data_type_support(data_type_t data_type) {
 #else
             return false;
 #endif
+        case data_type::f4_e3m0:
+        case data_type::f4_e2m1: return false;
         default: return true;
     }
 }
@@ -153,7 +155,7 @@ bool has_training_support(data_type_t data_type) {
 #if defined(USE_CBLAS) && defined(BLAS_HAS_SBGEMM) && defined(__MMA__)
             return true;
 #endif
-#elif DNNL_AARCH64_USE_ACL
+#elif defined(DNNL_AARCH64_USE_ACL)
             return arm_compute::CPUInfo::get().has_bf16();
 #else
             return false;
@@ -161,7 +163,7 @@ bool has_training_support(data_type_t data_type) {
         case data_type::f16:
 #if DNNL_X64
             return x64::mayiuse(x64::avx512_core_fp16);
-#elif DNNL_AARCH64_USE_ACL
+#elif defined(DNNL_AARCH64_USE_ACL)
             return arm_compute::CPUInfo::get().has_fp16();
 #else
             return false;
@@ -177,6 +179,67 @@ float s8s8_weights_scale_factor() {
             : 0.5f;
 #else
     return 1.0f;
+#endif
+}
+uint32_t get_num_sets_in_cache(int level) {
+    // if level 1 is requested we map it to the closest cache which is level 0
+    // level 1 is actually instruction cache
+    if (level <= 1) { level = level - 1; }
+
+    auto guess = [](int level) {
+        switch (level) {
+            case 1: return 64u;
+            case 2: return 2U * 1024;
+            case 3: return 114688u;
+            default: return 0U;
+        }
+    };
+
+#if DNNL_X64
+    using namespace x64;
+
+    if (cpu().getDataCacheLevels() == 0) return guess(level);
+
+    if (level >= 0 && (unsigned)level <= cpu().getDataCacheLevels()) {
+        uint32_t data[4] = {0};
+        Xbyak::util::Cpu::getCpuidEx(4, level, data);
+        uint32_t num_sets = data[2] + 1;
+        return num_sets;
+    } else
+        return 0;
+#else
+    return guess(level);
+#endif
+}
+uint32_t get_num_ways_in_cache(int level) {
+    // if level 1 is requested we map it to the closest cache which is level 0
+    // level 1 is actually instruction cache
+    if (level <= 1) { level = level - 1; }
+
+    auto guess = [](int level) {
+        switch (level) {
+            case 1: return 12u;
+            case 2: return 16u;
+            case 3: return 15u;
+            default: return 0U;
+        }
+    };
+
+#if DNNL_X64
+
+    using namespace x64;
+    if (cpu().getDataCacheLevels() == 0) return guess(level);
+
+    if (level >= 0 && (unsigned)level <= cpu().getDataCacheLevels()) {
+        uint32_t data[4] = {0};
+        Xbyak::util::Cpu::getCpuidEx(4, level, data);
+        uint32_t num_ways = ((data[1] & 0xFFC00000) >> 22) + 1;
+        return num_ways;
+    } else
+        return 0;
+
+#else
+    return guess(level);
 #endif
 }
 
@@ -207,8 +270,8 @@ unsigned get_per_core_cache_size(int level) {
 unsigned get_num_cores() {
 #if DNNL_X64
     return x64::cpu().getNumCores(Xbyak::util::CoreLevel);
-#elif DNNL_AARCH64_USE_ACL
-    return arm_compute::cpuinfo::num_threads_hint();
+#elif defined(DNNL_AARCH64_USE_ACL)
+    return aarch64::cpu().getNumCores(Xbyak_aarch64::util::CoreLevel);
 #else
     return 1;
 #endif
@@ -258,13 +321,14 @@ unsigned get_max_threads_to_use() {
 int get_vector_register_size() {
 #if DNNL_X64
     using namespace x64;
-    if (mayiuse(avx512_core)) return cpu_isa_traits<avx512_core>::vlen;
-    if (mayiuse(avx)) return cpu_isa_traits<avx>::vlen;
-    if (mayiuse(sse41)) return cpu_isa_traits<sse41>::vlen;
+    if (mayiuse(avx512_core)) return cpu_isa_traits_t<avx512_core>::vlen;
+    if (mayiuse(avx)) return cpu_isa_traits_t<avx>::vlen;
+    if (mayiuse(sse41)) return cpu_isa_traits_t<sse41>::vlen;
 #elif DNNL_AARCH64
     using namespace aarch64;
     if (mayiuse(asimd)) return cpu_isa_traits<asimd>::vlen;
     if (mayiuse(sve_512)) return cpu_isa_traits<sve_512>::vlen;
+    if (mayiuse(sve_256)) return cpu_isa_traits<sve_256>::vlen;
 #endif
     return 0;
 }

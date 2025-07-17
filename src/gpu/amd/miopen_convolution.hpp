@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,12 +19,13 @@
 #define GPU_AMD_MIOPEN_CONVOLUTION_HPP
 
 #include "common/c_types_map.hpp"
-#include "common/primitive.hpp"
 #include "common/primitive_desc.hpp"
+#include "gpu/amd/engine.hpp"
 #include "gpu/amd/miopen_convolution_impl.hpp"
 #include "gpu/amd/miopen_convolution_pd.hpp"
-#include "gpu/amd/sycl_hip_engine.hpp"
 #include "gpu/amd/sycl_hip_utils.hpp"
+#include "gpu/gpu_primitive.hpp"
+#include "xpu/sycl/memory_storage.hpp"
 
 #include <miopen/miopen.h>
 
@@ -33,8 +34,8 @@ namespace impl {
 namespace gpu {
 namespace amd {
 
-struct miopen_convolution_fwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_convolution_fwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public miopen_convolution_fwd_pd_t {
         using miopen_convolution_fwd_pd_t::miopen_convolution_fwd_pd_t;
@@ -45,11 +46,11 @@ struct miopen_convolution_fwd_t : public primitive_t {
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_convolution_fwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
 
             using sm_t = primitive_attr_t::skip_mask_t;
-            const auto attr_skip_mask = sm_t::oscale_runtime | sm_t::post_ops;
+            const auto attr_skip_mask = sm_t::post_ops;
 
             bool ok = utils::one_of(desc()->prop_kind,
                     prop_kind::forward_training, prop_kind::forward_inference);
@@ -80,10 +81,6 @@ struct miopen_convolution_fwd_t : public primitive_t {
                     && IMPLICATION(
                             desc()->alg_kind == dnnl_convolution_winograd,
                             ndims() < 5 && src_md_.data_type != s8);
-            ok = ok
-                    && IMPLICATION(!attr()->output_scales_.has_default_values(),
-                            src_md_.data_type == s8
-                                    && attr()->output_scales_.mask_ == 0);
             ok = ok
                     && IMPLICATION(
                             src_md_.data_type == s8, check_s8_configuration())
@@ -228,8 +225,8 @@ struct miopen_convolution_fwd_t : public primitive_t {
         }
     };
 
-    status_t init_temp_dst(engine_t *engine) {
-        auto sycl_engine = utils::downcast<sycl_hip_engine_t *>(engine);
+    status_t init_temp_dst(impl::engine_t *engine) {
+        auto sycl_engine = utils::downcast<amd::engine_t *>(engine);
         memory_storage_t *scratch_ptr = nullptr;
         auto wrap = memory_desc_wrapper(pd()->dst_md_temp_);
         CHECK(sycl_engine->create_memory_storage(
@@ -243,7 +240,7 @@ struct miopen_convolution_fwd_t : public primitive_t {
         return status::success;
     }
 
-    virtual status_t init(engine_t *engine) override {
+    virtual status_t init(impl::engine_t *engine) override {
         const auto impl = pd()->impl_.get();
         if (impl && impl->use_temp_dst()) { init_temp_dst(engine); }
         return status::success;
@@ -262,7 +259,7 @@ struct miopen_convolution_fwd_t : public primitive_t {
 
 private:
     ::sycl::buffer<uint8_t, 1> &buffer(memory_storage_t *mem_storage) const {
-        return utils::downcast<impl::sycl::sycl_buffer_memory_storage_t *>(
+        return utils::downcast<xpu::sycl::buffer_memory_storage_t *>(
                 mem_storage)
                 ->buffer();
     }
@@ -272,8 +269,8 @@ private:
     std::shared_ptr<memory_storage_t> scratch_storage_2;
 };
 
-struct miopen_convolution_bwd_data_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_convolution_bwd_data_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public miopen_convolution_bwd_data_pd_t {
         using miopen_convolution_bwd_data_pd_t::
@@ -281,7 +278,7 @@ struct miopen_convolution_bwd_data_t : public primitive_t {
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_convolution_bwd_data_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
 
             bool ok = desc()->prop_kind == prop_kind::backward_data;
@@ -385,8 +382,8 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 };
 
-struct miopen_convolution_bwd_weights_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_convolution_bwd_weights_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public miopen_convolution_bwd_weights_pd_t {
         using miopen_convolution_bwd_weights_pd_t::
@@ -394,7 +391,7 @@ struct miopen_convolution_bwd_weights_t : public primitive_t {
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_convolution_bwd_weights_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
 
             bool ok = desc()->prop_kind == prop_kind::backward_weights;

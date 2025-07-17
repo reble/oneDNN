@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,11 +37,12 @@
 namespace dnnl {
 namespace impl {
 
+// NOLINTBEGIN(google-default-arguments)
 struct binary_pd_t : public primitive_desc_t {
     static constexpr auto base_pkind = primitive_kind::binary;
 
-    typedef binary_pd_t base_class;
-    typedef binary_pd_t hint_class;
+    using base_class = binary_pd_t;
+    using hint_class = binary_pd_t;
 
     const binary_desc_t *desc() const { return &desc_; }
     const op_desc_t *op_desc() const override {
@@ -59,7 +60,8 @@ struct binary_pd_t : public primitive_desc_t {
     }
 
     arg_usage_t arg_usage(int arg) const override {
-        if (arg == DNNL_ARG_SRC_0 || arg == DNNL_ARG_SRC_1)
+        if (arg == DNNL_ARG_SRC_0 || arg == DNNL_ARG_SRC_1
+                || arg == DNNL_ARG_SRC_2)
             return arg_usage_t::input;
 
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
@@ -72,6 +74,7 @@ struct binary_pd_t : public primitive_desc_t {
         switch (arg) {
             case DNNL_ARG_SRC_0: return src_md(0);
             case DNNL_ARG_SRC_1: return src_md(1);
+            case DNNL_ARG_SRC_2: return src_md(2);
             case DNNL_ARG_DST: return dst_md(0, user_input);
             default: return primitive_desc_t::arg_md(arg);
         }
@@ -81,6 +84,7 @@ struct binary_pd_t : public primitive_desc_t {
             int index = 0, bool user_input = false) const override {
         if (index == 0) return user_input ? &desc()->src_desc[0] : &src0_md_;
         if (index == 1) return user_input ? &desc()->src_desc[1] : &src1_md_;
+        if (index == 2) return user_input ? &desc()->src_desc[2] : &src2_md_;
         return &glob_zero_md;
     }
     const memory_desc_t *dst_md(
@@ -89,7 +93,9 @@ struct binary_pd_t : public primitive_desc_t {
         return &glob_zero_md;
     }
 
-    int n_inputs() const override { return 2 + n_binary_po_inputs(); }
+    int n_inputs() const override {
+        return 2 + n_binary_po_inputs() + static_cast<int>(is_ternary_op());
+    }
     int n_outputs() const override { return 1; }
 
     const dims_t &broadcast_dims() const { return broadcast_dims_; }
@@ -106,21 +112,29 @@ struct binary_pd_t : public primitive_desc_t {
         return src0_d.consistent_with(src1_d);
     }
 
+    bool is_ternary_op() const {
+        const memory_desc_wrapper src2_d(src_md(2));
+        return !src2_d.is_zero()
+                && (desc()->alg_kind == alg_kind::binary_select);
+    }
+
 protected:
     binary_desc_t desc_;
 
     memory_desc_t src0_md_;
     memory_desc_t src1_md_;
+    memory_desc_t src2_md_;
     memory_desc_t dst_md_;
 
     dims_t broadcast_dims_;
 
-    binary_pd_t(const binary_desc_t *adesc, const primitive_attr_t *attr,
+    binary_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const binary_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<binary_desc_t>(adesc))
         , src0_md_(desc_.src_desc[0])
         , src1_md_(desc_.src_desc[1])
+        , src2_md_(desc_.src_desc[2])
         , dst_md_(desc_.dst_desc) {
         init_broadcast_dims();
     }
@@ -131,6 +145,14 @@ protected:
             if (src_d.is_blocking_desc()) {
                 CHECK(memory_desc_init_by_blocking_desc(
                         src1_md_, src_d.blocking_desc()));
+            }
+        }
+
+        if (is_ternary_op() && src2_md_.format_kind == format_kind::any) {
+            const memory_desc_wrapper src_d(src_md(0));
+            if (src_d.is_blocking_desc()) {
+                CHECK(memory_desc_init_by_blocking_desc(
+                        src2_md_, src_d.blocking_desc()));
             }
         }
 
@@ -158,10 +180,13 @@ protected:
 
     bool attr_scales_ok(const std::vector<int> &supported_args
             = {DNNL_ARG_SRC_0, DNNL_ARG_SRC_1, DNNL_ARG_DST}) const {
-        bool ok = attr()->scales_.has_default_values(supported_args);
-        for (int arg : supported_args) {
-            const auto &mask = attr()->scales_.get(arg).mask_;
-            ok = ok && (mask == 0);
+        const auto &scales = attr()->scales_;
+        bool ok = scales.has_default_values(supported_args);
+
+        for (const auto &arg : supported_args) {
+            if (scales.has_default_values(arg)) continue;
+
+            ok = ok && scales.get_mask(arg) == 0;
         }
         return ok;
     }
@@ -176,6 +201,7 @@ private:
                     = (dims_A[d] == dims_B[d] && dims_A[d] != 1) ? 0 : 1;
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

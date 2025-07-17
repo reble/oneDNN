@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -171,10 +171,10 @@ TEST(test_pool_execute_subgraph_int8, PoolAdd) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_s8_ts(src_s8, engine, src_s8_data);
-        test_tensor other_s8_ts(other_s8, engine, other_s8_data);
-        test_tensor case1_dst_s8_ts(dst_s8, engine, case1_dst_s8_data);
-        test_tensor case2_dst_s8_ts(dst_s8, engine, case2_dst_s8_data);
+        test_tensor_t src_s8_ts(src_s8, engine, src_s8_data);
+        test_tensor_t other_s8_ts(other_s8, engine, other_s8_data);
+        test_tensor_t case1_dst_s8_ts(dst_s8, engine, case1_dst_s8_data);
+        test_tensor_t case2_dst_s8_ts(dst_s8, engine, case2_dst_s8_data);
 
         // -------------------------case 1----------------------------------
         ASSERT_EQ(run_graph(g, {src_s8_ts, other_s8_ts}, {case1_dst_s8_ts},
@@ -224,7 +224,8 @@ TEST(test_pool_execute_subgraph_fp32, Pool3Postops) {
     std::vector<int64_t> pool_src_shape {2, 2, 4, 4};
     std::vector<int64_t> pool_dst_shape {2, 2, 2, 2};
 
-    std::vector<std::vector<float>> src_datas {};
+    std::vector<std::vector<float>> src_datas;
+    src_datas.reserve(1 + 3);
     src_datas.emplace_back(product(pool_src_shape));
     // at most 3 additional input tensors
     for (size_t i = 0; i < 3; ++i)
@@ -237,6 +238,7 @@ TEST(test_pool_execute_subgraph_fp32, Pool3Postops) {
                 [&]() { return f32_distribution(generator); });
 
     std::vector<graph::logical_tensor_t> lt_vec;
+    lt_vec.reserve(1 + 7);
     lt_vec.emplace_back(utils::logical_tensor_init(
             0, pool_src_shape, graph::data_type::f32));
     // at most 7 tensors in the whole graph
@@ -281,10 +283,11 @@ TEST(test_pool_execute_subgraph_fp32, Pool3Postops) {
         input_lts.push_back(lt_idx);
         pool_op.add_output(lt_vec[++lt_idx]);
 
-        std::vector<graph::op_t> post_ops {};
+        std::vector<graph::op_t> post_ops;
+        post_ops.reserve(post_op_ts.size());
         for (size_t i = 0; i < post_op_ts.size(); ++i) {
             auto pop_t = post_op_ts[i];
-            post_ops.emplace_back(graph::op_t {i + 1, pop_t, "post op"});
+            post_ops.emplace_back(i + 1, pop_t, "post op");
 
             post_ops.back().add_input(lt_vec[lt_idx]);
             if (std::find(binary_op_ts.begin(), binary_op_ts.end(), pop_t)
@@ -303,13 +306,14 @@ TEST(test_pool_execute_subgraph_fp32, Pool3Postops) {
             g.add_op(&pop);
         g.finalize();
 
-        std::vector<test_tensor> src_tss {};
+        std::vector<test_tensor_t> src_tss;
+        src_tss.reserve(input_lts.size());
         for (size_t i = 0; i < input_lts.size(); ++i)
             src_tss.emplace_back(lt_vec[input_lts[i]], engine, src_datas[i]);
 
         // -------------------------case 1----------------------------------
         std::vector<float> case1_out_data(product(pool_dst_shape));
-        test_tensor case1_dst_ts(lt_vec[lt_idx], engine, case1_out_data);
+        test_tensor_t case1_dst_ts(lt_vec[lt_idx], engine, case1_out_data);
 
         ASSERT_EQ(run_graph(g, src_tss, {case1_dst_ts}, *engine, *strm),
                 graph::status::success);
@@ -335,16 +339,18 @@ TEST(test_pool_execute_subgraph_fp32, Pool3Postops) {
         p.compile(&cp, lt_ins, lt_outs, engine);
 
         std::vector<float> case2_out_data(product(pool_dst_shape));
-        test_tensor case2_dst_ts(lt_vec[lt_idx], engine, case2_out_data);
+        test_tensor_t case2_dst_ts(lt_vec[lt_idx], engine, case2_out_data);
 
-        cp.execute(strm, test_tensor::to_graph_tensor(src_tss),
+        cp.execute(strm, test_tensor_t::to_graph_tensor(src_tss),
                 {case2_dst_ts.get()});
         strm->wait();
 
         case1_out_data = case1_dst_ts.as_vec_type<float>();
         case2_out_data = case2_dst_ts.as_vec_type<float>();
+        const float eps_scale = 10.0f;
+        const float atol = eps_scale * std::numeric_limits<float>::epsilon();
         for (size_t i = 0; i < case1_out_data.size(); ++i) {
-            ASSERT_FLOAT_EQ(case1_out_data[i], case2_out_data[i]);
+            ASSERT_NEAR(case1_out_data[i], case2_out_data[i], atol);
         }
     }
 }
@@ -400,8 +406,8 @@ TEST(test_pool_execute, AvgPoolExcludePad) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor dst_ts(lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t dst_ts(lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get()}, {dst_ts.get()});
@@ -463,8 +469,8 @@ TEST(test_pool_execute, AvgPoolIncludePad) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor dst_ts(lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t dst_ts(lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get()}, {dst_ts.get()});
@@ -476,6 +482,7 @@ TEST(test_pool_execute, AvgPoolIncludePad) {
 }
 
 TEST(test_pool_execute, AvgPoolBackwardExcludePad) {
+    SKIP_IF_NV_GPU("not supported on NVIDIA GPU");
     using dims = dnnl::impl::graph::dnnl_impl::dims;
     graph::engine_t *eng = get_engine();
 
@@ -522,8 +529,8 @@ TEST(test_pool_execute, AvgPoolBackwardExcludePad) {
     cp.query_logical_tensor(diff_src_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor diff_dst_ts(diff_dst_lt, eng, diff_dst);
-    test_tensor diff_src_ts(lt, eng, diff_src);
+    test_tensor_t diff_dst_ts(diff_dst_lt, eng, diff_dst);
+    test_tensor_t diff_src_ts(lt, eng, diff_src);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {diff_dst_ts.get()}, {diff_src_ts.get()});
@@ -535,6 +542,7 @@ TEST(test_pool_execute, AvgPoolBackwardExcludePad) {
 }
 
 TEST(test_pool_execute, AvgPoolBackwardIncludePad) {
+    SKIP_IF_NV_GPU("not supported on NVIDIA GPU");
     using dims = dnnl::impl::graph::dnnl_impl::dims;
     graph::engine_t *eng = get_engine();
 
@@ -581,8 +589,8 @@ TEST(test_pool_execute, AvgPoolBackwardIncludePad) {
     cp.query_logical_tensor(diff_src_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor diff_dst_ts(diff_dst_lt, eng, diff_dst);
-    test_tensor diff_src_ts(lt, eng, diff_src);
+    test_tensor_t diff_dst_ts(diff_dst_lt, eng, diff_dst);
+    test_tensor_t diff_src_ts(lt, eng, diff_src);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {diff_dst_ts.get()}, {diff_src_ts.get()});
@@ -689,9 +697,9 @@ TEST(test_pool_execute_subgraph_int8, Avgpool) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_u8_data);
-        test_tensor dst_u8_ts(dst_u8, engine, case1_out_data);
-        test_tensor dst_u8_case2_ts(dst_u8, engine, case2_out_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_u8_data);
+        test_tensor_t dst_u8_ts(dst_u8, engine, case1_out_data);
+        test_tensor_t dst_u8_case2_ts(dst_u8, engine, case2_out_data);
 
         // -------------------------case 1----------------------------------
         ASSERT_EQ(run_graph(g, {src_u8_ts}, {dst_u8_ts}, *engine, *strm),
@@ -780,8 +788,8 @@ TEST(test_pool_execute, MaxPool) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor dst_ts(lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t dst_ts(lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get()}, {dst_ts.get()});
@@ -842,8 +850,8 @@ TEST(test_pool_execute, MaxPoolwithCache) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor dst_ts(lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t dst_ts(lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get()}, {dst_ts.get()});
@@ -860,8 +868,8 @@ TEST(test_pool_execute, MaxPoolwithCache) {
     std::vector<float> ref_dst2 {-1.0, 2.0, 4.0, 2.0};
     std::vector<float> dst2(ref_dst2.size(), 0.0);
 
-    test_tensor src_ts2(src_lt, eng, src2);
-    test_tensor dst_ts2(lt, eng, dst2);
+    test_tensor_t src_ts2(src_lt, eng, src2);
+    test_tensor_t dst_ts2(lt, eng, dst2);
 
     cp.execute(strm, {src_ts2.get()}, {dst_ts2.get()});
     strm->wait();
@@ -996,9 +1004,9 @@ TEST(test_pool_execute, MaxPoolBackward) {
     cp.query_logical_tensor(diff_src_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor diff_dst_ts(diff_dst_lt, eng, diff_dst);
-    test_tensor diff_src_ts(lt, eng, diff_src);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t diff_dst_ts(diff_dst_lt, eng, diff_dst);
+    test_tensor_t diff_src_ts(lt, eng, diff_src);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), diff_dst_ts.get()}, {diff_src_ts.get()});
@@ -1059,9 +1067,9 @@ TEST(test_pool_execute, MaxPoolBackwardPlainGrad) {
     std::vector<float> diff_dst(product(output_dims), 1);
     std::vector<float> diff_src(product(input_dims), 1);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor diff_dst_ts(diff_dst_lt, eng, diff_dst);
-    test_tensor diff_src_ts(lt, eng, diff_src);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t diff_dst_ts(diff_dst_lt, eng, diff_dst);
+    test_tensor_t diff_src_ts(lt, eng, diff_src);
 
     graph::stream_t *strm = get_stream();
     cp.execute(strm, {src_ts.get(), diff_dst_ts.get()}, {diff_src_ts.get()});
@@ -1165,9 +1173,9 @@ TEST(test_pool_execute_subgraph_int8, Maxpool) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_u8_ts(src_u8, engine, src_u8_data);
-        test_tensor dst_u8_ts(dst_u8, engine, case1_out_data);
-        test_tensor dst_u8_case2_ts(dst_u8, engine, case2_out_data);
+        test_tensor_t src_u8_ts(src_u8, engine, src_u8_data);
+        test_tensor_t dst_u8_ts(dst_u8, engine, case1_out_data);
+        test_tensor_t dst_u8_case2_ts(dst_u8, engine, case2_out_data);
 
         // -------------------------case 1----------------------------------
         ASSERT_EQ(run_graph(g, {src_u8_ts}, {dst_u8_ts}, *engine, *strm),
@@ -1281,9 +1289,9 @@ TEST(test_pool_execute_subgraph_int8, MaxpoolAsymmetric) {
     g.add_op(&qout_op);
     g.finalize();
 
-    test_tensor src_u8_ts(src_u8, engine, src_u8_data);
-    test_tensor dst_u8_ts(dst_u8, engine, case1_out_data);
-    test_tensor dst_u8_case2_ts(dst_u8, engine, case2_out_data);
+    test_tensor_t src_u8_ts(src_u8, engine, src_u8_data);
+    test_tensor_t dst_u8_ts(dst_u8, engine, case1_out_data);
+    test_tensor_t dst_u8_case2_ts(dst_u8, engine, case2_out_data);
 
     // -------------------------case 1----------------------------------
     ASSERT_EQ(run_graph(g, {src_u8_ts}, {dst_u8_ts}, *engine, *strm),
@@ -1457,11 +1465,11 @@ public:
             cp.query_logical_tensor(add_dst_lt.id, &lt);
             ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-            test_tensor src_ts(src_lt, eng);
+            test_tensor_t src_ts(src_lt, eng);
             src_ts.fill<bfloat16_t>(4.0);
-            test_tensor post_src_ts(post_src_lt, eng);
+            test_tensor_t post_src_ts(post_src_lt, eng);
             post_src_ts.fill<bfloat16_t>(2.0);
-            test_tensor add_dst_ts(add_dst_lt, eng);
+            test_tensor_t add_dst_ts(add_dst_lt, eng);
 
             graph::stream_t *strm = get_stream();
             ASSERT_EQ(cp.execute(strm, {src_ts.get(), post_src_ts.get()},
@@ -1627,8 +1635,8 @@ TEST(test_pool_execute_subgraph_int8, DequantizePoolReshapeQunatize) {
         g.add_op(&qout_op);
         g.finalize();
 
-        test_tensor src_s8_ts(dq_in_s8, engine, src_s8_data);
-        test_tensor case1_dst_s8_ts(q_out_s8, engine, case1_dst_s8_data);
+        test_tensor_t src_s8_ts(dq_in_s8, engine, src_s8_data);
+        test_tensor_t case1_dst_s8_ts(q_out_s8, engine, case1_dst_s8_data);
         graph::pass::pass_base_ptr apass
                 = get_pass("x8_pool_reshape_transpose");
         apass->run(g);

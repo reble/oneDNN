@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2017-2024 Intel Corporation
+# Copyright 2017-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -72,8 +72,13 @@ function(register_benchdnn_test engine driver test_file)
         set(test_mode "${test_mode};B")
     endif()
 
+    # Parallel creation introduces race conditions inside native libraries.
+    # Additionally, only needed for speeding up JIT compilation of OCL kernels.
     set(mode_modifier "")
-    if(${engine} MATCHES "gpu" AND NOT WIN32)
+    if(${engine} MATCHES "gpu"
+       AND NOT WIN32
+       AND NOT ${DNNL_GPU_VENDOR} MATCHES "NVIDIA"
+       AND NOT ${DNNL_GPU_VENDOR} MATCHES "AMD")
         set(mode_modifier "--mode-modifier=P")
     endif()
 
@@ -82,7 +87,11 @@ function(register_benchdnn_test engine driver test_file)
         set(cmd "--mode=${tm} ${mode_modifier} -v1 --engine=${engine} --${driver} --batch=${test_file}")
         set(benchdnn_target ${target_name}_${engine})
 
-        if(DNNL_BUILD_FOR_CI)
+        if(DNNL_TEST_SET_HAS_GRAPH_EXE EQUAL 1)
+            string(PREPEND cmd "--execution-mode=graph ")
+        endif()
+
+        if(NOT WIN32 OR DNNL_BUILD_FOR_CI)
             string(REPLACE " " ";" cmd "benchdnn ${cmd}")
             add_dnnl_test(${benchdnn_target} ${cmd})
         else()
@@ -155,8 +164,8 @@ foreach(driver ${all_drivers})
     file(GLOB test_files_smoke RELATIVE ${driver_dir} inputs/${driver}/test_*_smoke)
     file(GLOB test_files_cpu RELATIVE ${driver_dir} inputs/${driver}/test_*)
     file(GLOB test_files_with_all RELATIVE ${driver_dir}
-        inputs/conv/test_conv_all inputs/graph/test_graph_all
-        inputs/rnn/test_lstm_all)
+        inputs/brgemm/test_brgemm_all inputs/conv/test_conv_all
+        inputs/graph/test_graph_all inputs/rnn/test_lstm_all)
 
     if(DNNL_TEST_SET_COVERAGE EQUAL DNNL_TEST_SET_SMOKE)
         if(has_gpu)
@@ -166,10 +175,6 @@ foreach(driver ${all_drivers})
             register_all_tests(cpu "${driver}" "${test_files_smoke}")
         endif()
     elseif(DNNL_TEST_SET_COVERAGE EQUAL DNNL_TEST_SET_CI)
-        if(NOT DNNL_EXPERIMENTAL_SPARSE)
-            list(REMOVE_ITEM test_files_ci "test_matmul_sparse_ci")
-        endif()
-
         # gpu_ci files may happen if cpu coverage can not be used on gpu
         # Filter out gpu_ci inputs from ci
         foreach(test_file ${test_files_gpu_ci})
@@ -188,10 +193,6 @@ foreach(driver ${all_drivers})
             register_all_tests(cpu "${driver}" "${test_files_ci}")
         endif()
     elseif(DNNL_TEST_SET_COVERAGE EQUAL DNNL_TEST_SET_NIGHTLY)
-        if(NOT DNNL_EXPERIMENTAL_SPARSE)
-            list(REMOVE_ITEM test_files_cpu "test_matmul_sparse")
-        endif()
-
         ## Filter out gpu, large cpu and invalid inputs from cpu
         foreach(test_file ${test_files_large_cpu} ${test_files_gpu_ci}
             ${test_files_gpu} ${test_files_ci} ${test_files_smoke})

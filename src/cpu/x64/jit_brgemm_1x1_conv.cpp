@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2024 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,11 +51,16 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
     const auto wei_type = weights_md(0)->data_type;
     const auto dst_type = dst_md(0)->data_type;
     const bool is_int8 = one_of(src_type, u8, s8);
+    const bool is_fp8 = one_of(src_type, f8_e4m3, f8_e5m2);
+
+    VDISPATCH_CONV(
+            impl::is_dense_format_kind({src_md(), weights_md(), dst_md()}),
+            VERBOSE_UNSUPPORTED_SPARSE_CFG);
 
     using skip_mask_t = primitive_attr_t::skip_mask_t;
     auto skip_mask = skip_mask_t::post_ops | skip_mask_t::sum_dt
-            | skip_mask_t::zero_points_runtime | skip_mask_t::fpmath_mode;
-    if (one_of(src_type, u8, s8)) skip_mask |= skip_mask_t::scales_runtime;
+            | skip_mask_t::zero_points | skip_mask_t::fpmath_mode;
+    if (is_int8 || is_fp8) skip_mask |= skip_mask_t::scales;
 
     VDISPATCH_CONV(is_fwd(), VERBOSE_BAD_PROPKIND);
     VDISPATCH_CONV(expect_data_types(src_type, wei_type, data_type::undef,
@@ -76,8 +81,8 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
             VERBOSE_UNSUPPORTED_ATTR);
     VDISPATCH_CONV(attr()->post_ops_.check_sum_consistency(dst_type, is_int8),
             VERBOSE_UNSUPPORTED_POSTOP);
-    VDISPATCH_CONV(zero_points_ok(), VERBOSE_UNSUPPORTED_ZP_CFG);
-    VDISPATCH_CONV(arg_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
+    CHECK(attr_scales_ok());
+    CHECK(attr_zero_points_ok());
 
     CHECK(brgemm_convolution_utils::init_1x1_conf(jcp_, isa, *desc(), src_md_,
             weights_md_, dst_md_, bias_md_, attr_, dnnl_get_max_threads()));
@@ -102,7 +107,8 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
         if (vM == 0 || vN == 0 || vK == 0) continue;
 
         if (!jcp_.is_reduced_rtus) {
-            brgemm_init_params_.emplace_front(i_init, vM, vN, vK, jcp_.LDA);
+            brgemm_init_params_.emplace_front(
+                    i_init, vM, vN, vK, jcp_.LDA, jcp_.extendable_k);
         } else {
             const bool is_accum_kernel = i_init == 0;
 
@@ -119,7 +125,8 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
             const auto brgemm_K = use_rtus_K ? rtus_k : vK;
             const bool use_rtus_LDA = use_rtus_K && is_accum_kernel;
             const auto LDA = use_rtus_LDA ? jcp_.rtus_padded_ic_size : jcp_.LDA;
-            brgemm_init_params_.emplace_front(i_init, vM, vN, brgemm_K, LDA);
+            brgemm_init_params_.emplace_front(
+                    i_init, vM, vN, brgemm_K, LDA, false);
         }
     }
 
@@ -134,12 +141,12 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
             auto vK = is_accum_kernel
                     ? jcp_.rtus_ic_size
                     : jcp_.ic_without_padding - jcp_.rtus_ic_size;
+            if (vM <= 0 || vK <= 0) continue;
             const bool use_rtus_LDA = is_accum_kernel;
             const auto LDA = use_rtus_LDA ? jcp_.rtus_padded_ic_size : jcp_.LDA;
             constexpr int extra_m_kernel_start_idx = 2;
             brgemm_init_params_.emplace_front(
-                    extra_m_kernel_start_idx + idx, vM, vN, vK, LDA);
-            assert(vM > 0 && vK > 0);
+                    extra_m_kernel_start_idx + idx, vM, vN, vK, LDA, false);
         }
     }
 
@@ -149,8 +156,8 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init(engine_t *engine) {
     auto scratchpad = scratchpad_registry().registrar();
     brgemm_convolution_utils::init_scratchpad(scratchpad, jcp_);
     if (jcp_.with_scales)
-        book_precomputed_scales(scratchpad, attr()->scales_, OC(),
-                jcp_.scale_adjust_factor != 1.0f);
+        book_precomputed_scales(
+                scratchpad, attr()->scales_, OC(), jcp_.scale_adjust_factor);
 
     return status::success;
 }
@@ -175,7 +182,7 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init_brgemm_desc() {
 
         const auto brg_idx = get_brg_idx(jcp_, params);
 
-        brgemm_t brg;
+        brgemm_desc_t brg;
         brgemm_strides_t brg_strides;
         brg_strides.stride_a = jcp_.brg_stride_a;
         brg_strides.stride_b = jcp_.brg_stride_b;
@@ -183,7 +190,7 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init_brgemm_desc() {
                 = (jcp_.brg_type == brgemm_strd) ? &brg_strides : nullptr;
         CHECK(brgemm_desc_init(&brg, isa, jcp_.brg_type, src_type, wei_type,
                 false, false, brgemm_row_major, alpha, vbeta, LDA, jcp_.LDB,
-                jcp_.LDC, vM, vN, vK, strides_ptr));
+                jcp_.LDC, vM, vN, vK, strides_ptr, jcp_.is_tf32));
 
         brgemm_attr_t brgattr;
         brgattr.max_bs = jcp_.gemm_batch_size;
@@ -200,7 +207,8 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init_brgemm_desc() {
         brgattr.hint_expected_B_size = vN * vK;
         brgattr.hint_expected_C_size = bd_blocking * vN;
 
-        brgattr.wary_tail_read = false;
+        brgattr.wary_A_k_tail_read = params.wary_tail_read_;
+        brgattr.extendable_k = jcp_.extendable_k;
         brgattr.use_uker = jcp_.use_uker;
         brgattr.use_interleave_stores = jcp_.use_interleave_stores;
         brgattr.hint_prefetching = jcp_.hint_prefetching;
@@ -218,6 +226,8 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::pd_t::init_brgemm_desc() {
         brg.with_weights_scale_adjust = jcp_.scale_adjust_factor != 1.0f;
         CHECK(brgemm_desc_set_postops(
                 &brg, attr(), &dst_md_, LDD, jcp_.bia_dt));
+        CHECK(brgemm_desc_finalize(&brg));
+
         jcp_.amx_buf_size_per_thread = nstl::max(
                 brg.get_wsp_buffer_size(), jcp_.amx_buf_size_per_thread);
         brgs_->insert(brg_idx, brg);
@@ -258,15 +268,14 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::init(engine_t *engine) {
     dst_d_sz = OD * dst_h_sz;
 
     const auto src_type = pd()->src_md(0)->data_type;
-
-    const auto last_ic_block = (isa == avx512_core_fp16 && src_type == f16)
-            ? 1
-            : data_type_vnni_granularity(src_type);
+    const data_type_t last_ic_block_dt
+            = get_mac_emu_data_type(src_type, isa, isa == avx512_core_fp16);
+    const auto last_ic_block = data_type_vnni_granularity(last_ic_block_dt);
 
     wei_ic_stride = jcp.wei_plain ? jcp.oc_without_padding : jcp.oc_block;
     wei_ocb_stride = jcp.wei_plain
             ? jcp.oc_block
-            : (dim_t)rnd_up(jcp.ic, last_ic_block) * jcp.oc_block;
+            : (dim_t)rnd_up(jcp.icp, last_ic_block) * jcp.oc_block;
     wei_g_stride = jcp.wei_plain ? jcp.oc : jcp.nb_oc * wei_ocb_stride;
 
     if (jcp.is_rtus) {
@@ -279,13 +288,14 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::init(engine_t *engine) {
     // JIT to precompute scales
     const bool is_jit_supported = mayiuse(avx512_core);
     const auto attr = pd()->attr();
-    if (is_jit_supported && req_copy_scales(attr, jcp.scale_adjust_factor)) {
-        const auto &attr_scales = attr->scales_;
-        int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
-        if (wei_scale_mask != 0) {
+    const auto &attr_scales = attr->scales_;
+    if (is_jit_supported && pd()->OC() > 1
+            && req_copy_scales(attr_scales, jcp.scale_adjust_factor)) {
+        int wei_scale_mask = attr_scales.get_mask(DNNL_ARG_WEIGHTS);
+        if (wei_scale_mask > 0) {
             CHECK(safe_ptr_assign(jit_scale_precompute_,
                     new jit_avx512_core_scale_precompute_t(
-                            jcp.scale_adjust_factor)));
+                            attr, jcp.scale_adjust_factor)));
             CHECK(jit_scale_precompute_->create_kernel());
         }
     }
@@ -333,16 +343,22 @@ void brgemm_1x1_convolution_fwd_t<isa>::maybe_rtus(int ithr,
             : icc * jcp.nb_ic_blocking * jcp.ic_block;
     const auto g_ic = g * jcp.ic_without_padding + icc_tail_start;
 
+    const memory_desc_wrapper src_d(pd()->src_md());
+
     auto call_kernel = [&](int nh, int nw, int od, int oh, int ow) {
         assert(nh == 0 || (nw == 0 && ow == 0));
         if (utils::everyone_is(0, nh, nw)) return;
         const int id = od * jcp.stride_d;
         const int ih = oh * jcp.stride_h;
         const int iw = ow * jcp.stride_w;
-        const auto inp_offset = n * src_d_sz + id * src_h_sz + ih * src_w_sz
-                + iw * jcp.ngroups * jcp.ic_without_padding + g_ic;
+
+        // Using blk_off to offset batch is motivated input\output striding aligment
+        const auto inp_offset = src_d.off_l(0)
+                + n * src_d.blk_off<false, true>(1) + id * src_h_sz
+                + ih * src_w_sz + iw * jcp.ngroups * jcp.ic_without_padding
+                + g_ic;
         auto p = jit_avx512_core_brgemm_conv_trans_kernel::
-                jit_brgemm_conv_trans_kernel_call_s();
+                jit_brgemm_conv_trans_kernel_args_t();
         p.h_count = nh;
         p.owb = nw;
         p.src = src + src_dt_size * inp_offset;
@@ -426,7 +442,6 @@ void brgemm_1x1_convolution_fwd_t<isa>::exec_ker(
 
     const int icb = icc * jcp.nb_ic_blocking;
     const int ic = icb * jcp.ic_block;
-    const int g_ic = g * jcp.ic + ic;
 
     const bool use_special_m_idx = get_extra_m_kernel_req(jcp) && is_last_os;
     const int kernel_init = static_cast<int>(icc == 0) + 2 * use_special_m_idx;
@@ -441,19 +456,33 @@ void brgemm_1x1_convolution_fwd_t<isa>::exec_ker(
             : (icc == pd()->ic_chunks_ - 1
                     && ((jcp.ic - ic) % jcp.ic_block != 0));
 
-    const auto src_offset = n * src_d_sz + id * src_h_sz + ih * src_w_sz
-            + iw * jcp.ngroups * jcp.ic_without_padding + g_ic;
-    const auto rtus_src
-            = jcp.is_reduced_rtus ? src + src_dt_size * src_offset : inp_buffer;
+    // Using blk_off to offset batch is motivated input\output striding aligment
+    // See `blk_off` definition.
+    const auto src_mb_c_offset = src_dt_size
+            * (src_d.off_l(0) + n * src_d.blk_off<false, true>(1)
+                    + g * src_d.blk_off<false, true>(0, 1) * jcp.ic + ic);
+    const auto src_hw_offset = src_dt_size
+            * (id * src_h_sz + ih * src_w_sz
+                    + iw * jcp.ngroups * jcp.ic_without_padding);
+
+    const auto rtus_src = jcp.is_reduced_rtus
+            ? src + src_mb_c_offset + src_hw_offset
+            : inp_buffer;
     const auto src_base
-            = jcp.is_rtus ? rtus_src : src + src_dt_size * src_offset;
+            = jcp.is_rtus ? rtus_src : src + src_mb_c_offset + src_hw_offset;
 
     const auto wei_offset = g * wei_g_stride + ocb * wei_ocb_stride;
     const auto wei_base = weights + wei_dt_size * wei_offset;
-    const auto ptr_D = dst
-            + dst_dt_size
-                    * (n * dst_d_sz + od * dst_h_sz + oh * dst_w_sz
-                            + ow * jcp.oc_without_padding + g_oc);
+
+    // Using blk_off to offset batch is motivated input\output striding aligment
+    // See `blk_off` definition.
+    const auto dst_base = dst_dt_size
+            * (dst_d.off_l(0) + n * dst_d.blk_off<false, true>(1)
+                    + g * dst_d.blk_off<false, true>(0, 1) * jcp.oc + oc);
+    const auto dst_offset = dst_dt_size
+            * (od * dst_h_sz + oh * dst_w_sz + ow * jcp.oc_without_padding);
+
+    const auto ptr_D = dst + dst_base + dst_offset;
     char *const ptr_C = (jcp.use_buffer) ? c_buffer : (char *)ptr_D;
 
     const auto bias_w
@@ -470,6 +499,8 @@ void brgemm_1x1_convolution_fwd_t<isa>::exec_ker(
             = (jcp.s8s8_compensation_required && icc == pd()->ic_chunks_ - 1)
             ? &s8s8_compensation[comp_offset]
             : nullptr;
+
+    const bool wary_tail_read = jcp.extendable_k;
 
     const auto call_brgemm = [&](int brg_idx, int ic_block_s, int n_ic_blocks,
                                      bool do_postops, bool brgemm_is_ic_tail) {
@@ -522,18 +553,21 @@ void brgemm_1x1_convolution_fwd_t<isa>::exec_ker(
 
     const auto do_post_work = (pd()->need_postwork_ || jcp.use_buffer)
             && icc == pd()->ic_chunks_ - 1;
-    if (jcp.is_reduced_rtus || nb_ic_b > 0) {
-        const auto brg_idx
-                = get_brg_idx(kernel_init, is_os_tail, is_oc_tail, false);
-        call_brgemm(brg_idx, 0, jcp.is_reduced_rtus ? 1 : nb_ic_b,
-                do_post_work && !is_ic_tail, false);
+    if (jcp.is_reduced_rtus) {
+        const auto brg_idx = get_brg_idx(
+                kernel_init, is_os_tail, is_oc_tail, false, wary_tail_read);
+        call_brgemm(brg_idx, 0, 1, do_post_work && !is_ic_tail, false);
+    } else if (nb_ic_b > 0) {
+        const auto brg_idx = get_brg_idx(
+                kernel_init, is_os_tail, is_oc_tail, false, wary_tail_read);
+        call_brgemm(brg_idx, 0, nb_ic_b, do_post_work && !is_ic_tail, false);
     }
     if (is_ic_tail) {
         const auto use_init_ker = jcp.is_reduced_rtus
                 ? kernel_init - 1
                 : kernel_init && (nb_ic_b == 0);
-        const auto brg_idx = get_brg_idx(
-                use_init_ker, is_os_tail, is_oc_tail, !jcp.is_reduced_rtus);
+        const auto brg_idx = get_brg_idx(use_init_ker, is_os_tail, is_oc_tail,
+                !jcp.is_reduced_rtus, wary_tail_read);
         call_brgemm(brg_idx, jcp.is_reduced_rtus ? 0 : nb_ic_b, 1, do_post_work,
                 jcp.is_reduced_rtus);
     }
@@ -694,9 +728,11 @@ status_t brgemm_1x1_convolution_fwd_t<isa>::execute_forward_all(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float *oscales = scale_utils::precompute_scales(scratchpad,
-            src_scales, wei_scales, pd()->OC(), pd()->attr(),
-            jit_scale_precompute_.get(), jcp.scale_adjust_factor);
+            src_scales, wei_scales, pd()->IC(), pd()->OC(), false,
+            wei_scale_mask > 0, pd()->attr(), jit_scale_precompute_.get(),
+            jcp.scale_adjust_factor);
 
     DEFINE_ZERO_POINT_VALUE(src_zero_point, DNNL_ARG_SRC);
     DEFINE_ZERO_POINT_VALUE(dst_zero_point, DNNL_ARG_DST);
@@ -752,6 +788,8 @@ template struct brgemm_1x1_convolution_fwd_t<avx512_core_bf16>;
 template struct brgemm_1x1_convolution_fwd_t<avx512_core_fp16>;
 template struct brgemm_1x1_convolution_fwd_t<avx512_core_amx>;
 template struct brgemm_1x1_convolution_fwd_t<avx512_core_amx_fp16>;
+template struct brgemm_1x1_convolution_fwd_t<avx10_2_512>;
+template struct brgemm_1x1_convolution_fwd_t<avx10_2_512_amx_2>;
 
 } // namespace x64
 } // namespace cpu

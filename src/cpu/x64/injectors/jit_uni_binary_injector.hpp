@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef CPU_X64_JIT_UNI_BINARY_INJECTOR_HPP
-#define CPU_X64_JIT_UNI_BINARY_INJECTOR_HPP
+#ifndef CPU_X64_INJECTORS_JIT_UNI_BINARY_INJECTOR_HPP
+#define CPU_X64_INJECTORS_JIT_UNI_BINARY_INJECTOR_HPP
 
 #include <array>
 #include <cassert>
@@ -32,6 +32,7 @@
 #include "cpu/binary_injector_utils.hpp"
 #include "cpu/x64/cpu_isa_traits.hpp"
 #include "cpu/x64/injectors/injector_utils.hpp"
+#include "cpu/x64/jit_avx512_core_fp8cvt.hpp"
 #include "cpu/x64/jit_generator.hpp"
 
 namespace dnnl {
@@ -40,13 +41,18 @@ namespace cpu {
 namespace x64 {
 namespace binary_injector {
 using dnnl::impl::cpu::binary_injector_utils::get_src1_desc;
+using dnnl::impl::cpu::binary_injector_utils::get_src2_desc;
 using dnnl::impl::cpu::binary_injector_utils::prepare_binary_args;
+
+bcast_set_t get_all_strategies_supported_by_injector();
 
 bool binary_args_broadcast_supported(const post_ops_t &post_ops,
         const memory_desc_wrapper &dst_d,
         const bcast_set_t &supported_strategy_set);
 
 bool any_binary_postop_rhs_non_scalar_broadcast(
+        const post_ops_t &post_ops, const memory_desc_wrapper &dst_d);
+bool any_binary_postop_rhs_with_ternary_scalar_bcast(
         const post_ops_t &post_ops, const memory_desc_wrapper &dst_d);
 bool any_binary_postop_rhs_per_oc_broadcast(const post_ops_t &post_ops,
         const memory_desc_wrapper &dst_d,
@@ -158,7 +164,7 @@ private:
  *
  * @param param1 - register storing abi param1. At the moment of calling
  * compute_vector_range method can be different than the default one defined
- * inside jit_generator.
+ * inside jit_generator_t.
  * @param bcast_set_t supported_strategy_set - set allowing disabling particular
  * bcast strategies
  * @param rhs_arg_static_params - params related to all binary post-ops right-hand side
@@ -168,6 +174,11 @@ private:
 struct static_params_t {
     static_params_t(const Xbyak::Reg64 &param1,
             const bcast_set_t &supported_strategy_set,
+            const rhs_arg_static_params_t &rhs_arg_static_params,
+            fp8_conversion_e5m2_t *f8_e5m2_cvt,
+            fp8_conversion_e4m3_t *f8_e4m3_cvt);
+    static_params_t(const Xbyak::Reg64 &param1,
+            const bcast_set_t &supported_strategy_set,
             const rhs_arg_static_params_t &rhs_arg_static_params);
     static_params_t(const Xbyak::Reg64 &param1,
             const rhs_arg_static_params_t &rhs_arg_static_params);
@@ -175,6 +186,10 @@ struct static_params_t {
     Xbyak::Reg64 param1;
     const bcast_set_t supported_strategy_set;
     rhs_arg_static_params_t rhs_arg_static_params;
+    // Both fp8 (e5m2 and e4m3) binary post-ops data types are possible.
+    // Therefore, we need both fp8 converters.
+    fp8_conversion_e5m2_t *f8_e5m2_cvt_ {nullptr};
+    fp8_conversion_e4m3_t *f8_e4m3_cvt_ {nullptr};
 };
 
 /*
@@ -243,11 +258,11 @@ bool is_supported(cpu_isa_t isa, const dnnl::impl::memory_desc_t &src1_desc,
  * isa: sse41, avx, avx2, avx512 with core, bf16 extensions as well as data
  * types: f32, bf16, s32, u8, s8.
  */
-template <cpu_isa_t isa, typename Vmm = typename cpu_isa_traits<isa>::Vmm>
+template <cpu_isa_t isa, typename Vmm = typename cpu_isa_traits_t<isa>::Vmm>
 class jit_uni_binary_injector_t {
 public:
     jit_uni_binary_injector_t(
-            jit_generator *host, const static_params_t &static_params);
+            jit_generator_t *host, const static_params_t &static_params);
 
     /*
      * Generates code of binary post_op injected to host primitive. Applied to
@@ -299,7 +314,7 @@ private:
             std::size_t rhs_arg_idx, const dnnl_post_ops::entry_t &post_op,
             const rhs_arg_dynamic_params_t &rhs_arg_params,
             const broadcasting_strategy_t rhs_broadcasting_strategy,
-            bool is_first) const;
+            bool is_first, bool is_ternary_input) const;
     /*
      * Loads data and applies particular binary operation.
      */
@@ -307,6 +322,12 @@ private:
             const Xbyak::Address &rhs_addr, bool with_tail,
             const tail_lode_mode_t tail_load_mode) const;
 
+    /*
+     * Loads data and applies binary operation that require ternary inputs.
+     */
+    void inject_binary_with_ternary_op(const dnnl_post_ops::entry_t &post_op,
+            Vmm dst, const Xbyak::Address &rhs_addr, Vmm tmp_vmm,
+            bool with_tail, const tail_lode_mode_t tail_load_mode) const;
     /*
      * Helper functions responsible for preparing rhs tensor slice address.
      */
@@ -316,7 +337,7 @@ private:
             const std::map<int, size_t> &vmm_idx_to_out_elem_off_val,
             int vmm_idx, const Xbyak::Reg64 &addr_reg,
             const Xbyak::Reg64 &tmp_reg, std::size_t elem_size_bytes,
-            bool is_first) const;
+            bool is_first, bool cache_addr) const;
     void calculate_no_broadcast_base(
             Xbyak::Address addr, const Xbyak::Reg64 &out_reg) const;
     void calculate_no_broadcast_partial(const std::size_t offset,
@@ -347,6 +368,19 @@ private:
     void calculate_oc_cspn_base(
             const dim_t *strides, const Xbyak::Reg64 &tmp_reg) const;
     void calculate_oc_cspn_partial(const dim_t *strides,
+            const std::size_t offset, const Xbyak::Reg64 &tmp_reg,
+            std::size_t elem_size_bytes) const;
+
+    void append_oc_d_offset(
+            const std::map<int, Xbyak::Address> &vmm_idx_to_out_addr,
+            const std::map<int, Xbyak::Reg64> &vmm_idx_to_out_reg,
+            const std::map<int, size_t> &vmm_idx_to_out_elem_off_val,
+            int vmm_idx, const Xbyak::Reg64 &addr_reg,
+            const Xbyak::Reg64 &tmp_reg, std::size_t elem_size_bytes,
+            bool is_first) const;
+    void calculate_oc_d_ncsp_base(
+            const dim_t *strides, const Xbyak::Reg64 &tmp_reg) const;
+    void calculate_oc_d_ncsp_partial(const dim_t *strides,
             const std::size_t offset, const Xbyak::Reg64 &tmp_reg,
             std::size_t elem_size_bytes) const;
 
@@ -480,6 +514,42 @@ private:
             const std::size_t offset, const Xbyak::Reg64 &tmp_reg,
             std::size_t elem_size_bytes) const;
 
+    void append_hw_offset(
+            const std::map<int, Xbyak::Address> &vmm_idx_to_out_addr,
+            const std::map<int, Xbyak::Reg64> &vmm_idx_to_out_reg,
+            const std::map<int, size_t> &vmm_idx_to_out_elem_off_val,
+            int vmm_idx, const Xbyak::Reg64 &addr_reg,
+            const Xbyak::Reg64 &tmp_reg, std::size_t elem_size_bytes,
+            bool is_first) const;
+    void calculate_hw_ncsp_base(
+            const dim_t *strides, const Xbyak::Reg64 &tmp_reg) const;
+    void calculate_hw_ncsp_partial(const dim_t *strides,
+            const std::size_t offset, const Xbyak::Reg64 &tmp_reg,
+            std::size_t elem_size_bytes) const;
+
+    void append_mb_oc_offset(
+            const std::map<int, Xbyak::Address> &vmm_idx_to_out_addr,
+            const std::map<int, Xbyak::Reg64> &vmm_idx_to_out_reg,
+            const std::map<int, size_t> &vmm_idx_to_out_elem_off_val,
+            int vmm_idx, const Xbyak::Reg64 &addr_reg,
+            const Xbyak::Reg64 &tmp_reg, std::size_t elem_size_bytes,
+            bool is_first) const;
+    void calculate_mb_oc_ncsp_base(
+            const dim_t *strides, const Xbyak::Reg64 &tmp_reg) const;
+    void calculate_mb_oc_ncsp_partial(const dim_t *strides,
+            const std::size_t offset, const Xbyak::Reg64 &tmp_reg,
+            std::size_t elem_size_bytes) const;
+    void calculate_mb_oc_nspc_base(
+            const dim_t *strides, const Xbyak::Reg64 &tmp_reg) const;
+    void calculate_mb_oc_nspc_partial(const dim_t *strides,
+            const std::size_t offset, const Xbyak::Reg64 &tmp_reg,
+            std::size_t elem_size_bytes) const;
+    void calculate_mb_oc_cspn_base(
+            const dim_t *strides, const Xbyak::Reg64 &tmp_reg) const;
+    void calculate_mb_oc_cspn_partial(const dim_t *strides,
+            const std::size_t offset, const Xbyak::Reg64 &tmp_reg,
+            std::size_t elem_size_bytes) const;
+
     template <typename T>
     typename std::enable_if<std::is_same<T, Xbyak::Zmm>::value
             || std::is_same<T, Xbyak::Address>::value>::type
@@ -549,7 +619,10 @@ private:
     */
     Xbyak::Opmask get_aux_kmask() const;
 
-    jit_generator *host_;
+    jit_generator_t *host_;
+    fp8_conversion_e5m2_t *f8_e5m2_cvt_ {nullptr};
+    fp8_conversion_e4m3_t *f8_e4m3_cvt_ {nullptr};
+
     const rhs_arg_static_params_t rhs_arg_static_params_;
     const Xbyak::Reg64 param1_;
     const bcast_set_t supported_strategy_set_;

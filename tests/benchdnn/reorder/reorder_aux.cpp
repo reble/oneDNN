@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,7 +39,10 @@ flag_t str2flag(const char *str) {
     else if (sub.compare("zp_comp") == 0)
         flag = FLAG_ZP_COMP;
     else {
-        assert(!"unknown flag");
+        BENCHDNN_PRINT(0,
+                "Error: unsupported flag value \'%s\'. Supported values are "
+                "\'s8s8_comp\' and \'zp_comp\'.\n",
+                sub.c_str());
         SAFE_V(FAIL);
     }
 
@@ -100,7 +103,8 @@ void prb_t::get_compensation_parameters(
         dims_t &comp_dims, int &mask, flag_bit_t flag) const {
     if (is_reorder_with_compensation(flag)) {
         for (const auto &i_oflag : oflag) {
-            if (i_oflag.first != flag) continue;
+            const bool has_flag_bit = (i_oflag.first & flag);
+            if (!has_flag_bit) continue;
 
             mask = i_oflag.second;
             for (int d = 0; d < ndims; ++d)
@@ -123,7 +127,7 @@ int prb_t::get_compensation_mask(flag_bit_t flag) const {
     return mask;
 }
 
-dt_conf_t prb_t::get_conf(data_kind_t kind) const {
+const dt_conf_t *prb_t::get_conf(data_kind_t kind) const {
     switch (kind) {
         case SRC: return dt2cfg(sdt);
         case DST: return dt2cfg(ddt);
@@ -152,7 +156,7 @@ benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> prb_t::get_md(int arg) const {
 }
 
 std::string prb_t::set_repro_line() {
-    std::stringstream s;
+    dnnl::impl::stringstream_t s;
     dump_global_params(s);
     settings_t def;
 
@@ -175,6 +179,8 @@ std::string prb_t::set_repro_line() {
         s << "--ctx-init=" << ctx_init << " ";
     if (canonical || ctx_exe != def.ctx_exe[0])
         s << "--ctx-exe=" << ctx_exe << " ";
+    if (canonical || !impl_filter.is_def() || !global_impl_filter.is_def())
+        s << impl_filter;
 
     s << static_cast<prb_dims_t>(*this);
 

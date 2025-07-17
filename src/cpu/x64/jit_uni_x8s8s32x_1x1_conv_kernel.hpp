@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #ifndef CPU_X64_JIT_UNI_X8S8S32X_1X1_CONV_KERNEL_HPP
 #define CPU_X64_JIT_UNI_X8S8S32X_1X1_CONV_KERNEL_HPP
 
+#include <memory>
 #include "common/c_types_map.hpp"
 #include "common/memory_tracking.hpp"
 
@@ -30,9 +31,9 @@ namespace cpu {
 namespace x64 {
 
 template <cpu_isa_t isa, typename Vmm>
-struct _jit_uni_x8s8s32x_1x1_conv_kernel : public jit_generator {
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(_jit_uni_x8s8s32x_1x1_conv_kernel)
-    _jit_uni_x8s8s32x_1x1_conv_kernel(const jit_1x1_conv_conf_t &ajcp,
+struct jit_uni_x8s8s32x_1x1_conv_kernel_vmm_t : public jit_generator_t {
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_uni_x8s8s32x_1x1_conv_kernel_vmm_t)
+    jit_uni_x8s8s32x_1x1_conv_kernel_vmm_t(const jit_1x1_conv_conf_t &ajcp,
             const primitive_attr_t &attr, const memory_desc_t &dst_md);
 
     int get_tail_size() { return jcp.oc_without_padding % jcp.oc_block; }
@@ -127,20 +128,20 @@ private:
 };
 
 template <cpu_isa_t isa>
-struct jit_uni_x8s8s32x_1x1_conv_kernel {
+struct jit_uni_x8s8s32x_1x1_conv_kernel_t {
 
-    jit_uni_x8s8s32x_1x1_conv_kernel(const jit_1x1_conv_conf_t &ajcp,
+    jit_uni_x8s8s32x_1x1_conv_kernel_t(const jit_1x1_conv_conf_t &ajcp,
             const primitive_attr_t &attr, const memory_desc_t &dst_md)
         : kernel_(nullptr) {
 
         switch (isa) {
             case avx2:
-                kernel_ = new jit_avx2_x8s8s32x_1x1_conv_kernel(
+                kernel_ = utils::make_unique<jit_avx2_x8s8s32x_1x1_conv_kernel>(
                         ajcp, attr, dst_md);
                 return;
             case sse41:
-                kernel_ = new jit_sse41_x8s8s32x_1x1_conv_kernel(
-                        ajcp, attr, dst_md);
+                kernel_ = utils::make_unique<
+                        jit_sse41_x8s8s32x_1x1_conv_kernel>(ajcp, attr, dst_md);
                 return;
             default: assert(!"Current ISA is not supported!");
         }
@@ -151,9 +152,9 @@ struct jit_uni_x8s8s32x_1x1_conv_kernel {
         return status::out_of_memory;
     }
 
-    ~jit_uni_x8s8s32x_1x1_conv_kernel() { delete kernel_; }
+    ~jit_uni_x8s8s32x_1x1_conv_kernel_t() = default;
 
-    void operator()(const jit_1x1_conv_call_s *p) const { (*kernel_)(p); }
+    void operator()(const jit_1x1_conv_args_t *p) const { (*kernel_)(p); }
 
     static status_t init_conf(jit_1x1_conv_conf_t &jcp,
             const convolution_desc_t &cd, const memory_desc_wrapper &src_d,
@@ -165,15 +166,15 @@ struct jit_uni_x8s8s32x_1x1_conv_kernel {
             const jit_1x1_conv_conf_t &jcp, const primitive_attr_t &attr);
 
     using jit_sse41_x8s8s32x_1x1_conv_kernel
-            = _jit_uni_x8s8s32x_1x1_conv_kernel<sse41, Xbyak::Xmm>;
+            = jit_uni_x8s8s32x_1x1_conv_kernel_vmm_t<sse41, Xbyak::Xmm>;
     using jit_avx2_x8s8s32x_1x1_conv_kernel
-            = _jit_uni_x8s8s32x_1x1_conv_kernel<avx2, Xbyak::Ymm>;
+            = jit_uni_x8s8s32x_1x1_conv_kernel_vmm_t<avx2, Xbyak::Ymm>;
 
     constexpr static int simd_w = isa == avx2 ? 8 : 4;
 
 private:
-    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_uni_x8s8s32x_1x1_conv_kernel);
-    jit_generator *kernel_;
+    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_uni_x8s8s32x_1x1_conv_kernel_t);
+    std::unique_ptr<jit_generator_t> kernel_;
 };
 
 } // namespace x64

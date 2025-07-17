@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -40,6 +40,10 @@ int fill_mean(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
 
         return fill_random_real(mem_dt, mem_fp, nullptr);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     benchdnn_parallel_nd(prb->mb, prb->g, [&](int64_t mb, int64_t g) {
         const int64_t idx = mb * prb->g + g;
@@ -51,7 +55,7 @@ int fill_mean(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
             if (prb->dt[0] == dnnl_u8 && mean_val_shift < 2) mean_val_shift = 2;
             val = val_coeff * (1LL << mean_val_shift);
         }
-        mem_fp.set_elem(idx, val);
+        mem_fp.set_f32_elem(idx, val);
     });
 
     if (mem_dt && IMPLICATION(prb->dir & FLAG_FWD, prb->use_stats()))
@@ -66,67 +70,106 @@ int fill_src(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, res);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, res, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     const auto spatial = prb->id * prb->ih * prb->iw;
     const float val_coeff = is_integral_dt(prb->dt[0]) ? 1.f : 0.25f;
 
     benchdnn_parallel_nd(prb->mb, prb->g, [&](int64_t mb, int64_t g) {
         const int64_t idx = mb * prb->g + g;
-        const float m = ref_mean.get_elem(idx);
+        const float m = ref_mean.get_f32_elem(idx);
         // Note: we use a different seed for each chunk to avoid
         // repeating patterns. We could use discard(idx_start) too but
         // it has a complexity in O(idx_start). We also add 1 to avoid
         // seeding with 0.
         std::minstd_rand b_seed(idx + 1);
         b_seed.discard(2);
-        std::bernoulli_distribution b_dist(0.5f);
+        std::bernoulli_distribution b_dist_big_val(0.5f);
+        std::bernoulli_distribution b_dist_nonzero_val(cfg.density_);
+
+        float m_check = 0.f; // To verify that filled data mean will match.
+        bool bigger_val = false; // Out of all loops.
+        bool is_nonzero = true; // Out of all loops, too.
 
         for (int64_t c = prb->get_c_start(g); c < prb->get_c_start(g + 1);
                 ++c) {
-            // l[0] must be even
-            int64_t l_base = spatial * (idx * prb->ic / prb->g + c * 239 * 2);
+            // The filling logic must start from scratch for odd n_channels.
+            // This var helps to make `index_order` even.
+            const int64_t odd_start
+                    = g % 2 && prb->get_c_start(1) % 2 && spatial % 2;
             int64_t off = data_off(prb, mb, c, 0, 0, 0);
-            bool bigger_val = false; // Out of spatial loop.
 
             for_(int64_t d = 0; d < prb->id; ++d)
             for_(int64_t h = 0; h < prb->ih; ++h)
             for (int64_t w = 0; w < prb->iw; ++w) {
                 const int64_t sp = d * prb->ih * prb->iw + h * prb->iw + w;
+                // If spatial and channels are odd, the algorithm must adjust
+                // values accordingly by specifying pairs of elements and a tail
+                // element.
+                const int64_t index_order = c * spatial + sp + odd_start;
                 float val = 0.f;
                 if (cfg.check_alg_ == ALG_2) {
-                    const bool is_even = sp % 2 == 0;
+                    const bool is_even = index_order % 2 == 0;
                     const float sign = is_even ? 1.f : -1.f;
                     // Update the value for even cases.
-                    bigger_val = is_even ? b_dist(b_seed) : bigger_val;
-                    const float val_shift = sign * val_coeff;
+                    bigger_val = is_even ? b_dist_big_val(b_seed) : bigger_val;
+                    // Sparsifying a tensor if cfg instructed to do so.
+                    if (cfg.density_ < 1.f) {
+                        is_nonzero = is_even ? b_dist_nonzero_val(b_seed)
+                                             : is_nonzero;
+                    }
+                    const float val_shift = sign * is_nonzero * val_coeff;
                     // Shift left and right from mean val, shift bigger with
                     // probability.
                     val = m + val_shift + 3.f * bigger_val * val_shift;
+                    if (cfg.L_ % 2
+                            && (c * spatial + sp == cfg.L_ * (g + 1) - 1)) {
+                        // Due to groups, the condition above involves them to
+                        // set the tail value for each group of channels.
+                        val = m;
+                    }
                 } else {
-                    const int64_t l = l_base + sp;
-
                     // Shortcut for zero values.
                     if (cfg.check_alg_ == ALG_0
-                            && !flip_coin(l / 2 * 257ULL, cfg.density_)) {
-                        mem_fp.set_elem(off + sp, 0);
+                            && !flip_coin(
+                                    index_order / 2 * 257ULL, cfg.density_)) {
+                        mem_fp.set_f32_elem(off + sp, 0);
                         continue;
                     }
 
-                    const int64_t gen = (l / 2 * 1637) & cfg.flex_mask_;
+                    const int64_t gen
+                            = (index_order / 2 * 1637) & cfg.flex_mask_;
                     // s_{i} + s_{i+1} = 2 * m
-                    const float sign = l % 2 == 0 ? 1.f : -1.f;
+                    const float sign = index_order % 2 == 0 ? 1.f : -1.f;
                     const float f = sign * gen / (1 << cfg.flex_bits_);
 
                     val = cfg.check_alg_ == ALG_0 ? f : m * (1.f + f);
                     if (prb->flags & GLOB_STATS) {
-                        val = (l % 65) - 32;
-                    } else if (cfg.L_ % 2 && (c * spatial + sp == cfg.L_ - 1)) {
+                        val = (index_order % 65) - 32;
+                    } else if (cfg.L_ % 2
+                            && (c * spatial + sp == cfg.L_ * (g + 1) - 1)) {
+                        // Due to groups, the condition above involves them to
+                        // set the tail value for each group of channels.
                         val = m;
                     }
                 }
-                mem_fp.set_elem(off + sp,
-                        round_to_nearest_representable(prb->dt[0], val));
+                auto round_val
+                        = round_to_nearest_representable(prb->dt[0], val);
+                mem_fp.set_f32_elem(off + sp, round_val);
+                m_check += round_val;
             }
+        }
+        m_check /= prb->get_c_start(1) * spatial;
+        if (!(prb->flags & GLOB_STATS) && m_check != m) {
+            BENCHDNN_PRINT(0,
+                    "Error: Mean of MB(%ld):G(%ld) for filled src values "
+                    "doesn't match the one filled ahead: `%g` (exp) versus "
+                    "`%g` (got).\n",
+                    (long)mb, (long)g, m, m_check);
+            SAFE_V(FAIL);
         }
     });
 
@@ -148,6 +191,10 @@ int fill_variance_fwd(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
                 attr_t::post_ops_t::kind_t::ADD, "variance");
         return fill_random_real(mem_dt, mem_fp, nullptr, fill_cfg);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     benchdnn_parallel_nd(prb->mb, prb->g, [&](int64_t mb, int64_t g) {
         const int64_t idx = mb * prb->g + g;
@@ -156,7 +203,7 @@ int fill_variance_fwd(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
         if (prb->flags & GLOB_STATS) {
             val = ((idx % 7) << 1);
         } else {
-            const float m = ref_mean.get_elem(idx);
+            const float m = ref_mean.get_f32_elem(idx);
             for (int64_t c = prb->get_c_start(g); c < prb->get_c_start(g + 1);
                     ++c) {
                 int64_t off = data_off(prb, mb, c, 0, 0, 0);
@@ -165,13 +212,13 @@ int fill_variance_fwd(const prb_t *prb, const cfg_t &cfg, dnn_mem_t &mem_fp,
                 for_(int64_t h = 0; h < prb->ih; ++h)
                 for (int64_t w = 0; w < prb->iw; ++w) {
                     const int64_t sp = d * prb->ih * prb->iw + h * prb->iw + w;
-                    const float s = ref_src.get_elem(sp + off);
+                    const float s = ref_src.get_f32_elem(sp + off);
                     val += (s - m) * (s - m);
                 }
             }
             val /= cfg.L_;
         }
-        mem_fp.set_elem(idx, val);
+        mem_fp.set_f32_elem(idx, val);
     });
 
     if (mem_dt && prb->use_stats()) SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -187,11 +234,15 @@ int fill_scale(const prb_t *prb, dnn_mem_t &mem_fp, dnn_mem_t &mem_dt) {
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, nullptr);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
         float val = (1.f / 8) * (1 << (c % 7));
         if (prb->flags & GLOB_STATS) val *= 8.f;
-        mem_fp.set_elem(c, val);
+        mem_fp.set_f32_elem(c, val);
     });
 
     if (mem_dt) SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -207,11 +258,15 @@ int fill_shift(const prb_t *prb, dnn_mem_t &mem_fp, dnn_mem_t &mem_dt) {
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, nullptr);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     benchdnn_parallel_nd(prb->ic, [&](int64_t c) {
         float val = ((c % 3) - 1) * (1.f / 512 * (1 << (c % 7)));
         if (prb->flags & GLOB_STATS) val *= 512.f;
-        mem_fp.set_elem(c, val);
+        mem_fp.set_f32_elem(c, val);
     });
 
     if (mem_dt) SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -264,12 +319,16 @@ int fill_variance_bwd(const prb_t *prb, dnn_mem_t &mem_fp, dnn_mem_t &mem_dt) {
                 attr_t::post_ops_t::kind_t::ADD, "variance");
         return fill_random_real(mem_dt, mem_fp, nullptr, fill_cfg);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     benchdnn_parallel_nd(prb->mb, prb->g, [&](int64_t mb, int64_t g) {
         const int64_t idx = mb * prb->g + g;
         // final variance = {0.25f, 1.f, 4.f}
         const float val = 0.25f * (1 << ((idx % 3) * 2));
-        mem_fp.set_elem(idx, val - prb->eps);
+        mem_fp.set_f32_elem(idx, val - prb->eps);
     });
 
     if (mem_dt) SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -286,6 +345,10 @@ int fill_src_bwd(const prb_t *prb, dnn_mem_t &mem_fp, dnn_mem_t &mem_dt,
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, res);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, res, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     const auto SP = prb->id * prb->ih * prb->iw;
 
@@ -296,13 +359,13 @@ int fill_src_bwd(const prb_t *prb, dnn_mem_t &mem_fp, dnn_mem_t &mem_dt,
         // random but we keep all values as pow2 values to have almost exact
         // summation result.
         int64_t idx = mb * prb->g + g;
-        const float m = ref_mean.get_elem(idx);
+        const float m = ref_mean.get_f32_elem(idx);
 
         for_(int64_t c = prb->get_c_start(g); c < prb->get_c_start(g + 1); ++c)
         for (int64_t sp = 0; sp < SP; ++sp) {
             const int64_t off = data_off(prb, mb, c, 0, 0, sp);
             const float val = sp % 2 == 0 ? (m - 1.f) : (m + 1.f);
-            mem_fp.set_elem(
+            mem_fp.set_f32_elem(
                     off, round_to_nearest_representable(prb->dt[0], val));
         }
     });
@@ -320,6 +383,10 @@ int fill_diff_dst_bwd(
     // Refer to modes documentation for filling principles.
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, res);
+    }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, res, get_perf_fill_cfg(mem_dt.dt()));
     }
 
     const auto SP = prb->id * prb->ih * prb->iw;
@@ -344,7 +411,7 @@ int fill_diff_dst_bwd(
             const float sign = half_dist(b_seed) ? 1.f : -1.f;
             // d_dst = powf(2, {-4, ... , 2})
             const float val = sign * 0.0625f * (1LL << data_dist(int_seed));
-            mem_fp.set_elem(
+            mem_fp.set_f32_elem(
                     off, round_to_nearest_representable(prb->dt[0], val));
         }
     });
@@ -400,7 +467,7 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     attr_args.prepare_post_ops_mds(
             prb->attr, prb->ndims, prb->data_dims().data());
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
-            create_dnnl_attr(prb->attr, attr_args));
+            create_dnnl_attr(prb->attr, attr_args, prb->ndims));
 
     auto flags = (dnnl_normalization_flags_t)prb->flags;
     if (prb->dir & FLAG_FWD) {
@@ -459,8 +526,14 @@ void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
         trh = trh_coeff * 5e-6;
     cmp.set_threshold(trh);
 
-    // u8 turns half of output into zeros.
-    if (prb->dt[1] == dnnl_u8) cmp.set_zero_trust_percent(60.f);
+    // Obtain number of non-zero elements for forward case from config.
+    if (kind == DST) {
+        cfg_t cfg(prb);
+        // u8 turns half of output into zeros.
+        const int neg_to_zero_coeff = 1 + (prb->dt[1] == dnnl_u8);
+        float n_zeros = 1.f - (cfg.density_ / neg_to_zero_coeff);
+        cmp.set_zero_trust_percent(MAX2(30.f, 100.f * n_zeros));
+    }
 
     // When the error is larger than `trh`, it could be due to a catastrophic
     // cancellation in final result which is computed as `Y = a * X + b`.
@@ -479,9 +552,9 @@ void setup_cmp(compare::compare_t &cmp, const prb_t *prb, data_kind_t kind,
 
                 const auto &sh = ref_args.find(DNNL_ARG_SHIFT);
                 const auto &dst = ref_args.find(DNNL_ARG_DST);
-                const int64_t c = dst.get_scale_idx(
-                        args.idx, 1 << 1 /* last_dim_mask */);
-                const float beta = sh.get_elem(c);
+                const int64_t c
+                        = dst.get_idx(args.idx, 1 << 1 /* last_dim_mask */);
+                const float beta = sh.get_f32_elem(c);
                 // Using an empirically derived threshold, check if
                 // cancellation error in `|Y| = |a*X - (-b)|` is huge.
                 const float abs_exp = fabsf(args.exp);
@@ -521,7 +594,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
     return (dir & FLAG_FWD) ? exec_fwd_args : exec_bwd_args;
 };
 
-fill_cfg_t binary_po_fill_cfg(
+void binary_po_fill_cfg(std::unordered_map<int, fill_cfg_t> &fill_cfg_map,
         int exec_arg, const dnn_mem_t &mem, const attr_t &attr) {
     fill_cfg_t cfg;
     const int post_ops_range = DNNL_ARG_ATTR_MULTIPLE_POST_OP(31)
@@ -535,16 +608,22 @@ fill_cfg_t binary_po_fill_cfg(
                 = exec_arg / DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE - 1;
         assert(bin_po_idx < attr.post_ops.len());
         const auto alg = attr.post_ops.entry[bin_po_idx].kind;
-        cfg = fill_cfg_t(mem.dt(), 4.f, 16.f, /* int = */ true, alg,
-                "gnorm_binary_post_op");
+        const bool is_src1_arg = !(exec_arg
+                ^ (DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_po_idx)
+                        | DNNL_ARG_SRC_1));
+
+        if (is_src1_arg) {
+            cfg = fill_cfg_t(mem.dt(), 4.f, 16.f, /* int = */ true, alg,
+                    "gnorm_binary_post_op");
+            fill_cfg_map.insert({DNNL_ARG_SRC_1, cfg});
+        }
     }
-    return cfg;
 }
 
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     // TODO: this function still allocates the full memory print needed to fill
     // the data and each argument can't be destroyed right away since filling
@@ -565,7 +644,8 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         // use switch below to define a memory desc for it.
         if (exec_arg != DNNL_ARG_SCRATCHPAD) {
             ref_mem_map.emplace(exec_arg,
-                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine,
+                            /* prefill = */ false));
         }
         auto &ref_mem = ref_mem_map[exec_arg];
 
@@ -576,15 +656,13 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
             case DNNL_ARG_VARIANCE:
                 if (prb->dir & FLAG_INF) {
                     const dnnl_dims_t dims2d = {prb->mb, prb->g};
-                    ref_mem_map[exec_arg] = dnn_mem_t(
-                            2, dims2d, dnnl_f32, tag::abx, ref_engine);
+                    ref_mem_map[exec_arg] = dnn_mem_t(2, dims2d, dnnl_f32,
+                            tag::abx, ref_engine, /* prefill = */ false);
                 }
                 break;
             default: {
-                const auto &binary_fill_cfg
-                        = binary_po_fill_cfg(exec_arg, mem, prb->attr);
-                std::unordered_map<int, fill_cfg_t> fill_cfg_map {
-                        {DNNL_ARG_SRC_1, binary_fill_cfg}};
+                std::unordered_map<int, fill_cfg_t> fill_cfg_map;
+                binary_po_fill_cfg(fill_cfg_map, exec_arg, mem, prb->attr);
                 SAFE(init_ref_memory_args_default_case(exec_arg, mem, ref_mem,
                              prb->attr, res, fill_cfg_map),
                         WARN);
@@ -630,15 +708,21 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     return OK;
 }
 
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
-    SAFE(check_caches(v_prim[0], prb, res), WARN);
+    if (has_bench_mode_bit(mode_bit_t::exec)) {
+        SAFE(check_total_size(res), WARN);
+    }
+    if (has_bench_mode_bit(mode_bit_t::corr)) {
+        SAFE(check_caches(v_prim[0], prb, res), WARN);
+    }
     return OK;
 }
 
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
+    set_zmalloc_max_expected_size(res->mem_size_args.zmalloc_expected_size);
+
     const auto &prim = v_prim[0];
 
     dnn_mem_map_t mem_map, ref_mem_map;
@@ -650,8 +734,8 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    check_correctness(
-            prb, get_kinds_to_check(prb), args, ref_args, setup_cmp, res);
+    check_correctness(prb, get_kinds_to_check(prb), args, ref_args, setup_cmp,
+            res, prb->dir);
     SAFE(check_bitwise(prim, get_kinds_to_check(prb), args, prb->attr,
                  prb->inplace, res),
             WARN);

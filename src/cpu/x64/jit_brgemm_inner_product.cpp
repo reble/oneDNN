@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -94,9 +94,11 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float *oscales
             = scale_utils::precompute_scales(scratchpad, src_scales, wei_scales,
-                    pd()->OC(), pd()->attr(), jit_scale_precompute_.get());
+                    pd()->IC(), pd()->OC(), false, wei_scale_mask == (1 << 0),
+                    pd()->attr(), jit_scale_precompute_.get());
 
     const size_t src_dt_size = types::data_type_size(jbgp.src_dt);
     const size_t bia_dt_size
@@ -505,12 +507,6 @@ status_t brgemm_inner_product_fwd_t<isa>::execute_forward(
     });
 
     if (jbgp.nthr_ic_b > 1) {
-        const bool is_f32
-                = everyone_is(f32, jbgp.src_dt, jbgp.wei_dt, jbgp.dst_dt);
-        const bool is_f32_compute = is_f32 && !jbgp.is_bf32;
-        MAYBE_UNUSED(is_f32_compute);
-        assert(jbgp.use_buffer && is_f32_compute);
-
         const auto get_dst_reduced_off = [&](int ithr_ic, int osb, int ocb) {
             assert(jbgp.nthr_ic_b > 1);
             int os = osb * jbgp.os_block;
@@ -637,6 +633,8 @@ template struct brgemm_inner_product_fwd_t<avx512_core_vnni>;
 template struct brgemm_inner_product_fwd_t<avx512_core_amx>;
 template struct brgemm_inner_product_fwd_t<avx512_core_fp16>;
 template struct brgemm_inner_product_fwd_t<avx512_core_amx_fp16>;
+template struct brgemm_inner_product_fwd_t<avx10_2_512>;
+template struct brgemm_inner_product_fwd_t<avx10_2_512_amx_2>;
 
 template <cpu_isa_t isa>
 void brgemm_inner_product_bwd_data_t<isa>::execute_backward_data(
@@ -1023,6 +1021,7 @@ template struct brgemm_inner_product_bwd_data_t<avx512_core_amx>;
 template struct brgemm_inner_product_bwd_data_t<avx512_core_bf16>;
 template struct brgemm_inner_product_bwd_data_t<avx512_core_amx_fp16>;
 template struct brgemm_inner_product_bwd_data_t<avx512_core_fp16>;
+template struct brgemm_inner_product_bwd_data_t<avx10_2_512>;
 
 template <cpu_isa_t isa>
 struct brgemm_inner_product_bwd_weights_t<isa>::thread_info_t {
@@ -1241,7 +1240,7 @@ void brgemm_inner_product_bwd_weights_t<isa>::transpose_matrix_c_chunk(
     const auto &jbgp = pd()->jbgp_;
 
     if (jbgp.is_amx) {
-        auto p = jit_amx_ip_trans_diff_wei::ctx_t();
+        auto p = jit_amx_ip_trans_diff_wei_t::ctx_t();
 
         // Note: This assumes AxB{inner_blocking} weights memory format.
         const dim_t ext_nb_ic = div_up(jbgp.ic, ext_ic_block_);
@@ -1791,6 +1790,7 @@ template struct brgemm_inner_product_bwd_weights_t<avx512_core_amx>;
 template struct brgemm_inner_product_bwd_weights_t<avx512_core_bf16>;
 template struct brgemm_inner_product_bwd_weights_t<avx512_core>;
 template struct brgemm_inner_product_bwd_weights_t<avx2>;
+template struct brgemm_inner_product_bwd_weights_t<avx10_2_512>;
 
 } // namespace x64
 } // namespace cpu

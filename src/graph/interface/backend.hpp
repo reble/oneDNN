@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2023 Intel Corporation
+ * Copyright 2020-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,12 +38,8 @@ namespace impl {
 namespace graph {
 
 // forward declaration
-void register_dnnl_backend();
-void register_fake_backend();
-#ifdef DNNL_ENABLE_COMPILER_BACKEND
-// register graph compiler backend
-void register_compiler_backend();
-#endif
+status_t register_dnnl_backend();
+status_t register_fake_backend();
 
 class backend_t {
 public:
@@ -131,10 +127,11 @@ public:
         return inst;
     }
 
-    backend_t *register_backend(const backend_t *abackend) {
+    status_t register_backend(const backend_t *abackend) {
         auto has_colliding_name = [&](const backend_t *backend) {
             return backend->get_name().compare(abackend->get_name()) == 0;
         };
+
         auto backend_already_registered = [&]() {
             return std::find_if(sorted_backends_.begin(),
                            sorted_backends_.end(), has_colliding_name)
@@ -145,10 +142,7 @@ public:
             return l->get_priority() > r->get_priority();
         };
 
-        if (backend_already_registered()) {
-            throw std::runtime_error(
-                    "backend name not unique: " + abackend->get_name());
-        }
+        if (backend_already_registered()) { return status::runtime_error; }
 
         std::lock_guard<std::mutex> lock(m_);
 
@@ -156,7 +150,7 @@ public:
         sorted_backends_.emplace_back(abackend);
         std::sort(sorted_backends_.begin(), sorted_backends_.end(),
                 compare_priority);
-        return const_cast<backend_t *>(abackend);
+        return status::success;
     }
 
     // This interface will firstly register all available backends and then
@@ -164,7 +158,6 @@ public:
     // of vector
     std::vector<const backend_t *> &get_registered_backends() {
         invoke_backend_registration();
-        std::lock_guard<std::mutex> lock(m_);
         return sorted_backends_;
     }
 
@@ -177,7 +170,6 @@ public:
     const backend_t *get_registered_backend(size_t layout_id) {
         invoke_backend_registration();
         size_t backend_id = extract_backend_id(layout_id);
-        std::lock_guard<std::mutex> lock(m_);
         return backends_[backend_id];
     }
 
@@ -196,15 +188,7 @@ private:
     backend_registry_t &operator=(const backend_registry_t &) = delete;
     backend_registry_t &operator=(backend_registry_t &&) = delete;
 
-    inline void invoke_backend_registration() {
-        std::call_once(register_flag_, []() {
-            register_dnnl_backend();
-            register_fake_backend();
-#ifdef DNNL_ENABLE_COMPILER_BACKEND
-            register_compiler_backend();
-#endif
-        });
-    }
+    void invoke_backend_registration();
 
     std::mutex m_;
 

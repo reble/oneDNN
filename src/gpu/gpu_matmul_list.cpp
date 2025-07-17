@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2022 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,8 +16,24 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/ocl/gemm_matmul.hpp"
-#include "gpu/ocl/ref_matmul.hpp"
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/gemm_matmul.hpp"
+#include "gpu/intel/ref_matmul.hpp"
+#include "gpu/intel/ref_sparse_matmul.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+#include "gpu/nvidia/cudnn_matmul.hpp"
+#include "gpu/nvidia/cudnn_matmul_lt.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_AMD
+#include "gpu/amd/miopen_matmul.hpp"
+#endif
+
+#ifdef GENERIC_SYCL_KERNELS_ENABLED
+#include "gpu/generic/sycl/ref_matmul.hpp"
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -27,8 +43,13 @@ namespace {
 
 // clang-format off
 constexpr impl_list_item_t impl_list[] = REG_MATMUL_P({
-        INSTANCE(ocl::gemm_matmul_t)
-        INSTANCE(ocl::ref_matmul_t)
+        GPU_INSTANCE_INTEL(intel::gemm_matmul_t)
+        GPU_INSTANCE_INTEL(intel::ref_sparse_matmul_t)
+        GPU_INSTANCE_INTEL_REF(intel::ref_matmul_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_matmul_lt_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_matmul_t)
+        GPU_INSTANCE_AMD(amd::miopen_matmul_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_matmul_t)
         nullptr,
 });
 // clang-format on

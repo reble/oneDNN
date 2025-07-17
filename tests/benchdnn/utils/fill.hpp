@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -40,12 +40,13 @@ struct fill_cfg_t {
         : dt_(dnnl_f32)
         , range_min_val_(-16.f)
         , range_max_val_(16.f)
-        , only_integer_(false)
-        , name_("") {}
+        , predefined_set_({})
+        , only_integer_(false) {}
 
     fill_cfg_t(dnnl_data_type_t dt, float range_min_val, float range_max_val,
             bool only_integer, attr_t::post_ops_t::kind_t alg,
             const std::string &name);
+    fill_cfg_t(const std::vector<float> &user_set, const std::string &name);
 
     std::string print_verbose() const;
 
@@ -55,6 +56,12 @@ struct fill_cfg_t {
     float range_min_val_;
     // The upper bound for the filling range.
     float range_max_val_;
+    // It's an alternative approach to fill the data. Instead of setting range
+    // borders, pass a set of fixed values. The function will use uniform_int
+    // randomizer to choose the value.
+    //
+    // Helpful to generate pow2 filling, by passing {2.f, 4.f, ...};
+    std::vector<float> predefined_set_;
     // A flag to generate only integer values.
     bool only_integer_;
     // Config name for verbosity.
@@ -62,6 +69,9 @@ struct fill_cfg_t {
 };
 
 const fill_cfg_t &get_default_fill_cfg();
+const fill_cfg_t &get_perf_fill_cfg(dnnl_data_type_t dt);
+
+int fill_dropout_mask(dnn_mem_t &mem_dt, dnn_mem_t &mem_fp);
 
 int fill_scales(
         const attr_t &attr, int arg, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp);

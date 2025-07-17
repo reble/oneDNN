@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2022 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
+#include "common/math_utils.hpp"
 #include "dnnl_test_common.hpp"
-#include "math_utils.hpp"
 #include "oneapi/dnnl/dnnl.hpp"
 #include "test_convolution_eltwise_forward_common.hpp"
 #include "gtest/gtest.h"
@@ -23,9 +23,9 @@
 namespace dnnl {
 
 using convolution_test_u8s8s32f32
-        = convolution_eltwise_test<uint8_t, int8_t, int32_t, float>;
+        = convolution_eltwise_test_t<uint8_t, int8_t, int32_t, float>;
 using convolution_test_s8s8s32f32
-        = convolution_eltwise_test<int8_t, int8_t, int32_t, float>;
+        = convolution_eltwise_test_t<int8_t, int8_t, int32_t, float>;
 
 #define EXPAND_FORMATS(src, weights, bias, dst) \
     { \

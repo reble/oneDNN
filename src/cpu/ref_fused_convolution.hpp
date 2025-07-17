@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2022 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -74,46 +74,49 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
     };
 
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd) {
-            name_ = "ref_fused_convolution:any";
-        }
-
-        pd_t(const pd_t &other) = default;
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(name_.c_str(), ref_fused_convolution_fwd_t);
 
         virtual status_t init(engine_t *engine) {
             using namespace primitive_kind;
-            bool ok = true && is_fwd()
-                    && attr()->post_ops_.has_default_values(
-                            {binary, eltwise, convolution});
 
-            if (!ok) return status::unimplemented;
+            VDISPATCH_CONV(is_fwd(), VERBOSE_BAD_PROPKIND);
+            VDISPATCH_CONV(attr()->post_ops_.has_default_values(
+                                   {binary, eltwise, convolution}),
+                    VERBOSE_UNSUPPORTED_ATTR);
 
             CHECK(init_ops(engine));
             init_name();
             return status::success;
         }
 
+        // NOLINTBEGIN(google-default-arguments)
         const memory_desc_t *src_md(
                 int index = 0, bool user_input = false) const override {
+            if (op_pds_.empty())
+                return cpu_convolution_fwd_pd_t::src_md(index, user_input);
             return op_pds_.front()->src_md(index, user_input);
         }
 
         const memory_desc_t *dst_md(
                 int index = 0, bool user_input = false) const override {
+            if (op_pds_.empty())
+                return cpu_convolution_fwd_pd_t::dst_md(index, user_input);
             return op_pds_.back()->dst_md(index, user_input);
         }
 
         const memory_desc_t *weights_md(
                 int index = 0, bool user_input = false) const override {
+            if (op_pds_.empty())
+                return cpu_convolution_fwd_pd_t::weights_md(index, user_input);
             return op_pds_.front()->weights_md(index, user_input); // for now
         }
 
         const memory_desc_t *arg_md(
                 int arg, bool user_input = false) const override {
+            if (op_pds_.empty())
+                return cpu_convolution_fwd_pd_t::arg_md(arg, user_input);
             // Binary post-op:
             // format_tag::any should be supported here since output dst_md
             // may be different from the intermediate one and they should be
@@ -152,14 +155,15 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
                 default: return convolution_fwd_pd_t::arg_md(arg, user_input);
             }
         }
+        // NOLINTEND(google-default-arguments)
 
         arg_usage_t arg_usage(int arg) const override {
             if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS))
                 return arg_usage_t::input;
 
-            if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS)
-                    && attr_post_op_dw_inputs() > 1)
-                return arg_usage_t::input;
+            if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS))
+                return attr_post_op_dw_inputs() > 1 ? arg_usage_t::input
+                                                    : arg_usage_t::unused;
 
             if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_SRC))
                 return arg_usage_t::input;
@@ -175,7 +179,7 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
         std::vector<arg_cache_t> args_;
 
     private:
-        std::string name_;
+        std::string name_ = "ref_fused_convolution:any";
         const unsigned int max_fusions_ = 1;
 
         status_t append_op(std::shared_ptr<primitive_desc_t> &op_pd,
@@ -222,10 +226,10 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
             primitive_attr_t attr_1x1(*attr());
             // erase dw_conv post-op scales
             for (auto arg : {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST}) {
-                auto &scale
-                        = attr_1x1.scales_.get(DNNL_ARG_ATTR_POST_OP_DW | arg);
-                if (!scale.has_default_values())
-                    attr_1x1.scales_.reset(DNNL_ARG_ATTR_POST_OP_DW | arg);
+                if (!attr_1x1.scales_.has_default_values(
+                            DNNL_ARG_ATTR_POST_OP_DW | arg))
+                    CHECK(attr_1x1.scales_.set(DNNL_ARG_ATTR_POST_OP_DW | arg,
+                            default_quant_entry()));
             }
             // erase post-ops after fusion as they will be handled separately
             auto &e = attr_1x1.post_ops_.entry_;
@@ -248,7 +252,7 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
             arg_cache.append_ctx_arg(DNNL_ARG_SRC);
             arg_cache.append_ctx_arg(DNNL_ARG_WEIGHTS);
             for (auto arg : {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST})
-                if (!attr_1x1.scales_.get(arg).has_default_values())
+                if (!attr_1x1.scales_.has_default_values(arg))
                     arg_cache.append_ctx_arg(DNNL_ARG_ATTR_SCALES | arg);
             if (desc()->bias_desc.data_type != data_type::undef)
                 arg_cache.append_ctx_arg(DNNL_ARG_BIAS);
@@ -314,12 +318,12 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
                 arg_cache.append_ctx_arg(DNNL_ARG_WEIGHTS,
                         DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
                 for (auto arg : {DNNL_ARG_WEIGHTS, DNNL_ARG_DST})
-                    if (!attr_dw.scales_.get(arg).has_default_values())
+                    if (!attr_dw.scales_.has_default_values(arg))
                         arg_cache.append_ctx_arg(DNNL_ARG_ATTR_SCALES | arg,
                                 DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_ATTR_SCALES
                                         | arg);
                 // dw_conv src_scale = 1x1_conv dst_scale
-                if (!attr_1x1.scales_.get(DNNL_ARG_DST).has_default_values())
+                if (!attr_1x1.scales_.has_default_values(DNNL_ARG_DST))
                     arg_cache.append_ctx_arg(
                             DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC,
                             DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST);
@@ -371,7 +375,6 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
                 name_.append(":");
                 name_.append(op_pd->name());
             }
-            return;
         }
     };
 
@@ -387,7 +390,7 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
         return status::success;
     }
 
-#if DNNL_AARCH64 && DNNL_AARCH64_USE_ACL
+#if DNNL_AARCH64 && defined(DNNL_AARCH64_USE_ACL)
     status_t create_resource(
             engine_t *engine, resource_mapper_t &mapper) const override {
         for (auto &p : primitives_) {
@@ -406,7 +409,7 @@ struct ref_fused_convolution_fwd_t : public primitive_t {
 
         const auto &ctx_args = ctx.args();
         const auto op_count = primitives_.size();
-        std::vector<std::unique_ptr<memory_t>> inout_memory;
+        std::vector<std::unique_ptr<memory_t, memory_deleter_t>> inout_memory;
 
         for (size_t i = 0; i < op_count; ++i) {
             const auto &op = primitives_[i];

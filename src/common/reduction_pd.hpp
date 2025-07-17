@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,10 +37,11 @@ status_t reduction_desc_init(reduction_desc_t *reduction_desc,
         alg_kind_t alg_kind, const memory_desc_t *src_desc,
         const memory_desc_t *dst_desc, float p, float eps);
 
+// NOLINTBEGIN(google-default-arguments)
 struct reduction_pd_t : public primitive_desc_t {
     static constexpr auto base_pkind = primitive_kind::reduction;
 
-    typedef reduction_pd_t hint_class;
+    using hint_class = reduction_pd_t;
 
     const reduction_desc_t *desc() const { return &desc_; }
     const op_desc_t *op_desc() const override {
@@ -131,16 +132,20 @@ struct reduction_pd_t : public primitive_desc_t {
         }
     }
 
+    bool has_zero_dim_memory() const {
+        return memory_desc_wrapper(src_md()).has_zero_dim();
+    }
+
 protected:
     reduction_desc_t desc_;
 
     memory_desc_t src_md_;
     memory_desc_t dst_md_;
 
-    reduction_pd_t(const reduction_desc_t *adesc, const primitive_attr_t *attr,
+    reduction_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const hint_class *hint_fwd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<reduction_desc_t>(adesc))
         , src_md_(desc_.src_desc)
         , dst_md_(desc_.dst_desc) {}
 
@@ -161,6 +166,7 @@ protected:
         return status::success;
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,8 +17,6 @@
 #ifndef UTILS_DATA_KIND_HPP
 #define UTILS_DATA_KIND_HPP
 
-#define BENCHDNN_DNNL_ARG_UNDEF 0
-
 enum data_kind_t {
     SRC = 0,
     WEI,
@@ -28,6 +26,8 @@ enum data_kind_t {
     ACC,
     // bnorm, lnorm
     SRC_1,
+    // select
+    SRC_2,
     MEAN,
     VAR,
     SC,
@@ -41,8 +41,11 @@ enum data_kind_t {
     WEI_ITER,
     WEI_PEEPHOLE,
     WEI_PROJECTION,
+    DROPOUT_MASK,
 
     DAT_TOTAL,
+    // softmax stats
+    DST_1,
 };
 const char *data_kind2str(data_kind_t kind);
 

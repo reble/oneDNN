@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2024 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,7 +28,13 @@ bool check_pads(const op_t *n);
 
 bool check_bn_data_type(const op_t *n);
 
-bool check_ln_data_type(const op_t *n);
+bool check_matmul_dtype(const op_t *n);
+
+bool check_softmax_dtype(const op_t *n);
+
+bool check_softmax_bwd_output_dtype(const op_t *n);
+
+bool check_ln_gn_data_type(const op_t *n);
 
 bool check_typecast_data_type(const op_t *n);
 
@@ -40,7 +46,7 @@ bool check_conv_bwd_weights_weights_shape(const op_t *n);
 
 bool check_interpolate_sizes_scales(const op_t *n);
 
-bool check_ln_fwd_outputs_num(const op_t *n);
+bool check_ln_gn_fwd_outputs_num(const op_t *n);
 
 bool check_ln_bwd_use_affine(const op_t *n);
 

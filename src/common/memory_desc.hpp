@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2024-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@
 
 namespace dnnl {
 namespace impl {
+
+enum class cublaslt_memory_format_t { col32_2r_4r4 };
 
 // Winograd-specific formats
 enum class wino_memory_format_t {
@@ -54,7 +56,7 @@ const rnn_packed_memory_format_t ldio_p = rnn_packed_memory_format_t::ldio_p;
 // TODO: convert to 'enum class'.
 // Flags for memory special features
 enum memory_extra_flags_t {
-    dnnl_memory_extra_flag_none = 0x0U,
+    dnnl_memory_extra_flag_none = 0u,
     // Indicates the weights have an additional buffer, that depends on the
     // @p compensation_mask.
     //
@@ -62,13 +64,22 @@ enum memory_extra_flags_t {
     // the additional buffer would consist of OC values:
     // O[oc : 0,OC] =
     //  -128 * SUM(ic : 0,IC; kh : 0,KH; kw : 0,KW){ weights(oc, ic, kh, kw) }
-    dnnl_memory_extra_flag_compensation_conv_s8s8 = 0x1U,
-    dnnl_memory_extra_flag_scale_adjust = 0x2U,
-    dnnl_memory_extra_flag_rnn_u8s8_compensation = 0x4U,
+    dnnl_memory_extra_flag_compensation_conv_s8s8 = 1u,
+    dnnl_memory_extra_flag_scale_adjust = 2u,
+    dnnl_memory_extra_flag_rnn_u8s8_compensation = 4u,
     dnnl_memory_extra_flag_gpu_rnn_u8s8_compensation
     = dnnl_memory_extra_flag_rnn_u8s8_compensation,
-    dnnl_memory_extra_flag_compensation_conv_asymmetric_src = 0x8U,
-    dnnl_memory_extra_flag_rnn_s8s8_compensation = 0x16U,
+    dnnl_memory_extra_flag_compensation_conv_asymmetric_src = 8u,
+    dnnl_memory_extra_flag_rnn_s8s8_compensation = 16u,
+    // This flag has to be kept separate from *compensation_conv_asymmetric_src
+    // since the GPU precompute algorithm is incompatible with that of the CPU
+    dnnl_memory_extra_flag_compensation_gpu_conv_asymmetric_src = 32u,
+    // This flag depends on *compensation_gpu_conv_asymmetric_src and is used
+    // when precompute is to be performed for a backward-by-data convolution
+    dnnl_memory_extra_flag_compensation_gpu_conv_asymmetric_src_bwd = 64u,
+    // This flag depends on *compensation_gpu_conv_asymmetric_src and is used
+    // when IC and OC are swapped to reinterpret a deconv as a BWD_D conv
+    dnnl_memory_extra_flag_compensation_gpu_conv_asymmetric_src_swap = 128u,
 };
 
 // Create aliases for extra flags to preserve the old behavior.
@@ -85,7 +96,22 @@ const memory_extra_flags_t rnn_s8s8_compensation
         = dnnl_memory_extra_flag_rnn_s8s8_compensation;
 const memory_extra_flags_t compensation_conv_asymmetric_src
         = dnnl_memory_extra_flag_compensation_conv_asymmetric_src;
+const memory_extra_flags_t compensation_gpu_conv_asymmetric_src
+        = dnnl_memory_extra_flag_compensation_gpu_conv_asymmetric_src;
+const memory_extra_flags_t compensation_gpu_conv_asymmetric_src_bwd
+        = dnnl_memory_extra_flag_compensation_gpu_conv_asymmetric_src_bwd;
+const memory_extra_flags_t compensation_gpu_conv_asymmetric_src_swap
+        = dnnl_memory_extra_flag_compensation_gpu_conv_asymmetric_src_swap;
 } // namespace memory_extra_flags
+
+inline bool check_md_extra_flags_compensation_gpu(uint64_t flags) {
+    using namespace memory_extra_flags;
+    const uint64_t c = compensation_gpu_conv_asymmetric_src;
+    const uint64_t b = compensation_gpu_conv_asymmetric_src_bwd;
+    const uint64_t s = compensation_gpu_conv_asymmetric_src_swap;
+    return (flags == none) || (flags == c) || (flags == (c | b))
+            || (flags == (c | b | s));
+}
 
 // Generic description of blocked data layout for most memory formats.
 struct blocking_desc_t {
@@ -132,6 +158,11 @@ struct rnn_packed_desc_t {
     size_t part_pack_size[max_n_parts];
     unsigned pack_part[max_n_parts];
     size_t offset_compensation;
+    size_t size;
+};
+
+struct cublaslt_blocked_desc_t {
+    cublaslt_memory_format_t cublaslt_format;
     size_t size;
 };
 
@@ -201,7 +232,12 @@ struct memory_extra_desc_t {
         : flags(0)
         , compensation_mask(0)
         , scale_adjust(0.0f)
-        , asymm_compensation_mask(0) {}
+        , asymm_compensation_mask(0)
+        , idhw {0, 0, 0}
+        , odhw {0, 0, 0}
+        , pdhw {0, 0, 0}
+        , ddhw {0, 0, 0}
+        , dst_size(0) {}
     // The flags contain arbitrary extra information, such as compensation.
     // @sa dnnl_memory_extra_flags_t
     uint64_t flags;
@@ -211,6 +247,16 @@ struct memory_extra_desc_t {
     float scale_adjust;
     // Compensation mask for asymmetric quantization
     int asymm_compensation_mask;
+    // Precomp GPU ZP convolution input spatials
+    dim_t idhw[3];
+    // Precomp GPU ZP convolution output spatials
+    dim_t odhw[3];
+    // Precomp GPU ZP convolution padding spatials
+    dim_t pdhw[3];
+    // Precomp GPU ZP convolution dilation spatials
+    dim_t ddhw[3];
+    // Precomp GPU ZP convolution destination size
+    dim_t dst_size;
 };
 
 status_t DNNL_API memory_desc_init_by_tag(memory_desc_t &memory_desc, int ndims,
@@ -245,8 +291,7 @@ struct dnnl_memory_desc : public dnnl::impl::c_compatible {
         , padded_offsets {}
         , offset0(0)
         , format_kind(dnnl::impl::format_kind::undef)
-        , format_desc {}
-        , extra {} {}
+        , format_desc {} {}
     // Number of dimensions
     int ndims;
     // Dimensions in the following order:
@@ -289,6 +334,8 @@ struct dnnl_memory_desc : public dnnl::impl::c_compatible {
         dnnl::impl::wino_desc_t wino_desc;
         // Tensor of packed weights for RNN.
         dnnl::impl::rnn_packed_desc_t rnn_packed_desc;
+        // Description of the data layout for memory formats used in cublasLt IMMA kernels.
+        dnnl::impl::cublaslt_blocked_desc_t cublaslt_blocked_desc;
         // Description of the sparse encodings.
         dnnl::impl::sparse_desc_t sparse_desc;
         // ... other descriptions possible

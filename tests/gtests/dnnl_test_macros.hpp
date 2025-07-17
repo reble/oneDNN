@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -69,6 +69,21 @@
 #define SKIP_FOR_LOOP_HIP(cond, message)
 #endif
 
+#ifdef DNNL_SYCL_GENERIC
+#define SKIP_IF_GENERIC(cond, message) \
+    do { \
+        SKIP_IF(get_test_engine_kind() == engine::kind::gpu && (cond), \
+                (message)); \
+    } while (0)
+
+#define SKIP_FOR_LOOP_GENERIC(cond, message) \
+    SKIP_FOR_LOOP( \
+            get_test_engine_kind() == engine::kind::gpu && (cond), (message));
+#else
+#define SKIP_IF_GENERIC(cond, message)
+#define SKIP_FOR_LOOP_GENERIC(cond, message)
+#endif
+
 #define TEST_F_(test_fixture, test_name) TEST_F(test_fixture, test_name)
 
 #define CPU_TEST_F(test_fixture, test_name) \
@@ -109,6 +124,7 @@
     } \
     void Testing()
 
+//NOLINTBEGIN(bugprone-macro-parentheses)
 // Wrapper around TEST from gtest, intended to catch exceptions thrown by a unit
 // test.
 #define HANDLE_EXCEPTIONS_FOR_TEST(test_fixture, test_name) \
@@ -177,5 +193,7 @@
 #define HANDLE_EXCEPTIONS_FOR_TEST_P(test_fixture, test_name) \
     TEST_P(test_fixture, test_name)
 #endif
+
+//NOLINTEND(bugprone-macro-parentheses)
 
 #endif

@@ -1,6 +1,7 @@
 /*******************************************************************************
 * Copyright 2021 Intel Corporation
-* Copyright 2021 FUJITSU LIMITED
+* Copyright 2021-2024 FUJITSU LIMITED
+* Copyright 2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -119,7 +120,7 @@ void jit_uni_dw_convolution_fwd_t<isa, src_type, dst_type>::execute_forward(
             const auto ic_off_idx = is_src_layout_nxc ? ch * jcp.ch_block : ch;
             const auto oc_off_idx = is_dst_layout_nxc ? ch * jcp.ch_block : ch;
 
-            auto par_conv = jit_conv_call_s();
+            auto par_conv = jit_conv_args_t();
             par_conv.src = jcp.is_fused_conv
                     ? src
                     : &src[src_d.blk_off(n, ic_off_idx, ih, iw)];
@@ -160,6 +161,8 @@ void jit_uni_dw_convolution_fwd_t<isa, src_type, dst_type>::execute_forward(
 }
 
 template struct jit_uni_dw_convolution_fwd_t<sve_512, data_type::f32>;
+template struct jit_uni_dw_convolution_fwd_t<sve_256, data_type::f32>;
+template struct jit_uni_dw_convolution_fwd_t<sve_256, data_type::bf16>;
 
 template <cpu_isa_t isa, data_type_t diff_dst_type, data_type_t diff_src_type>
 void jit_uni_dw_convolution_bwd_data_t<isa, diff_dst_type,
@@ -177,7 +180,7 @@ void jit_uni_dw_convolution_bwd_data_t<isa, diff_dst_type,
     auto kernel_params = [&](int ur_str_w, int iw, int oh, int ih,
                                  int i_t_overflow, int i_b_overflow,
                                  int stride_off_h, int ch, int ch_num, int n) {
-        auto par_conv = jit_conv_call_s();
+        auto par_conv = jit_conv_args_t();
 
         const int i_l_overflow = div_up(
                 nstl::max(0,
@@ -239,7 +242,7 @@ void jit_uni_dw_convolution_bwd_data_t<isa, diff_dst_type,
                     (jcp.kw - 1) * (jcp.dilate_w + 1) - jcp.l_pad, jcp.iw);
             int ur_str_w = 1;
             for (; iw < l_border; iw += jcp.stride_w) {
-                jit_conv_call_s par_conv
+                jit_conv_args_t par_conv
                         = kernel_params(ur_str_w, iw, oh, ih, i_t_overflow,
                                 i_b_overflow, stride_off_h, ch, ch_num, n);
                 (*kernel_)(&par_conv);
@@ -248,7 +251,7 @@ void jit_uni_dw_convolution_bwd_data_t<isa, diff_dst_type,
             // main loop
             ur_str_w = (aux_w - iw) / jcp.stride_w;
             if (ur_str_w > 0) {
-                jit_conv_call_s par_conv
+                jit_conv_args_t par_conv
                         = kernel_params(ur_str_w, iw, oh, ih, i_t_overflow,
                                 i_b_overflow, stride_off_h, ch, ch_num, n);
                 (*kernel_)(&par_conv);
@@ -258,7 +261,7 @@ void jit_uni_dw_convolution_bwd_data_t<isa, diff_dst_type,
             // right border
             ur_str_w = 1;
             for (; iw < jcp.iw; iw += jcp.stride_w) {
-                jit_conv_call_s par_conv
+                jit_conv_args_t par_conv
                         = kernel_params(ur_str_w, iw, oh, ih, i_t_overflow,
                                 i_b_overflow, stride_off_h, ch, ch_num, n);
 
@@ -269,6 +272,7 @@ void jit_uni_dw_convolution_bwd_data_t<isa, diff_dst_type,
 }
 
 template struct jit_uni_dw_convolution_bwd_data_t<sve_512, data_type::f32>;
+template struct jit_uni_dw_convolution_bwd_data_t<sve_256, data_type::f32>;
 
 template <cpu_isa_t isa, data_type_t src_type, data_type_t diff_weights_type>
 jit_uni_dw_convolution_bwd_weights_t<isa, src_type, diff_weights_type>::
@@ -307,7 +311,7 @@ void jit_uni_dw_convolution_bwd_weights_t<isa, src_type,
     const int ch_block = jcp.ch_block;
 
     auto set_kernel_params
-            = [&](jit_dw_conv_call_s *conv_params, const int batch,
+            = [&](jit_dw_conv_args_t *conv_params, const int batch,
                       const int group, const int oh_start, const int work_size,
                       const unsigned char exec_flag, const size_t kh_padding,
                       const size_t filter_off) {
@@ -342,7 +346,7 @@ void jit_uni_dw_convolution_bwd_weights_t<isa, src_type,
     parallel(jcp.nthr, [&](const int ithr, const int nthr) {
         assert(nthr == jcp.nthr);
 
-        auto conv_params = jit_dw_conv_call_s();
+        auto conv_params = jit_dw_conv_args_t();
         const int h_block_size = 15;
 
         /* assign iteration space to thread */
@@ -404,7 +408,7 @@ void jit_uni_dw_convolution_bwd_weights_t<isa, src_type,
  * this should be explored in the future if further optimizations are required.
  */
 template <>
-void jit_uni_dw_convolution_bwd_weights_t<sve_512,
+void jit_uni_dw_convolution_bwd_weights_t<sve_256,
         data_type::bf16>::execute_reduction(const exec_ctx_t &ctx) const {
 
     auto diff_wei_reduction_buf
@@ -527,7 +531,7 @@ void jit_uni_dw_convolution_bwd_weights_t<isa, src_type,
 }
 
 template struct jit_uni_dw_convolution_bwd_weights_t<sve_512, data_type::f32>;
-
+template struct jit_uni_dw_convolution_bwd_weights_t<sve_256, data_type::f32>;
 } // namespace aarch64
 } // namespace cpu
 } // namespace impl

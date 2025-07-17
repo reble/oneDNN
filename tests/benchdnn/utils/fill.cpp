@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -50,14 +50,35 @@ fill_cfg_t::fill_cfg_t(dnnl_data_type_t dt, float range_min_val,
     }
 }
 
+fill_cfg_t::fill_cfg_t(
+        const std::vector<float> &user_set, const std::string &name)
+    : dt_(dnnl_data_type_undef)
+    , range_min_val_(-FLT_MAX)
+    , range_max_val_(FLT_MAX)
+    , predefined_set_(user_set)
+    , only_integer_(false)
+    , name_(name) {
+    assert(!predefined_set_.empty());
+}
+
 std::string fill_cfg_t::print_verbose() const {
     std::stringstream ss;
 
     ss << "[FILL_CFG]";
-    if (!name_.empty()) ss << " name:" << name_;
-    ss << " dt:" << dt_;
-    ss << " range:[" << range_min_val_ << ";" << range_max_val_ << "]";
-    if (only_integer_) ss << " only_integer:true";
+    if (!name_.empty()) ss << " name:\'" << name_ << "\';";
+
+    // Predefined set is mutually excluded with a range setting.
+    if (!predefined_set_.empty()) {
+        ss << " set:[";
+        for (const auto &e : predefined_set_) {
+            ss << e << ";";
+        }
+        ss << "]";
+    } else {
+        ss << " dt:" << dt_;
+        ss << " range:[" << range_min_val_ << ";" << range_max_val_ << "]";
+        if (only_integer_) ss << " only_integer:true";
+    }
 
     return ss.str();
 }
@@ -65,6 +86,42 @@ std::string fill_cfg_t::print_verbose() const {
 const fill_cfg_t &get_default_fill_cfg() {
     static const fill_cfg_t fill_cfg;
     return fill_cfg;
+}
+
+const fill_cfg_t &get_perf_fill_cfg(dnnl_data_type_t dt) {
+    assert(has_bench_mode_bit(mode_bit_t::perf));
+
+#define CASE(dt, low_end, high_end) \
+    case dt: { \
+        static const fill_cfg_t fill_cfg(dt, MAX2((low_end), lowest_dt(dt)), \
+                MIN2((high_end), max_dt(dt)), /* only_int = */ false, \
+                attr_t::post_ops_t::kind_t::ADD, "perf_mode_fill"); \
+        return fill_cfg; \
+    }
+
+    switch (dt) {
+        CASE(dnnl_f4_e2m1, -2.f, 2.f);
+        CASE(dnnl_f4_e3m0, -2.f, 2.f);
+        CASE(dnnl_e8m0, -2.f, 2.f);
+        CASE(dnnl_f8_e5m2, -2.f, 2.f);
+        CASE(dnnl_f8_e4m3, -2.f, 2.f);
+        CASE(dnnl_bf16, -32.f, 32.f);
+        CASE(dnnl_f16, -8.f, 8.f);
+        CASE(dnnl_f32, -1024.f, 1024.f);
+        CASE(dnnl_f64, -1024.f, 1024.f);
+        CASE(dnnl_s32, -1024.f, 1024.f);
+        CASE(dnnl_s8, -32, 32);
+        CASE(dnnl_u8, 0, 64);
+        CASE(dnnl_s4, -8, 7);
+        CASE(dnnl_u4, 0, 15);
+        default: {
+            assert(!"bad data_type");
+            SAFE_V(FAIL);
+            static const fill_cfg_t dummy;
+            return dummy;
+        }
+    }
+#undef CASE
 }
 
 int fill_scales(
@@ -82,7 +139,7 @@ int fill_scales(const attr_t::arg_scales_t::entry_t &e, dnn_mem_t &mem_dt,
 
     if (e.policy == policy_t::COMMON) {
         assert(nelems == 1);
-        mem_fp.set_elem(0, e.scale);
+        mem_fp.set_f32_elem(0, e.scale);
         if (mem_dt) mem_dt.set_elem(0, e.scale);
     } else {
         /* Do fixed partitioning to have same filling for any number of threads */
@@ -106,7 +163,7 @@ int fill_scales(const attr_t::arg_scales_t::entry_t &e, dnn_mem_t &mem_dt,
                 const float gen_val
                         = pow2 < 0 ? (1.f / pow2_shift) : pow2_shift;
                 const float val = gen_val;
-                mem_fp.set_elem(idx, val);
+                mem_fp.set_f32_elem(idx, val);
                 if (mem_dt) mem_dt.set_elem(idx, val);
             }
         });
@@ -125,7 +182,7 @@ int fill_zero_points(
     const auto &e = attr.zero_points.get(arg);
     if (e.policy == policy_t::COMMON) {
         assert(nelems == 1);
-        mem_fp.set_elem(0, e.value);
+        mem_fp.set_f32_elem(0, e.value);
         if (mem_dt) mem_dt.set_elem(0, e.value);
     } else {
         /* Do fixed partitioning to have same filling for any number of threads */
@@ -146,7 +203,7 @@ int fill_zero_points(
 
             for (int64_t idx = idx_start; idx < idx_end; ++idx) {
                 const float zp_val = gen(int_seed);
-                mem_fp.set_elem(idx, zp_val);
+                mem_fp.set_f32_elem(idx, zp_val);
                 if (mem_dt) mem_dt.set_elem(idx, zp_val);
             }
         });
@@ -162,14 +219,15 @@ int fill_random_real_dense(dnn_mem_t &mem, dnn_mem_t &mem_ref, res_t *res,
 
     BENCHDNN_PRINT(6, "%s\n", fill_cfg.print_verbose().c_str());
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
+    // This function doesn't handle the predefined set yet.
+    assert(fill_cfg.predefined_set_.empty());
+
     // The `nelems()` function returns a product of dims/pdims regardless of
     // whether the tensor is dense or sparse (this is by design). Because of
     // that we need to adjust the `nelems` value for the sparse tensor as the
     // number of elements to fill is equal to `nnz`.
     if (mem_ref.format_kind() == dnnl_format_kind_sparse)
         nelems = query_md_nnz(mem_ref.md_);
-#endif
 
     // Note: fill_cfg_t drives value distribution, but the final rounding is
     // in compliance with the memory object the values are inserted. Depending
@@ -202,10 +260,19 @@ int fill_random_real_dense(dnn_mem_t &mem, dnn_mem_t &mem_ref, res_t *res,
                     : gen_real(int_seed);
         };
 
-        for (int64_t idx = idx_start; idx < idx_end; ++idx) {
-            float val = get_val();
-            mem_ref.set_elem(
-                    idx, round_to_nearest_representable(round_dt, val));
+        if (mem_ref.dt() == dnnl_f32) {
+            for (int64_t idx = idx_start; idx < idx_end; ++idx) {
+                float val = get_val();
+                mem_ref.set_f32_elem(
+                        idx, round_to_nearest_representable(round_dt, val));
+            }
+        } else {
+            // There are some rare scenarios when mem_ref is not f32.
+            for (int64_t idx = idx_start; idx < idx_end; ++idx) {
+                float val = get_val();
+                mem_ref.set_elem(
+                        idx, round_to_nearest_representable(round_dt, val));
+            }
         }
     });
 
@@ -223,17 +290,25 @@ int fill_random_real_dense(dnn_mem_t &mem, dnn_mem_t &mem_ref, res_t *res,
                         ? orig_val - 0.5f
                         : orig_val + 0.5f;
             } else if (round_dt == dnnl_s8) {
-                ; // s8 is fine.
+                ; // Using s8 val of -128 leads to a binary_mul alg magnifying
+                        // the diff (at least for eltwise) when it used to fit.
+                        // Need a general solution for the problem.
             } else if (round_dt == dnnl_u8) {
                 return 128.f; // catch faulty s8 loads instead of u8.
             } else if (round_dt == dnnl_s32) {
                 return 256.f; // catch faulty int8 loads instead of s32.
+            } else if (round_dt == dnnl_u4) {
+                return 15.f;
+            } else if (round_dt == dnnl_s4) {
+                return -8.f;
             } else {
                 assert(!"unexpected data type");
             }
             return orig_val;
         };
 
+        // There are some rare scenarios when mem_ref is not f32. Since it's a
+        // single element per tensor, can call a regular interface.
         const float elem_first_val = adjust_val(mem_ref.get_elem(0));
         mem_ref.set_elem(
                 0, round_to_nearest_representable(round_dt, elem_first_val));
@@ -251,16 +326,17 @@ int fill_random_real_dense(dnn_mem_t &mem, dnn_mem_t &mem_ref, res_t *res,
     return OK;
 }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
+// Since a sparsity pattern affects performance, it's crucial to keep the
+// pattern intact and only randomize tensor values. Thus, the function relies on
+// an assumption that every sparse format contains three handles, where the
+// second and the third are responsible for a sparsity pattern, and are
+// **already filled**.
 int fill_random_real_sparse(const_dnnl_memory_t dnnl_memory, dnn_mem_t &mem,
         dnn_mem_t &mem_ref, res_t *res, const fill_cfg_t &fill_cfg) {
     auto orig_cc_mem_md = query_md(dnnl_memory);
     const int nhandles = query_md_num_handles(orig_cc_mem_md);
     assert(nhandles == 3);
-    // Since a sparsity pattern affects performance, it's crucial to keep the
-    // pattern intact and only randomize tensor values.
-    // The assumption is every sparse format contains three handles and the
-    // second and the third are responsible for a sparsity pattern.
+    // Copy-exact the content of metadata buffers. Let data handle go further.
     for (int idx = 1; idx < nhandles; idx++) {
         void *dst_ptr = mem_ref.get_mapped_pointer<void>(idx);
         void *src_ptr = nullptr;
@@ -272,17 +348,14 @@ int fill_random_real_sparse(const_dnnl_memory_t dnnl_memory, dnn_mem_t &mem,
 
     return fill_random_real_dense(mem, mem_ref, res, fill_cfg);
 }
-#endif
 
 int fill_random_real(dnn_mem_t &mem, dnn_mem_t &mem_ref, res_t *res,
         const fill_cfg_t &fill_cfg, const_dnnl_memory_t dnnl_memory) {
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     if (mem_ref.format_kind() == dnnl_format_kind_sparse) {
         assert(dnnl_memory != nullptr);
         return fill_random_real_sparse(
                 dnnl_memory, mem, mem_ref, res, fill_cfg);
     }
-#endif
     return fill_random_real_dense(mem, mem_ref, res, fill_cfg);
 }
 

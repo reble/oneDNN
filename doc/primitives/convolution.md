@@ -100,13 +100,24 @@ Here:
 - \f$OW = \left\lfloor{\frac{IW - DKW + PW_L + PW_R}{SW}}
         \right\rfloor + 1,\f$ where \f$DKW = 1 + (KW - 1) \cdot (DW + 1)\f$.
 
+@note In oneDNN, convolution without dilation is defined by setting the dilation
+parameters to `0`. This differs from PyTorch and TensorFlow, where a non-dilated
+case corresponds to a dilation value of `1`. As a result, the PyTorch and
+TensorFlow dilation parameters need to be adjusted by subtracting `1` (for example,
+\f$DH_onednn = DH_torch - 1\f$, and \f$DW_onednn = DW_torch - 1\f$).
+
 #### Deconvolution (Transposed Convolution)
 
 Deconvolutions (also called fractionally strided convolutions or transposed
 convolutions) work by swapping the forward and backward passes of a
-convolution. One way to put it is to note that the weights define a
-convolution, but whether it is a direct convolution or a transposed
-convolution is determined by how the forward and backward passes are computed.
+convolution. The key difference between convolution and deconvolution lies
+in how the weights are applied in the operation. In a convolution, the weights
+are used to reduce the input data and extract key features from the input,
+while in a deconvolution, they are used to expand the input data and produce
+an output that is larger than the input. Thus, while the weights play a
+crucial role in both operations, the way they are used in the forward and
+backward passes determines whether it is a direct convolution or a transposed
+convolution.
 
 #### Difference Between Forward Training and Forward Inference
 
@@ -141,7 +152,8 @@ argument index as specified by the following table.
 | \diffbias                   | DNNL_ARG_DIFF_BIAS                                                         |
 | \diffdst                    | DNNL_ARG_DIFF_DST                                                          |
 | \f$depthwise\f$             | DNNL_ARG_ATTR_POST_OP_DW                                                   |
-| \f$\text{binary post-op}\f$ | DNNL_ARG_ATTR_MULTIPLE_POST_OP(binary_post_op_position) \| DNNL_ARG_SRC_1  |
+| \f$\text{binary post-op}\f$ | DNNL_ARG_ATTR_MULTIPLE_POST_OP(binary_post_op_position) \| DNNL_ARG_SRC_1, |
+|                             | DNNL_ARG_ATTR_MULTIPLE_POST_OP(binary_post_op_position) \| DNNL_ARG_SRC_2  |
 | \f$\text{prelu post-op}\f$  | DNNL_ARG_ATTR_MULTIPLE_POST_OP(prelu_post_op_position) \| DNNL_ARG_WEIGHTS |
 
 ## Implementation Details
@@ -155,22 +167,25 @@ N/A.
 Convolution primitive supports the following combination of data types for
 source, destination, and weights memory objects:
 
-| Propagation    | Source    | Weights      | Destination                 | Bias                        |
-|:---------------|:----------|:-------------|:----------------------------|:----------------------------|
-| forward        | f32       | f32          | f32, u8, s8                 | f32                         |
-| forward        | f16       | f16          | f16, f32, u8, s8            | f16, f32                    |
-| forward        | u8, s8    | s8           | u8, s8, s32, f32, f16, bf16 | u8, s8, s32, f32, f16, bf16 |
-| forward        | bf16      | bf16         | f32, bf16                   | f32, bf16                   |
-| forward        | f8_e5m2   | f8_e5m2      | f8_e5m2, f32, f16, bf16     | f32                         |
-| forward        | f64       | f64          | f64                         | f64                         |
-| backward       | f32, bf16 | bf16         | bf16                        |                             |
-| backward       | f32, f16  | f16          | f16                         |                             |
-| backward       | f8_e5m2   | f8_e5m2      | f8_e5m2                     |                             |
-| backward       | f32       | f32          | f32                         | f32                         |
-| backward       | f64       | f64          | f64                         | f64                         |
-| weights update | bf16      | f32, bf16    | bf16, s8, u8                | f32, bf16                   |
-| weights update | f16       | f32, f16     | f16                         | f32, f16                    |
-| weights update | f8_e5m2   | f32, f8_e5m2 | f8_e5m2                     | f32                         |
+| Propagation    | Source           | Weights               | Destination                      | Bias                        |
+|:---------------|:-----------------|:----------------------|:---------------------------------|:----------------------------|
+| forward        | f32              | f32                   | f32, u8, s8                      | f32                         |
+| forward        | f16              | f16                   | f16, f32, u8, s8                 | f16, f32                    |
+| forward        | u8, s8           | s8                    | u8, s8, s32, f32, f16, bf16      | u8, s8, s32, f32, f16, bf16 |
+| forward        | bf16             | bf16                  | f32, bf16                        | f32, bf16                   |
+| forward        | f8_e5m2, f8_e4m3 | f8_e5m2, f8_e4m3      | f8_e5m2, f8_e4m3, f32, f16, bf16 | f32                         |
+| forward        | f4_e2m1, f4_e3m0 | f4_e2m1, f4_e3m0      | f4_e2m1, f4_e3m0, f32, f16, bf16 | f32                         |
+| forward        | f64              | f64                   | f64                              | f64                         |
+| backward       | f32, bf16        | bf16                  | bf16                             |                             |
+| backward       | f32, f16         | f16                   | f16                              |                             |
+| backward       | f8_e5m2, f8_e4m3 | f8_e5m2, f8_e4m3      | f8_e5m2, f8_e4m3                 |                             |
+| backward       | f4_e2m1, f4_e3m0 | f4_e2m1, f4_e3m0      | f4_e2m1, f4_e3m0                 |                             |
+| backward       | f32              | f32                   | f32                              | f32                         |
+| backward       | f64              | f64                   | f64                              | f64                         |
+| weights update | bf16             | f32, bf16             | bf16, s8, u8                     | f32, bf16                   |
+| weights update | f16              | f32, f16              | f16                              | f32, f16                    |
+| weights update | f8_e5m2, f8_e4m3 | f32, f8_e5m2, f8_e4m3 | f8_e5m2, f8_e4m3                 | f32                         |
+| weights update | f4_e2m1, f4_e3m0 | f32, f4_e2m1, f4_e3m0 | f4_e2m1, f4_e3m0                 | f32                         |
 
 @warning
     There might be hardware and/or implementation specific restrictions.
@@ -427,12 +442,13 @@ of Winograd algorithm implementations.
 
 3. **GPU**
    - Depthwise post-op is not supported
-   - Only reference support is available for f8_e4m3. Optimized implementation
-     is available for f8_e5m2 on Intel(R) Data Center GPU Max Series only.
+   - `f8` iplementation uses Intel XMX cores only on Intel GPUs based on
+     Xe-HPC and Xe2-LPG, and Xe2-HPG uArch.
 
 4. **CPU**
    - Only reference support for fp8 data types (f8_e5m2, f8_e4m3) is
      is available on CPU.
+   - No support is available for f4_e3m0 or f4_e2m1.
    - No support is available for f64.
 
 ## Performance Tips
@@ -446,3 +462,7 @@ of Winograd algorithm implementations.
 [Convolution Primitive Example](@ref convolution_example_cpp)
 
 @copydetails convolution_example_cpp_short
+
+[Deconvolution Primitive Example](@ref deconvolution_example_cpp)
+
+@copydetails deconvolution_example_cpp_short

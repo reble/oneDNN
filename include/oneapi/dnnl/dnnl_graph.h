@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 *******************************************************************************/
 
 /// @file
-/// C API
+/// Graph C API
 
 #ifndef ONEAPI_DNNL_DNNL_GRAPH_H
 #define ONEAPI_DNNL_DNNL_GRAPH_H
@@ -27,6 +27,9 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/// @addtogroup dnnl_api
+/// @{
 
 /// @addtogroup dnnl_graph_api
 /// @{
@@ -190,6 +193,17 @@ dnnl_status_t DNNL_API dnnl_graph_tensor_create(dnnl_graph_tensor_t *tensor,
         const dnnl_graph_logical_tensor_t *logical_tensor, dnnl_engine_t engine,
         void *handle);
 
+/// Creates a scalar tensor with logical tensor and scalar data handle.
+///
+/// @param tensor Output scalar tensor.
+/// @param logical_tensor Description for this tensor.
+/// @param handle Handle of the memory buffer to use as an underlying storage.
+/// @returns #dnnl_success on success or a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API dnnl_graph_tensor_create_scalar(
+        dnnl_graph_tensor_t *tensor,
+        const dnnl_graph_logical_tensor_t *logical_tensor, void *handle);
+
 /// Destroys a tensor.
 ///
 /// @param tensor The tensor to be destroyed.
@@ -223,6 +237,16 @@ dnnl_status_t DNNL_API dnnl_graph_tensor_set_data_handle(
 ///     otherwise.
 dnnl_status_t DNNL_API dnnl_graph_tensor_get_engine(
         const_dnnl_graph_tensor_t tensor, dnnl_engine_t *engine);
+
+/// Returns the logical tensor of a tensor object.
+///
+/// @param tensor The input tensor.
+/// @param logical_tensor Output logical tensor of the tensor object.
+/// @returns #dnnl_success on success or a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API dnnl_graph_tensor_get_logical_tensor(
+        const_dnnl_graph_tensor_t tensor,
+        dnnl_graph_logical_tensor_t *logical_tensor);
 
 /// @} dnnl_graph_api_tensor
 
@@ -577,6 +601,28 @@ dnnl_status_t DNNL_API dnnl_graph_graph_create_with_fpmath_mode(
 ///     otherwise.
 dnnl_status_t DNNL_API dnnl_graph_graph_destroy(dnnl_graph_graph_t graph);
 
+/// Set the floating point math mode for a graph.
+///
+/// @param graph The target graph.
+/// @param mode The floating-point math mode.
+/// @param apply_to_int The flag that controls whether to use floating-point
+///     arithmetic for integral operations.
+/// @returns #dnnl_success on success or a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API dnnl_graph_graph_set_fpmath_mode(
+        dnnl_graph_graph_t graph, dnnl_fpmath_mode_t mode, int apply_to_int);
+
+/// Get the floating point math mode for a graph.
+///
+/// @param graph The target graph.
+/// @param mode The floating-point math mode.
+/// @param apply_to_int The flag that controls whether to use floating-point
+///     arithmetic for integral operations.
+/// @returns #dnnl_success on success or a status describing the error
+///     otherwise.
+dnnl_status_t DNNL_API dnnl_graph_graph_get_fpmath_mode(
+        dnnl_graph_graph_t graph, dnnl_fpmath_mode_t *mode, int *apply_to_int);
+
 /// Adds an operation into a graph. The API will return failure if the operator
 /// has already been added to the graph or the operation cannot pass the schema
 /// check in the library (eg. input and output numbers and data types, the
@@ -728,6 +774,8 @@ dnnl_status_t DNNL_API dnnl_graph_get_constant_tensor_cache_capacity(
 /// @} dnnl_graph_api_constant_tensor_cache
 
 /// @} dnnl_graph_api
+
+/// @} dnnl_api
 
 #ifdef __cplusplus
 }

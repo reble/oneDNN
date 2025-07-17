@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -40,13 +40,7 @@ namespace x64 {
 template <cpu_isa_t isa>
 struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        using dw_conv_pd_type = cpu_convolution_fwd_pd_t;
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd)
-            , jcp_()
-            , rtus_()
-            , jcp_dw_(nullptr) {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         pd_t(const pd_t &other) : cpu_convolution_fwd_pd_t(other) {
             if (copy(other) != status::success) is_initialized_ = false;
@@ -80,22 +74,20 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
             VDISPATCH_CONV(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
 
             VDISPATCH_CONV(
-                    attr()->has_default_values(smask_t::scales_runtime
-                                    | smask_t::zero_points_runtime
-                                    | smask_t::post_ops | smask_t::sum_dt,
+                    attr()->has_default_values(smask_t::scales
+                                    | smask_t::zero_points | smask_t::post_ops
+                                    | smask_t::sum_dt,
                             dst_md(0)->data_type),
                     VERBOSE_UNSUPPORTED_ATTR);
-            VDISPATCH_CONV(attr()->scales_.has_default_values({DNNL_ARG_SRC,
-                                   DNNL_ARG_WEIGHTS, DNNL_ARG_DST,
-                                   DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS,
-                                   DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_DST}),
-                    VERBOSE_UNSUPPORTED_SCALES_CFG);
             VDISPATCH_CONV(set_default_formats_common(
                                    dat_tag(), format_tag::any, dat_tag()),
                     VERBOSE_UNSUPPORTED_TAG);
             VDISPATCH_CONV(set_or_check_wei_format(), VERBOSE_UNSUPPORTED_TAG);
-            VDISPATCH_CONV(attr_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
-            VDISPATCH_CONV(zero_points_ok(), VERBOSE_UNSUPPORTED_ZP_CFG);
+            CHECK(attr_scales_ok({{DNNL_ARG_SRC, {0}},
+                    {DNNL_ARG_WEIGHTS, {0, 1}}, {DNNL_ARG_DST, {0}},
+                    {DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS, {0, 1}},
+                    {DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_DST, {0}}}));
+            CHECK(attr_zero_points_ok());
             VDISPATCH_CONV(attr()->post_ops_.check_sum_consistency(
                                    dst_md(0)->data_type, /* is_int8 */ true),
                     VERBOSE_UNSUPPORTED_POSTOP);
@@ -105,16 +97,19 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
 
             const convolution_desc_t *conv_d = desc();
             const memory_desc_t *src_d = src_md();
+
+            // TODO: make `rtus_prepare` assign initialized object to `rtus_`
             rtus_prepare(this, conv_d, src_d, dst_md(), weights_md());
 
-            CHECK(jit_uni_x8s8s32x_1x1_conv_kernel<isa>::init_conf(jcp_,
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_uni_x8s8s32x_1x1_conv_kernel_t<isa>::init_conf(jcp_,
                     *conv_d, *src_d, *weights_md(), *dst_md(),
                     with_bias() ? *weights_md(1) : types::zero_md(), attr_,
                     dnnl_get_max_threads(), rtus_.reduce_src_));
             if (jcp_.with_dw_conv) CHECK(depthwise_po_init(engine));
 
             auto scratchpad = scratchpad_registry().registrar();
-            jit_uni_x8s8s32x_1x1_conv_kernel<isa>::init_scratchpad(
+            jit_uni_x8s8s32x_1x1_conv_kernel_t<isa>::init_scratchpad(
                     scratchpad, jcp_, *attr());
 
             rtus_prepare_space_info(this, scratchpad, jcp_.nthr);
@@ -126,16 +121,17 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
             return cpu_convolution_fwd_pd_t::dst_md(index);
         }
 
+        // NOLINTBEGIN(google-default-arguments)
         const memory_desc_t *dst_md(
                 int index = 0, bool user_input = false) const override {
-            return jcp_.with_dw_conv
+            return dw_conv_pd_ && jcp_.with_dw_conv
                     ? dw_conv_pd_->dst_md(index, user_input)
                     : cpu_convolution_fwd_pd_t::dst_md(index, user_input);
         }
 
         const memory_desc_t *arg_md(
                 int arg, bool user_input = false) const override {
-            if (jcp_.with_dw_conv) {
+            if (dw_conv_pd_ && jcp_.with_dw_conv) {
                 switch (arg) {
                     case DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_SRC:
                         return cpu_convolution_fwd_pd_t::dst_md(0, user_input);
@@ -148,38 +144,26 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
             }
             return convolution_fwd_pd_t::arg_md(arg, user_input);
         }
+        // NOLINTEND(google-default-arguments)
 
         arg_usage_t arg_usage(int arg) const override {
             if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS))
                 return arg_usage_t::input;
 
-            if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS)
-                    && attr_post_op_dw_inputs() > 1)
-                return arg_usage_t::input;
-
-            if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_ATTR_OUTPUT_SCALES)
-                    && jcp_.with_dw_conv)
-                return arg_usage_t::input;
+            if (arg == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_BIAS))
+                return attr_post_op_dw_inputs() > 1 ? arg_usage_t::input
+                                                    : arg_usage_t::unused;
 
             return convolution_fwd_pd_t::arg_usage(arg);
         }
 
-        jit_1x1_conv_conf_t jcp_;
-        reduce_to_unit_stride_t rtus_;
-        jit_conv_conf_t *jcp_dw_; // doesn't own a resource
+        jit_1x1_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
+        reduce_to_unit_stride_t rtus_ = utils::zero<decltype(rtus_)>();
+        jit_conv_conf_t *jcp_dw_ = nullptr; // doesn't own a resource
         std::unique_ptr<cpu_convolution_fwd_pd_t> dw_conv_pd_;
         using dw_pd_t = typename jit_uni_x8s8s32x_convolution_fwd_t<isa>::pd_t;
 
     protected:
-        bool zero_points_ok() const {
-            // Only common zero points are supported -> mask should only be 0
-            int mask_src = 0, mask_dst = 0;
-            attr()->zero_points_.get(DNNL_ARG_SRC, &mask_src);
-            attr()->zero_points_.get(DNNL_ARG_DST, &mask_dst);
-            return attr()->zero_points_.has_default_values(DNNL_ARG_WEIGHTS)
-                    && mask_src == 0 && mask_dst == 0;
-        }
-
         status_t copy(const pd_t &other) {
             jcp_ = other.jcp_;
             rtus_ = other.rtus_;
@@ -270,19 +254,21 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
             // for 1x1: Check that no better ISA is available.
             // for dw: Always fuse with same ISA.
             // Caveat: May be a better dw conv exists.
-            VDISPATCH_CONV(!mayiuse(isa == avx2 ? avx512_core : avx2),
-                    "heuristic to skip implementation when higher ISA is "
-                    "supported");
+            VDISPATCH_CONV_IC(!mayiuse(isa == avx2 ? avx512_core : avx2),
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL, "higher isa is supported");
 
-            VDISPATCH_CONV(attr_1x1.post_ops_.find(primitive_kind::sum) == -1,
-                    "sum post-op unsupported in int8 uni_1x1_convolution");
+            VDISPATCH_CONV_IC(
+                    attr_1x1.post_ops_.find(primitive_kind::sum) == -1,
+                    VERBOSE_UNSUPPORTED_FEATURE, "unsupported sum post-op");
 
             // TODO: Below may be further tuned.
-            VDISPATCH_CONV(l2_cache < src_d.size(), "cache size check failed");
+            VDISPATCH_CONV_IC(l2_cache < src_d.size(),
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL, "cache size check failed");
             // load_grp_count check can be redundant due to l2 check
             // above. Adding it explicitly as the current driver doesn't
             // work if this condition fails.
-            VDISPATCH_CONV(jcp_1x1.load_grp_count < 2, "load group count > 1");
+            VDISPATCH_CONV_IC(jcp_1x1.load_grp_count < 2,
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL, "load group count > 1");
 
             int dw_po_index
                     = attr_1x1.post_ops_.find(primitive_kind::convolution);
@@ -298,16 +284,17 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
             jcp_dw_ = &(fusable_pd->jcp_);
             dw_conv_pd_ = std::move(fusable_pd);
 
-            VDISPATCH_CONV(
+            VDISPATCH_CONV_IC(
                     dnnl_memory_desc_equal(&src_md, dw_conv_pd_->src_md(0)),
                     VERBOSE_INCONSISTENT_MDS, "src_md", "dw_conv_pd_->src_md");
-            VDISPATCH_CONV(jcp_1x1.oc_without_padding % jcp_1x1.oc_block == 0,
-                    "output-channel is not an exact multiple of oc_block "
-                    "(currently unsupported padded output-channel)");
-            VDISPATCH_CONV(IMPLICATION(jcp_dw_->ow_block,
-                                   jcp_dw_->ow_block == jcp_dw_->ow),
-                    "heuristic: ow_block does not equal output-width "
-                    "(unsupported output-width partitioning)");
+            VDISPATCH_CONV_IC(
+                    jcp_1x1.oc_without_padding % jcp_1x1.oc_block == 0,
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL,
+                    "output-channel is not an exact multiple of oc_block");
+            VDISPATCH_CONV_IC(IMPLICATION(jcp_dw_->ow_block,
+                                      jcp_dw_->ow_block == jcp_dw_->ow),
+                    VERBOSE_1x1CONV_HEURISTIC_FAIL,
+                    "ow_block does not equal output-width");
 
             assert(jcp_dw_);
             assert(dw_conv_pd_->dst_md(0)->format_kind != format_kind::any);
@@ -361,11 +348,11 @@ struct jit_uni_x8s8s32x_1x1_convolution_fwd_t : public primitive_t {
 
     // Note: In case of fused depthwise convolution, the final output data type
     // after fusion may not be same as for dst.
-    typedef typename prec_traits<data_type::s32>::type acc_data_t;
+    using acc_data_t = typename prec_traits_t<data_type::s32>::type;
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
-                new jit_uni_x8s8s32x_1x1_conv_kernel<isa>(
+                new jit_uni_x8s8s32x_1x1_conv_kernel_t<isa>(
                         pd()->jcp_, *pd()->attr(), *pd()->dst_1x1_md())));
         CHECK(kernel_->create_kernel());
 
@@ -398,9 +385,9 @@ private:
             const void *post_ops_binary_rhs_arg_vec_dw) const;
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
-    std::unique_ptr<jit_uni_x8s8s32x_1x1_conv_kernel<isa>> kernel_;
+    std::unique_ptr<jit_uni_x8s8s32x_1x1_conv_kernel_t<isa>> kernel_;
     std::unique_ptr<rtus_driver_t<isa>> rtus_driver_;
-    using dw_conv_kernel_t = jit_uni_x8s8s32x_fwd_kernel<isa>;
+    using dw_conv_kernel_t = jit_uni_x8s8s32x_fwd_kernel_t<isa>;
     std::unique_ptr<dw_conv_kernel_t> kernel_dw_;
 };
 

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2024 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@ void typed_zero_pad_blk(const memory_desc_wrapper &m_d, void *data_handle) {
      * This allows user will be to create bf16 memory
      * on non-avx512_core machines. */
     using data_t = typename utils::conditional<dt == bf16, uint16_t,
-            typename prec_traits<dt>::type>::type;
+            typename prec_traits_t<dt>::type>::type;
     auto data = reinterpret_cast<data_t *>(data_handle);
     const auto &dims = m_d.dims();
     const auto &pdims = m_d.padded_dims();
@@ -142,7 +142,7 @@ void typed_zero_pad_generic_blocked(
      * This allows user will be to create bf16 memory
      * on non-avx512_core machines. */
     using data_t = typename utils::conditional<dt == bf16, uint16_t,
-            typename prec_traits<dt>::type>::type;
+            typename prec_traits_t<dt>::type>::type;
     auto data = reinterpret_cast<data_t *>(data_handle);
     const int ndims = m_d.ndims();
     const auto &dims = m_d.dims();
@@ -204,7 +204,7 @@ status_t typed_zero_pad(const memory_t *memory, const exec_ctx_t &ctx) {
     void *mapped_ptr
             = ctx.map_memory_storage(memory_storage, ctx.stream(), map_size);
 
-    auto *data = static_cast<typename prec_traits<dt>::type *>(mapped_ptr);
+    auto *data = static_cast<typename prec_traits_t<dt>::type *>(mapped_ptr);
     auto blk = mdw.blocking_desc();
 
     auto get_blksize = [&](int ind) {
@@ -280,6 +280,9 @@ static status_t zero_pad(const memory_t *memory, const exec_ctx_t &ctx) {
     switch (mdw.data_type()) {
         case f16: return typed_zero_pad<f16>(memory, ctx);
         case bf16: return typed_zero_pad<bf16>(memory, ctx);
+        case f4_e3m0: return typed_zero_pad<f4_e3m0>(memory, ctx);
+        case f4_e2m1: return typed_zero_pad<f4_e2m1>(memory, ctx);
+        case e8m0: return typed_zero_pad<e8m0>(memory, ctx);
         case f8_e5m2: return typed_zero_pad<f8_e5m2>(memory, ctx);
         case f8_e4m3: return typed_zero_pad<f8_e4m3>(memory, ctx);
         case f32: return typed_zero_pad<f32>(memory, ctx);
@@ -288,6 +291,7 @@ static status_t zero_pad(const memory_t *memory, const exec_ctx_t &ctx) {
         case u8: return typed_zero_pad<u8>(memory, ctx);
         case s4: return typed_zero_pad<s8>(memory, ctx);
         case u4: return typed_zero_pad<u8>(memory, ctx);
+        case f64: return typed_zero_pad<f64>(memory, ctx);
         default: assert(!"memory is undefined"); return unimplemented;
     }
     return unimplemented;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 
 #include "dnnl_traits.hpp"
 #include "nstl.hpp"
+#include "type_helpers.hpp"
 #include "utils.hpp"
 
 namespace dnnl {
@@ -67,7 +68,8 @@ inline T gcd(T a, T b) {
     return b;
 }
 
-inline int lcm(int a, int b) {
+template <typename T>
+inline T lcm(T a, T b) {
     a = impl::nstl::abs(a);
     b = impl::nstl::abs(b);
     assert(a > 0 && b > 0);
@@ -87,9 +89,9 @@ inline int ilog2q(size_t v) {
     int p = 0;
 #define CP(pw) \
     do { \
-        if (v >= (1ull << pw)) { \
-            v >>= pw; \
-            p += pw; \
+        if (v >= (1ull << (pw))) { \
+            v >>= (pw); \
+            p += (pw); \
         } \
     } while (0)
     CP(32);
@@ -237,7 +239,7 @@ template <typename T, typename U = typename utils::remove_reference<T>::type>
 inline U logistic_fwd(T s) {
     // Here we avoid division/inverse by infinity as some architectures have
     // non-standard behavior
-    float exp_overflow_bound = 88.72283172607421875;
+    float exp_overflow_bound = 88.72283172607421875f;
     float in = (float)-s;
     return in < exp_overflow_bound ? (U)(1.f / (1.f + ::expf(in))) : 0.f;
 }
@@ -254,7 +256,7 @@ inline U logistic_bwd_use_dst(T dd, T d) {
 template <typename T, typename A,
         typename U = typename utils::remove_reference<T>::type>
 inline U soft_relu_fwd(T s, A alpha) {
-    float exp_overflow_bound = 88.72283172607421875;
+    float exp_overflow_bound = 88.72283172607421875f;
     float in = (float)s * (float)alpha;
     float v = (in < exp_overflow_bound ? (U)(::log1pf(::expf(in))) : (U)in);
     return (U)(v / alpha);
@@ -430,7 +432,7 @@ inline bool is_eltwise_ok(
                     one_of(alg, eltwise_clip, eltwise_clip_v2), beta >= alpha)
             && IMPLICATION(alg == eltwise_round, src_dt == dnnl_f32)
             && IMPLICATION(one_of(src_dt, dnnl_s32, dnnl_s8, dnnl_u8),
-                    one_of(alg, eltwise_relu, eltwise_linear));
+                    one_of(alg, eltwise_relu, eltwise_linear, eltwise_clip));
 
     const bool eltwise_use_dst
             = one_of(alg, eltwise_relu_use_dst_for_bwd,
@@ -446,6 +448,124 @@ inline bool is_eltwise_ok(
                     alg == eltwise_clip_v2_use_dst_for_bwd, beta >= alpha);
 
     return eltwise_use_src || eltwise_use_dst;
+}
+
+inline uint32_t philox4x32(uint32_t idx, uint32_t seed) {
+    // Note 1: This impl computes 4 different int32_t rand
+    //   values. Even though this is redundundant for sequential ref,
+    //   keeping vector version to guide optimized implementations.
+    // Note 2: this can be used for 8x16 as well by changing indexing.
+
+    uint32_t x = (idx & ~3L);
+    uint32_t ctr[4] = {x + 0, x + 1, x + 2, x + 3};
+    uint32_t key[2] = {uint32_t(seed), uint32_t(seed)};
+
+    auto mulhilo32 = [&](uint32_t a, uint32_t b, uint32_t &hi, uint32_t &lo) {
+        const uint64_t product = static_cast<uint64_t>(a) * b;
+        lo = static_cast<uint32_t>(product);
+        hi = static_cast<uint32_t>(product >> 32);
+    };
+
+    auto philox4x32round = [&]() {
+        constexpr static uint32_t PHILOX_M4x32_0 = 0xD2511F53;
+        constexpr static uint32_t PHILOX_M4x32_1 = 0xCD9E8D57;
+        uint32_t hi0, lo0;
+        uint32_t hi1, lo1;
+        mulhilo32(PHILOX_M4x32_0, ctr[0], hi0, lo0);
+        mulhilo32(PHILOX_M4x32_1, ctr[2], hi1, lo1);
+        ctr[0] = hi1 ^ ctr[1] ^ key[0];
+        ctr[1] = lo1;
+        ctr[2] = hi0 ^ ctr[3] ^ key[1];
+        ctr[3] = lo0;
+    };
+
+    auto philox4x32bumpkey = [&]() {
+        constexpr static uint32_t PHILOX_W4x32_0 = 0x9E3779B9;
+        constexpr static uint32_t PHILOX_W4x32_1 = 0xBB67AE85;
+        key[0] += PHILOX_W4x32_0;
+        key[1] += PHILOX_W4x32_1;
+    };
+
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+    philox4x32bumpkey();
+    philox4x32round();
+
+    return ctr[idx & 3L];
+}
+
+inline uint16_t philox8x16(uint32_t idx, uint32_t seed) {
+    // we split the index in two parts:
+    // - 31 msb are used to generate 32 random bits
+    // - 1 lsb is used to index 16-bit words within this 32 bit random
+    //   value
+    uint32_t r = philox4x32(idx >> 1, seed);
+    return (uint16_t)(r >> ((idx & 1) * sizeof(uint16_t) * 8));
+}
+
+inline uint8_t philox16x8(uint32_t idx, uint32_t seed) {
+    // we split the index in two parts:
+    // - 30 msb are used to generate 32 random bits
+    // - 2 lsb is used to index 8-bit words within this 32 bit random
+    //   value
+    uint32_t r = philox4x32(idx >> 2, seed);
+    return (uint8_t)(r >> ((idx & 3) * sizeof(uint8_t) * 8));
+}
+
+inline float stochastic_round_fwd(
+        float s, uint32_t idx, uint32_t seed, data_type_t dst_dt) {
+    // The general algorithm for stochastic rounding:
+    // - generates random bias
+    // - aligns the bias to dst_dt mantissa precision
+    // - add the bias and truncate to destination accuracy.
+    // - saturate properly to final destination datatype
+
+    // Note: the bias alignment performed allows to apply stochastic
+    // flush-to-zero (sftz).
+
+    // TODO: NaN handling when dst_dt has no NaN
+    if (std::isnan(s)) return s;
+    if (dst_dt == data_type::undef) return NAN;
+
+    using namespace dnnl::impl::types;
+    if (digits<uint32_t>(data_type::f32) < digits<uint32_t>(dst_dt)) {
+        assert(!"dst_dt is a bad data type");
+        return NAN;
+    }
+
+    uint32_t truncation_mask = 0xffffffff
+            << (digits<uint32_t>(data_type::f32) - digits<uint32_t>(dst_dt));
+
+    // IMPORTANT: lsb of bias are used.
+    uint32_t rnd_bias = data_type_size(dst_dt) == 2 ? philox16x8(idx, seed)
+                                                    : philox8x16(idx, seed);
+    rnd_bias = rnd_bias & ~truncation_mask;
+
+    uint32_t s_u = utils::bit_cast<uint32_t>(s);
+    uint32_t r_u = (s_u + rnd_bias) & truncation_mask;
+    float r = utils::bit_cast<float>(r_u);
+    // Result saturation and flush to zero.
+    r = nstl::min(nstl::max(r, lowest_value<float>(dst_dt)),
+            max_value<float>(dst_dt));
+    if (r > 0 && r < min_value<float>(dst_dt)) r = 0;
+    if (r < 0 && r > -min_value<float>(dst_dt)) r = 0;
+
+    return r;
 }
 
 } // namespace math

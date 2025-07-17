@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -118,7 +118,7 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
 
     if (is_nvidia_gpu() || is_amd_gpu()) {
         res->state = SKIPPED;
-        res->reason = CASE_NOT_SUPPORTED;
+        res->reason = skip_reason::case_not_supported;
     }
 }
 
@@ -138,7 +138,8 @@ int doit(const prb_t *prb, res_t *res) {
 
     const auto &test_engine = get_test_engine();
 
-    dnn_mem_t test_mem(data_md, test_engine);
+    // `NaN` prefilling is essential for zero-padding.
+    dnn_mem_t test_mem(data_md, test_engine, /* prefill = */ true);
 
     args_t args;
     args.set(0, test_mem);

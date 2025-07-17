@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,12 +39,12 @@ using namespace Xbyak;
 using namespace Xbyak::util;
 
 template <data_type_t d_type>
-class jit_avx512_common_lrn_kernel_bwd_t : public jit_generator {
+class jit_avx512_common_lrn_kernel_bwd_t : public jit_generator_t {
 public:
     jit_avx512_common_lrn_kernel_bwd_t(float alpha, float beta, int local_size,
-            void *code_ptr, size_t code_size, const char *name = jit_name());
+            const char *name = jit_name());
 
-    using data_t = typename prec_traits<d_type>::type;
+    using data_t = typename prec_traits_t<d_type>::type;
 
     struct jit_args_bwd_t {
         jit_args_bwd_t();

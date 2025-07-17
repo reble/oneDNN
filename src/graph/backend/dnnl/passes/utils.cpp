@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -44,7 +44,6 @@ namespace graph {
 namespace dnnl_impl {
 using op_t = op_t;
 using op_ptr = std::shared_ptr<op_t>;
-using value_ptr = std::shared_ptr<value_t>;
 using ltw = logical_tensor_wrapper_t;
 
 status_t set_given_inputs_outputs(std::shared_ptr<subgraph_t> &sg,
@@ -65,9 +64,8 @@ status_t set_given_inputs_outputs(std::shared_ptr<subgraph_t> &sg,
 
             // partition in/outs should not have default id. There must be some
             // errors in previous graph transformation stage
-            if (edge_id == std::numeric_limits<size_t>::max())
-                return status::invalid_graph;
-
+            VCHECK_UTILS(edge_id != std::numeric_limits<size_t>::max(),
+                    status::invalid_graph, "Invalid edge_id %zu", edge_id);
             bool found = false;
             for (const auto &given : givens) {
                 if (edge_id == given.id) {
@@ -87,7 +85,9 @@ status_t set_given_inputs_outputs(std::shared_ptr<subgraph_t> &sg,
                                 }
                             }
                         }
-                        if (!valid) return status::invalid_arguments;
+                        VCHECK_UTILS(valid, status::invalid_arguments,
+                                "Invalid given logical tensor for given.id %zu",
+                                given.id);
                     }
 
                     edge->set_logical_tensor(given);
@@ -96,17 +96,15 @@ status_t set_given_inputs_outputs(std::shared_ptr<subgraph_t> &sg,
                 }
             }
 
-            if (!found) return status::invalid_arguments;
+            VCHECK_UTILS(found, status::invalid_arguments,
+                    "Can't find given logical tensor for edge_id %zu", edge_id);
         }
         return status::success;
     };
 
-    status_t ret;
-    ret = func(graph_in_vals, inputs, true, true);
-    if (ret != status::success) return ret;
-
-    ret = func(graph_out_vals, outputs, true, false);
-    return ret;
+    CHECK(func(graph_in_vals, inputs, true, true));
+    CHECK(func(graph_out_vals, outputs, true, false));
+    return status::success;
 }
 
 status_t set_given_inputs_outputs(std::vector<op_ptr> &subgraph,
@@ -188,7 +186,8 @@ std::vector<value_t *> get_constant_block_output_values(
         return status::success;
     };
     status_t status = topo_order_visit(sg->get_output_ops(), func);
-    if (status != status::success) return {};
+    VCHECK_UTILS(status == status::success, {},
+            "Failed to get constant block output values");
     return ret;
 }
 
@@ -221,8 +220,7 @@ status_t infer_shape(std::shared_ptr<subgraph_t> &sg) {
         }
     }
 
-    auto ret = sg->infer_shape();
-    if (ret != status::success) return ret;
+    CHECK(sg->infer_shape());
 
     // Fill the inferred shape and strides to subgraph's outputs
     for (size_t i = 0; i < sg->outs_.size(); i++) {
@@ -239,7 +237,7 @@ status_t infer_shape(std::shared_ptr<subgraph_t> &sg) {
         op->remove_attr(op_attr::dw_type);
     }
 
-    return ret;
+    return status::success;
 }
 
 const std::map<op_kind_t, dnnl::algorithm> &get_binary_alg_map() {
@@ -250,7 +248,9 @@ const std::map<op_kind_t, dnnl::algorithm> &get_binary_alg_map() {
                     {graph::op_kind::Minimum, dnnl::algorithm::binary_min},
                     {graph::op_kind::Maximum, dnnl::algorithm::binary_max},
                     {graph::op_kind::Subtract, dnnl::algorithm::binary_sub},
-                    {graph::op_kind::BiasAdd, dnnl::algorithm::binary_add}};
+                    {graph::op_kind::BiasAdd, dnnl::algorithm::binary_add},
+                    {graph::op_kind::GreaterEqual, dnnl::algorithm::binary_ge},
+                    {graph::op_kind::Select, dnnl::algorithm::binary_select}};
     return binary_alg_map;
 }
 
@@ -267,25 +267,47 @@ bool binary_doable(
     return true;
 }
 
+// TODO: ekind can be removed once CPU optimized 5d tensor MatMul with
+// broadcasted post op
 static bool post_binary_fusible_impl(const op_t *base_op,
         const std::vector<dim_t> &fused_shape,
-        const std::vector<dim_t> &other_shape) {
-    assertm(fused_shape.size() == other_shape.size(),
-            "must have same ndims, pls run binary_canonicalization pass first");
+        const std::vector<dim_t> &other_shape, engine_kind_t ekind) {
+    VCHECK_UTILS(fused_shape.size() == other_shape.size(), false,
+            "binary fusible ops must have same ndims, "
+            "fused_shape size is %zu, other_shape size is %zu."
+            "pls run binary_canonicalization pass first",
+            fused_shape.size(), other_shape.size());
     // full tensor and per tensor broadcasted
     if (fused_shape == other_shape
             || std::all_of(other_shape.begin(), other_shape.end(),
                     [](dim_t i) { return i == 1; }))
         return true;
 
-    // any broadcasted for 4d tensor MatMul
     int32_t output_ndims = static_cast<int32_t>(fused_shape.size());
-    if (base_op->get_kind() == op_kind::dnnl_matmul && output_ndims == 4) {
+    // 5d tensor MatMul with broadcasted post was not optimized on CPU
+    if (ekind == dnnl_cpu && base_op->get_kind() == op_kind::dnnl_matmul
+            && output_ndims == 5)
+        return false;
+    // any broadcasted for 4d or 5d tensor MatMul
+    if (base_op->get_kind() == op_kind::dnnl_matmul
+            && (output_ndims == 4 || output_ndims == 5)) {
         for (int32_t i = output_ndims - 1; i >= 0; i--) {
             if (other_shape[i] == 1) continue;
             if (fused_shape[i] != other_shape[i]) { return false; }
         }
         return true;
+    }
+
+    // allow fusion for conv + [N,C,1,1] shape post-binary src
+    if (base_op->get_kind() == op_kind::dnnl_convolution && output_ndims == 4) {
+        if (base_op->get_attr<std::string>(op_attr::data_format) == "NCX"
+                && other_shape[2] == 1 && other_shape[3] == 1) {
+            return true;
+        }
+        if (base_op->get_attr<std::string>(op_attr::data_format) == "NXC"
+                && other_shape[1] == 1 && other_shape[2] == 1) {
+            return true;
+        }
     }
 
     // per channel broadcasted
@@ -355,10 +377,12 @@ std::pair<bool, std::pair<size_t, int64_t>> shuffle_fusible(
     return {true, {c_over_g_pos, groups}};
 }
 
-bool post_binary_fusible(const op_t *base_op, const op_t *bin_op) {
+bool post_binary_fusible(
+        const op_t *base_op, const op_t *bin_op, graph::engine_kind_t ekind) {
     auto fused_out = base_op->get_output_values()[0];
     auto consumers = fused_out->get_consumers();
     if (consumers.size() != 1) return false;
+    if (consumers[0].get_op().num_inputs() != 2) return false;
 
     size_t fused_in_off = consumers[0].get_offset();
     auto fused_in = bin_op->get_input_value(fused_in_off)->get_logical_tensor();
@@ -375,8 +399,35 @@ bool post_binary_fusible(const op_t *base_op, const op_t *bin_op) {
             return false;
     }
 
+    // Special check: dnnl_eltwise only support src and dst datatype are same
+    if (base_op->get_kind() == op_kind::dnnl_eltwise) {
+        auto bin_out = bin_op->get_output_values()[0]->get_logical_tensor();
+        if (ltw(fused_in).data_type() != ltw(bin_out).data_type()) return false;
+    }
+
     return post_binary_fusible_impl(
-            base_op, ltw(fused_in).vdims(), ltw(other_in).vdims());
+            base_op, ltw(fused_in).vdims(), ltw(other_in).vdims(), ekind);
+}
+
+bool post_eltwise_fusible(
+        const op_t *base_op, const op_t *elt_op, graph::engine_kind_t ekind) {
+// binary + sqrt post-op fusion is unsupported on NVIDIA GPU
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+    if (base_op->get_kind() == op_kind::dnnl_binary
+            && static_cast<dnnl::algorithm>(
+                       elt_op->get_attr<int64_t>(op_attr::alg_kind))
+                    == dnnl::algorithm::eltwise_sqrt
+            && ekind == dnnl_gpu) {
+        return false;
+    }
+    return true;
+#else
+    UNUSED(base_op);
+    UNUSED(elt_op);
+    UNUSED(ekind);
+    return true;
+#endif
 }
 
 bool post_depthwise_conv_fusible(
@@ -470,6 +521,8 @@ get_post_ops_fusible_map() {
                     {dnnl_resampling, {dnnl_eltwise, dnnl_binary}},
                     {dnnl_reorder, {dnnl_binary}},
                     {dnnl_softmax, {dnnl_eltwise, dnnl_binary}},
+                    {dnnl_layernorm, {dnnl_eltwise, dnnl_binary}},
+                    {dnnl_groupnorm, {dnnl_eltwise, dnnl_binary}},
             };
     return fusible_map;
 }
@@ -547,24 +600,24 @@ bool is_typecast(const op_t *op) {
 }
 
 bool with_runtime_zps(const op_ptr &op, const fusion_info_mgr_t &mgr,
-        bool is_input, size_t indice) {
+        bool is_input, size_t index) {
     if (op->has_attr(op_attr::fusion_info_key)
             && op->get_attr<int64_t>(op_attr::fusion_info_key) != -1) {
         int64_t key = op->get_attr<int64_t>(op_attr::fusion_info_key);
         const fusion_info_t &fusion_info = mgr.get_info(key);
-        return fusion_info.with_runtime_zero_points(is_input, indice);
+        return fusion_info.with_runtime_zero_points(is_input, index);
     } else {
         return false;
     }
 }
 
 bool with_runtime_scales(const op_ptr &op, const fusion_info_mgr_t &mgr,
-        bool is_input, size_t indice) {
+        bool is_input, size_t index) {
     if (op->has_attr(op_attr::fusion_info_key)
             && op->get_attr<int64_t>(op_attr::fusion_info_key) != -1) {
         int64_t key = op->get_attr<int64_t>(op_attr::fusion_info_key);
         const fusion_info_t &fusion_info = mgr.get_info(key);
-        return fusion_info.with_runtime_scales(is_input, indice);
+        return fusion_info.with_runtime_scales(is_input, index);
     } else {
         return false;
     }
@@ -592,10 +645,10 @@ bool is_layout_reorder(const op_t *op) {
 }
 
 std::shared_ptr<op_t> clone_mul_scales(const std::shared_ptr<op_t> &scale_op) {
-    assertm(scale_op->num_inputs() <= 1,
-            "scale_op should have only one input value.");
-    assertm(!scale_op->has_attr(op_attr::with_runtime_scales),
-            "scale_op should be static");
+    VCHECK_UTILS(scale_op->num_inputs() <= 1
+                    && !scale_op->has_attr(op_attr::with_runtime_scales),
+            nullptr,
+            "scale_op should be static and have only one input value.");
     auto new_op = std::make_shared<op_t>(op_kind::dnnl_mul_scales);
     new_op->set_attr<std::vector<float>>(op_attr::scales,
             scale_op->get_attr<std::vector<float>>(op_attr::scales));
@@ -607,16 +660,30 @@ std::shared_ptr<op_t> clone_mul_scales(const std::shared_ptr<op_t> &scale_op) {
 }
 
 bool inverse_mul_scales(std::shared_ptr<op_t> &scale_op) {
-    assertm(scale_op->num_inputs() <= 1,
-            "scale_op should have only one input value.");
-    assertm(!scale_op->has_attr(op_attr::with_runtime_scales),
-            "scale_op should be static");
+    VCHECK_UTILS(scale_op->num_inputs() <= 1
+                    && !scale_op->has_attr(op_attr::with_runtime_scales),
+            false, "scale_op should be static and have only one input value.");
     auto scales = scale_op->get_attr<std::vector<float>>(op_attr::scales);
     scales = dnnl_impl::utils::fmap(scales, [](float s) { return 1.f / s; });
     scale_op->set_attr(op_attr::scales, scales);
     return true;
 }
 
+bool need_broadcast_for_inputs(
+        const std::shared_ptr<op_t> &op, size_t index1, size_t index2) {
+    auto in_vals = op->get_input_values();
+
+    const dims input1_dims
+            = logical_tensor_wrapper_t(in_vals[index1]->get_logical_tensor())
+                      .vdims();
+    const dims input2_dims
+            = logical_tensor_wrapper_t(in_vals[index2]->get_logical_tensor())
+                      .vdims();
+
+    if (input1_dims != input2_dims) { return true; }
+
+    return false;
+}
 } // namespace dnnl_impl
 } // namespace graph
 } // namespace impl

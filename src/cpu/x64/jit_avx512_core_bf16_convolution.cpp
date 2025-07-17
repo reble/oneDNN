@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -82,7 +82,7 @@ void jit_avx512_core_bf16_convolution_fwd_t::execute_forward_1d(
     parallel(nthr, [&](const int ithr, const int nthr) {
         dim_t start {0}, end {0};
         balance211(work_amount, nthr, ithr, start, end);
-        auto par_conv = jit_conv_call_s();
+        auto par_conv = jit_conv_args_t();
 
         int n {0}, gg {0}, occ {0}, owb {0};
 
@@ -183,10 +183,12 @@ void jit_avx512_core_bf16_convolution_fwd_t::execute_forward_2d(
     parallel(nthr, [&](const int ithr, const int nthr) {
         dim_t start {0}, end {0};
         balance211(work_amount, nthr, ithr, start, end);
-        auto par_conv = jit_conv_call_s();
+        auto par_conv = jit_conv_args_t();
 
-        size_t src_h_stride = src_d.blk_off(0, 0, 1);
-        size_t dst_h_stride = dst_d.blk_off(0, 0, 1);
+        // The second arg in template means sub_offset0 = true
+        // See `blk_off` method definition.
+        size_t src_h_stride = src_d.blk_off<false, true>(0, 0, 1);
+        size_t dst_h_stride = dst_d.blk_off<false, true>(0, 0, 1);
         size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
 
         int n {0}, gg {0}, occ {0}, oh_s {0}, owb {0};
@@ -307,11 +309,13 @@ void jit_avx512_core_bf16_convolution_fwd_t::execute_forward_3d(
     parallel(nthr, [&](const int ithr, const int nthr) {
         dim_t start {0}, end {0};
         balance211(work_amount, nthr, ithr, start, end);
-        auto par_conv = jit_conv_call_s();
+        auto par_conv = jit_conv_args_t();
 
-        size_t src_d_stride = src_d.blk_off(0, 0, 1);
-        size_t src_h_stride = src_d.blk_off(0, 0, 0, 1);
-        size_t dst_h_stride = dst_d.blk_off(0, 0, 0, 1);
+        // The second arg in template means sub_offset0 = true
+        // See `blk_off` method definition.
+        size_t src_d_stride = src_d.blk_off<false, true>(0, 0, 1);
+        size_t src_h_stride = src_d.blk_off<false, true>(0, 0, 0, 1);
+        size_t dst_h_stride = dst_d.blk_off<false, true>(0, 0, 0, 1);
         size_t wht_d_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
         size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 0, 1);
 
@@ -434,10 +438,12 @@ void jit_avx512_core_bf16_convolution_bwd_data_t ::execute_backward_data_3d(
         int work_amount = nb_groups * jcp.mb * ic_chunks * jcp.id * jcp.ih;
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto par_conv = jit_conv_call_s();
+        auto par_conv = jit_conv_args_t();
 
-        size_t diff_src_h_stride = diff_src_d.blk_off(0, 0, 0, 1);
-        size_t diff_dst_h_stride = diff_dst_d.blk_off(0, 0, 0, 1);
+        // The second arg in template means sub_offset0 = true
+        // See `blk_off` method definition.
+        size_t diff_src_h_stride = diff_src_d.blk_off<false, true>(0, 0, 0, 1);
+        size_t diff_dst_h_stride = diff_dst_d.blk_off<false, true>(0, 0, 0, 1);
         size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 0, 1);
 
         bool is_fast_path_d = jcp.dilate_d == 0 && jcp.stride_d == 1;
@@ -600,9 +606,12 @@ void jit_avx512_core_bf16_convolution_bwd_data_t ::execute_backward_data(
         int work_amount = nb_groups * jcp.mb * ic_chunks * jcp.ih * jcp.nb_iw;
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto par_conv = jit_conv_call_s();
-        size_t diff_src_h_stride = diff_src_d.blk_off(0, 0, 1);
-        size_t diff_dst_h_stride = diff_dst_d.blk_off(0, 0, 1);
+        auto par_conv = jit_conv_args_t();
+
+        // The second arg in template means sub_offset0 = true
+        // See `blk_off` method definition.
+        size_t diff_src_h_stride = diff_src_d.blk_off<false, true>(0, 0, 1);
+        size_t diff_dst_h_stride = diff_dst_d.blk_off<false, true>(0, 0, 1);
         size_t wht_h_stride = wht_blk_off(weights_d, 0, 0, 0, 1);
 
         bool is_fast_path = jcp.dilate_h == 0 && jcp.stride_h == 1;
@@ -726,8 +735,8 @@ status_t jit_avx512_core_bf16_convolution_bwd_weights_t ::init(
     nthr_oc_b_ = j.nthr_oc_b;
     nthr_ic_b_ = j.nthr_ic_b;
 
-    CHECK(safe_ptr_assign(
-            kernel_, new jit_avx512_core_bf16_conv_bwd_weights_kernel_f32(j)));
+    CHECK(safe_ptr_assign(kernel_,
+            new jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t(j)));
     CHECK(kernel_->create_kernel());
 
     if (j.transpose_src) {
@@ -1046,7 +1055,7 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t ::compute_diff_weights_2d(
     nd_iterator_init(start, img, jcp.mb, oh_s, jcp.oh);
 
     while (start < end) {
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         int work_rem = end - start;
         const int oh_e = oh_s + work_rem > jcp.oh ? jcp.oh : oh_s + work_rem;
         int ih_s = nstl::max(0, -jcp.t_pad + oh_s * jcp.stride_h);
@@ -1278,7 +1287,7 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t ::compute_diff_weights_3d(
 
     nd_iterator_init(start, img, jcp.mb, od_s, jcp.od);
     while (start < end) {
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         int work_rem = end - start;
         const int od_e = od_s + work_rem > jcp.od ? jcp.od : od_s + work_rem;
         int id_s = nstl::max(0, -jcp.f_pad + od_s * jcp.stride_d);
@@ -1492,8 +1501,9 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t ::compute_diff_weights(
             jcp.src_tag, format_tag::nwc, format_tag::nhwc, format_tag::ndhwc);
     const bool is_ddst_layout_nxc = utils::one_of(
             jcp.dst_tag, format_tag::nwc, format_tag::nhwc, format_tag::ndhwc);
-    const int wei_size = jcp.ngroups * jcp.nb_oc * jcp.oc_block * jcp.nb_ic
-            * jcp.ic_block * jcp.kh * jcp.kw * jcp.kd;
+    const size_t wei_size = static_cast<size_t>(jcp.ngroups) * jcp.nb_oc
+            * jcp.oc_block * jcp.nb_ic * jcp.ic_block * jcp.kh * jcp.kw
+            * jcp.kd;
     const int bias_buf_size = jcp.ngroups * jcp.nb_oc * jcp.oc_block;
 
     float *diff_wei;
@@ -1545,7 +1555,7 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t ::compute_diff_weights(
     auto uker_trans = [&](int img, int g = 0, int ic_b = 0) {
         int j {0}, d {0};
         int my_work = jcp.ih * jcp.id;
-        int ic;
+        dim_t ic;
         int icb_start = ic_b;
         if (jcp.global_transpose) {
             const int work_amount = is_src_layout_nxc
@@ -1573,11 +1583,13 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t ::compute_diff_weights(
             g += ti->g_start;
             ic_b += ti->ic_b_start;
             icb_start = ic_b;
-            ic = is_src_layout_nxc ? g * jcp.ic + ic_b * jcp.ic_block
-                                   : g * jcp.nb_ic + ic_b;
+            ic = is_src_layout_nxc ? static_cast<dim_t>(g) * jcp.ic
+                            + static_cast<dim_t>(ic_b) * jcp.ic_block
+                                   : static_cast<dim_t>(g) * jcp.nb_ic + ic_b;
         } else {
-            ic = is_src_layout_nxc ? g * jcp.ic + ic_b * jcp.ic_block
-                                   : g * jcp.nb_ic + ic_b;
+            ic = is_src_layout_nxc ? static_cast<dim_t>(g) * jcp.ic
+                            + static_cast<dim_t>(ic_b) * jcp.ic_block
+                                   : static_cast<dim_t>(g) * jcp.nb_ic + ic_b;
             g = 0;
             ic_b = 0;
         }
@@ -1585,7 +1597,9 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t ::compute_diff_weights(
         const auto local_gwork = need_local_gwork ? ti->g_work : 1;
 
         for (int gg = g; gg < g + local_gwork; ++gg) {
-            if (need_local_gwork) ic = gg * jcp.ic + ic_b * jcp.ic_block;
+            if (need_local_gwork)
+                ic = static_cast<dim_t>(gg) * jcp.ic
+                        + static_cast<dim_t>(ic_b) * jcp.ic_block;
             src_data_t *tr_src = (jcp.ndims == 5)
                     ? &ti->tr_src[tr_src_off_3d(gg, ic_b, d, j)]
                     : &ti->tr_src[tr_src_off(gg, ic_b, j)];
@@ -1677,7 +1691,7 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t ::compute_diff_weights(
     };
 
     for (int img = ti->img_start; img < ti->img_end; ++img) {
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         if (jcp.global_transpose) {
             using simple_barrier::barrier;
             // TODO: try to call local transpositions just before jit kernel
@@ -1775,8 +1789,9 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t ::
     const memory_desc_wrapper diff_weights_d(pd()->diff_weights_md(0));
 
     const auto &jcp = kernel_->jcp;
-    const int wei_size = jcp.ngroups * jcp.nb_oc * jcp.oc_block * jcp.nb_ic
-            * jcp.ic_block * jcp.kh * jcp.kw * ((jcp.ndims == 5) ? jcp.kd : 1);
+    const size_t wei_size = static_cast<size_t>(jcp.ngroups) * jcp.nb_oc
+            * jcp.oc_block * jcp.nb_ic * jcp.ic_block * jcp.kh * jcp.kw
+            * ((jcp.ndims == 5) ? jcp.kd : 1);
 
     const bool is_bf16_out = diff_weights_d.data_type() == data_type::bf16;
     const bool is_bf16_bias = jcp.with_bias && jcp.bia_dt == data_type::bf16;
@@ -1904,7 +1919,7 @@ void jit_avx512_core_bf16_convolution_bwd_weights_t::prepare_scratchpad_data(
 
     if (jcp.transpose_src) {
         // XXX: See the comment about tr_iw and guarding elements in
-        // jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_conf()
+        // jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::init_conf()
         auto tr_src = scratchpad.template get<src_data_t>(key_conv_tr_src);
         // Zero out guard elements that cross a buffer boundary to prevent a
         // race condition due to buffer overflows from memory optimization where

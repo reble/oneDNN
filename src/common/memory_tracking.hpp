@@ -1,5 +1,6 @@
 /*******************************************************************************
-* Copyright 2018-2024 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
+* Copyright 2024-2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -52,12 +53,12 @@ namespace memory_tracking {
  * 3. While a primitive is responsible for its scratchpad, the implementation
  *    might use some other basic blocks (e.g. cpu_reducer) that also require
  *    scratchpad memory. So there should be a simple way of passing the
- *    information back and force between the main algorithm (a primitive) and
+ *    information back and forth between the main algorithm (a primitive) and
  *    auxiliary stuff that lives completely separately from it (e.g. reducer).
  *
- * To address these challenges this header file provides 3 structures:
- * 1. registry_t  -- the class the stores the information about requested
- *                   memory. The information includes required size and desired
+ * To address these challenges this header file provides 3 abstractions:
+ * 1. registry_t  -- the class to store the information about requested memory.
+ *                   The information includes required size and desired
  *                   alignment for each piece. This class is also responsible
  *                   for computing the right offset to a given piece using the
  *                   base pointer.
@@ -96,7 +97,7 @@ namespace memory_tracking {
  *      void exec(const grantor_t &scratchpad) {
  *          // get the pointer to preserved space. scratchpad came from
  *          // upper primitive (convolution in this example)
- *          auto space = scratchpad.get<float>(key_reducer_space);
+ *          auto space = scratchpad.template get<float>(key_reducer_space);
  *
  *          space[:] += ...;
  *      }
@@ -114,7 +115,7 @@ namespace memory_tracking {
  *              // flexibility targeted at memory debugging purposes
  *              scratchpad.book(key_conv_padded_bias, 128, 2, 4, 64);
  *
- *              // create a proxy registrar for the reducer All entries made
+ *              // create a proxy registrar for the reducer. All entries made
  *              // by reducer would live in convolution's registry, but would
  *              // have their own `prefix`, so no interference with conv's
  *              // buffers.
@@ -126,16 +127,13 @@ namespace memory_tracking {
  *          registry_t scratchpad_registry_;
  *      }
  *
- *      void exec() {
- *          // get the base pointer to a scratchpad memory from a user
- *          void *scratchpad_ptr = this->input(DNNL_MEM_SCRATCHPAD);
- *
- *          // create a grantor to the scratchpad (and provide the base
- *          // pointer).
- *          grantor_t scratchpad(pd()->scratchpad_registry_, scratchpad_ptr);
+ *      void exec(const exec_ctx_t &ctx) {
+ *          // get a grantor to the scratchpad from the execution context.
+ *          auto scratchpad = ctx.get_scratchpad_grantor();
  *
  *          // access the padded_bias (need only key name and the grantor)
- *          auto padded_bias = scratchpad.get<float>(key_conv_padded_bias);
+ *          float *padded_bias = scratchpad.template get<float>(
+ *                  memory_tracking::names::key_conv_padded_bias);
  *
  *          // to give the `right` grantor to reducer we need to add the
  *          // corresponding prefix, so that reducer would be able to access
@@ -168,11 +166,13 @@ enum {
     key_brgemm_primitive_buffer_d,
     key_brgemm_primitive_zp_comp_a,
     key_brgemm_primitive_zp_comp_b,
+    key_brgemm_primitive_buffer_reduce,
     key_concat_iptrs,
     key_concat_istrides,
     key_concat_nelems,
     key_concat_optrs,
     key_concat_tent_dst,
+    key_conv_pack_space,
     key_conv_adjusted_scales,
     key_conv_amx_inp_buffer,
     key_conv_amx_tilecfg,
@@ -181,6 +181,8 @@ enum {
     key_conv_amx_wsp_buffer,
     key_conv_bia_reduction,
     key_conv_bias_bf16_convert_wsp,
+    key_conv_bias_f16_convert_wsp,
+    key_conv_bias_s32_convert,
     key_conv_cudnn,
     key_conv_cudnn_algo,
     key_conv_cudnn_filter,
@@ -197,10 +199,18 @@ enum {
     key_conv_bwd_w_1st_wei_reorder,
     key_conv_gemm_acc,
     key_conv_gemm_col,
+    key_conv_gemm_row,
     key_conv_gemm_imtr,
     key_conv_gemm_zp_src_comp,
     key_conv_int_dat_in_acc_dt,
+    key_conv_ncsp_dst,
+    key_conv_ncsp_src,
+    key_conv_ncsp_diff_dst,
+    key_conv_ncsp_diff_src,
+    key_conv_ncsp_matmul_dst,
+    key_conv_ncsp_diff_sp_sum,
     key_conv_padded_bias,
+    key_conv_permuted_weights,
     key_conv_rtus_space,
     key_conv_store_wsp,
     key_conv_tails,
@@ -223,10 +233,21 @@ enum {
     key_eltwise_src,
     key_fusion_forward_scratchpad,
     key_fusion_inout_buffer,
+    key_gemm_asm_tmp_buffer,
     key_gemm_tmp_buffer,
     key_gemm_blocked_a,
     key_gemm_blocked_b,
     key_gemm_accumulator,
+    key_gemm_interleaved_lhs,
+    key_gemm_mm_result_s32,
+    key_gemm_mm_signed_a,
+    key_gemm_mm_signed_output,
+    key_gemm_output,
+    key_gemm_pretranspose,
+    key_gemm_pretranspose_b,
+    key_gemm_pretransposed_rhs,
+    key_gemm_transposed_1xwrhs,
+    key_generic_acc,
     key_gnorm_cvt,
     key_gnorm_reduction,
     key_gnorm_tmp_mean,
@@ -235,16 +256,27 @@ enum {
     key_iprod_dst_bf16_convert_wsp,
     key_iprod_dst_reorder,
     key_iprod_int_dat_in_acc_dt,
+    key_iprod_src_reorder,
+    key_iprod_weights_reorder,
     key_lnorm_inv_sqrtvar,
     key_lnorm_tmp_mean,
     key_lnorm_tmp_var,
     key_lnorm_tmp_diff_ss,
     key_lnorm_reduction,
+    key_matmul_pack_space,
     key_matmul_dst_in_acc_dt,
+    key_matmul_lt_algo_scratch,
+    key_matmul_lt_block_c,
+    key_matmul_src_trans,
+    key_matmul_wei_trans,
+    key_matmul_dst_trans,
+    key_matmul_dst_cast_acc,
+    key_matmul_sparse_tmp_ptr,
     key_pool_dst_bf16cvt,
     key_pool_dst_plain2blocked_cvt,
     key_pool_ind_plain2blocked_cvt,
     key_pool_src_bf16cvt,
+    key_pool_src_f32_accum,
     key_pool_src_plain2blocked_cvt,
     key_pool_reduction,
     key_precomputed_scales,
@@ -253,6 +285,7 @@ enum {
     key_reducer_space_bctx,
     key_reduction,
     key_reduction_1,
+    key_reduction_out,
     key_reorder_cross_space,
     key_reorder_space,
     key_reorder_src_scales,
@@ -265,6 +298,9 @@ enum {
     key_reorder_rnn_weights_reduction,
     key_reorder_rnn_weights_transposition,
     key_reorder_rnn_weights_xf16_cvt,
+    key_reorder_cublaslt_src_float,
+    key_reorder_cublaslt_dst_float,
+    key_reorder_cublaslt_generic,
     key_rnn_space,
     key_rnn_bf32_attention_trans,
     key_rnn_bf32_wei_layer_trans,
@@ -276,7 +312,6 @@ enum {
     key_rnn_diff_gates,
     key_rnn_src_layer_trans,
     key_rnn_src_iter_trans,
-    key_rnn_ht,
     key_rnn_diff_ht,
     key_rnn_ptrs_bia,
     key_rnn_ptrs_wei_layer,
@@ -396,14 +431,8 @@ struct registry_t {
     public:
         common_iterator_t(const void *base_ptr_,
                 const std::unordered_map<key_t, entry_t> &map,
-                bool is_begin = true) {
-            base_ptr = base_ptr_;
-            if (is_begin) {
-                iter = map.cbegin();
-            } else {
-                iter = map.cend();
-            }
-        }
+                bool is_begin = true)
+            : base_ptr(base_ptr_), iter(is_begin ? map.cbegin() : map.cend()) {}
         common_iterator_t &operator++(int) {
             iter++;
             return *this;
@@ -421,8 +450,8 @@ struct registry_t {
                     (return_type)ptr_start, entry.size};
         }
     };
-    typedef common_iterator_t<void *> iterator;
-    typedef common_iterator_t<const void *> const_iterator;
+    using iterator = common_iterator_t<void *>;
+    using const_iterator = common_iterator_t<const void *>;
     iterator begin(void *base_ptr_) const {
         return iterator(base_ptr_, offset_map_);
     }
@@ -513,11 +542,19 @@ struct grantor_t {
         if (e.size == 0) return nullptr;
 
         if (is_cpu_engine(base_mem_storage_)) {
+            // For SYCL CPU this interface must be used when returned
+            // memory_storage will be wrapped into memory objects which will be
+            // passed to nested primitives. It's required to keep host mapping
+            // working. It's working because handles in memory storages are keys
+            // in mapping.
             char *host_storage_ptr = get_host_storage_ptr(base_mem_storage_);
             char *base_ptr
                     = host_storage_ptr + base_mem_storage_->base_offset();
             char *aligned_ptr = (char *)e.compute_ptr(base_ptr);
             size_t aligned_offset = size_t(aligned_ptr - host_storage_ptr);
+            // Note: this interface is broken for SYCL buffer storages as
+            // returning sub_storage is basically a base storage itself by
+            // design.
             return base_mem_storage_->get_sub_storage(aligned_offset, e.size);
         }
 

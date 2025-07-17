@@ -1,5 +1,7 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
+* Copyright 2024-2025 FUJITSU LIMITED
+* Copyright 2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -126,6 +128,7 @@ const alg_kind_t binary_le = dnnl_binary_le;
 const alg_kind_t binary_lt = dnnl_binary_lt;
 const alg_kind_t binary_eq = dnnl_binary_eq;
 const alg_kind_t binary_ne = dnnl_binary_ne;
+const alg_kind_t binary_select = dnnl_binary_select;
 const alg_kind_t resampling_nearest = dnnl_resampling_nearest;
 const alg_kind_t resampling_linear = dnnl_resampling_linear;
 const alg_kind_t reduction_max = dnnl_reduction_max;
@@ -141,11 +144,23 @@ const alg_kind_t reduction_norm_lp_power_p_sum
         = dnnl_reduction_norm_lp_power_p_sum;
 const alg_kind_t softmax_accurate = dnnl_softmax_accurate;
 const alg_kind_t softmax_log = dnnl_softmax_log;
+// Internal only alg kinds.
+const alg_kind_t internal_only_start = (alg_kind_t)(1 << 12);
+// GPU only via jit_eltwise injector.
+const alg_kind_t eltwise_stochastic_round
+        = (alg_kind_t)(internal_only_start + 1);
+// Internal algorithm for softmax to convert NaNs/-inf into 0.f in case when
+// all axis values are -inf.
+const alg_kind_t softmax_accurate_inf_as_zero
+        = (alg_kind_t)(internal_only_start + 2);
 } // namespace alg_kind
 
 using data_type_t = dnnl_data_type_t;
 namespace data_type {
 const data_type_t undef = dnnl_data_type_undef;
+const data_type_t f4_e3m0 = dnnl_f4_e3m0;
+const data_type_t f4_e2m1 = dnnl_f4_e2m1;
+const data_type_t e8m0 = dnnl_e8m0;
 const data_type_t f8_e5m2 = dnnl_f8_e5m2;
 const data_type_t f8_e4m3 = dnnl_f8_e4m3;
 const data_type_t f16 = dnnl_f16;
@@ -190,22 +205,19 @@ const scratchpad_mode_t library = dnnl_scratchpad_mode_library;
 const scratchpad_mode_t user = dnnl_scratchpad_mode_user;
 } // namespace scratchpad_mode
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
+using rounding_mode_t = dnnl_rounding_mode_t;
+namespace rounding_mode {
+const rounding_mode_t environment = dnnl_rounding_mode_environment;
+const rounding_mode_t stochastic = dnnl_rounding_mode_stochastic;
+} // namespace rounding_mode
+
 using sparse_encoding_t = dnnl_sparse_encoding_t;
 namespace sparse_encoding {
 const sparse_encoding_t undef = dnnl_sparse_encoding_undef;
 const sparse_encoding_t csr = dnnl_csr;
+const sparse_encoding_t coo = dnnl_coo;
 const sparse_encoding_t packed = dnnl_packed;
 } // namespace sparse_encoding
-#else
-// Declare dummy values to avoid guarding internal implementation.
-using sparse_encoding_t = int;
-namespace sparse_encoding {
-const sparse_encoding_t undef = 0;
-const sparse_encoding_t csr = 1;
-const sparse_encoding_t packed = 2;
-} // namespace sparse_encoding
-#endif
 
 using format_kind_t = dnnl_format_kind_t;
 namespace format_kind {
@@ -213,16 +225,13 @@ const format_kind_t undef = dnnl_format_kind_undef;
 const format_kind_t any = dnnl_format_kind_any;
 const format_kind_t blocked = dnnl_blocked;
 const format_kind_t opaque = dnnl_format_kind_opaque;
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 const format_kind_t sparse = dnnl_format_kind_sparse;
-#else
-const format_kind_t sparse = static_cast<format_kind_t>(4);
-#endif
 
 // Internal only format kinds.
 const format_kind_t internal_only_start = (format_kind_t)(1 << 8);
 const format_kind_t wino = internal_only_start;
 const format_kind_t rnn_packed = (format_kind_t)(internal_only_start + 1);
+const format_kind_t cublaslt_blocked = (format_kind_t)(internal_only_start + 2);
 } // namespace format_kind
 
 #ifdef DNNL_EXPERIMENTAL_PROFILING
@@ -241,6 +250,8 @@ const profiling_data_kind_t internal_only_start
         = (profiling_data_kind_t)(1 << 8);
 const profiling_data_kind_t cycles
         = (profiling_data_kind_t)(internal_only_start + 1);
+const profiling_data_kind_t time_per_kernel
+        = (profiling_data_kind_t)(internal_only_start + 2);
 } // namespace profiling_data_kind
 
 using format_tag_t = dnnl_format_tag_t;
@@ -282,13 +293,16 @@ const format_tag_t ba = dnnl_ba;
 const format_tag_t bac = dnnl_bac;
 const format_tag_t bacd = dnnl_bacd;
 const format_tag_t bca = dnnl_bca;
+const format_tag_t bcad = dnnl_bcad;
 const format_tag_t bcda = dnnl_bcda;
 const format_tag_t bcdea = dnnl_bcdea;
 const format_tag_t bacde = dnnl_bacde;
 const format_tag_t cab = dnnl_cab;
 const format_tag_t cba = dnnl_cba;
+const format_tag_t cabd = dnnl_cabd;
 const format_tag_t cdab = dnnl_cdab;
 const format_tag_t cdba = dnnl_cdba;
+const format_tag_t dabc = dnnl_dabc;
 const format_tag_t dcab = dnnl_dcab;
 const format_tag_t cdeab = dnnl_cdeab;
 const format_tag_t cdeba = dnnl_cdeba;
@@ -348,6 +362,9 @@ const format_tag_t aCB16b16c = dnnl_aCB16b16c;
 const format_tag_t aCB16b32c = dnnl_aCB16b32c;
 const format_tag_t aCB16b48c = dnnl_aCB16b48c;
 const format_tag_t aCB16b64c = dnnl_aCB16b64c;
+const format_tag_t BA24b8a = dnnl_BA24b8a;
+const format_tag_t aCB24c8b = dnnl_aCB24c8b;
+const format_tag_t abDC24d8c = dnnl_abDC24d8c;
 const format_tag_t aCB16b16c2b = dnnl_aCB16b16c2b;
 const format_tag_t aCB16b32c2b = dnnl_aCB16b32c2b;
 const format_tag_t aCB16b48c2b = dnnl_aCB16b48c2b;
@@ -359,6 +376,7 @@ const format_tag_t aCB16b64c4b = dnnl_aCB16b64c4b;
 
 const format_tag_t Ab4a = dnnl_Ab4a;
 const format_tag_t Ab8a = dnnl_Ab8a;
+const format_tag_t Ab32a = dnnl_Ab32a;
 const format_tag_t Abc16a = dnnl_Abc16a;
 const format_tag_t ABc16a16b = dnnl_ABc16a16b;
 const format_tag_t ABc4a2b = dnnl_ABc4a2b;
@@ -605,6 +623,7 @@ const format_tag_t aBdefc16b = dnnl_aBdefc16b;
 const format_tag_t aBdefC16b2c = dnnl_aBdefC16b2c;
 const format_tag_t aBdefC16b4c = dnnl_aBdefC16b4c;
 const format_tag_t aCBdef16c16b = dnnl_aCBdef16c16b;
+const format_tag_t aCBdef8b8c = dnnl_aCBdef8b8c;
 const format_tag_t aCBdef16b16c = dnnl_aCBdef16b16c;
 const format_tag_t aBdefc4b = dnnl_aBdefc4b;
 const format_tag_t aBdefc8b = dnnl_aBdefc8b;
@@ -619,8 +638,10 @@ const format_tag_t Acb4a = dnnl_Acb4a;
 const format_tag_t Acb8a = dnnl_Acb8a;
 const format_tag_t AcB8a2b = dnnl_AcB8a2b;
 const format_tag_t AcB8a4b = dnnl_AcB8a4b;
+const format_tag_t aCBd8b8c = dnnl_aCBd8b8c;
 const format_tag_t aCBd16b16c = dnnl_aCBd16b16c;
 const format_tag_t aCBd16c16b = dnnl_aCBd16c16b;
+const format_tag_t aCBde8b8c = dnnl_aCBde8b8c;
 const format_tag_t aCBde16b16c = dnnl_aCBde16b16c;
 const format_tag_t aCBde16c16b = dnnl_aCBde16c16b;
 const format_tag_t Acdb16a = dnnl_Acdb16a;
@@ -639,7 +660,9 @@ const format_tag_t AcdeB8a2b = dnnl_AcdeB8a2b;
 const format_tag_t AcdeB8a4b = dnnl_AcdeB8a4b;
 const format_tag_t Acedb16a = dnnl_Acedb16a;
 const format_tag_t Adcb16a = dnnl_Adcb16a;
+const format_tag_t BAc8a8b = dnnl_BAc8a8b;
 const format_tag_t BAc16a16b = dnnl_BAc16a16b;
+const format_tag_t BAcd8a8b = dnnl_BAcd8a8b;
 const format_tag_t BAcd16a16b = dnnl_BAcd16a16b;
 const format_tag_t ABc32a16b = dnnl_ABc32a16b;
 const format_tag_t ABcd32a16b = dnnl_ABcd32a16b;
@@ -648,6 +671,7 @@ const format_tag_t ABc40a16b = dnnl_ABc40a16b;
 const format_tag_t ABcd40a16b = dnnl_ABcd40a16b;
 const format_tag_t ABcde40a16b = dnnl_ABcde40a16b;
 const format_tag_t ABc32a32b = dnnl_ABc32a32b;
+const format_tag_t BAcde8a8b = dnnl_BAcde8a8b;
 const format_tag_t BAcde16a16b = dnnl_BAcde16a16b;
 const format_tag_t ABcd32a32b = dnnl_ABcd32a32b;
 const format_tag_t ABcde32a32b = dnnl_ABcde32a32b;
@@ -679,6 +703,7 @@ const format_tag_t AB32a32b8a2b = dnnl_AB32a32b8a2b;
 const format_tag_t AB8a2b = dnnl_AB8a2b;
 const format_tag_t abDc16d = dnnl_abDc16d;
 const format_tag_t abDc32d = dnnl_abDc32d;
+const format_tag_t abDC16d4c = dnnl_abDC16d4c;
 const format_tag_t abDC32d4c = dnnl_abDC32d4c;
 const format_tag_t abCd4c = dnnl_abCd4c;
 const format_tag_t abCde4c = dnnl_abCde4c;
@@ -688,6 +713,7 @@ const format_tag_t abCde32c = dnnl_abCde32c;
 const format_tag_t abCdef32c = dnnl_abCdef32c;
 const format_tag_t abdEc16e = dnnl_abdEc16e;
 const format_tag_t abdEc32e = dnnl_abdEc32e;
+const format_tag_t abdEC16e4c = dnnl_abdEC16e4c;
 const format_tag_t abdEC32e2c = dnnl_abdEC32e2c;
 const format_tag_t abdEC32e4c = dnnl_abdEC32e4c;
 const format_tag_t abdEC64e2c = dnnl_abdEC64e2c;
@@ -818,8 +844,10 @@ const format_tag_t aBdefC16c64b2c = dnnl_aBdefC16c64b2c;
 const format_tag_t aBdefC16c64b4c = dnnl_aBdefC16c64b4c;
 const format_tag_t decbA16a = dnnl_decbA16a;
 const format_tag_t decbA8a = dnnl_decbA8a;
+const format_tag_t decbA4a = dnnl_decbA4a;
 const format_tag_t defcbA16a = dnnl_defcbA16a;
 const format_tag_t defcbA8a = dnnl_defcbA8a;
+const format_tag_t defcbA4a = dnnl_defcbA4a;
 const format_tag_t aCB16c2b = dnnl_aCB16c2b;
 const format_tag_t aCB16c4b = dnnl_aCB16c4b;
 const format_tag_t BA16b2a = dnnl_BA16b2a;
@@ -1039,6 +1067,22 @@ const format_tag_t ABcd8b24a2b = dnnl_ABcd8b24a2b;
 const format_tag_t AcdB8b24a2b = dnnl_AcdB8b24a2b;
 const format_tag_t ABcde8b24a2b = dnnl_ABcde8b24a2b;
 const format_tag_t AcdeB8b24a2b = dnnl_AcdeB8b24a2b;
+const format_tag_t BA2a24b = dnnl_BA2a24b;
+const format_tag_t aCB2b24c = dnnl_aCB2b24c;
+const format_tag_t BA2a8b = dnnl_BA2a8b;
+const format_tag_t aCB2b8c = dnnl_aCB2b8c;
+const format_tag_t BA8a24b = dnnl_BA8a24b;
+const format_tag_t aCB8b24c = dnnl_aCB8b24c;
+const format_tag_t BA8a16b = dnnl_BA8a16b;
+const format_tag_t aCB8b16c = dnnl_aCB8b16c;
+const format_tag_t BA8a8b = dnnl_BA8a8b;
+const format_tag_t aCB8b8c = dnnl_aCB8b8c;
+const format_tag_t abDC8d8c = dnnl_abDC8d8c;
+const format_tag_t abDC16d8c = dnnl_abDC16d8c;
+const format_tag_t aCB8c8b = dnnl_aCB8c8b;
+const format_tag_t aCB16c8b = dnnl_aCB16c8b;
+const format_tag_t BA8b8a = dnnl_BA8b8a;
+const format_tag_t BA16b8a = dnnl_BA16b8a;
 
 const format_tag_t last = dnnl_format_tag_last;
 
@@ -1144,6 +1188,7 @@ const format_tag_t Ohwi32o = dnnl_Ohwi32o;
 const format_tag_t gIOhw16i16o = dnnl_gIOhw16i16o;
 const format_tag_t gOhwi32o = dnnl_gOhwi32o;
 const format_tag_t Goidhw16g = dnnl_Goidhw16g;
+const format_tag_t IOw8o8i = dnnl_IOw8o8i;
 const format_tag_t IOw16o16i = dnnl_IOw16o16i;
 const format_tag_t IOw16i16o = dnnl_IOw16i16o;
 const format_tag_t gIOw16i16o = dnnl_gIOw16i16o;
@@ -1199,7 +1244,9 @@ const format_tag_t Owi4o = dnnl_Owi4o;
 const format_tag_t Owi8o = dnnl_Owi8o;
 const format_tag_t OwI8o2i = dnnl_OwI8o2i;
 const format_tag_t OwI8o4i = dnnl_OwI8o4i;
+const format_tag_t IOdhw8o8i = dnnl_IOdhw8o8i;
 const format_tag_t IOdhw16o16i = dnnl_IOdhw16o16i;
+const format_tag_t IOhw8o8i = dnnl_IOhw8o8i;
 const format_tag_t IOhw16o16i = dnnl_IOhw16o16i;
 const format_tag_t Ohwi16o = dnnl_Ohwi16o;
 const format_tag_t OhwI16o2i = dnnl_OhwI16o2i;
@@ -1307,6 +1354,7 @@ const format_tag_t OIdhw8i8o = dnnl_OIdhw8i8o;
 const format_tag_t OdhwI8i8o = dnnl_OdhwI8i8o;
 const format_tag_t OIdhw8o8i = dnnl_OIdhw8o8i;
 const format_tag_t OIdhw8o4i = dnnl_OIdhw8o4i;
+const format_tag_t gIOw8o8i = dnnl_gIOw8o8i;
 const format_tag_t gIOw16o16i = dnnl_gIOw16o16i;
 const format_tag_t Goiw16g = dnnl_Goiw16g;
 const format_tag_t Goiw8g = dnnl_Goiw8g;
@@ -1335,7 +1383,9 @@ const format_tag_t gOwi4o = dnnl_gOwi4o;
 const format_tag_t gOwi8o = dnnl_gOwi8o;
 const format_tag_t gOwI8o2i = dnnl_gOwI8o2i;
 const format_tag_t gOwI8o4i = dnnl_gOwI8o4i;
+const format_tag_t gIOdhw8o8i = dnnl_gIOdhw8o8i;
 const format_tag_t gIOdhw16o16i = dnnl_gIOdhw16o16i;
+const format_tag_t gIOhw8o8i = dnnl_gIOhw8o8i;
 const format_tag_t gIOhw16o16i = dnnl_gIOhw16o16i;
 const format_tag_t gOhwi16o = dnnl_gOhwi16o;
 const format_tag_t gOhwI16o2i = dnnl_gOhwI16o2i;
@@ -1434,10 +1484,12 @@ const format_tag_t gOIhw4o8i2o = dnnl_gOIhw4o8i2o;
 const format_tag_t gOIdhw4o8i2o = dnnl_gOIdhw4o8i2o;
 const format_tag_t ldOi16o = dnnl_ldOi16o;
 const format_tag_t ldOi32o = dnnl_ldOi32o;
+const format_tag_t ldOI16o4i = dnnl_ldOI16o4i;
 const format_tag_t ldOI32o4i = dnnl_ldOI32o4i;
 const format_tag_t ldIo32i = dnnl_ldIo32i;
 const format_tag_t ldgOi16o = dnnl_ldgOi16o;
 const format_tag_t ldgOi32o = dnnl_ldgOi32o;
+const format_tag_t ldgOI16o4i = dnnl_ldgOI16o4i;
 const format_tag_t ldgOI32o2i = dnnl_ldgOI32o2i;
 const format_tag_t ldgOI32o4i = dnnl_ldgOI32o4i;
 const format_tag_t ldgOI64o2i = dnnl_ldgOI64o2i;
@@ -1798,8 +1850,10 @@ const format_tag_t gIdhwO24i4o = dnnl_gIdhwO24i4o;
 
 const format_tag_t hwioG16g = dnnl_hwioG16g;
 const format_tag_t hwioG8g = dnnl_hwioG8g;
+const format_tag_t hwioG4g = dnnl_hwioG4g;
 const format_tag_t dhwioG16g = dnnl_dhwioG16g;
 const format_tag_t dhwioG8g = dnnl_dhwioG8g;
+const format_tag_t dhwioG4g = dnnl_dhwioG4g;
 const format_tag_t Owi24o = dnnl_Owi24o;
 const format_tag_t Ohwi24o = dnnl_Ohwi24o;
 const format_tag_t Odhwi24o = dnnl_Odhwi24o;
@@ -1865,6 +1919,7 @@ const normalization_flags_t use_scale = dnnl_use_scale;
 const normalization_flags_t use_shift = dnnl_use_shift;
 const normalization_flags_t fuse_norm_relu = dnnl_fuse_norm_relu;
 const normalization_flags_t fuse_norm_add_relu = dnnl_fuse_norm_add_relu;
+const normalization_flags_t rms_norm = dnnl_rms_norm;
 } // namespace normalization_flags
 
 using rnn_flags_t = dnnl_rnn_flags_t;
@@ -1929,6 +1984,7 @@ const primitive_kind_t group_normalization = dnnl_group_normalization;
 // Internal only primitive kinds.
 const primitive_kind_t internal_only_start = (primitive_kind_t)(1 << 12);
 const primitive_kind_t zero_pad = internal_only_start;
+const primitive_kind_t sdpa = (primitive_kind_t)(internal_only_start + 1);
 } // namespace primitive_kind
 
 using query_t = dnnl_query_t;
@@ -1999,21 +2055,23 @@ const query_t inner_nblks_s32 = dnnl_query_inner_nblks_s32;
 const query_t inner_blks = dnnl_query_inner_blks;
 const query_t inner_idxs = dnnl_query_inner_idxs;
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 const query_t sparse_encoding = dnnl_query_sparse_encoding;
 const query_t nnz_s64 = dnnl_query_nnz_s64;
 const query_t num_handles_s32 = dnnl_query_num_handles_s32;
-#else
-const query_t sparse_encoding = static_cast<query_t>(266);
-const query_t nnz_s64 = static_cast<query_t>(267);
-const query_t num_handles_s32 = static_cast<query_t>(268);
-#endif
 
 // Internal only query kinds.
 const query_t internal_only_start = (query_t)(1 << 12);
 const query_t zero_pad_d = internal_only_start;
 const query_t preferred_gpu_threads_per_eu = (query_t)(internal_only_start + 1);
 } // namespace query
+
+// There are no external values to map to because this is an internal feature
+// for now.
+using matmul_reduce_kind_t = int;
+namespace matmul_reduce_kind {
+const matmul_reduce_kind_t undef = 0;
+const matmul_reduce_kind_t src = 1;
+} // namespace matmul_reduce_kind
 
 using rnn_direction_t = dnnl_rnn_direction_t;
 

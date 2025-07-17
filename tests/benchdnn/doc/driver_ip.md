@@ -21,13 +21,11 @@ where *ip-knobs* are:
             Refer to [tags](knobs_tag.md) for details.
  - `--dtag={any [default], ...}` -- physical dst memory layout.
             Refer to [tags](knobs_tag.md) for details.
- - `--attr-scales=STRING` -- scale primitive attribute. No scale is
-            set by default. Refer to [attributes](knobs_attr.md) for details.
- - `--attr-post-ops=STRING` -- post operation primitive attribute. No post
-            operations are set by default. Refer to [attributes](knobs_attr.md)
-            for details.
- - `--attr-fpmath=STRING` -- fpmath mode primitive attribute. `strict` math mode
-            is set by default. Refer to [attributes](knobs_attr.md) for details.
+ - `--bia-dt={undef [default], f32, bf16, f16, ...}` -- bias data type.
+            To run Inner Product without bias, use `undef` data type (default).
+            `--dir=FWD_B|BWD_WB` will set `--bia-dt` to `f32` to preserve
+            compatibility with the former behavior.
+            Refer to [data types](knobs_dt.md) for details.
  - `--mb=INT` -- override minibatch size specified in the problem description.
              When set to `0`, use minibatch size as defined by the individual
              problem descriptor. The default is `0`.
@@ -35,6 +33,7 @@ where *ip-knobs* are:
             `REGEX`. By default no pattern is applied (run everything).
             Note: Windows may interpret only string arguments surrounded by
             double quotation marks.
+ - Any attributes options. Refer to [attributes](knobs_attr.md) for details.
 
 and *ip-desc* is a problem descriptor. The canonical form is:
 ```

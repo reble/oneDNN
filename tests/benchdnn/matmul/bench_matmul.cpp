@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,17 +25,7 @@
 
 namespace matmul {
 
-using create_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t *,
-        res_t *)>;
-using check_cache_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t *,
-        res_t *)>;
-using do_func_t = std::function<int(
-        const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &,
-        const prb_t *, res_t *)>;
-using driver_task_executor_t = task_executor_t<prb_t, perf_report_t,
-        create_func_t, check_cache_func_t, do_func_t>;
+TASK_EXECUTOR_DECL_TYPES;
 
 void check_correctness(
         const settings_t &s, driver_task_executor_t &task_executor) {
@@ -53,34 +43,19 @@ void check_correctness(
     for_(const auto &i_stag : s.stag)
     for_(const auto &i_wtag : s.wtag)
     for_(const auto &i_dtag : s.dtag)
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     for_(const auto &i_sparse_options : s.sparse_options)
-#endif
     for_(const auto &i_strides : s.strides)
     for_(const auto &i_rt_dims_masks : s.rt_dims_masks)
-    for_(const auto &i_scales : s.scales)
-    for_(const auto &i_zero_points : s.zero_points)
-    for_(const auto &i_post_ops : s.post_ops)
-    for_(const auto &i_scratchpad_mode : s.scratchpad_mode)
-    for_(const auto &i_deterministic : s.deterministic)
+    for_(const auto &i_attr : s.attributes)
     for_(const auto &i_ctx_init : s.ctx_init)
     for_(const auto &i_ctx_exe : s.ctx_exe)
-    for_(const auto &i_fpmath_mode : s.fpmath_mode)
-    for_(const auto &i_acc_mode : s.acc_mode)
     for (const auto &i_bia_cfg : bia_cfg) {
-        auto attr = settings_t::get_attr(i_scales, i_zero_points, i_post_ops,
-                i_scratchpad_mode, i_fpmath_mode, i_acc_mode, i_deterministic);
-
         const prb_t prb(s.prb_vdims, i_dt, i_stag, i_wtag, i_dtag, i_strides,
                 i_bia_cfg.first, i_bia_cfg.second, i_rt_dims_masks,
-#ifdef DNNL_EXPERIMENTAL_SPARSE
-                i_sparse_options,
-#endif
-                attr, i_ctx_init, i_ctx_exe);
+                i_sparse_options, i_attr, i_ctx_init, i_ctx_exe, s.impl_filter);
         if (s.pattern && !match_regex(prb.str(), s.pattern)) return;
 
-        task_executor.submit(
-                prb, s.perf_template, createit, check_cacheit, doit);
+        task_executor.submit(prb, s.perf_template, createit, checkit, doit);
     }
 }
 
@@ -101,7 +76,7 @@ int verify_input(const settings_t &s, const settings_t &def) {
 
     for (const auto &i_strides : s.strides) {
         if (i_strides.size() != n_inputs) {
-            std::stringstream ss;
+            dnnl::impl::stringstream_t ss;
             ss << i_strides;
             fprintf(stderr,
                     "ERROR: matmul driver: `strides` option expects three "
@@ -163,6 +138,15 @@ static const std::string help_runtime_dims_masks
           "For tensors with runtime dimensions specified a correspondent "
           "memory format must be specified, too.\n";
 
+bool parse_legacy_dt(std::vector<dnnl_data_type_t> &dt,
+        const std::vector<dnnl_data_type_t> &def_dt, const char *str,
+        const std::string &option_name /* = "dt"*/) {
+    // TODO: uncomment in v3.8
+    // BENCHDNN_PRINT(0, "%s\n", "Warning: \'--bia_dt\' option is deprecated.
+    //         Please use the \'--bia-dt\' one.");
+    return parser::parse_dt(dt, def_dt, str, option_name);
+}
+
 int bench(int argc, char **argv) {
     driver_name = "matmul";
     using namespace parser;
@@ -176,38 +160,24 @@ int bench(int argc, char **argv) {
                 || parse_tag(s.stag, def.stag, argv[0], "stag")
                 || parse_tag(s.wtag, def.wtag, argv[0], "wtag")
                 || parse_tag(s.dtag, def.dtag, argv[0], "dtag")
-#ifdef DNNL_EXPERIMENTAL_SPARSE
                 || parse_encoding(s.sparse_options, argv[0], "encoding")
-#endif
                 || parse_strides(s.strides, def.strides, argv[0], "strides")
-                || parse_dt(s.bia_dt, def.bia_dt, argv[0], "bia_dt")
+                || parse_dt(s.bia_dt, def.bia_dt, argv[0], "bia-dt")
+                // TODO: remove this later
+                || parse_legacy_dt(s.bia_dt, def.bia_dt, argv[0], "bia_dt")
                 || parse_vector_option(s.bia_mask, def.bia_mask, atoi, argv[0],
                         "bia_mask", help_bia_mask)
                 || parse_multivector_option(s.rt_dims_masks, def.rt_dims_masks,
                         atoi, argv[0], "runtime_dims_masks",
                         help_runtime_dims_masks)
-                || parse_attr_scales(s.scales, argv[0])
-                || parse_attr_zero_points(s.zero_points, argv[0])
-                || parse_attr_post_ops(s.post_ops, argv[0])
-                || parse_attr_scratchpad_mode(
-                        s.scratchpad_mode, def.scratchpad_mode, argv[0])
-                || parse_attr_fpmath_mode(
-                        s.fpmath_mode, def.fpmath_mode, argv[0])
-                || parse_attr_acc_mode(s.acc_mode, def.acc_mode, argv[0])
-                || parse_attr_deterministic(
-                        s.deterministic, def.deterministic, argv[0])
-                || parse_ctx_init(s.ctx_init, def.ctx_init, argv[0])
-                || parse_ctx_exe(s.ctx_exe, def.ctx_exe, argv[0])
-                || parse_test_pattern_match(s.pattern, argv[0])
-                || parse_perf_template(s.perf_template, s.perf_template_def,
-                        s.perf_template_csv(), argv[0])
-                || parse_reset(s, argv[0]) || parse_help(argv[0]);
+                || parse_driver_shared_settings(s, def, argv[0]);
         if (!parsed_options) {
             catch_unknown_options(argv[0]);
 
             parse_prb_vdims(s.prb_vdims, argv[0]);
 
             SAFE(verify_input(s, def), WARN);
+            s.finalize();
             check_correctness(s, task_executor);
         }
     }

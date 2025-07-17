@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2021 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,12 +25,12 @@ namespace impl {
 namespace cpu {
 namespace x64 {
 
-class jit_avx512_core_gemm_bf16bf16f32_kern : public jit_generator {
+class jit_avx512_core_gemm_bf16bf16f32_kern_t : public jit_generator_t {
 public:
-    jit_avx512_core_gemm_bf16bf16f32_kern(
+    jit_avx512_core_gemm_bf16bf16f32_kern_t(
             bool beta_zero, bool alpha_one, bool use_zmm);
-    ~jit_avx512_core_gemm_bf16bf16f32_kern();
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_gemm_bf16bf16f32_kern);
+    ~jit_avx512_core_gemm_bf16bf16f32_kern_t() override;
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_gemm_bf16bf16f32_kern_t);
 
 protected:
     bool beta_zero_;
@@ -58,7 +58,7 @@ protected:
     void innerloop(int unroll_m, int unroll_n);
     void outerloop(int unroll_x, int unroll_y, Xbyak::Label *&outerloop_label);
 
-    void generate() override ATTRIBUTE_OPTIMIZE;
+    void generate() override;
 
 private:
     static const int UNROLL_N_ = 8;
@@ -90,13 +90,15 @@ private:
             arg_coffset_r_;
 
     // For bfloat16 emulation on avx512 and avx512_vnni ISAs
-    bf16_emulation_t *bf16_emu_;
+    std::unique_ptr<bf16_emulation_t> bf16_emu_;
     Xbyak::Reg64 scratch_;
     Xbyak::Zmm one_;
     Xbyak::Zmm even_;
     Xbyak::Zmm selector_;
     Xbyak::Zmm zmm_tmp0_;
     Xbyak::Zmm zmm_tmp1_;
+
+    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_avx512_core_gemm_bf16bf16f32_kern_t);
 };
 
 } // namespace x64

@@ -1,5 +1,11 @@
 --reset
 
+# Test v2 implementation
+--batch=option_set_v2
+--impl=v2
+--batch=option_set_v2
+--reset
+
 # f32
 --dt=f32
 --mb=2,16
@@ -37,7 +43,6 @@
 --dir=FWD_B
 --batch=set_gpu
 
-# bf16
 --dt=bf16,f32:bf16:bf16
 --mb=2,16
 --dir=BWD_D
@@ -114,7 +119,7 @@ g2ic2ih1iw2oc4oh1ow2kh1kw1ph0pw0
 --stag=axb,abx
 --wtag=xba,abx
 --dtag=axb,abx
---dir=FWD_B,BWD_WB --mb=2 --batch=shapes_basic_gpu
+--dir=FWD_B,BWD_WB --mb=2 --batch=shapes_ci_gpu
 
 # regression test cases
 --batch=test_conv_regression_gpu
@@ -131,9 +136,32 @@ mb128ic3ih230oc64oh112kh7sh2ph0
 --mb=2,16
 --dir=FWD_B --stag=any
 --batch=set_gpu
---batch=shapes_basic_gpu
+--batch=shapes_ci_gpu
 
-# dw gen9 fwd conv
+# fp8 Stochastic Rounding
+--reset
+--dt=f8_e5m2,f8_e4m3
+--mb=2,16
+--dir=FWD_B
+--attr-rounding-mode=dst:stochastic
+--batch=shapes_ci_gpu
+
+# mixed fp8
+--reset --mb=1 --dt=f8_e5m2:f8_e5m2:bf16,f8_e4m3:f8_e4m3:bf16 --dir=fwd_d --batch=shapes_basic
+--reset --mb=1 --dt=f16:f8_e5m2:f8_e5m2,f32:f8_e4m3:f8_e4m3 --dir=bwd_d --batch=shapes_basic
+--reset --mb=1 --dt=f8_e5m2:f16:f8_e5m2,f8_e4m3:f32:f8_e4m3 --dir=bwd_w --batch=shapes_basic
+--reset --mb=1 --dt=f8_e5m2,f8_e4m3 --dir=fwd_d
+--attr-scales=wei:per_oc:bf16+dst:per_oc:bf16,\
+                      wei:common:2:bf16+src:common:2:bf16+dst:common:2:bf16,\
+                      wei:per_oc:f32+dst:per_oc:f32,\
+                      wei:common:2:f32+src:common:2:f32+dst:common:2:f32
+--batch=shapes_ci_gpu
+
+# Test fp4
+--reset
+--batch=test_conv_fp4
+
+# dw xe fwd conv
 --reset
 --dt=f16,f16:f16:s8
 --mb=48,64
@@ -142,6 +170,31 @@ mb128ic3ih230oc64oh112kh7sh2ph0
 --batch=shapes_mobilenet_dw
 
 --batch=harness_conv_arbitrary_dst
+
+# Test CI in Nightly
+--reset
+--batch=test_conv_gpu_ci
+
+# Test zero points
+--reset
+--batch=harness_conv_zero_points
+
+# Test strided tensors
+--reset
+--dt=u8:s8:u8,f16,f32
+--mb=1,16
+--dir=FWD_B,BWD_D
+--batch=shapes_mem_strided
+
+--reset
+--dt=bf16,f32
+--mb=1,16
+--dir=BWD_WB
+--batch=shapes_mem_strided
+
+# ref smoke test
+--batch=harness_conv_smoke_ref
+
 
 # Test layers of some key GPU DL Frameworks
 --reset

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,8 +15,8 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef GPU_NVIDIA_SYCL_CUDA_ELTWISE_IMPL_HPP
-#define GPU_NVIDIA_SYCL_CUDA_ELTWISE_IMPL_HPP
+#ifndef GPU_NVIDIA_CUDNN_ELTWISE_IMPL_HPP
+#define GPU_NVIDIA_CUDNN_ELTWISE_IMPL_HPP
 
 #include "cudnn.h"
 
@@ -92,6 +92,13 @@ public:
         if (pd->ndims() > CUDNN_DIM_MAX) { return status::invalid_arguments; }
         ndims = pd->ndims() < 4 ? 4 : pd->ndims();
 
+        for (int i = 0; i < ndims; ++i) {
+            if (pd->src_md()->padded_dims[i]
+                    > std::numeric_limits<int>::max()) {
+                return status::unimplemented;
+            }
+        }
+
         // Obtain source and destination dimensions, strides and datatype
         convert_dims(pd->src_md()->padded_dims, dims_, pd->ndims());
         convert_dims(pd->src_md()->format_desc.blocking.strides, strides_,
@@ -139,6 +146,12 @@ public:
         if (pd->ndims() > CUDNN_DIM_MAX) { return status::invalid_arguments; }
         ndims = pd->ndims() < 4 ? 4 : pd->ndims();
 
+        for (int i = 0; i < ndims; ++i) {
+            if (pd->src_md()->padded_dims[i]
+                    > std::numeric_limits<int>::max()) {
+                return status::unimplemented;
+            }
+        }
         // Obtain dimension and strides for the backward eltwise operation
         convert_dims(pd->src_md()->padded_dims, dims_, pd->ndims());
 

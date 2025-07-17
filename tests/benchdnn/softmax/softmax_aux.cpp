@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,6 +30,8 @@ alg_t str2alg(const char *str) {
     CASE(softmax_accurate);
     CASE(LOGSOFTMAX);
     CASE(softmax_log);
+    CASE(SOFTMAX_INF_AS_ZERO);
+    CASE(softmax_accurate_inf_as_zero);
 #undef CASE
     assert(!"unknown algorithm");
     return UNDEF;
@@ -38,12 +40,13 @@ alg_t str2alg(const char *str) {
 const char *alg2str(alg_t alg) {
     if (alg == SOFTMAX) return "SOFTMAX";
     if (alg == LOGSOFTMAX) return "LOGSOFTMAX";
+    if (alg == SOFTMAX_INF_AS_ZERO) return "SOFTMAX_INF_AS_ZERO";
     assert(!"unknown algorithm");
     return "UNDEF";
 }
 
 std::string prb_t::set_repro_line() {
-    std::stringstream s;
+    dnnl::impl::stringstream_t s;
     dump_global_params(s);
     settings_t def;
 
@@ -62,6 +65,8 @@ std::string prb_t::set_repro_line() {
         s << "--ctx-init=" << ctx_init << " ";
     if (canonical || ctx_exe != def.ctx_exe[0])
         s << "--ctx-exe=" << ctx_exe << " ";
+    if (canonical || !impl_filter.is_def() || !global_impl_filter.is_def())
+        s << impl_filter;
 
     s << static_cast<prb_dims_t>(*this);
 

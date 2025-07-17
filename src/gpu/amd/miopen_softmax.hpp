@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,26 +22,26 @@
 
 #include "miopen/miopen.h"
 
-#include "common/primitive.hpp"
 #include "common/softmax_pd.hpp"
+#include "gpu/amd/engine.hpp"
 #include "gpu/amd/miopen_softmax_impl.hpp"
-#include "gpu/amd/sycl_hip_engine.hpp"
 #include "gpu/amd/sycl_hip_utils.hpp"
+#include "gpu/gpu_primitive.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace gpu {
 namespace amd {
 
-struct miopen_softmax_fwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_softmax_fwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public softmax_fwd_pd_t {
         using softmax_fwd_pd_t::softmax_fwd_pd_t;
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_softmax_fwd_t);
 
-        status_t init(engine_t *) {
+        status_t init(impl::engine_t *) {
             const memory_desc_wrapper src_d(src_md());
             const memory_desc_wrapper dst_d(dst_md());
             bool ok = is_fwd()
@@ -78,15 +78,15 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 };
 
-struct miopen_softmax_bwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_softmax_bwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public softmax_bwd_pd_t {
         using softmax_bwd_pd_t::softmax_bwd_pd_t;
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_softmax_bwd_t);
 
-        status_t init(engine_t *) {
+        status_t init(impl::engine_t *) {
             const memory_desc_wrapper diff_src_d(diff_src_md());
             const memory_desc_wrapper diff_dst_d(diff_dst_md());
             const memory_desc_wrapper dst_d(dst_md());

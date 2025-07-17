@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,12 +18,14 @@
 #define BENCHDNN_GRAPH_REF_PARTITION_HPP
 
 #include <list>
-#include "deserialize.hpp"
+#include <unordered_set>
+
 #include "dnnl_common.hpp"
+
+#include "deserialize.hpp"
 #include "graph_memory.hpp"
 #include "input_displacer.hpp"
 #include "ref_primitive.hpp"
-#include <unordered_set>
 
 namespace graph {
 
@@ -32,14 +34,16 @@ public:
     ref_partition_t() = default;
     // to get a Topo ordered partition OPs reference and save the map
     // of input/output logical tensors ids to partition OPs reference
-    ref_partition_t(const deserialized_graph &dg,
+    ref_partition_t(const deserialized_graph_t &dg,
             const dnnl::graph::partition &par,
             const std::vector<dnnl::graph::logical_tensor> &ins,
             const std::vector<dnnl::graph::logical_tensor> &outs);
 
     // prepare memories in both paths, one by one ref primitive
-    int init_ref(const std::vector<size_t> &graph_ports,
-            partition_mem_map_t &partition_mem_map, res_t *res);
+    int init_ref(const std::vector<size_t> &graph_ports, res_t *res);
+
+    int init_graph_mem(partition_mem_map_t &partition_mem_map, res_t *res);
+
     // run partition in ref path, one by one ref primitive
     void exec_ops(res_t *res);
 
@@ -47,42 +51,62 @@ public:
     int check_partition_correctness(
             partition_mem_map_t &partition_mem_map, res_t *res);
 
+    // check the partition memory footprint of graph path
+    int check_partition_total_size(const deserialized_op_t &op, res_t *res);
+
+    // check the partition memory footprint of reference path
+    int check_partition_total_size(
+            const check_mem_size_args_t &check_mem_size_args, bool is_output_op,
+            res_t *res);
+
     // get the reference of ops of the partition
     const op_ref_list_t &get_partition_ops() const {
         return partition_ops_ref_;
     }
 
 private:
-    // check whether partition input ops support bf16-in-f32-out rewrite
-    bool check_valid_bf16_in() const;
+    // Returns `true` if an `op` has a parent op in the partition for any of
+    // its logical tensors.
+    // When `check_all_in_lts` is set to true, returns `true` if only the op has
+    // a parent for each of its logical tensors.
+    bool has_parent_op(
+            const deserialized_op_t &op, bool check_all_in_lts) const;
 
-    // check whether partition output ops support bf16-in-f32-out rewrite
-    bool check_valid_bf16_out() const;
+    // Returns `true` if an `op` has a child op in the partition.
+    // If `child_op_ptr` is not empty, updates the pointer with a child op.
+    //
+    // Note: double pointer is needed to initialize a pointer. A pointer is
+    // needed to avoid a copy of an `child_op` object.
+    bool has_child_op(const deserialized_op_t &op,
+            const deserialized_op_t **child_op_ptr) const;
 
-    bool is_bf16_partition_support_f32_intermediate_result() const;
+    // Returns a pointer to parent op for a given input lt id. If the parent is
+    // not found, an empty pointer is returned.
+    const deserialized_op_t *get_parent_op(size_t in_lt_id) const;
 
-    // bf16 cases:use f32 as intermediate tensor dt to improve accuracy
-    void handle_special_case_bf16(res_t *res);
+    // Returns `true` if unfusable transcendental op should have cropped output.
+    // `dt` is a target data type for following transform. Updated only when the
+    // function returns `true`.
+    bool need_unfusable_output_crop(const deserialized_op_t &op,
+            size_t output_offset, dnnl_data_type_t &dt) const;
 
-    // rewrite x16->f32 from typecast (f32->x16) to typecast (x16->f32)
-    void handle_typecast_x16();
+    bool is_input_op(const deserialized_op_t &op) const;
+    bool is_output_op(const deserialized_op_t &op) const;
+    std::vector<size_t> get_in_out_lt_ids(const deserialized_op_t &op) const;
 
+    const deserialized_graph_t *dg_;
     // Objects below are constructed.
     // OPs in the partition, which is Topo ordered
     op_ref_list_t partition_ops_ref_;
     // map of input logical tensor id to its consumer ops
     std::unordered_map<size_t, op_ref_list_t> in_lt_2_ops_;
     // map of output logical tensor id to its producer op
-    std::unordered_map<size_t, std::reference_wrapper<const deserialized_op>>
-            out_lt_2_op_;
+    std::unordered_map<size_t, op_ref_t> out_lt_2_op_;
     ::graph::partition_data_displacer_t data_displacer;
     // partition in logical tensors' ids
     std::vector<size_t> partition_in_ids_;
     // partition out logical tensors' ids
     std::vector<size_t> partition_out_ids_;
-    // Objects below are modified at special bf16 and int8 cases.
-    // IDs of logical tensors to replace bf16 data type with fp32.
-    std::unordered_set<size_t> bf16_to_f32_rewrite_lt_id_;
 
     // reference primitives for a single partition
     std::unordered_map<size_t, ::std::shared_ptr<ref_primitive_t>> ref_prims_;
@@ -94,7 +118,7 @@ private:
     // keep the lt id for fake output which is not supported by primitive
     std::unordered_set<size_t> fake_lt_ids_;
 
-    std::unordered_map<size_t, const deserialized_lt &> lt_id_2_lt_;
+    std::unordered_map<size_t, const deserialized_lt_t &> lt_id_2_lt_;
 };
 
 } // namespace graph

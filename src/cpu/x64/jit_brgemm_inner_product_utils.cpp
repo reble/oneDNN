@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
 *******************************************************************************/
 
 #include "cpu/x64/jit_brgemm_inner_product_utils.hpp"
+#include "common/math_utils.hpp"
 
 #include "cpu/x64/brgemm/brgemm.hpp"
 
@@ -169,8 +170,10 @@ jit_brgemm_ip_conf_t::get_desired_weights_tag() const {
     using namespace format_tag;
     const int n_sp_dims = jbgp.ndims - 2;
     const bool is_xf16 = utils::one_of(jbgp.wei_dt, bf16, f16);
+    const bool is_fp8 = utils::one_of(jbgp.wei_dt, f8_e5m2, f8_e4m3);
     const bool is_not_vnni_tag = jbgp.wei_dt == f32
-            || (jbgp.wei_dt == f16 && jbgp.isa == avx512_core_fp16);
+            || (jbgp.wei_dt == f16
+                    && one_of(jbgp.isa, avx512_core_fp16, avx10_2_512));
     if (is_not_vnni_tag) {
         if (is_superset(jbgp.isa, avx512_core))
             return {{64,
@@ -224,7 +227,7 @@ jit_brgemm_ip_conf_t::get_desired_weights_tag() const {
                             pick(n_sp_dims, OI8i8o2i, OwI8i8o2i, OhwI8i8o2i,
                                     OdhwI8i8o2i)}};
         }
-    } else if (jbgp.wei_dt == data_type::s8) {
+    } else if (jbgp.wei_dt == data_type::s8 || is_fp8) {
         if (jbgp.is_amx) {
             return {{64,
                             pick(n_sp_dims, OI16i64o4i, OwI16i64o4i,
@@ -442,8 +445,7 @@ status_t jit_brgemm_ip_fwd_conf_t::init_conf(cpu_isa_t isa,
     const memory_desc_wrapper dst_d(&dst_md);
     if (!post_ops_ok(attr, dst_d)) return status::unimplemented;
     if (jbgp.with_scales) {
-        const auto &wei_scales = attr.scales_.get(DNNL_ARG_WEIGHTS);
-        jbgp.is_oc_scale = wei_scales.mask_ != 0;
+        jbgp.is_oc_scale = attr.scales_.get_mask(DNNL_ARG_WEIGHTS) > 0;
     }
 
     const int min_ic_divisor = is_amx_int8 ? 4 : is_amx_xf16 ? 2 : 1;
@@ -696,11 +698,12 @@ status_t jit_brgemm_ip_fwd_conf_t::init_conf(cpu_isa_t isa,
 
     if (use_min_os_block) {
         // Get potential bd_block from main kernel.
-        brgemm_t brg_desc;
+        brgemm_desc_t brg_desc;
         status_t st = brgemm_desc_init(&brg_desc, isa, jbgp.brg_type,
                 jbgp.src_dt, jbgp.wei_dt, false, false, brgemm_row_major, 1.0f,
                 1.0f, jbgp.ic_without_padding, jbgp.oc_block,
                 jbgp.oc_without_padding, jbgp.os_block, jbgp.oc_block, jbgp.K);
+        if (st == success) st = brgemm_desc_finalize(&brg_desc);
 
         if (st == success) {
             int bd_block = brg_desc.bd_block;
@@ -1259,7 +1262,7 @@ status_t jit_brgemm_ip_bwd_w_conf_t::init_conf(cpu_isa_t isa,
 }
 
 size_t buf_dt_size(data_type_t dt, cpu_isa_t isa) {
-    const auto buf_dt = isa == avx512_core_fp16 && dt == data_type::f16
+    const auto buf_dt = one_of(isa, avx512_core_fp16) && dt == data_type::f16
             ? data_type::f32
             : dt;
     return types::data_type_size(buf_dt);
@@ -1344,9 +1347,28 @@ status_t jit_brgemm_ip_conf_t::init_conf_base(cpu_isa_t isa,
             && one_of(attr.fpmath_.mode_, fpmath_mode::bf16, fpmath_mode::any)
             && jbgp.is_amx;
 
+    const bool is_fp8
+            = everyone_is(f8_e5m2, jbgp.src_dt, jbgp.wei_dt, jbgp.dst_dt)
+            || pick_by_prop_kind(jbgp.prop_kind,
+                    everyone_is(f8_e5m2, jbgp.src_dt, jbgp.wei_dt)
+                            && one_of(jbgp.dst_dt, f32, f16),
+                    everyone_is(f8_e5m2, jbgp.wei_dt, jbgp.dst_dt)
+                            && jbgp.src_dt == f32,
+                    everyone_is(f8_e5m2, jbgp.src_dt, jbgp.dst_dt)
+                            && jbgp.wei_dt == f32)
+            || everyone_is(f8_e4m3, jbgp.src_dt, jbgp.wei_dt, jbgp.dst_dt)
+            || pick_by_prop_kind(jbgp.prop_kind,
+                    everyone_is(f8_e4m3, jbgp.src_dt, jbgp.wei_dt)
+                            && one_of(jbgp.dst_dt, f32, f16),
+                    everyone_is(f8_e4m3, jbgp.wei_dt, jbgp.dst_dt)
+                            && jbgp.src_dt == f32,
+                    everyone_is(f8_e4m3, jbgp.src_dt, jbgp.dst_dt)
+                            && jbgp.wei_dt == f32);
+
     if (!IMPLICATION(is_int8,
                 one_of(isa, avx2_vnni, avx2_vnni_2, avx512_core,
-                        avx512_core_vnni, avx512_core_amx)))
+                        avx512_core_vnni, avx512_core_amx, avx10_2_512,
+                        avx10_2_512_amx_2)))
         return status::unimplemented;
     if (!IMPLICATION(is_bf16,
                 one_of(isa, avx2_vnni_2, avx512_core_bf16, avx512_core_amx)))
@@ -1354,11 +1376,13 @@ status_t jit_brgemm_ip_conf_t::init_conf_base(cpu_isa_t isa,
     if (!IMPLICATION(is_f32, jbgp.is_bf32 || one_of(isa, avx512_core, avx2)))
         return status::unimplemented;
     if (!IMPLICATION(is_f16,
-                one_of(isa, avx2_vnni_2, avx512_core_fp16,
-                        avx512_core_amx_fp16)))
+                one_of(isa, avx2_vnni_2, avx512_core_fp16, avx512_core_amx_fp16,
+                        avx10_2_512)))
+        return status::unimplemented;
+    if (!IMPLICATION(is_fp8, one_of(isa, avx512_core_amx_fp16)))
         return status::unimplemented;
 
-    if (!one_of(true, is_int8, is_bf16, is_f16, is_f32))
+    if (!one_of(true, is_int8, is_bf16, is_f16, is_f32, is_fp8))
         return status::unimplemented;
     if (is_int8) {
         jbgp.acc_dt = s32;
@@ -1379,8 +1403,7 @@ status_t jit_brgemm_ip_conf_t::init_conf_base(cpu_isa_t isa,
             = (jbgp.os <= 16 && jbgp.ic <= amx_row && jbgp.oc <= amx_row)
             || (jbgp.ic <= max_size && jbgp.oc <= max_size && jbgp.mb == 1
                     && jbgp.ic % amx_row != 0);
-    if (one_of(jbgp.isa, avx512_core_amx, avx512_core_amx) && is_small_shapes)
-        return status::unimplemented;
+    if (jbgp.is_amx && is_small_shapes) return status::unimplemented;
 
     auto set_or_check_tags = [&]() -> status_t {
         using namespace format_tag;
@@ -1688,7 +1711,9 @@ void jit_brgemm_ip_fwd_conf_t::choose_loop_order() {
     const bool is_int8 = one_of(src_dt, u8, s8) && wei_dt == s8;
     const bool is_compute_amx = (is_xf16 || is_int8) && is_amx;
 
-    if ((os_block < 32 || do_occ_osc) && (is_compute_amx || is_f32_avx2))
+    // Disable specific shape to use osb inner most order for perf purpose
+    if ((os_block < 32 || do_occ_osc) && (is_compute_amx || is_f32_avx2)
+            && !(os == 16384 && ic == 768 && oc == 30522))
         loop_order = icc_occ_osc_ocb_osb;
 }
 

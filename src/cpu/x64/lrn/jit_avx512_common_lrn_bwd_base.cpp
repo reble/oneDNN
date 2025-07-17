@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -70,12 +70,18 @@ void jit_avx512_common_lrn_kernel_bwd_t<f16>::load_data(
 template <>
 void jit_avx512_common_lrn_kernel_bwd_t<f16>::store_data(
         bool nt, const Address addr, Zmm zr) {
-    this->vcvtps2ph(addr, zr, this->_op_mxcsr);
+    this->vcvtps2ph(addr, zr, jit_generator_t::_op_mxcsr);
 }
 
 template <>
 void jit_avx512_common_lrn_kernel_bwd_t<bf16>::store_data(
         bool nt, const Address addr, Zmm zr) {
+    const bool is_bf16_supported
+            = mayiuse(avx512_core_bf16) || bf16_emu_ != nullptr;
+    if (!is_bf16_supported) {
+        assert(!"Failure in storing bf16 data.");
+        return;
+    }
     const Ymm yr = Ymm(zr.getIdx());
     if (mayiuse(avx512_core_bf16))
         vcvtneps2bf16(yr, zr);
@@ -98,7 +104,7 @@ void jit_avx512_common_lrn_kernel_bwd_t<d_type>::load_tail(int tail_value,
         Reg64 src, int src_mem_offset, int dst_stack_offset,
         int tmp_load_to_stack_idx_tail) {
     // TODO: Investigate if this method can be simplified by using mask or
-    // jit_generator load utilities.
+    // jit_generator_t load utilities.
     static constexpr auto src_acc_size
             = utils::one_of(d_type, bf16, f16) ? acc_bf_16_size : acc_size;
     auto tmp_xreg = this->xreg(0, tmp_load_to_stack_idx_tail);
@@ -210,9 +216,8 @@ void jit_avx512_common_lrn_kernel_bwd_t<f16>::store_tail(int tail_value,
 
 template <data_type_t d_type>
 jit_avx512_common_lrn_kernel_bwd_t<d_type>::jit_avx512_common_lrn_kernel_bwd_t(
-        float alpha, float beta, int local_size, void *code_ptr,
-        size_t code_size, const char *name)
-    : jit_generator(name, code_ptr, code_size, true, avx512_core_bf16)
+        float alpha, float beta, int local_size, const char *name)
+    : jit_generator_t(name, avx512_core_bf16)
     , local_size_ {local_size - !(local_size % 2)}
     , z_prev_ {[this]() {
         std::vector<int> v(this->local_size_ / 2);

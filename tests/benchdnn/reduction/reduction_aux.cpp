@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -76,7 +76,7 @@ dnnl_alg_kind_t alg2alg_kind(alg_t alg) {
 }
 
 std::string prb_t::set_repro_line() {
-    std::stringstream s;
+    dnnl::impl::stringstream_t s;
     dump_global_params(s);
     settings_t def;
 
@@ -93,6 +93,8 @@ std::string prb_t::set_repro_line() {
         s << "--ctx-init=" << ctx_init << " ";
     if (canonical || ctx_exe != def.ctx_exe[0])
         s << "--ctx-exe=" << ctx_exe << " ";
+    if (canonical || !impl_filter.is_def() || !global_impl_filter.is_def())
+        s << impl_filter;
 
     s << static_cast<prb_vdims_t>(*this);
 

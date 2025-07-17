@@ -1,7 +1,8 @@
 /*******************************************************************************
 * Copyright 2017-2023 Intel Corporation
 * Copyright 2018 YANDEX LLC
-* Copyright 2020-2023 FUJITSU LIMITED
+* Copyright 2020-2024 FUJITSU LIMITED
+* Copyright 2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -32,7 +33,8 @@ namespace aarch64 {
 using namespace Xbyak_aarch64;
 using namespace alg_kind;
 
-#define GET_OFF(field) static_cast<uint32_t>(offsetof(jit_pool_call_s, field))
+#define GET_OFF(field) \
+    static_cast<uint32_t>(offsetof(jit_uni_pooling_args_t, field))
 
 static bcast_set_t get_supported_bcast_strategies() {
     return {broadcasting_strategy_t::scalar, broadcasting_strategy_t::per_oc,
@@ -121,7 +123,10 @@ status_t jit_uni_pool_kernel<isa>::init_conf(jit_pool_conf_t &jpp,
     jpp.ndims = ndims;
     jpp.mb = src_d.dims()[0];
     jpp.c_without_padding = src_d.dims()[1];
-    jpp.c_block = 16;
+    switch (isa) {
+        case sve_512: jpp.c_block = 16; break;
+        default: jpp.c_block = 8; break;
+    }
 
     jpp.alg = pd.alg_kind;
     jpp.tmp_md = memory_desc_t();
@@ -155,8 +160,9 @@ status_t jit_uni_pool_kernel<isa>::init_conf(jit_pool_conf_t &jpp,
                             && !(jpp.alg == pooling_max
                                     && block_size > L3_cache_size_per_core)));
 
-    ncsp_fmt_tag = ((forward_ncsp_allowed || backward_ncsp_allowed)
-                           && isa == sve_512 && ndims <= 5)
+    ncsp_fmt_tag
+            = ((forward_ncsp_allowed || backward_ncsp_allowed)
+                      && utils::one_of(isa, sve_512, sve_256) && ndims <= 5)
             ? utils::pick(ndims - 3, ncw, nchw, ncdhw)
             : format_tag::undef;
 
@@ -379,7 +385,8 @@ bool jit_uni_pool_kernel<isa>::post_ops_ok(jit_pool_conf_t &jpp,
         for (const auto &entry : entries) {
             if (entry.is_eltwise()) {
                 const auto alg = entry.eltwise.alg;
-                jpp.with_eltwise = eltwise_injector::is_supported(isa, alg);
+                jpp.with_eltwise
+                        = eltwise_injector::is_supported(to_vla_sve(isa), alg);
             } else if (entry.is_binary()) {
                 if (entry.binary.src1_desc.data_type == data_type::bf16
                         && entry.binary.src1_desc.data_type == data_type::f16)
@@ -541,7 +548,7 @@ inline void jit_uni_pool_kernel<isa>::avg_step(int ur_w, int ur_bc, int pad_l,
                     } else {
                         add_imm(X_DEFAULT_ADDR, aux_reg_input, input_offset,
                                 X_TMP_0);
-                        ldr(z_tmp0, ptr(X_DEFAULT_ADDR));
+                        ld1w(z_tmp0.s, P_ALL_ONE / T_z, ptr(X_DEFAULT_ADDR));
                         fadd(accvr, accvr, z_tmp0.s);
                     }
                 }
@@ -889,6 +896,11 @@ void jit_uni_pool_kernel<isa>::generate() {
 
     this->preamble();
 
+    size_t simd_w_ = cpu_isa_traits<isa>::vlen / sizeof(float);
+
+    if (simd_w_ != cpu_sveLen / sizeof(float))
+        set_preg(P_ALL_ONE.s, simd_w_, X_TMP_0, X_TMP_1);
+
     Label idx_table;
 
     int ow = jpp.ow;
@@ -1051,6 +1063,7 @@ void jit_uni_pool_kernel<isa>::generate() {
 }
 
 template struct jit_uni_pool_kernel<sve_512>;
+template struct jit_uni_pool_kernel<sve_256>;
 
 } // namespace aarch64
 } // namespace cpu

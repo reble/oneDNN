@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -75,8 +75,8 @@ std::ostream &operator<<(std::ostream &s, dnnl_engine_kind_t ek) {
 }
 
 dnnl_prop_kind_t prop2prop_kind(const dir_t dir) {
-    if (dir == FWD_D) return dnnl_forward_training;
     if (dir == FWD_I) return dnnl_forward_inference;
+    if (dir & FLAG_FWD) return dnnl_forward_training;
     if (dir == BWD_DW) return dnnl_backward;
     assert(!"unknown dir");
     return dnnl_prop_kind_undef;
@@ -99,7 +99,7 @@ static const std::map<int, std::vector<const char *>> supported_args {
         {DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS, {"attr_post_op_dw_wei"}},
 };
 
-static int str2arg(const std::string &str) {
+int str2arg(const std::string &str) {
     for (const auto &arg : supported_args)
         for (const auto &s : arg.second)
             if (str.compare(s) == 0) return arg.first;
@@ -110,15 +110,15 @@ static int str2arg(const std::string &str) {
         if (str_index.empty() /* TODO: || non-digit string */) {
             BENCHDNN_PRINT(0, "%s\n",
                     "Error: \'msrc\' argument requires index to be specified.");
-            return BENCHDNN_DNNL_ARG_UNDEF;
+            return DNNL_ARG_UNDEF;
         }
         const auto index = stoul(str_index);
         return DNNL_ARG_MULTIPLE_SRC + index;
     }
-    return BENCHDNN_DNNL_ARG_UNDEF;
+    return DNNL_ARG_UNDEF;
 }
 
-static std::string arg2str(int arg) {
+std::string arg2str(int arg) {
     if (supported_args.find(arg) != supported_args.end())
         return std::string(supported_args.at(arg)[0]);
     if (arg & DNNL_ARG_MULTIPLE_SRC) {
@@ -164,7 +164,20 @@ const char *attr_t::policy2str(policy_t policy) {
     return "unknown attr_t::policy_t policy";
 }
 
-int attr_t::get_default_mask(policy_t policy) {
+dnnl_rounding_mode_t str2rounding_mode(const std::string &str) {
+    std::string s(str);
+    // s.compare is lexicographical, case matters
+    std::transform(s.begin(), s.end(), s.begin(), ::tolower);
+#define CASE(_rm) \
+    if (s.compare(STRINGIFY(_rm)) == 0) return dnnl_rounding_mode_##_rm
+    CASE(environment);
+    CASE(stochastic);
+#undef CASE
+    assert(!"unknown attr_t::rounding_mode_t rounding_mode");
+    return dnnl_rounding_mode_environment;
+}
+
+int attr_t::get_default_mask(policy_t policy, int ndims) {
     switch (policy) {
         case PER_DIM_0: return (1 << 0);
         case PER_OC:
@@ -173,45 +186,56 @@ int attr_t::get_default_mask(policy_t policy) {
         case PER_DIM_01: return (1 << 0) + (1 << 1);
         case PER_DIM_2: return (1 << 2);
         case PER_DIM_3: return (1 << 3);
-        case PER_TENSOR: return (1 << DNNL_MAX_NDIMS) - 1;
+        case PER_TENSOR:
+            assert(ndims > 0 && ndims <= DNNL_MAX_NDIMS);
+            return (1 << ndims) - 1;
         case COMMON: return 0;
         default: SAFE(FAIL, CRIT); return 0;
     }
 }
 
-int attr_t::policy2mask(int arg, policy_t policy,
-        dnnl_primitive_kind_t prim_kind, const_dnnl_memory_desc_t wei_md,
-        bool has_groups) {
-    if (arg != DNNL_ARG_WEIGHTS || policy == policy_t::COMMON)
-        return attr_t::get_default_mask(policy);
+int attr_t::policy2mask(int arg, policy_t policy, int ndims,
+        dnnl_primitive_kind_t prim_kind, bool has_groups) {
 
     // Handle of weights mask for various primitives.
     if (prim_kind == dnnl_convolution || prim_kind == dnnl_deconvolution
             || prim_kind == dnnl_inner_product) {
+        if (arg != DNNL_ARG_WEIGHTS || policy == policy_t::COMMON)
+            return attr_t::get_default_mask(policy, ndims);
+
         switch (policy) {
             case PER_OC:
                 if (has_groups)
-                    return attr_t::get_default_mask(PER_DIM_01);
+                    return attr_t::get_default_mask(PER_DIM_01, ndims);
                 else
-                    return attr_t::get_default_mask(PER_DIM_0);
+                    return attr_t::get_default_mask(PER_DIM_0, ndims);
             default: SAFE(FAIL, CRIT); return -1;
         }
     } else if (prim_kind == dnnl_matmul) {
-        if (query_md_ndims(wei_md) <= 0) SAFE_V(FAIL);
+        if ((arg != DNNL_ARG_SRC && arg != DNNL_ARG_WEIGHTS
+                    && arg != DNNL_ARG_DST)
+                || policy == policy_t::COMMON)
+            return attr_t::get_default_mask(policy, ndims);
+
+        if (ndims < 2) SAFE_V(FAIL);
         switch (policy) {
-            case PER_OC: return (1 << (query_md_ndims(wei_md) - 1));
-            case PER_OCIC:
-                return (1 << (query_md_ndims(wei_md) - 1))
-                        + (1 << (query_md_ndims(wei_md) - 2));
+            case PER_DIM_1:
+            case PER_OC: return (1 << (ndims - 1));
+            case PER_OCIC: return (1 << (ndims - 1)) + (1 << (ndims - 2));
+            case PER_TENSOR: return attr_t::get_default_mask(policy, ndims);
             default: SAFE_V(FAIL); return -1;
         }
+    } else if (prim_kind == dnnl_layer_normalization) {
+        if (arg != DNNL_ARG_SRC_1 || policy != policy_t::PER_OC)
+            return attr_t::get_default_mask(policy, ndims);
+
+        // PER_OC
+        assert(policy == policy_t::PER_OC);
+        if (ndims < 1) SAFE_V(FAIL);
+        return 1 << (ndims - 1);
     } else {
-        assert(prim_kind == dnnl_undefined_primitive);
-        assert(!"Weights may have specific mask for a given primitive. "
-                "Please re-direct new primitive to one of two branches "
-                "above");
-        SAFE(FAIL, CRIT);
-        return -1;
+        // Default case
+        return attr_t::get_default_mask(policy, ndims);
     }
 }
 
@@ -227,13 +251,13 @@ int parse_value_and_runtime(float &value, const std::string &s) {
                 "Error: scale or zero point input value is expected to be a "
                 "real number. Given input:",
                 s.c_str());
-        SAFE_V(FAIL);
+        SAFE(FAIL, WARN);
     }
     if (scale_pos != s.size()) {
         BENCHDNN_PRINT(0, "%s \'%s\'. %s \'%g\'.\n",
                 "Error: not every input symbol was processed. Given input:",
                 s.c_str(), "Parsed value:", value);
-        SAFE_V(FAIL);
+        SAFE(FAIL, WARN);
     }
     return OK;
 }
@@ -291,6 +315,8 @@ int attr_t::arg_scales_t::entry_t::from_str(const std::string &s) {
 
     if (!groups.empty()) {
         switch (this->policy) {
+            case PER_TENSOR:
+            case PER_OC:
             case PER_OCIC:
                 if (this->groups.size() != 2) {
                     BENCHDNN_PRINT(0, "%s\n",
@@ -301,7 +327,8 @@ int attr_t::arg_scales_t::entry_t::from_str(const std::string &s) {
                 break;
             default:
                 BENCHDNN_PRINT(0, "%s\n",
-                        "Error: groups are supported only for policy PER_OCIC");
+                        "Error: groups are supported only for PER_OC and "
+                        "PER_OCIC policies.");
                 SAFE_V(FAIL);
         }
     }
@@ -357,6 +384,8 @@ int attr_t::zero_points_t::entry_t::from_str(const std::string &s) {
             parser::parser_utils::stoll_safe, g_str, 'x');
     if (!groups.empty()) {
         switch (this->policy) {
+            case PER_TENSOR:
+            case PER_OC:
             case PER_OCIC:
                 if (this->groups.size() != 2) {
                     BENCHDNN_PRINT(0, "%s\n",
@@ -388,7 +417,7 @@ int attr_t::zero_points_t::from_str(const std::string &s) {
         size_t subs_pos = 0;
 
         auto arg = str2arg(parser::get_substr(subs, subs_pos, ':'));
-        if (arg == BENCHDNN_DNNL_ARG_UNDEF || subs_pos == std::string::npos
+        if (arg == DNNL_ARG_UNDEF || subs_pos == std::string::npos
                 || subs_pos >= subs.size()) {
             BENCHDNN_PRINT(0,
                     "Error: argument name \'%s\' was not recognized.\n",
@@ -419,7 +448,7 @@ int attr_t::arg_scales_t::from_str(const std::string &s) {
         size_t subs_pos = 0;
 
         auto arg = str2arg(parser::get_substr(subs, subs_pos, ':'));
-        if (arg == BENCHDNN_DNNL_ARG_UNDEF || subs_pos == std::string::npos
+        if (arg == DNNL_ARG_UNDEF || subs_pos == std::string::npos
                 || subs_pos >= s.size()) {
             BENCHDNN_PRINT(0,
                     "Error: argument name \'%s\' was not recognized.\n",
@@ -506,6 +535,7 @@ static po_table_entry_t kind_table[] = {
         {pk_t::MIN, {"min", "binary_min"}, dnnl_binary_min},
         {pk_t::MUL, {"mul", "binary_mul"}, dnnl_binary_mul},
         {pk_t::NE, {"ne", "binary_ne"}, dnnl_binary_ne},
+        {pk_t::SELECT, {"select", "binary_select"}, dnnl_binary_select},
         {pk_t::SUB, {"sub", "binary_sub"}, dnnl_binary_sub},
         {pk_t::BINARY_END, {"binary_undef"}, dnnl_alg_kind_undef},
         // prelu
@@ -547,37 +577,47 @@ dnnl_alg_kind_t attr_t::post_ops_t::kind2dnnl_kind(pk_t kind) {
     return kind_table[table_size - 1].dnnl_kind;
 }
 
-std::vector<std::pair<int, int>> attr_t::post_ops_t::get_po_masks() const {
+std::vector<std::pair<int, int>> attr_t::post_ops_t::get_po_masks(
+        int ndims, dnnl_primitive_kind_t prim_kind) const {
     std::vector<std::pair<int, int>> v_masks;
     for (int idx = 0; idx < len(); ++idx) {
         const auto &e = this->entry[idx];
         int mask = -1;
-        int arg = BENCHDNN_DNNL_ARG_UNDEF;
+        int arg = DNNL_ARG_UNDEF;
         if (e.is_binary_kind()) {
             using mask_input_t = entry_t::binary_t::mask_input_t;
             auto mask_input = e.binary.mask_input;
             mask = mask_input == mask_input_t::mask
                     ? e.binary.mask
-                    : attr_t::get_default_mask(e.binary.policy);
+                    : policy2mask(
+                            DNNL_ARG_SRC_1, e.binary.policy, ndims, prim_kind);
             arg = DNNL_ARG_SRC_1;
         } else if (e.is_prelu_kind()) {
-            mask = attr_t::get_default_mask(e.prelu.policy);
+            mask = attr_t::get_default_mask(e.prelu.policy, ndims);
             arg = DNNL_ARG_WEIGHTS;
         } else
             continue;
 
         assert(mask >= 0);
-        v_masks.emplace_back(std::make_pair(
-                DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | arg, mask));
+        v_masks.emplace_back(DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | arg, mask);
+
+        // there is no broadcasting support for the ternary src2 input, hence
+        // no mask is required.
+        if (e.is_binary_kind_with_ternary_op())
+            v_masks.emplace_back(
+                    DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_SRC_2, -1);
     }
     return v_masks;
 }
 
-bool attr_t::is_def(bool skip_fpmath) const {
+bool attr_t::is_def(bool skip_fpmath, bool skip_acc_mode) const {
     return scales.is_def() && zero_points.is_def() && post_ops.is_def()
             && scratchpad_mode == get_default_scratchpad_mode()
             && IMPLICATION(!skip_fpmath, fpmath_mode.is_def())
-            && deterministic.is_def();
+            && IMPLICATION(
+                    !skip_acc_mode, acc_mode == dnnl_accumulation_mode_strict)
+            && rounding_mode.is_def() && deterministic.is_def()
+            && dropout.is_def();
 }
 
 int attr_t::post_ops_t::find(pk_t kind, int start, int stop) const {
@@ -599,6 +639,9 @@ bool attr_t::post_ops_t::entry_t::is_eltwise_kind() const {
 }
 bool attr_t::post_ops_t::entry_t::is_binary_kind() const {
     return kind > pk_t::BINARY_START && kind < pk_t::BINARY_END;
+}
+bool attr_t::post_ops_t::entry_t::is_binary_kind_with_ternary_op() const {
+    return kind == pk_t::SELECT;
 }
 bool attr_t::post_ops_t::entry_t::is_prelu_kind() const {
     return kind == PRELU;
@@ -643,7 +686,7 @@ std::ostream &operator<<(
 
     s << scale.policy;
     if (scale.policy == policy_t::COMMON) s << ":" << scale.scale;
-    if (scale.dt != dnnl_f32) s << ':' << scale.dt;
+    if (scale.dt != dnnl_f32 || !scale.groups.empty()) s << ':' << scale.dt;
     if (!scale.groups.empty()) s << ":" << dims2str(scale.groups);
     return s;
 }
@@ -658,7 +701,8 @@ std::ostream &operator<<(
         s << arg2str(point.first) << ":" << point.second.policy;
         if (point.second.policy == policy_t::COMMON)
             s << ":" << point.second.value;
-        if (point.second.dt != dnnl_s32) s << ':' << point.second.dt;
+        if (point.second.dt != dnnl_s32 || !point.second.groups.empty())
+            s << ':' << point.second.dt;
         if (!point.second.groups.empty())
             s << ":" << dims2str(point.second.groups);
         delim = "+";
@@ -710,18 +754,42 @@ std::ostream &operator<<(std::ostream &s, const attr_t::post_ops_t &post_ops) {
                 s << ":" << e.eltwise.alpha;
         } else if (e.is_binary_kind()) {
             s << ":" << e.binary.src1_dt;
+            const auto src_delim
+                    = e.is_binary_kind_with_ternary_op() ? "." : ":";
+
             using mask_input_t
                     = attr_t::post_ops_t::entry_t::binary_t::mask_input_t;
+
             if (e.binary.mask_input != mask_input_t::none
                     || e.binary.tag != tag::any) {
                 if (e.binary.mask_input == mask_input_t::mask) {
-                    s << ":" << e.binary.mask;
+                    s << src_delim << e.binary.mask;
                 } else {
                     assert(e.binary.mask_input == mask_input_t::policy);
-                    s << ":" << e.binary.policy;
+                    s << src_delim << e.binary.policy;
                 }
             }
-            if (e.binary.tag != tag::any) s << ":" << e.binary.tag;
+            if (e.binary.tag != tag::any) s << src_delim << e.binary.tag;
+
+            if (e.is_binary_kind_with_ternary_op()) {
+                bool delim_added = false;
+
+                if (e.binary.src2_mask_input != mask_input_t::none
+                        || e.binary.src2_tag != tag::any) {
+                    s << ":";
+                    delim_added = true;
+                    if (e.binary.src2_mask_input == mask_input_t::mask) {
+                        s << e.binary.src2_mask;
+                    } else {
+                        assert(e.binary.src2_mask_input
+                                == mask_input_t::policy);
+                        s << e.binary.src2_policy;
+                    }
+                }
+                if (e.binary.src2_tag != tag::any) {
+                    s << (delim_added ? src_delim : ":") << e.binary.src2_tag;
+                }
+            }
         } else if (e.is_prelu_kind()) {
             if (e.prelu.policy != policy_t::COMMON) {
                 s << ":" << e.prelu.policy;
@@ -751,8 +819,25 @@ std::ostream &operator<<(std::ostream &s, dnnl_accumulation_mode_t am) {
     return s;
 }
 
+std::ostream &operator<<(std::ostream &s, const attr_t::rounding_mode_t &rm) {
+    std::string sep;
+    for (const auto &i : rm.rounding_modes_) {
+        s << sep << arg2str(i.first) << ":" << rounding_mode2str(i.second);
+        if (rm.is_set_seed) s << ":" << rm.seed;
+        sep = "+";
+    }
+    return s;
+}
+
 std::ostream &operator<<(std::ostream &s, const attr_t::deterministic_t &d) {
     s << bool2str(d.enabled);
+    return s;
+}
+
+std::ostream &operator<<(std::ostream &s, const attr_t::dropout_t &drop) {
+    s << drop.p;
+    if ((drop.seed != 0) || (drop.tag != tag::any)) s << ":" << drop.seed;
+    if (drop.tag != tag::any) s << ":" << drop.tag;
     return s;
 }
 
@@ -769,13 +854,16 @@ std::ostream &operator<<(std::ostream &s, const attr_t &attr) {
             s << "--attr-fpmath=" << attr.fpmath_mode << " ";
         if (attr.acc_mode != dnnl_accumulation_mode_strict)
             s << "--attr-acc-mode=" << attr.acc_mode << " ";
+        if (!attr.rounding_mode.is_def())
+            s << "--attr-rounding-mode=" << attr.rounding_mode << " ";
         if (!attr.deterministic.is_def())
             s << "--attr-deterministic=" << attr.deterministic << " ";
+        if (!attr.dropout.is_def())
+            s << "--attr-dropout=" << attr.dropout << " ";
     }
     return s;
 }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 std::ostream &operator<<(std::ostream &s, dnnl_sparse_encoding_t se) {
     s << sparse_encoding2str(se);
     return s;
@@ -803,7 +891,6 @@ std::ostream &operator<<(
     }
     return s;
 }
-#endif
 
 std::ostream &operator<<(std::ostream &s, memory_kind_ext_t memory_kind) {
     switch (memory_kind) {
@@ -852,27 +939,35 @@ std::ostream &dump_global_params(std::ostream &s) {
         s << "--cpu-isa-hints=" << isa_hints_t::hints2str(hints) << " ";
     if (canonical || attr_same_pd_check != false)
         s << "--attr-same-pd-check=" << bool2str(attr_same_pd_check) << " ";
+    if (canonical || check_ref_impl != false)
+        s << "--check-ref-impl=" << bool2str(check_ref_impl) << " ";
 #if defined(DNNL_WITH_SYCL) || DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
     if (canonical || memory_kind != default_memory_kind)
         s << "--memory-kind=" << memory_kind << " ";
     if (canonical || stream_kind != default_stream_kind)
         s << "--stream-kind=" << stream_kind << " ";
 #endif
-    if (canonical || cold_cache_mode != default_cold_cache_mode)
-        s << "--cold-cache=" << cold_cache_mode << " ";
+    if (canonical || cold_cache_input != default_cold_cache_input())
+        s << "--cold-cache=" << cold_cache_input << " ";
+    if (canonical || execution_mode != execution_mode_t::direct)
+        s << "--execution-mode=" << execution_mode2str(execution_mode) << " ";
 
     return s;
 }
 
-dnnl_engine_kind_t str2engine_kind(const char *str) {
-    const char *param = "cpu";
-    if (!strncasecmp(param, str, strlen(param))) return dnnl_cpu;
-
-    param = "gpu";
-    if (!strncasecmp(param, str, strlen(param))) return dnnl_gpu;
-
-    assert(!"not expected");
-    return dnnl_cpu;
+dnnl_engine_kind_t str2engine_kind(const std::string &s) {
+    if (s == "cpu") {
+        return dnnl_cpu;
+    } else if (s == "gpu") {
+        return dnnl_gpu;
+    } else {
+        BENCHDNN_PRINT(0,
+                "Error: engine kind supports values \'cpu\' and \'gpu\' only. "
+                "Given input: %s\n",
+                s.c_str());
+        SAFE_V(FAIL);
+    }
+    return dnnl_any_engine;
 }
 
 dnnl_scratchpad_mode_t str2scratchpad_mode(const char *str) {
@@ -945,10 +1040,11 @@ struct post_ops_rhs_tensor_entry_t {
 namespace {
 
 post_ops_rhs_tensor_entry_t get_po_rhs_tensor_entry(
-        const attr_t::post_ops_t::entry_t &entry) {
+        const attr_t::post_ops_t::entry_t &entry, int ndims,
+        dnnl_primitive_kind_t prim_kind) {
     if (entry.is_prelu_kind()) {
         const auto &prelu = entry.prelu;
-        const int mask = attr_t::get_default_mask(prelu.policy);
+        const int mask = attr_t::get_default_mask(prelu.policy, ndims);
         return {dnnl_f32, mask, tag::axb, DNNL_ARG_WEIGHTS};
     } else if (entry.is_binary_kind()) {
         const auto &binary = entry.binary;
@@ -960,7 +1056,8 @@ post_ops_rhs_tensor_entry_t get_po_rhs_tensor_entry(
             case mask_input_t::none: mask = 0; break;
             case mask_input_t::mask: mask = binary.mask; break;
             case mask_input_t::policy:
-                mask = attr_t::get_default_mask(binary.policy);
+                mask = attr_t::policy2mask(
+                        DNNL_ARG_SRC_1, binary.policy, ndims, prim_kind);
                 break;
             default: assert(!"unknown mask_input value"); break;
         }
@@ -972,8 +1069,8 @@ post_ops_rhs_tensor_entry_t get_po_rhs_tensor_entry(
 
 } // namespace
 
-int attr_args_t::prepare_post_ops_mds(
-        const attr_t &attr, int ndims, const dnnl_dims_t prb_dims) {
+int attr_args_t::prepare_post_ops_mds(const attr_t &attr, int ndims,
+        const dnnl_dims_t prb_dims, dnnl_primitive_kind_t prim_kind) {
     const auto &po = attr.post_ops;
     dnnl_dims_t dims;
     for (int d = 0; d < ndims; ++d)
@@ -983,7 +1080,8 @@ int attr_args_t::prepare_post_ops_mds(
         const auto &e = po.entry[idx];
         if (e.is_binary_kind() || e.is_prelu_kind()) {
 
-            const auto po_rhs_tensor_entry = get_po_rhs_tensor_entry(e);
+            const auto po_rhs_tensor_entry
+                    = get_po_rhs_tensor_entry(e, ndims, prim_kind);
             const int mask = po_rhs_tensor_entry.mask;
 
             // deduce binary, prelu dims based on input policy
@@ -996,10 +1094,26 @@ int attr_args_t::prepare_post_ops_mds(
             mds.emplace((DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
                                 | po_rhs_tensor_entry.arg_attr_mask),
                     std::move(rhs_tensor_desc));
+
+            if (e.is_binary_kind_with_ternary_op()) {
+                auto rhs_src2_tensor_desc = dnn_mem_t::init_md(
+                        ndims, dims, e.binary.src2_dt, tag::any);
+                mds.emplace(
+                        (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_SRC_2),
+                        std::move(rhs_src2_tensor_desc));
+            }
+
         } else if (e.is_convolution_kind()) {
             // Update dims for post operations appended after conv_dw
             conv_dw_fusion::get_fused_conv_dst_dims(ndims, e, dims, dims);
         }
+    }
+
+    // dropout
+    if (!attr.dropout.is_def()) {
+        auto drop_tensor_desc
+                = dnn_mem_t::init_md(ndims, dims, dnnl_u8, attr.dropout.tag);
+        mds.emplace(DNNL_ARG_ATTR_DROPOUT_MASK, std::move(drop_tensor_desc));
     }
 
     return OK;
@@ -1015,7 +1129,7 @@ void attr_args_t::prepare_dw_post_op(
 }
 
 dnnl_primitive_attr_t create_dnnl_attr(
-        const attr_t &attr, const attr_args_t &attr_args) {
+        const attr_t &attr, const attr_args_t &attr_args, const int ndims) {
     dnnl_primitive_attr_t dnnl_attr = nullptr;
     DNN_SAFE_V(dnnl_primitive_attr_create(&dnnl_attr));
 
@@ -1026,14 +1140,12 @@ dnnl_primitive_attr_t create_dnnl_attr(
             if (as.is_def(arg_name)) continue;
 
             const auto &e = arg.second;
-            // Weights mask differs from primitive to primitive, that's why it
-            // is stashed in `attr_args` at primitive creation time.
-            const bool is_wei_arg = arg_name == DNNL_ARG_WEIGHTS
-                    || arg_name
-                            == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
-            int mask = (is_wei_arg && e.policy != policy_t::COMMON)
-                    ? attr_args.get_mask(arg_name)
-                    : attr_t::policy2mask(arg_name, e.policy);
+            // Check if there's a arg with pre-defined mask in `attr_args`...
+            int args_mask = attr_args.get_mask(DNNL_ARG_ATTR_SCALES | arg_name);
+            // If it's non-default, use it, otherwise, deduce it.
+            int mask = args_mask != attr_args_t::undefined_mask
+                    ? args_mask
+                    : attr_t::policy2mask(arg_name, e.policy, ndims);
 
             DNN_SAFE_V(dnnl_primitive_attr_set_scales(dnnl_attr, arg_name, mask,
                     static_cast<int>(e.groups.size()), e.groups.data(), e.dt));
@@ -1047,14 +1159,13 @@ dnnl_primitive_attr_t create_dnnl_attr(
             if (zp.is_def(arg_name)) continue;
 
             const auto &e = arg.second;
-            // Weights mask differs from primitive to primitive, that's why it
-            // is stashed in `attr_args` at primitive creation time.
-            const bool is_wei_arg = arg_name == DNNL_ARG_WEIGHTS
-                    || arg_name
-                            == (DNNL_ARG_ATTR_POST_OP_DW | DNNL_ARG_WEIGHTS);
-            int mask = (is_wei_arg && e.policy != policy_t::COMMON)
-                    ? attr_args.get_mask(DNNL_ARG_ATTR_ZERO_POINTS | arg_name)
-                    : attr_t::policy2mask(arg_name, e.policy);
+            // Check if there's a arg with pre-defined mask in `attr_args`...
+            int args_mask
+                    = attr_args.get_mask(DNNL_ARG_ATTR_ZERO_POINTS | arg_name);
+            // If it's non-default, use it, otherwise, deduce it.
+            int mask = args_mask != attr_args_t::undefined_mask
+                    ? args_mask
+                    : attr_t::policy2mask(arg_name, e.policy, ndims);
 
             int ndims = static_cast<int>(e.groups.size());
             const auto &groups = e.groups.data();
@@ -1062,6 +1173,13 @@ dnnl_primitive_attr_t create_dnnl_attr(
 
             DNN_SAFE_V(dnnl_primitive_attr_set_zero_points(
                     dnnl_attr, arg_name, mask, ndims, groups, dt));
+        }
+    }
+
+    if (!attr.rounding_mode.is_def()) {
+        for (const auto &e : attr.rounding_mode.rounding_modes_) {
+            DNN_SAFE_V(dnnl_primitive_attr_set_rounding(
+                    dnnl_attr, e.first, e.second));
         }
     }
 
@@ -1088,12 +1206,20 @@ dnnl_primitive_attr_t create_dnnl_attr(
             } else if (e.is_binary_kind()) {
                 const auto &src1_md = attr_args.get_md(
                         (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_SRC_1));
+                const auto &src2_md = attr_args.get_md(
+                        (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_SRC_2));
                 assert(query_md_ndims(src1_md) != 0);
-                DNN_SAFE_V(dnnl_post_ops_append_binary(
-                        ops, e.binary.alg, src1_md));
+
+                if (e.is_binary_kind_with_ternary_op()) {
+                    assert(query_md_ndims(src2_md) != 0);
+                }
+
+                DNN_SAFE_V(dnnl_post_ops_append_binary_v2(
+                        ops, e.binary.alg, src1_md, src2_md));
+
             } else if (e.is_prelu_kind()) {
                 const auto &policy = e.prelu.policy;
-                const auto mask = attr_t::get_default_mask(policy);
+                const auto mask = attr_t::get_default_mask(policy, ndims);
                 DNN_SAFE_V(dnnl_post_ops_append_prelu(ops, mask));
             } else {
                 assert(!"unknown attr::post_ops::kind");
@@ -1118,6 +1244,10 @@ dnnl_primitive_attr_t create_dnnl_attr(
     DNN_SAFE_V(dnnl_primitive_attr_set_deterministic(
             dnnl_attr, attr.deterministic.enabled));
 
+    if (!attr.dropout.is_def()) {
+        const auto &drop_mask_md = attr_args.get_md(DNNL_ARG_ATTR_DROPOUT_MASK);
+        DNN_SAFE_V(dnnl_primitive_attr_set_dropout(dnnl_attr, drop_mask_md));
+    }
     return dnnl_attr;
 }
 
@@ -1505,7 +1635,7 @@ float compute_eltwise_bwd(
     return NAN;
 }
 
-float compute_binary(pk_t kind, float src0, float src1) {
+float compute_binary(pk_t kind, float src0, float src1, bool src2) {
     // don't compute on nan, propagate it
     if (std::isnan(src0) || std::isnan(src1)) return NAN;
 
@@ -1533,18 +1663,55 @@ float compute_binary(pk_t kind, float src0, float src1) {
         return src0 == src1;
     } else if (kind == pk_t::NE) {
         return src0 != src1;
+    } else if (kind == pk_t::SELECT) {
+        return src2 ? src0 : src1;
     } else {
         assert(!"operation not supported!");
     }
     return NAN;
 }
 
+// This function is a full copy of ref_dropout(...) from the library.
+void maybe_dropout(const attr_t &attr, float &val, int64_t offset,
+        const dnn_mem_t &dropout_m) {
+
+    auto philox_bernoulli = [](float p, int seed, int64_t d) {
+        uint32_t r = dnnl::impl::math::philox4x32(d, seed);
+        p = std::max(std::min(p, 1.f), 0.f);
+        return (r > double(std::numeric_limits<uint32_t>::max()) * p);
+    };
+
+    if (!attr.dropout.is_def()) {
+        float p = attr.dropout.p;
+        int seed = attr.dropout.seed;
+        float inv_q = (p != 1.f) ? 1.f / (1.f - p) : 0.f;
+        uint8_t m = philox_bernoulli(p, seed, offset);
+        dropout_m.set_elem(offset, m);
+        val = (m) ? val * inv_q : 0;
+    }
+}
+
+void maybe_round(const attr_t &attr, int arg, float &val, int64_t offset,
+        dnnl_data_type_t dst_dt) {
+    uint32_t seed = attr.rounding_mode.seed;
+    switch (attr.rounding_mode.get(arg)) {
+        case dnnl_rounding_mode_stochastic:
+            val = dnnl::impl::math::stochastic_round_fwd(
+                    val, offset, seed, dst_dt);
+            break;
+        case dnnl_rounding_mode_environment: break;
+        default: assert(!"unknown rounding mode");
+    }
+}
+
 void maybe_post_ops(const attr_t &attr, float &val, float sum_val,
         const std::vector<float> &v_po_vals) {
+    const auto &po = attr.post_ops;
+    if (po.len() == 0) return;
+
     using namespace dnnl::impl::math;
 
     auto it_po = v_po_vals.begin();
-    const auto &po = attr.post_ops;
     for (int idx = 0; idx < po.len(); ++idx) {
         const auto &e = po.entry[idx];
 
@@ -1557,7 +1724,15 @@ void maybe_post_ops(const attr_t &attr, float &val, float sum_val,
             const auto &b = e.eltwise.beta;
             val = compute_eltwise_fwd(e.kind, val, a, b);
         } else if (e.is_binary_kind()) {
-            val = compute_binary(e.kind, val, *it_po);
+
+            auto src1_val = *it_po;
+            bool src2_val = false;
+
+            if (e.is_binary_kind_with_ternary_op()) {
+                it_po++;
+                src2_val = static_cast<bool>(*it_po);
+            }
+            val = compute_binary(e.kind, val, src1_val, src2_val);
             it_po++;
         } else if (e.is_prelu_kind()) {
             val = val > 0 ? val : val * (*it_po);
@@ -1566,24 +1741,33 @@ void maybe_post_ops(const attr_t &attr, float &val, float sum_val,
     }
 }
 
-void update_cpu_ref_attrs(attr_t &attr, dnnl_data_type_t new_dt) {
+// This is a part of prim_ref setup. Update binary post-op data types and tags
+// to let prim_ref dispatch to the library as GPU may use data types not
+// supported natively on CPU, and output format may not be supported as well.
+// prim_ref will be configured and correspondent reorders used to a selected by
+// the library format.
+//
+// `dst_dt` helps to decide on sum_dt. When it's not f32, `sum.dt` must be
+// preserved, otherwise, updated.
+void update_cpu_ref_attrs(attr_t &attr, dnnl_data_type_t dst_dt) {
     auto &po = attr.post_ops;
     for (int idx = 0; idx < po.len(); ++idx) {
         auto &e = po.entry[idx];
-        if (!e.is_binary_kind()) continue;
-
-        e.binary.src1_dt = new_dt;
-        e.binary.tag = tag::abx; // Hardcoded in local fill functions.
-        // Since tag is updated, it might get printed with policy, which means
-        // that mask_input should be specified.
-        using mask_input_t
-                = attr_t::post_ops_t::entry_t::binary_t::mask_input_t;
-        if (e.binary.mask_input == mask_input_t::none)
-            e.binary.mask_input = mask_input_t::policy;
+        if (e.is_binary_kind()) {
+            e.binary.src1_dt = dnnl_f32;
+            e.binary.tag = tag::any;
+            // Since tag is updated, it might get printed with policy, which
+            // means that mask_input should be specified.
+            using mask_input_t
+                    = attr_t::post_ops_t::entry_t::binary_t::mask_input_t;
+            if (e.binary.mask_input == mask_input_t::none)
+                e.binary.mask_input = mask_input_t::policy;
+        } else if (e.is_sum_kind()) {
+            if (dst_dt == dnnl_f32) e.sum.dt = dnnl_data_type_undef;
+        }
     }
 }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 int sparse_options_t::from_str(const std::string &s) {
     *this = sparse_options_t();
     if (s.empty()) return OK;
@@ -1600,7 +1784,9 @@ int sparse_options_t::from_str(const std::string &s) {
     int options_count = 0;
     size_t start_pos = 0;
     while (start_pos != std::string::npos) {
-        auto subs = parser::get_substr(s, start_pos, ':');
+        // Note: `csr+0.99::` is a valid input, dangling `:` is legit.
+        auto subs = parser::get_substr(
+                s, start_pos, ':', /* allow_dangling = */ true);
 
         if (subs.empty()) {
             add(get_arg(options_count), sparse_options_t::def_encoding,
@@ -1626,6 +1812,3 @@ int sparse_options_t::from_str(const std::string &s) {
     static const int expected_num_options = 3;
     return options_count == expected_num_options ? OK : FAIL;
 }
-#endif
-
-#undef BENCHDNN_DNNL_ARG_UNDEF

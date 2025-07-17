@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -49,10 +49,10 @@ cpu_isa_t get_io_isa(cpu_isa_t isa, data_type_t d_type) {
 template <template <cpu_isa_t isa, data_type_t d_type> class Derived,
         cpu_isa_t isa, data_type_t d_type>
 jit_uni_lrn_kernel_t<Derived<isa, d_type>>::jit_uni_lrn_kernel_t(
-        void *code_ptr, size_t code_size, const char *name)
-    : jit_generator(name, code_ptr, code_size, true, isa)
-    , emulate_bfloat_(isa == avx512_core && d_type == data_type::bf16
-              && !mayiuse(avx512_core_bf16))
+        const char *name)
+    : jit_generator_t(name, isa)
+    , emulate_bfloat_(d_type == data_type::bf16 && !mayiuse(avx512_core_bf16)
+              && is_superset(isa, avx512_core))
     , bf16_emu_(
               emulate_bfloat_ ? utils::make_unique<bf16_emulation_t>(this,
                       bf16_emu_reserv_1_, bf16_emu_reserv_2_,
@@ -67,12 +67,11 @@ jit_uni_lrn_kernel_t<Derived<isa, d_type>>::jit_uni_lrn_kernel_t(
 template <template <cpu_isa_t isa, data_type_t d_type> class Derived,
         cpu_isa_t isa, data_type_t d_type>
 jit_uni_lrn_kernel_t<Derived<isa, d_type>>::jit_uni_lrn_kernel_t(
-        const within_config_t &config, void *code_ptr, size_t code_size,
-        const char *name)
-    : jit_uni_lrn_kernel_t(code_ptr, code_size, name) {
+        const within_config_t &config, const char *name)
+    : jit_uni_lrn_kernel_t(name) {
     if (config.dat_tag == nhwc)
         single_pixel_offset_
-                = config.C * sizeof(typename prec_traits<d_type>::type);
+                = config.C * sizeof(typename prec_traits_t<d_type>::type);
 }
 
 template <template <cpu_isa_t isa, data_type_t d_type> class Derived,
@@ -129,7 +128,7 @@ void jit_uni_lrn_kernel_t<Derived<isa, d_type>>::within_loop(
 
     this->dec(h_);
     this->cmp(h_, 0);
-    this->jne(lrn_loop_h, this->T_NEAR);
+    this->jne(lrn_loop_h, T_NEAR);
 
     for (int i = config.H - upper_bound; i < config.H; ++i) {
         pixel_count = 0;
@@ -170,7 +169,7 @@ void jit_uni_lrn_kernel_t<Derived<isa, d_type>>::within_body_reg_blocked(
         derived_ptr->move_data_pointers(max_reg_blocks, pk);
         this->dec(this->w_);
         this->cmp(this->w_, 0);
-        this->jne(reg_block_compute_loop, this->T_NEAR);
+        this->jne(reg_block_compute_loop, T_NEAR);
     }
     if (res.rem) {
         derived_ptr->within_body(
@@ -358,9 +357,8 @@ void jit_uni_lrn_fwd_kernel_t<isa, d_type>::move_data_pointers(
 
 template <cpu_isa_t isa, data_type_t d_type>
 jit_uni_lrn_fwd_kernel_t<isa, d_type>::jit_uni_lrn_fwd_kernel_t(
-        const within_config_t &config, float A, float K, prop_kind_t pk,
-        void *code_ptr, size_t code_size)
-    : Base(config, code_ptr, code_size, jit_name())
+        const within_config_t &config, float A, float K, prop_kind_t pk)
+    : Base(config, jit_name())
     , config_(lrn_config_t::within_config)
     , within_config_(config)
     , alpha_(A)
@@ -396,9 +394,8 @@ void jit_uni_lrn_fwd_kernel_t<isa, d_type>::generate(
 
 template <cpu_isa_t isa, data_type_t d_type>
 jit_uni_lrn_fwd_kernel_t<isa, d_type>::jit_uni_lrn_fwd_kernel_t(
-        const struct nchw8c_across_t &J, float A, float K, prop_kind_t pk,
-        void *code_ptr, size_t code_size)
-    : Base(code_ptr, code_size, jit_name())
+        const struct nchw8c_across_t &J, float A, float K, prop_kind_t pk)
+    : Base(jit_name())
     , config_(lrn_config_t::nchw8c_across)
     , nchw8c_across_(J)
     , alpha_(A)
@@ -496,9 +493,8 @@ void jit_uni_lrn_fwd_kernel_t<isa, d_type>::generate(const nchw8c_across_t &J) {
 
 template <>
 jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::jit_uni_lrn_fwd_kernel_t(
-        const struct nchw8c_across_t &J, float A, float K, prop_kind_t pk,
-        void *code_ptr, size_t code_size)
-    : Base(code_ptr, code_size, jit_name())
+        const struct nchw8c_across_t &J, float A, float K, prop_kind_t pk)
+    : Base(jit_name())
     , config_(lrn_config_t::nchw8c_across)
     , nchw8c_across_(J)
     , alpha_(A)
@@ -629,7 +625,7 @@ void jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::generate(
     if (pk_ != prop_kind::forward_inference) add(scratch_, 32);
     this->dec(hw);
     this->cmp(hw, 0);
-    this->jne(lrn_loop, this->T_NEAR);
+    this->jne(lrn_loop, jit_generator_t::T_NEAR);
 
     this->add(t, 64);
     this->postamble();
@@ -637,9 +633,8 @@ void jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::generate(
 
 template <cpu_isa_t isa, data_type_t d_type>
 jit_uni_lrn_fwd_kernel_t<isa, d_type>::jit_uni_lrn_fwd_kernel_t(
-        const struct nhwc_across_t &J, float A, float K, prop_kind_t pk,
-        void *code_ptr, size_t code_size)
-    : Base(code_ptr, code_size, jit_name())
+        const struct nhwc_across_t &J, float A, float K, prop_kind_t pk)
+    : Base(jit_name())
     , config_(lrn_config_t::nhwc_across)
     , nhwc_across_(J)
     , alpha_(A)
@@ -727,7 +722,7 @@ void jit_uni_lrn_fwd_kernel_t<isa, d_type>::generate(const nhwc_across_t &J) {
 
     this->dec(c);
     this->cmp(c, 0);
-    this->jne(lrn_loop, this->T_NEAR);
+    this->jne(lrn_loop, jit_generator_t::T_NEAR);
 
     this->vmovups(yc, this->ptr[src_]);
     this->vfmadd231ps(ysum, yc, yc);
@@ -761,9 +756,8 @@ void jit_uni_lrn_fwd_kernel_t<isa, d_type>::generate(const nhwc_across_t &J) {
 
 template <>
 jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::jit_uni_lrn_fwd_kernel_t(
-        const struct nhwc_across_t &J, float A, float K, prop_kind_t pk,
-        void *code_ptr, size_t code_size)
-    : Base(code_ptr, code_size, jit_name())
+        const struct nhwc_across_t &J, float A, float K, prop_kind_t pk)
+    : Base(jit_name())
     , config_(lrn_config_t::nhwc_across)
     , nhwc_across_(J)
     , alpha_(A)
@@ -918,7 +912,7 @@ void jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::generate(
 
     this->dec(c);
     this->cmp(c, 0);
-    this->jne(lrn_loop, this->T_NEAR);
+    this->jne(lrn_loop, jit_generator_t::T_NEAR);
 
     /* compute last 3 blocks of channels:
      * block:       | -- low -- | -- hi --  |
@@ -1165,9 +1159,8 @@ void jit_uni_lrn_fwd_kernel_t<isa, d_type>::nchw_body_sse41(int tail, int HW,
 
 template <cpu_isa_t isa, data_type_t d_type>
 jit_uni_lrn_fwd_kernel_t<isa, d_type>::jit_uni_lrn_fwd_kernel_t(
-        const nchw_across_t &J, float A, float K, prop_kind_t pk,
-        void *code_ptr, size_t code_size)
-    : Base(code_ptr, code_size, jit_name())
+        const nchw_across_t &J, float A, float K, prop_kind_t pk)
+    : Base(jit_name())
     , config_(lrn_config_t::nchw_across)
     , nchw_across_(J)
     , alpha_(A)
@@ -1240,7 +1233,7 @@ void jit_uni_lrn_fwd_kernel_t<isa, d_type>::generate(const nchw_across_t &J) {
     if (pk_ != prop_kind::forward_inference) this->add(scratch_, J.HW * 4);
     this->dec(c);
     this->cmp(c, 0);
-    this->jne(lrn_loop, this->T_NEAR);
+    this->jne(lrn_loop, jit_generator_t::T_NEAR);
 
     this->vxorps(ye, ye, ye);
 
@@ -1259,9 +1252,8 @@ jit_uni_lrn_fwd_kernel_t<isa, d_type>::~jit_uni_lrn_fwd_kernel_t() = default;
 
 template <>
 jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::jit_uni_lrn_fwd_kernel_t(
-        const nchw_across_t &J, float A, float K, prop_kind_t pk,
-        void *code_ptr, size_t code_size)
-    : Base(code_ptr, code_size, jit_name())
+        const nchw_across_t &J, float A, float K, prop_kind_t pk)
+    : Base(jit_name())
     , config_(lrn_config_t::nchw_across)
     , nchw_across_(J)
     , alpha_(A)
@@ -1316,7 +1308,7 @@ void jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::generate(
     const Xbyak::Xmm &xe_lo = this->xmm14;
     const Xbyak::Xmm &xe_hi = this->xmm15;
 
-    const int vlen = cpu_isa_traits<sse41>::vlen / sizeof(float);
+    const int vlen = cpu_isa_traits_t<sse41>::vlen / sizeof(float);
 
     bool compute_tail = J.tail != 0;
     bool load_lo = J.tail == 0 || J.tail > 4;
@@ -1418,7 +1410,7 @@ void jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::generate(
     if (pk_ != prop_kind::forward_inference) add(scratch_, J.HW * 4);
     this->dec(c);
     this->cmp(c, 0);
-    this->jne(lrn_loop, this->T_NEAR);
+    this->jne(lrn_loop, jit_generator_t::T_NEAR);
 
     this->xorps(xe_lo, xe_lo);
     this->xorps(xe_hi, xe_hi);
@@ -1439,9 +1431,8 @@ void jit_uni_lrn_fwd_kernel_t<sse41, data_type::f32>::generate(
 // backward kernel
 template <cpu_isa_t isa, data_type_t d_type>
 jit_uni_lrn_bwd_kernel_t<isa, d_type>::jit_uni_lrn_bwd_kernel_t(
-        const nchw8c_across_t &J, float A, float B, int use_h_parallel,
-        void *code_ptr, size_t code_size)
-    : Base(code_ptr, code_size, jit_name())
+        const nchw8c_across_t &J, float A, float B, int use_h_parallel)
+    : Base(jit_name())
     , config_(lrn_config_t::nchw8c_across)
     , nchw8c_across_(J)
     , nalphabeta_(-2 * A * B)
@@ -1577,9 +1568,8 @@ void jit_uni_lrn_bwd_kernel_t<isa, d_type>::generate(const nchw8c_across_t &J) {
 
 template <cpu_isa_t isa, data_type_t d_type>
 jit_uni_lrn_bwd_kernel_t<isa, d_type>::jit_uni_lrn_bwd_kernel_t(
-        const within_config_t &config, float A, float B, void *code_ptr,
-        size_t code_size)
-    : Base(config, code_ptr, code_size, jit_name())
+        const within_config_t &config, float A, float B)
+    : Base(config, jit_name())
     , config_(lrn_config_t::within_config)
     , within_config_(config)
     , nalphabeta_(-2.0f * A * B)

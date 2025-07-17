@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,10 +18,24 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/jit/pooling/gen_pooling.hpp"
-#include "gpu/ocl/gen9_global_pooling.hpp"
-#include "gpu/ocl/gen9_pooling.hpp"
-#include "gpu/ocl/ref_pooling.hpp"
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/jit/pooling/gen_pooling.hpp"
+#include "gpu/intel/ref_pooling.hpp"
+#include "gpu/intel/xe_global_pooling.hpp"
+#include "gpu/intel/xe_pooling.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+#include "gpu/nvidia/cudnn_pooling.hpp"
+#endif
+
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_AMD
+#include "gpu/amd/miopen_pooling.hpp"
+#endif
+
+#ifdef GENERIC_SYCL_KERNELS_ENABLED
+#include "gpu/generic/sycl/ref_pooling.hpp"
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -34,16 +48,22 @@ using namespace dnnl::impl::prop_kind;
 const std::map<pk_impl_key_t, std::vector<impl_list_item_t>>
         impl_list_map REG_POOLING_P({
     {{forward}, {
-        INSTANCE(jit::gen_pooling_fwd_t)
-        INSTANCE(ocl::gen9_global_pooling_fwd_t)
-        INSTANCE(ocl::gen9_pooling_fwd_t)
-        INSTANCE(ocl::ref_pooling_fwd_t)
+        GPU_INSTANCE_INTEL(intel::jit::gen_pooling_fwd_t)
+        GPU_INSTANCE_INTEL(intel::xe_global_pooling_fwd_t)
+        GPU_INSTANCE_INTEL(intel::xe_pooling_fwd_t)
+        GPU_INSTANCE_INTEL(intel::ref_pooling_fwd_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_pooling_fwd_t)
+        GPU_INSTANCE_AMD(amd::miopen_pooling_fwd_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_pooling_fwd_t)
         nullptr,
     }},
     {{backward}, REG_BWD_PK({
-        INSTANCE(ocl::gen9_global_pooling_bwd_t)
-        INSTANCE(ocl::gen9_pooling_bwd_t)
-        INSTANCE(ocl::ref_pooling_bwd_t)
+        GPU_INSTANCE_INTEL(intel::xe_global_pooling_bwd_t)
+        GPU_INSTANCE_INTEL(intel::xe_pooling_bwd_t)
+        GPU_INSTANCE_INTEL(intel::ref_pooling_bwd_t)
+        GPU_INSTANCE_NVIDIA(nvidia::cudnn_pooling_bwd_t)
+        GPU_INSTANCE_AMD(amd::miopen_pooling_bwd_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_pooling_bwd_t)
         nullptr,
     })},
 });

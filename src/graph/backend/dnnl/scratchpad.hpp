@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2021-2023 Intel Corporation
+ * Copyright 2021-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@
 #include "oneapi/dnnl/dnnl.hpp"
 
 #ifdef DNNL_WITH_SYCL
-#include "graph/utils/sycl_check.hpp"
+#include "oneapi/dnnl/dnnl_sycl.hpp"
 #endif
 
 namespace dnnl {
@@ -52,40 +52,50 @@ public:
         , size_(size)
         , eng_(&eng)
         , alloc_(&alloc)
-#ifdef DNNL_WITH_SYCL
-        , e_(::sycl::event())
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+        , ocl_e_(nullptr)
 #endif
     {
-        buffer_ = reinterpret_cast<char *>(dnnl_allocator_t::malloc(
-                size, eng, &alloc, allocator_t::mem_type_t::temp));
+        if (size > 0) {
+            buffer_ = reinterpret_cast<char *>(dnnl_allocator_t::malloc(
+                    size, eng, &alloc, allocator_t::mem_type_t::temp));
+        }
         if (!buffer_) { size_ = 0; }
     }
 
     ~temporary_scratchpad_t() override {
-#ifdef DNNL_WITH_SYCL
-        dnnl_allocator_t::free(buffer_, *eng_, alloc_, e_);
+        if (eng_->get_kind() == dnnl::engine::kind::cpu) {
+#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_SYCL
+            dnnl_allocator_t::free(buffer_, *eng_, alloc_, e_);
 #else
-        dnnl_allocator_t::free(buffer_, *eng_, alloc_);
+            dnnl_allocator_t::free(buffer_, *eng_, alloc_);
 #endif
+        } else if (eng_->get_kind() == dnnl::engine::kind::gpu) {
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+            dnnl_allocator_t::free(buffer_, *eng_, alloc_, ocl_e_);
+#elif DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
+            dnnl_allocator_t::free(buffer_, *eng_, alloc_, e_);
+#else
+            assert(!"unsupport gpu runtime");
+#endif
+        }
         size_ = 0;
     }
 
-    temporary_scratchpad_t(temporary_scratchpad_t &&other) noexcept
-        : buffer_(nullptr), size_(0) {
-        buffer_ = other.buffer_;
-        size_ = other.size_;
-        eng_ = other.eng_;
-        alloc_ = other.alloc_;
-        other.buffer_ = nullptr;
-        other.size_ = 0;
-    }
+    // Disable assignment and copy
+    temporary_scratchpad_t(const temporary_scratchpad_t &) = delete;
+    temporary_scratchpad_t &operator=(const temporary_scratchpad_t &) = delete;
 
     char *get_buffer() const override { return buffer_; }
 
     size_t size() const override { return size_; }
 
 #ifdef DNNL_WITH_SYCL
-    void set_deps(::sycl::event event) { e_ = event; }
+    void set_deps(::sycl::event event) { e_ = std::move(event); }
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    void set_deps(cl_event event) { ocl_e_ = event; }
 #endif
 
 private:
@@ -95,6 +105,10 @@ private:
     const allocator_t *alloc_;
 #ifdef DNNL_WITH_SYCL
     ::sycl::event e_;
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    cl_event ocl_e_;
 #endif
 };
 
@@ -198,7 +212,8 @@ public:
     }
 
     char *get(const registry_t::key_t &key) const {
-        return aligned_base_ptr_ + registry_.get(key);
+        return aligned_base_ptr_ ? (aligned_base_ptr_ + registry_.get(key))
+                                 : nullptr;
     }
 
 private:

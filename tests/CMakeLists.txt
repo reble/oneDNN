@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2016-2023 Intel Corporation
+# Copyright 2016-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,9 +18,7 @@ if (NOT DNNL_BUILD_TESTS)
     return()
 endif()
 
-if(POLICY CMP0065)
-    cmake_policy(SET CMP0065 NEW)
-endif()
+include_directories_with_host_compiler(${PROJECT_SOURCE_DIR}/third_party)
 
 # propagate TEST specific flags
 append(CMAKE_C_FLAGS "${CMAKE_TEST_CCXX_FLAGS}")
@@ -73,7 +71,7 @@ if(NOT DNNL_CPU_RUNTIME STREQUAL "NONE" AND
     register_exe(api-c api.c "test" "${LIBM}")
 endif()
 
-if(NOT "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" AND (UNIX OR MINGW))
+if(NOT CMAKE_CXX_COMPILER_ID MATCHES "(Apple)?[Cc]lang" AND (UNIX OR MINGW))
     get_directory_property(include_dirs INCLUDE_DIRECTORIES)
     set(test_c_symbols "${CMAKE_CURRENT_BINARY_DIR}/test_c_symbols.c")
     add_custom_command(

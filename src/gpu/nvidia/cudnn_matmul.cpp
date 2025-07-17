@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -16,15 +16,16 @@
 *******************************************************************************/
 
 #include "gpu/nvidia/cudnn_matmul.hpp"
+#include "gpu/nvidia/cudnn_matmul_lt.hpp"
 
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
 #include "common/type_helpers.hpp"
 
 #include "gpu/nvidia/cudnn_matmul_executor.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/engine.hpp"
+#include "gpu/nvidia/stream.hpp"
 #include "gpu/nvidia/sycl_cuda_scoped_context.hpp"
-#include "gpu/nvidia/sycl_cuda_stream.hpp"
 #include "gpu/nvidia/sycl_cuda_stream_utils.hpp"
 
 namespace dnnl {
@@ -35,39 +36,93 @@ namespace nvidia {
 status_t cudnn_matmul_t::execute(const exec_ctx_t &ctx) const {
     if (pd()->has_zero_dim_memory()) return status::success;
 
-    const bool has_runtime_args = matmul_impl_->has_runtime_params();
-
     const auto src_d = ctx.memory_mdw(DNNL_ARG_SRC, pd()->src_md());
     const auto weights_d = ctx.memory_mdw(DNNL_ARG_WEIGHTS, pd()->weights_md());
     const auto dst_d = ctx.memory_mdw(DNNL_ARG_DST, pd()->dst_md());
     const auto bias_d = ctx.memory_mdw(DNNL_ARG_BIAS, pd()->weights_md(1));
 
-    status_t status;
-    size_t scratchpad_size = 0; // To avoid extra allocation in an executor.
-    if (has_runtime_args) {
-        // Initialise all runtime parameters
-        status = matmul_impl_->init_parameters(src_d, weights_d, dst_d, bias_d);
-        if (status != status::success) return status;
+    nvidia::stream_t *cuda_stream
+            = utils::downcast<nvidia::stream_t *>(ctx.stream());
 
-        scratchpad_size = pd()->scratchpad_size(dst_d.md_);
-    }
+    status_t status = executor_->execute(ctx, ctx.stream()->engine(),
+            matmul_impl_, pd()->params_, src_d, weights_d, dst_d, bias_d);
 
-    nvidia::sycl_cuda_stream_t *cuda_stream
-            = utils::downcast<nvidia::sycl_cuda_stream_t *>(ctx.stream());
-
-    status = executor_->execute(
-            ctx, ctx.stream()->engine(), matmul_impl_, scratchpad_size);
-
-    if (has_runtime_args) {
+    if (pd()->params_->has_runtime_params_) {
         auto &evts = cuda_stream->sycl_ctx().get_sycl_deps().events;
         for (auto e : evts) {
             e.wait();
         }
+    }
+    return status;
+}
 
-        matmul_impl_->cleanup();
+status_t cudnn_matmul_lt_t::execute(const exec_ctx_t &ctx) const {
+    if (pd()->has_zero_dim_memory()) return status::success;
+
+    const auto src_d = ctx.memory_mdw(DNNL_ARG_SRC, pd()->src_md());
+    const auto weights_d = ctx.memory_mdw(DNNL_ARG_WEIGHTS, pd()->weights_md());
+    const auto dst_d = ctx.memory_mdw(DNNL_ARG_DST, pd()->dst_md());
+
+    nvidia::stream_t *cuda_stream
+            = utils::downcast<nvidia::stream_t *>(ctx.stream());
+
+    const bool has_dst_scales
+            = ctx.args().find(DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST)
+            != ctx.args().end();
+
+    CHECK(executor_->execute(ctx, ctx.stream()->engine(), matmul_impl_,
+            pd()->params_, src_d, weights_d, dst_d));
+
+    if (pd()->params_->with_bias_) {
+        // bias sycl binary
+        exec_args_t binary_args;
+        std::unique_ptr<memory_t, memory_deleter_t> scratch_mem;
+        if (dst_d.data_type() == dnnl_s8) {
+            auto scratchpad_storage
+                    = ctx.get_scratchpad_grantor().get_memory_storage(
+                            memory_tracking::names::key_matmul_dst_in_acc_dt);
+
+            safe_ptr_assign(scratch_mem,
+                    new memory_t(ctx.stream()->engine(), &pd()->s32_dst_md_,
+                            std::move(scratchpad_storage)));
+            binary_args[DNNL_ARG_SRC_0]
+                    = memory_arg_t {scratch_mem.get(), true};
+        } else {
+            binary_args[DNNL_ARG_SRC_0]
+                    = memory_arg_t {ctx.args().at(DNNL_ARG_DST).mem, true};
+        }
+        binary_args[DNNL_ARG_SRC_1] = ctx.args().at(DNNL_ARG_BIAS);
+        binary_args[DNNL_ARG_DST] = ctx.args().at(DNNL_ARG_DST);
+
+        exec_ctx_t binary_ctx(ctx, std::move(binary_args));
+
+        CHECK(binary_->execute(binary_ctx));
     }
 
-    return status;
+    if (has_dst_scales
+            && (pd()->params_->multi_dst_scale_
+                    || pd()->params_->acc_type_ == CUDA_R_32I)) {
+        // dst scale sycl binary
+        exec_args_t dst_scale_binary_args;
+        dst_scale_binary_args[DNNL_ARG_SRC_0]
+                = memory_arg_t {ctx.args().at(DNNL_ARG_DST).mem, true};
+        dst_scale_binary_args[DNNL_ARG_SRC_1] = memory_arg_t {
+                ctx.args().at(DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST).mem, true};
+        dst_scale_binary_args[DNNL_ARG_DST] = ctx.args().at(DNNL_ARG_DST);
+
+        exec_ctx_t binary_ctx(ctx, std::move(dst_scale_binary_args));
+
+        CHECK(dst_scale_binary_->execute(binary_ctx));
+    }
+
+    if (pd()->params_->has_runtime_params_) {
+        auto &evts = cuda_stream->sycl_ctx().get_sycl_deps().events;
+        for (auto e : evts) {
+            e.wait();
+        }
+    }
+
+    return status::success;
 }
 
 } // namespace nvidia

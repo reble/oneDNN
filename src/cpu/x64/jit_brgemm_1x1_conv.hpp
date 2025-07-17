@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2024 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -46,9 +46,7 @@ namespace x64 {
 template <cpu_isa_t isa>
 struct brgemm_1x1_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd) {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("brgconv_1x1:", isa, ""),
                 brgemm_1x1_convolution_fwd_t);
@@ -56,12 +54,18 @@ struct brgemm_1x1_convolution_fwd_t : public primitive_t {
         status_t init(engine_t *engine);
 
         struct brgemm_init_params_t {
-            brgemm_init_params_t(
-                    int k_accum_idx, int m, int n, int k, size_t lda)
-                : k_accum_idx_(k_accum_idx), M_(m), N_(n), K_(k), LDA_(lda) {}
+            brgemm_init_params_t(int k_accum_idx, int m, int n, int k,
+                    size_t lda, bool wary_tail_read)
+                : k_accum_idx_(k_accum_idx)
+                , M_(m)
+                , N_(n)
+                , K_(k)
+                , LDA_(lda)
+                , wary_tail_read_(wary_tail_read) {}
             const int k_accum_idx_; // controls brgemm:beta param
             const int M_, N_, K_;
             const size_t LDA_;
+            bool wary_tail_read_ {false};
         };
 
         std::shared_ptr<brgemm_containers::brgemm_desc_container_t> brgs_;
@@ -70,22 +74,7 @@ struct brgemm_1x1_convolution_fwd_t : public primitive_t {
         bool need_postwork_;
         int ic_chunks_;
 
-        jit_brgemm_conv_conf_t jcp_;
-
-    protected:
-        bool arg_scales_ok() const {
-            std::vector<int> supported_args
-                    = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST};
-            return attr_scales_ok(supported_args);
-        }
-        bool zero_points_ok() const {
-            // Only common zero points are supported -> mask should only be 0
-            int mask_src = 0, mask_dst = 0;
-            attr()->zero_points_.get(DNNL_ARG_SRC, &mask_src);
-            attr()->zero_points_.get(DNNL_ARG_DST, &mask_dst);
-            return attr()->zero_points_.has_default_values(DNNL_ARG_WEIGHTS)
-                    && mask_src == 0 && mask_dst == 0;
-        }
+        jit_brgemm_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
 
     private:
         status_t init_brgemm_desc();
@@ -94,7 +83,7 @@ struct brgemm_1x1_convolution_fwd_t : public primitive_t {
     brgemm_1x1_convolution_fwd_t(const pd_t *apd)
         : primitive_t(apd), bias_d(pd()->weights_md(1)) {}
 
-    ~brgemm_1x1_convolution_fwd_t() {}
+    ~brgemm_1x1_convolution_fwd_t() override = default;
 
     status_t execute(const exec_ctx_t &ctx) const override {
         execute_forward_all(ctx);
@@ -154,19 +143,21 @@ private:
 
     static int get_brg_idx(const jit_brgemm_conv_conf_t &jcp,
             const typename pd_t::brgemm_init_params_t &bparams) {
-        const int k_accum_idx = bparams.k_accum_idx_;
         const int is_M_tail = bparams.M_ == jcp.M_tail;
         const int is_N_tail = bparams.N_ == jcp.N_tail;
         const int is_K_tail = bparams.K_ == jcp.K_tail;
-        return get_brg_idx(k_accum_idx, is_M_tail, is_N_tail, is_K_tail);
+        return get_brg_idx(bparams.k_accum_idx_, is_M_tail, is_N_tail,
+                is_K_tail, bparams.wary_tail_read_);
     }
 
     static int get_brg_idx(int do_initialization, bool is_M_tail,
-            bool is_N_tail, bool is_K_tail) {
-        return (((int)do_initialization * 2 + (int)is_M_tail) * 2
-                       + (int)is_N_tail)
+            bool is_N_tail, bool is_K_tail, bool wary_tail_read) {
+        return ((((int)do_initialization * 2 + (int)is_M_tail) * 2
+                        + (int)is_N_tail)
+                               * 2
+                       + (int)is_K_tail)
                 * 2
-                + (int)is_K_tail;
+                + (int)wary_tail_read;
     }
 
     static int get_ker_po_idx(int is_M_tail, bool is_N_tail) {
@@ -188,8 +179,8 @@ private:
         return jcp.is_reduced_rtus && (!get_extra_m_kernel_req(jcp));
     }
 
-    brgemm_containers::brgemm_kernel_container_t brg_kernels_ {32};
-    brgemm_containers::brgemm_palette_container_t brgemm_palettes_ {32};
+    brgemm_containers::brgemm_kernel_container_t brg_kernels_ {64};
+    brgemm_containers::brgemm_palette_container_t brgemm_palettes_ {64};
 
     std::unique_ptr<jit_avx512_core_brgemm_conv_trans_kernel::
                     jit_avx512_core_brgemm_conv_rtus_kernel_t>

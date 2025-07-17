@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -59,11 +59,14 @@ struct group_normalization_pd_t : public primitive_desc_t {
 
     dim_t MB() const { return src_md()->dims[0]; }
     dim_t C() const { return src_md()->dims[1]; }
+    dim_t G() const { return stat_md()->dims[1]; }
     dim_t D() const { return ndims() >= 5 ? src_md()->dims[ndims() - 3] : 1; }
     dim_t H() const { return ndims() >= 4 ? src_md()->dims[ndims() - 2] : 1; }
     dim_t W() const { return src_md()->dims[ndims() - 1]; }
 
     int ndims() const { return src_md()->ndims; }
+
+    const memory_desc_t *stat_md() const { return &stat_md_; }
 
     bool stats_is_src() const {
         return desc_.flags & normalization_flags::use_global_stats;
@@ -97,20 +100,21 @@ protected:
     memory_desc_t stat_md_;
     memory_desc_t scaleshift_md_;
 
-    group_normalization_pd_t(const group_normalization_desc_t *adesc,
+    group_normalization_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const group_normalization_fwd_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<group_normalization_desc_t>(adesc))
         , hint_fwd_pd_(hint_fwd_pd)
         , src_md_(desc_.src_desc)
         , stat_md_(desc_.stat_desc)
         , scaleshift_md_(desc_.scaleshift_desc) {}
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct group_normalization_fwd_pd_t : public group_normalization_pd_t {
-    typedef group_normalization_fwd_pd_t base_class;
-    typedef group_normalization_fwd_pd_t hint_class;
+    using base_class = group_normalization_fwd_pd_t;
+    using hint_class = group_normalization_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg == DNNL_ARG_SRC) return arg_usage_t::input;
@@ -120,8 +124,10 @@ struct group_normalization_fwd_pd_t : public group_normalization_pd_t {
             return arg_usage_t::unused;
         }
 
-        if (arg == DNNL_ARG_SCALE && use_scale()) return arg_usage_t::input;
-        if (arg == DNNL_ARG_SHIFT && use_shift()) return arg_usage_t::input;
+        if (arg == DNNL_ARG_SCALE)
+            return use_scale() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_SHIFT)
+            return use_shift() ? arg_usage_t::input : arg_usage_t::unused;
 
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
         return primitive_desc_t::arg_usage(arg);
@@ -161,8 +167,6 @@ struct group_normalization_fwd_pd_t : public group_normalization_pd_t {
         return index == 0 ? &scaleshift_md_ : &glob_zero_md;
     }
 
-    const memory_desc_t *stat_md() const { return &stat_md_; }
-
     int n_inputs() const override {
         return 1 + 2 * stats_is_src() + use_scale() + use_shift()
                 + n_binary_po_inputs();
@@ -174,7 +178,7 @@ struct group_normalization_fwd_pd_t : public group_normalization_pd_t {
 protected:
     memory_desc_t dst_md_;
 
-    group_normalization_fwd_pd_t(const group_normalization_desc_t *adesc,
+    group_normalization_fwd_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr, const hint_class *hint_fwd_pd)
         : group_normalization_pd_t(adesc, attr, hint_fwd_pd)
         , dst_md_(desc_.dst_desc) {}
@@ -189,43 +193,44 @@ protected:
         return IMPLICATION(use_scale() || use_shift(),
                 weights_md()->data_type == data_type::f32);
     }
-    bool attr_scales_ok() const {
+    bool attr_scales_ok(const std::vector<int> &supported_args
+            = {DNNL_ARG_SRC, DNNL_ARG_DST}) const {
         using namespace data_type;
         const auto &scales = attr()->scales_;
-        const std::vector<int> supported_args({DNNL_ARG_SRC, DNNL_ARG_DST});
         bool ok = scales.has_default_values(supported_args);
 
         for (const auto &arg : supported_args) {
-            const auto &sc = scales.get(arg);
-            if (!sc.has_default_values()) {
+            if (!scales.has_default_values(arg)) {
                 const data_type_t dt = arg_md(arg)->data_type;
-                ok = ok && utils::one_of(dt, s8, u8) && sc.mask_ == 0;
+                ok = ok && utils::one_of(dt, s8, u8);
+                ok = ok && scales.get_mask(arg) == 0;
             }
         }
         return ok;
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct group_normalization_bwd_pd_t : public group_normalization_pd_t {
-    typedef group_normalization_bwd_pd_t base_class;
-    typedef group_normalization_fwd_pd_t hint_class;
+    using base_class = group_normalization_bwd_pd_t;
+    using hint_class = group_normalization_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_MEAN, DNNL_ARG_VARIANCE,
                     DNNL_ARG_DIFF_DST))
             return arg_usage_t::input;
 
-        if (arg == DNNL_ARG_SCALE && use_scale()) return arg_usage_t::input;
-
-        if (arg == DNNL_ARG_WORKSPACE && !types::is_zero_md(workspace_md()))
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_SCALE)
+            return use_scale() ? arg_usage_t::input : arg_usage_t::unused;
 
         if (arg == DNNL_ARG_DIFF_SRC) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_DIFF_SCALE && use_scale())
-            return arg_usage_t::output;
-        if (arg == DNNL_ARG_DIFF_SHIFT && use_shift())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_DIFF_SCALE)
+            return use_scale() ? arg_usage_t::output : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_SHIFT)
+            return use_shift() ? arg_usage_t::output : arg_usage_t::unused;
+
         return primitive_desc_t::arg_usage(arg);
     }
 
@@ -284,7 +289,7 @@ protected:
     memory_desc_t diff_dst_md_;
     memory_desc_t diff_scaleshift_md_;
 
-    group_normalization_bwd_pd_t(const group_normalization_desc_t *adesc,
+    group_normalization_bwd_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr, const hint_class *hint_fwd_pd)
         : group_normalization_pd_t(adesc, attr, hint_fwd_pd)
         , diff_src_md_(desc_.diff_src_desc)
@@ -308,6 +313,7 @@ protected:
                         diff_weights_md()->data_type));
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

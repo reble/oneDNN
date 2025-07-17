@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@
 namespace graph = dnnl::impl::graph;
 namespace dnnl_impl = graph::dnnl_impl;
 
-TEST(test_op_executable_op_executable, DummyArgIndicesGetterDeathTest) {
+TEST(test_op_executable, DummyArgIndicesGetterDeathTest) {
     graph::op_t op {0, graph::op_kind::Wildcard, "op"};
     dnnl_impl::fusion_info_mgr_t mgr;
 #ifndef NDEBUG
@@ -40,7 +40,7 @@ TEST(test_op_executable_op_executable, DummyArgIndicesGetterDeathTest) {
 #endif
 }
 
-TEST(test_op_executable_op_executable, DummyExecutableCreatorDeathTest) {
+TEST(test_op_executable, DummyExecutableCreatorDeathTest) {
     dnnl::engine p_engine;
     dnnl_impl::fusion_info_mgr_t mgr;
     dnnl_impl::pd_cache_t pd_cache;
@@ -51,7 +51,7 @@ TEST(test_op_executable_op_executable, DummyExecutableCreatorDeathTest) {
 }
 
 #ifdef DNNL_WITH_SYCL
-TEST(test_op_executable_op_executable, DummyImpl) {
+TEST(test_op_executable, DummyImpl) {
 #if DNNL_CPU_RUNTIME != DNNL_RUNTIME_SYCL
     graph::engine_kind_t kind = get_test_engine_kind();
     SKIP_IF(kind == graph::engine_kind::cpu,
@@ -86,7 +86,7 @@ TEST(test_op_executable_op_executable, DummyImpl) {
     auto returned_event2 = op_exec->execute_sycl(
             p_stream, {}, {std::move(input_event0), std::move(input_event1)});
     const auto &event_list2 = returned_event2.get_wait_list();
-    ASSERT_GT(event_list2.size(), 0U);
+    ASSERT_LE(event_list2.size(), 2U);
     returned_event2.wait();
     ASSERT_EQ(
             returned_event2

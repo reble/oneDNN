@@ -27,6 +27,7 @@ the type of tracing information to display.
 |:---------------------------|:--------------------|:--------------------------------------------------|
 | `ONEDNN_VERBOSE`           | `none`              | no messages printed                               |
 | \                          | **`error`**         | **error messages**  (default)                     |
+| \                          | `warn`              | warning messages                                  |
 | \                          | `check`             | primitive creation parameter checking information |
 | \                          | `profile_create`    | primitive creation  timings                       |
 | \                          | `profile_exec`      | primitive execution timings                       |
@@ -92,14 +93,14 @@ ONEDNN_VERBOSE=all ./benchdnn --matmul 256x256:25x256
 This produces the following output:
 
 ~~~sh
-onednn_verbose,info,oneDNN v3.2.0 (commit 6afab8e57f65a8995685d97ba6f80fa6c24b87a0)
-onednn_verbose,info,cpu,runtime:OpenMP,nthr:128
-onednn_verbose,info,cpu,isa:Intel AVX-512 with Intel DL Boost
-onednn_verbose,info,gpu,runtime:none
-onednn_verbose,info,graph,backend,0:dnnl_backend
-onednn_verbose,primitive,info,template:operation,engine,primitive,implementation,prop_kind,memory_descriptors,attributes,auxiliary,problem_desc,exec_time
-onednn_verbose,graph,info,template:operation,engine,partition_id,partition_kind,op_names,data_formats,logical_tensors,fpmath_mode,backend,exec_time
-onednn_verbose,primitive,create:check,matmul,dimension src:1 is inconsistent with weights:0,src/common/matmul.cpp:144
+onednn_verbose,v0,info,oneDNN v3.2.0 (commit 6afab8e57f65a8995685d97ba6f80fa6c24b87a0)
+onednn_verbose,v0,info,cpu,runtime:OpenMP,nthr:128
+onednn_verbose,v0,info,cpu,isa:Intel AVX-512 with Intel DL Boost
+onednn_verbose,v0,info,gpu,runtime:none
+onednn_verbose,v0,info,graph,backend,0:dnnl_backend
+onednn_verbose,v0,primitive,info,template:operation,engine,primitive,implementation,prop_kind,memory_descriptors,attributes,auxiliary,problem_desc,exec_time
+onednn_verbose,v0,graph,info,template:operation,engine,partition_id,partition_kind,op_names,data_formats,logical_tensors,fpmath_mode,backend,exec_time
+onednn_verbose,v0,primitive,create:check,matmul,dimension src:1 is inconsistent with weights:0,src/common/matmul.cpp:144
 ~~~
 
 The last line here shows that the matmul primitive failed to be
@@ -133,23 +134,24 @@ ONEDNN_VERBOSE=dispatch ./benchdnn --matmul --dt=u8:s8:f32 256x256:256x256
 This produces the following log (shortened for brevity).
 
 ~~~sh
-onednn_verbose,info,oneDNN v3.2.0 (commit 6afab8e57f65a8995685d97ba6f80fa6c24b87a0)
-onednn_verbose,info,cpu,runtime:OpenMP,nthr:128
-onednn_verbose,info,cpu,isa:Intel AVX-512 with Intel DL Boost
-onednn_verbose,info,gpu,runtime:none
-onednn_verbose,info,graph,backend,0:dnnl_backend
-onednn_verbose,primitive,info,template:operation,engine,primitive,implementation,prop_kind,memory_descriptors,attributes,auxiliary,problem_desc,exec_time
-onednn_verbose,graph,info,template:operation,engine,partition_id,partition_kind,op_names,data_formats,logical_tensors,fpmath_mode,backend,exec_time
-onednn_verbose,primitive,create:dispatch,matmul,cpu,matmul,brg:avx512_core_amx_fp16,undef,src_u8:a:any:any::f0 wei_s8:a:any:any::f0 dst_f32:a:any:any::f0,,,256x256:256x256,unsupported isa,src/cpu/x64/matmul/brgemm_matmul.cpp:97
-onednn_verbose,primitive,create:dispatch,matmul,cpu,matmul,brg:avx512_core_amx,undef,src_u8:a:any:any::f0 wei_s8:a:any:any::f0 dst_f32:a:any:any::f0,,,256x256:256x256,unsupported isa,src/cpu/x64/matmul/brgemm_matmul.cpp:97
-onednn_verbose,primitive,create:dispatch,matmul,cpu,matmul,brg:avx512_core_fp16,undef,src_u8:a:any:any::f0 wei_s8:a:any:any::f0 dst_f32:a:any:any::f0,,,256x256:256x256,unsupported isa,src/cpu/x64/matmul/brgemm_matmul.cpp:97
-onednn_verbose,primitive,create:dispatch,matmul,cpu,matmul,brg:avx512_core_bf16,undef,src_u8:a:any:any::f0 wei_s8:a:any:any::f0 dst_f32:a:any:any::f0,,,256x256:256x256,unsupported isa,src/cpu/x64/matmul/brgemm_matmul.cpp:97
+onednn_verbose,v0,info,oneDNN v3.2.0 (commit 6afab8e57f65a8995685d97ba6f80fa6c24b87a0)
+onednn_verbose,v0,info,cpu,runtime:OpenMP,nthr:128
+onednn_verbose,v0,info,cpu,isa:Intel AVX-512 with Intel DL Boost
+onednn_verbose,v0,info,gpu,runtime:none
+onednn_verbose,v0,info,graph,backend,0:dnnl_backend
+onednn_verbose,v0,primitive,info,template:operation,engine,primitive,implementation,prop_kind,memory_descriptors,attributes,auxiliary,problem_desc,exec_time
+onednn_verbose,v0,graph,info,template:operation,engine,partition_id,partition_kind,op_names,data_formats,logical_tensors,fpmath_mode,backend,exec_time
+onednn_verbose,v0,primitive,create:dispatch,matmul,cpu,matmul,brg:avx512_core_amx_fp16,undef,src_u8:a:any:any::f0 wei_s8:a:any:any::f0 dst_f32:a:any:any::f0,,,256x256:256x256,unsupported isa,src/cpu/x64/matmul/brgemm_matmul.cpp:97
+onednn_verbose,v0,primitive,create:dispatch,matmul,cpu,matmul,brg:avx512_core_amx,undef,src_u8:a:any:any::f0 wei_s8:a:any:any::f0 dst_f32:a:any:any::f0,,,256x256:256x256,unsupported isa,src/cpu/x64/matmul/brgemm_matmul.cpp:97
+onednn_verbose,v0,primitive,create:dispatch,matmul,cpu,matmul,brg:avx512_core_fp16,undef,src_u8:a:any:any::f0 wei_s8:a:any:any::f0 dst_f32:a:any:any::f0,,,256x256:256x256,unsupported isa,src/cpu/x64/matmul/brgemm_matmul.cpp:97
+onednn_verbose,v0,primitive,create:dispatch,matmul,cpu,matmul,brg:avx512_core_bf16,undef,src_u8:a:any:any::f0 wei_s8:a:any:any::f0 dst_f32:a:any:any::f0,,,256x256:256x256,unsupported isa,src/cpu/x64/matmul/brgemm_matmul.cpp:97
 ~~~
 
 Above, we can see that the highest performance implementations were
 not dispatched either because they required a higher ISA, or because
 they did not support that datatype configuration.
-
+A complete list of verbose messages encountered in the dispatch mode 
+can be found [here](https://uxlfoundation.github.io/oneDNN/dev_guide_verbose_table.html) along with their explanation.
 
 ### Enable ONEDNN_VERBOSE with timestamps
 
@@ -160,24 +162,24 @@ ONEDNN_VERBOSE=profile ONEDNN_VERBOSE_TIMESTAMP=1 ./benchdnn --conv ic16ih7oc16o
 This produces the following output:
 
 ~~~sh
-onednn_verbose,info,oneDNN v3.2.0 (commit 6afab8e57f65a8995685d97ba6f80fa6c24b87a0)
-onednn_verbose,info,cpu,runtime:OpenMP,nthr:128
-onednn_verbose,info,cpu,isa:Intel AVX-512 with Intel DL Boost
-onednn_verbose,info,gpu,runtime:none
-onednn_verbose,info,graph,backend,0:dnnl_backend
-onednn_verbose,primitive,info,template:timestamp,operation,engine,primitive,implementation,prop_kind,memory_descriptors,attributes,auxiliary,problem_desc,exec_time
-onednn_verbose,graph,info,template:timestamp,operation,engine,partition_id,partition_kind,op_names,data_formats,logical_tensors,fpmath_mode,backend,exec_time
-onednn_verbose,1693533460193.346924,primitive,create:cache_miss,cpu,convolution,jit:avx512_core,forward_training,src_f32:a:blocked:aBcd16b::f0 wei_f32:a:blocked:ABcd16b16a::f0 bia_f32:a:blocked:a::f0 dst_f32:a:blocked:aBcd16b::f0,,alg:convolution_direct,mb2_ic16oc16_ih7oh7kh5sh1dh0ph2_iw7ow7kw5sw1dw0pw2,0.709961
-onednn_verbose,1693533460194.199951,primitive,create:cache_hit,cpu,convolution,jit:avx512_core,forward_training,src_f32:a:blocked:aBcd16b::f0 wei_f32:a:blocked:ABcd16b16a::f0 bia_f32:a:blocked:a::f0 dst_f32:a:blocked:aBcd16b::f0,,alg:convolution_direct,mb2_ic16oc16_ih7oh7kh5sh1dh0ph2_iw7ow7kw5sw1dw0pw2,0.0161133
-onednn_verbose,1693533460228.559082,primitive,create:cache_miss,cpu,reorder,jit:uni,undef,src_f32::blocked:abcd::f0 dst_f32::blocked:ABcd16b16a::f0,,,16x16x5x5,0.724854
-onednn_verbose,1693533460229.437012,primitive,exec,cpu,reorder,jit:uni,undef,src_f32::blocked:abcd::f0 dst_f32::blocked:ABcd16b16a::f0,,,16x16x5x5,16.481
-onednn_verbose,1693533460259.165039,primitive,create:cache_miss,cpu,reorder,jit:blk,undef,src_f32::blocked:abcd::f0 dst_f32::blocked:aBcd16b::f0,,,2x16x7x7,0.349854
-onednn_verbose,1693533460259.586914,primitive,exec,cpu,reorder,jit:blk,undef,src_f32::blocked:abcd::f0 dst_f32::blocked:aBcd16b::f0,,,2x16x7x7,12.604
-onednn_verbose,1693533460272.332031,primitive,create:cache_miss,cpu,reorder,simple:any,undef,src_f32::blocked:a::f0 dst_f32::blocked:a::f0,,,16,0.0358887
-onednn_verbose,1693533460272.416992,primitive,exec,cpu,reorder,simple:any,undef,src_f32::blocked:a::f0 dst_f32::blocked:a::f0,,,16,0.052002
-onednn_verbose,1693533460272.561035,primitive,exec,cpu,convolution,jit:avx512_core,forward_training,src_f32:a:blocked:aBcd16b::f0 wei_f32:a:blocked:ABcd16b16a::f0 bia_f32:a:blocked:a::f0 dst_f32:a:blocked:aBcd16b::f0,,alg:convolution_direct,mb2_ic16oc16_ih7oh7kh5sh1dh0ph2_iw7ow7kw5sw1dw0pw2,0.0878906
-onednn_verbose,1693533460313.719971,primitive,create:cache_miss,cpu,reorder,jit:blk,undef,src_f32::blocked:aBcd16b::f0 dst_f32::blocked:abcd::f0,,,2x16x7x7,0.275146
-onednn_verbose,1693533460314.072021,primitive,exec,cpu,reorder,jit:blk,undef,src_f32::blocked:aBcd16b::f0 dst_f32::blocked:abcd::f0,,,2x16x7x7,18.8389
+onednn_verbose,v0,info,oneDNN v3.2.0 (commit 6afab8e57f65a8995685d97ba6f80fa6c24b87a0)
+onednn_verbose,v0,info,cpu,runtime:OpenMP,nthr:128
+onednn_verbose,v0,info,cpu,isa:Intel AVX-512 with Intel DL Boost
+onednn_verbose,v0,info,gpu,runtime:none
+onednn_verbose,v0,info,graph,backend,0:dnnl_backend
+onednn_verbose,v0,primitive,info,template:timestamp,operation,engine,primitive,implementation,prop_kind,memory_descriptors,attributes,auxiliary,problem_desc,exec_time
+onednn_verbose,v0,graph,info,template:timestamp,operation,engine,partition_id,partition_kind,op_names,data_formats,logical_tensors,fpmath_mode,backend,exec_time
+onednn_verbose,v0,1693533460193.346924,primitive,create:cache_miss,cpu,convolution,jit:avx512_core,forward_training,src_f32:a:blocked:aBcd16b::f0 wei_f32:a:blocked:ABcd16b16a::f0 bia_f32:a:blocked:a::f0 dst_f32:a:blocked:aBcd16b::f0,,alg:convolution_direct,mb2_ic16oc16_ih7oh7kh5sh1dh0ph2_iw7ow7kw5sw1dw0pw2,0.709961
+onednn_verbose,v0,1693533460194.199951,primitive,create:cache_hit,cpu,convolution,jit:avx512_core,forward_training,src_f32:a:blocked:aBcd16b::f0 wei_f32:a:blocked:ABcd16b16a::f0 bia_f32:a:blocked:a::f0 dst_f32:a:blocked:aBcd16b::f0,,alg:convolution_direct,mb2_ic16oc16_ih7oh7kh5sh1dh0ph2_iw7ow7kw5sw1dw0pw2,0.0161133
+onednn_verbose,v0,1693533460228.559082,primitive,create:cache_miss,cpu,reorder,jit:uni,undef,src_f32::blocked:abcd::f0 dst_f32::blocked:ABcd16b16a::f0,,,16x16x5x5,0.724854
+onednn_verbose,v0,1693533460229.437012,primitive,exec,cpu,reorder,jit:uni,undef,src_f32::blocked:abcd::f0 dst_f32::blocked:ABcd16b16a::f0,,,16x16x5x5,16.481
+onednn_verbose,v0,1693533460259.165039,primitive,create:cache_miss,cpu,reorder,jit:blk,undef,src_f32::blocked:abcd::f0 dst_f32::blocked:aBcd16b::f0,,,2x16x7x7,0.349854
+onednn_verbose,v0,1693533460259.586914,primitive,exec,cpu,reorder,jit:blk,undef,src_f32::blocked:abcd::f0 dst_f32::blocked:aBcd16b::f0,,,2x16x7x7,12.604
+onednn_verbose,v0,1693533460272.332031,primitive,create:cache_miss,cpu,reorder,simple:any,undef,src_f32::blocked:a::f0 dst_f32::blocked:a::f0,,,16,0.0358887
+onednn_verbose,v0,1693533460272.416992,primitive,exec,cpu,reorder,simple:any,undef,src_f32::blocked:a::f0 dst_f32::blocked:a::f0,,,16,0.052002
+onednn_verbose,v0,1693533460272.561035,primitive,exec,cpu,convolution,jit:avx512_core,forward_training,src_f32:a:blocked:aBcd16b::f0 wei_f32:a:blocked:ABcd16b16a::f0 bia_f32:a:blocked:a::f0 dst_f32:a:blocked:aBcd16b::f0,,alg:convolution_direct,mb2_ic16oc16_ih7oh7kh5sh1dh0ph2_iw7ow7kw5sw1dw0pw2,0.0878906
+onednn_verbose,v0,1693533460313.719971,primitive,create:cache_miss,cpu,reorder,jit:blk,undef,src_f32::blocked:aBcd16b::f0 dst_f32::blocked:abcd::f0,,,2x16x7x7,0.275146
+onednn_verbose,v0,1693533460314.072021,primitive,exec,cpu,reorder,jit:blk,undef,src_f32::blocked:aBcd16b::f0 dst_f32::blocked:abcd::f0,,,2x16x7x7,18.8389
 0:PASSED __REPRO: --conv ic16ih7oc16oh7kh5ph2nwip
 ~~~
 
@@ -194,11 +196,12 @@ Each subsequent line of primitive verbose information is formatted as a
 comma-separated list and contains the following, in order of appearance in the
 line from left to right:
 * `onednn_verbose` marker string
+* verbose mode version: `v0` or `v1` 
 * if `ONEDNN_VERBOSE_TIMESTAMP=1` is specified, start time of the call. On Linux
   this number represents amount of milliseconds since Unix epoch. On Windows
   this number represents amount of milliseconds since the last system start.
 * API kind: `primitive|graph|common` for API information
-* operation: `exec|create:<cache_hit|cache_miss|from_cache_blob>` for
+* operation: `exec|create:<cache_hit|cache_miss|kernel_cache_hit|persistent_cache_hit|nested_cache_hit>` for
   profiling information, `error|check|dispatch` for other information.
 * engine kind: `cpu` or `gpu` (`cpu2gpu` or `gpu2cpu` for cross-engine reorder)
 * primitive name: `convolution`, `reorder`, `sum`, etc
@@ -237,7 +240,7 @@ primitive execution.
 
 @note
 When oneDNN verbose mode is enabled for builds with
-[Compute Library for the Arm architecture](https://oneapi-src.github.io/oneDNN/dev_guide_build.html#gcc-with-arm-compute-library-acl-on-aarch64-host),
+[Compute Library for the Arm architecture](https://uxlfoundation.github.io/oneDNN/dev_guide_build.html#gcc-with-arm-compute-library-acl-on-aarch64-host),
 any failures in the validation of Compute Library primitives will be detailed
 in the verbose output.
 

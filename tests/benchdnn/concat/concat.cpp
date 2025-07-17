@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     }
 
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
-            create_dnnl_attr(prb->attr, attr_args_t()));
+            create_dnnl_attr(prb->attr, attr_args_t(), prb->ndims));
 
     std::vector<dnnl_memory_desc_t> src_d(
             src_d_wrappers.begin(), src_d_wrappers.end());
@@ -71,6 +71,10 @@ int fill_src(int input_idx, dnnl_data_type_t dt, dnn_mem_t &mem_dt,
     // Refer to modes documentation for filling principles.
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, nullptr);
+    }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
     }
 
     // Do fixed partitioning to have same filling for any number of threads.
@@ -97,9 +101,11 @@ int fill_src(int input_idx, dnnl_data_type_t dt, dnn_mem_t &mem_dt,
         std::minstd_rand msr(input_idx * n_chunks + idx_start + 1);
         msr.discard(1);
         std::uniform_int_distribution<> igen(min_val, max_val);
-        // No need to round final value as it's already in needed dt.
-        for (int64_t idx = idx_start; idx < idx_end; ++idx)
-            mem_fp.set_elem(idx, (float)igen(msr));
+        // Most fp8 values can't be represented exactly with integers.
+        for (int64_t idx = idx_start; idx < idx_end; ++idx) {
+            mem_fp.set_f32_elem(idx,
+                    round_to_nearest_representable(mem_dt.dt(), igen(msr)));
+        }
     });
 
     SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -110,6 +116,7 @@ int fill_src(int input_idx, dnnl_data_type_t dt, dnn_mem_t &mem_dt,
 void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
     skip_unimplemented_data_type({prb->sdt, prb->ddt}, prb->dir, res);
     skip_unimplemented_sum_po(prb->attr, res, dnnl_concat, prb->sdt);
+    skip_unimplemented_binary_po(prb->attr, res);
     skip_unimplemented_prelu_po(prb->attr, res, dnnl_concat);
     skip_unimplemented_arg_scale(prb->attr, res);
 
@@ -125,7 +132,8 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
                     (prb->sdt == dnnl_f32 || prb->sdt == prb->ddt));
 
     if (is_cpu() && (!valid_xf16_input || !valid_xf16_output)) {
-        res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+        res->state = SKIPPED;
+        res->reason = skip_reason::case_not_supported;
         return;
     }
 }
@@ -146,7 +154,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     const auto &ref_engine = get_cpu_engine();
 
@@ -163,7 +171,8 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         // use switch below to define a memory desc for it.
         if (exec_arg != DNNL_ARG_SCRATCHPAD) {
             ref_mem_map.emplace(exec_arg,
-                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine,
+                            /* prefill = */ false));
         }
         auto &ref_mem = ref_mem_map[exec_arg];
 
@@ -191,25 +200,34 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     return OK;
 }
 
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
-    // Assume it doesn't change through the execution.
-    static int capacity = 0;
-    static auto st = dnnl_get_primitive_cache_capacity(&capacity);
-    if (st != dnnl_success) return FAIL;
-    if (capacity > 0 && prb->n_inputs() + 1 > capacity) {
-        BENCHDNN_PRINT(2, "%s\n",
-                "[INFO] The number of potential internal reorder pds plus "
-                "concat itself exceeds the cache capacity which will lead to a "
-                "test case false-positive failure.");
-        return OK;
+    if (has_bench_mode_bit(mode_bit_t::exec)) {
+        SAFE(check_total_size(res), WARN);
     }
-    return check_caches(v_prim[0], prb, res);
+    if (has_bench_mode_bit(mode_bit_t::corr)) {
+        // The assumtion is the capacity doesn't change through the execution.
+        static int capacity = 0;
+        static auto st = dnnl_get_primitive_cache_capacity(&capacity);
+        if (st != dnnl_success) return FAIL;
+
+        if (capacity > 0 && prb->n_inputs() + 1 > capacity) {
+            BENCHDNN_PRINT(2, "%s\n",
+                    "[INFO] The number of potential internal reorder pds plus "
+                    "concat itself exceeds the cache capacity which will lead "
+                    "to a test case false-positive failure.");
+            return OK;
+        }
+
+        SAFE(check_caches(v_prim[0], prb, res), WARN);
+    }
+    return OK;
 }
 
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
+    set_zmalloc_max_expected_size(res->mem_size_args.zmalloc_expected_size);
+
     const auto &prim = v_prim[0];
 
     dnn_mem_map_t mem_map, ref_mem_map;
@@ -221,7 +239,7 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
+    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res, prb->dir);
     SAFE(check_bitwise(prim, {DST}, args, prb->attr, prb->inplace, res), WARN);
 
     return measure_perf(prb->ctx_exe, res, prim, args);

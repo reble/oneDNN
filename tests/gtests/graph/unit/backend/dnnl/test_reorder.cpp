@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -64,8 +64,8 @@ TEST(test_reorder_execute, ReorderData) {
     ASSERT_EQ(p.compile(&cp, inputs, outputs, engine), graph::status::success);
 
     graph::stream_t *stream = get_stream();
-    test_tensor src_ts(src_lt, engine, src);
-    test_tensor dst_ts(dst_lt, engine, dst);
+    test_tensor_t src_ts(src_lt, engine, src);
+    test_tensor_t dst_ts(dst_lt, engine, dst);
 
     cp.execute(stream, {src_ts.get()}, {dst_ts.get()});
     stream->wait();
@@ -125,7 +125,7 @@ TEST(test_reorder_execute, Int8Reorder) {
 
     ASSERT_EQ(agraph.finalize(), graph::status::success);
 
-    graph::pass::pass_base_ptr apass = get_pass("int8_reorder_fusion");
+    graph::pass::pass_base_ptr apass = get_pass("x8_reorder");
     apass->run(agraph);
     ASSERT_EQ(agraph.get_num_partitions(), 1U);
     auto part = agraph.get_partitions()[0];
@@ -140,8 +140,8 @@ TEST(test_reorder_execute, Int8Reorder) {
     ASSERT_EQ(p.compile(&cp, inputs, outputs, engine), graph::status::success);
 
     graph::stream_t *stream = get_stream();
-    test_tensor src_ts(int8_src_lt, engine, int8_src);
-    test_tensor dst_ts(int8_dst_lt, engine, int8_dst);
+    test_tensor_t src_ts(int8_src_lt, engine, int8_src);
+    test_tensor_t dst_ts(int8_dst_lt, engine, int8_dst);
 
     cp.execute(stream, {src_ts.get()}, {dst_ts.get()});
     stream->wait();
@@ -226,8 +226,8 @@ TEST(test_reorder_execute, ReorderDataBf16) {
     ASSERT_EQ(p.compile(&cp, inputs, outputs, engine), graph::status::success);
 
     graph::stream_t *stream = get_stream();
-    test_tensor src_ts(src_lt, engine, src);
-    test_tensor dst_ts(dst_lt, engine, dst);
+    test_tensor_t src_ts(src_lt, engine, src);
+    test_tensor_t dst_ts(dst_lt, engine, dst);
 
     cp.execute(stream, {src_ts.get()}, {dst_ts.get()});
     stream->wait();
@@ -271,7 +271,7 @@ TEST(test_reorder_execute, ReorderAddBf16) {
 
     ASSERT_EQ(agraph.finalize(), graph::status::success);
 
-    graph::pass::pass_base_ptr apass = get_pass("reorder_sum_fusion");
+    graph::pass::pass_base_ptr apass = get_pass("fp_reorder_sum");
     apass->run(agraph);
 
     ASSERT_EQ(agraph.get_num_partitions(), 1U);
@@ -286,9 +286,9 @@ TEST(test_reorder_execute, ReorderAddBf16) {
     std::vector<const graph::logical_tensor_t *> outputs {&add_dst_lt};
     ASSERT_EQ(p.compile(&cp, inputs, outputs, eng), graph::status::success);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor post_src_ts(add_src_lt, eng, post_src);
-    test_tensor dst_ts(add_dst_lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t post_src_ts(add_src_lt, eng, post_src);
+    test_tensor_t dst_ts(add_dst_lt, eng, dst);
     cp.execute(strm, {src_ts.get(), post_src_ts.get()}, {dst_ts.get()});
     strm->wait();
 }
@@ -321,7 +321,7 @@ TEST(test_reorder_compile, ReorderAddGetInplacePair) {
 
     ASSERT_EQ(agraph.finalize(), graph::status::success);
 
-    graph::pass::pass_base_ptr apass = get_pass("reorder_sum_fusion");
+    graph::pass::pass_base_ptr apass = get_pass("fp_reorder_sum");
     apass->run(agraph);
 
     ASSERT_EQ(agraph.get_num_partitions(), 1U);
@@ -352,8 +352,6 @@ TEST(test_reorder_execute, Int8ReorderAdd) {
         |
         quant
     */
-    // todo(xinyu): fix the case
-    GTEST_SKIP();
     graph::engine_t *engine = get_engine();
 
     std::vector<uint8_t> int8_src {1, 2, 3, 4, 5, 6};
@@ -417,10 +415,9 @@ TEST(test_reorder_execute, Int8ReorderAdd) {
 
     ASSERT_EQ(agraph.finalize(), graph::status::success);
 
-    graph::pass::pass_base_ptr apass
-            = get_pass(engine->kind() == graph::engine_kind::cpu
-                            ? "int8_reorder_sum_fusion_cpu"
-                            : "int8_reorder_sum_fusion_gpu");
+    graph::pass::pass_base_ptr apass = get_pass(
+            engine->kind() == graph::engine_kind::cpu ? "x8_reorder_sum_cpu"
+                                                      : "x8_reorder_sum_gpu");
     apass->run(agraph);
 
     ASSERT_EQ(agraph.get_num_partitions(), 1U);
@@ -437,9 +434,9 @@ TEST(test_reorder_execute, Int8ReorderAdd) {
     ASSERT_EQ(p.compile(&cp, inputs, outputs, engine), graph::status::success);
 
     graph::stream_t *stream = get_stream();
-    test_tensor src_ts(int8_src_lt, engine, int8_src);
-    test_tensor src_other_ts(int8_src_other_lt, engine, int8_src_other);
-    test_tensor dst_ts(int8_dst_add_lt, engine, int8_dst);
+    test_tensor_t src_ts(int8_src_lt, engine, int8_src);
+    test_tensor_t src_other_ts(int8_src_other_lt, engine, int8_src_other);
+    test_tensor_t dst_ts(int8_dst_add_lt, engine, int8_dst);
 
     cp.execute(stream, {src_ts.get(), src_other_ts.get()}, {dst_ts.get()});
     stream->wait();
@@ -449,7 +446,7 @@ TEST(test_reorder_execute, Int8ReorderAdd) {
     }
 }
 
-TEST(test_reorder_compile, ReorderBlockLayoutInput) {
+TEST(test_reorder_compile, ReorderBlockLayoutInput_GPU) {
     using dims = graph::dnnl_impl::dims;
 
     /*    | 

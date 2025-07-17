@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -36,6 +36,7 @@ dnnl_data_type_t prb_t::get_dt(data_kind_t data_kind) const {
         case WEI: return wei_dt();
         case BIA: return bia_dt;
         case DST: return dst_dt();
+        case DROPOUT_MASK: return dnnl_u8;
         default: assert(!"unexpected"); return dnnl_data_type_undef;
     }
 }
@@ -55,6 +56,9 @@ benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> prb_t::get_md(int arg) const {
         case DNNL_ARG_DST:
             assert(dst_runtime_dim_mask().any());
             return dnn_mem_t::init_md(ndims, dst_dims.data(), dst_dt(), dtag);
+        case DNNL_ARG_ATTR_DROPOUT_MASK:
+            return dnn_mem_t::init_md(ndims, dst_dims.data(),
+                    get_dt(DROPOUT_MASK), attr.dropout.tag);
         default:
             assert(!"unsupported arg");
             return make_benchdnn_dnnl_wrapper<dnnl_memory_desc_t>(nullptr);
@@ -62,7 +66,7 @@ benchdnn_dnnl_wrapper_t<dnnl_memory_desc_t> prb_t::get_md(int arg) const {
 }
 
 std::string prb_t::set_repro_line() {
-    std::stringstream s;
+    dnnl::impl::stringstream_t s;
     dump_global_params(s);
     settings_t def;
 
@@ -72,9 +76,7 @@ std::string prb_t::set_repro_line() {
 
     if (canonical || !has_default_dts) s << "--dt=" << dt << " ";
     if (canonical || stag != def.stag[0]) s << "--stag=" << stag << " ";
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     s << sparse_options;
-#endif
     if (canonical || wtag != def.wtag[0]) s << "--wtag=" << wtag << " ";
     if (canonical || dtag != def.dtag[0]) s << "--dtag=" << dtag << " ";
     if (canonical || strides != def.strides[0])
@@ -86,7 +88,7 @@ std::string prb_t::set_repro_line() {
           << weights_runtime_dim_mask().to_ulong() << " ";
 
     if (canonical || bia_dt != def.bia_dt[0]) {
-        s << "--bia_dt=" << bia_dt << " ";
+        s << "--bia-dt=" << bia_dt << " ";
 
         if (canonical || bia_mask != def.bia_mask[0])
             s << "--bia_mask=" << bia_mask << " ";
@@ -97,6 +99,8 @@ std::string prb_t::set_repro_line() {
         s << "--ctx-init=" << ctx_init << " ";
     if (canonical || ctx_exe != def.ctx_exe[0])
         s << "--ctx-exe=" << ctx_exe << " ";
+    if (canonical || !impl_filter.is_def() || !global_impl_filter.is_def())
+        s << impl_filter;
 
     s << static_cast<const prb_vdims_t &>(*this);
 

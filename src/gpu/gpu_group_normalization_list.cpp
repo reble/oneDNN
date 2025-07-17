@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2024 Intel Corporation
+* Copyright 2024-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,7 +16,13 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/ocl/ref_group_normalization.hpp"
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/ref_group_normalization.hpp"
+#endif
+
+#ifdef GENERIC_SYCL_KERNELS_ENABLED
+#include "gpu/generic/sycl/ref_group_normalization.hpp"
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -29,12 +35,14 @@ using namespace dnnl::impl::prop_kind;
 const std::map<pk_impl_key_t, std::vector<impl_list_item_t>>
 impl_list_map REG_GNORM_P({
     {{forward}, {
-        INSTANCE(ocl::ref_group_normalization_fwd_t)
+        GPU_INSTANCE_INTEL(intel::ref_group_normalization_fwd_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_group_normalization_fwd_t)
         nullptr,
         }
     },
     {{backward}, REG_BWD_PK({
-        INSTANCE(ocl::ref_group_normalization_bwd_t)
+        GPU_INSTANCE_INTEL(intel::ref_group_normalization_bwd_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_group_normalization_bwd_t)
         nullptr,
         })
     },

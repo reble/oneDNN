@@ -1,5 +1,7 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
+* Copyright 2024-2025 FUJITSU LIMITED
+* Copyright 2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,6 +21,7 @@
 
 #ifndef ONEAPI_DNNL_DNNL_HPP
 #define ONEAPI_DNNL_DNNL_HPP
+// NOLINTBEGIN(readability-identifier-naming)
 
 #include "oneapi/dnnl/dnnl_config.h"
 
@@ -300,6 +303,23 @@ inline dnnl_scratchpad_mode_t convert_to_c(scratchpad_mode mode) {
     return static_cast<dnnl_scratchpad_mode_t>(mode);
 }
 
+/// Rounding mode
+enum class rounding_mode {
+    /// rounding mode dictated by the floating-point environment
+    environment = dnnl_rounding_mode_environment,
+    /// stochastic rounding mode where a random bias is added to the
+    /// trailing mantissa bits before conversion.
+    stochastic = dnnl_rounding_mode_stochastic
+};
+
+/// Converts a rounding mode enum value from C++ API to C API type.
+///
+/// @param mode C++ API rounding mode enum value.
+/// @returns Corresponding C API rounding mode enum value.
+inline dnnl_rounding_mode_t convert_to_c(rounding_mode mode) {
+    return static_cast<dnnl_rounding_mode_t>(mode);
+}
+
 /// Propagation kind.
 enum class prop_kind {
     /// Undefined propagation kind.
@@ -453,6 +473,8 @@ enum class algorithm {
     binary_eq = dnnl_binary_eq,
     /// Binary not equal
     binary_ne = dnnl_binary_ne,
+    /// Binary select
+    binary_select = dnnl_binary_select,
     /// Nearest Neighbor resampling method
     resampling_nearest = dnnl_resampling_nearest,
     /// Linear (Bilinear, Trilinear) resampling method
@@ -496,9 +518,13 @@ inline dnnl_alg_kind_t convert_to_c(algorithm aalgorithm) {
 /// Flags for normalization primitives.
 enum class normalization_flags : unsigned {
     /// Use no normalization flags. If specified, the library computes mean and
-    /// variance on forward propagation for training and inference, outputs them
-    /// on forward propagation for training, and computes the respective
+    /// variance on forward propagation for training and inference, outputs
+    /// them on forward propagation for training, and computes the respective
     /// derivatives on backward propagation.
+    ///
+    /// @note
+    ///     Backward propagation of type #dnnl::prop_kind::backward_data has
+    ///     the same behavior as #dnnl::prop_kind::backward.
     none = dnnl_normalization_flags_none,
 
     /// Use global statistics. If specified, the library uses mean and
@@ -524,12 +550,35 @@ enum class normalization_flags : unsigned {
     /// the workspace to implement backward propagation. On inference, the
     /// workspace is not required and behavior is the same as when normalization
     /// is fused with ReLU using the post-ops API.
+    ///
+    /// @note
+    ///     The flag implies negative slope being 0. On training this is the only
+    ///     configuration supported. For inference, to use non-zero negative slope
+    ///     consider using @ref dev_guide_attributes_post_ops.
     fuse_norm_relu = dnnl_fuse_norm_relu,
 
-    /// Fuse normalization with elementwise binary Add and then fuse with ReLU.
-    /// On training, normalization will require the workspace to implement
-    /// backward propagation. On inference, the workspace is not required.
+    /// Fuse normalization with an elementwise binary Add operation
+    /// followed by ReLU.
+    /// During training, normalization will require a workspace to implement
+    /// backward propagation. For inference, the workspace is not needed.
+    /// On forward propagation, an elementwise binary Add operation is applied
+    /// to the normalization results with an additional input tensor, followed
+    /// by ReLU with a negative slope of 0.
+    /// On backward propagation, the result of the backward ReLU operation
+    /// with the input tensor and workspace from the forward pass is saved
+    /// to an extra output tensor, and backward normalization is performed.
     fuse_norm_add_relu = dnnl_fuse_norm_add_relu,
+
+    /// Use Root Mean Square (RMS) Normalization. In forward propagation,
+    /// the mean is considered zero, and RMS norm is used instead of variance
+    /// for scaling. Only the RMS norm is output during forward propagation for
+    /// training. In backward propagation, the library calculates the derivative
+    /// with respect to the RMS norm only, assuming the mean is zero.
+    ///
+    /// @note
+    ///     When used with #dnnl::normalization_flags::use_global_stats,
+    ///     only RMS norm is required to be provided as input.
+    rms_norm = dnnl_rms_norm,
 };
 
 /// Converts normalization flags enum value from C++ API to C API type.
@@ -717,14 +766,12 @@ enum class query {
     inner_blks = dnnl_query_inner_blks,
     /// vector of logical indices of the blocks
     inner_idxs = dnnl_query_inner_idxs,
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     /// Sparse encoding
     sparse_encoding = dnnl_query_sparse_encoding,
     /// Number of non-zero entries
     nnz_s64 = dnnl_query_nnz_s64,
     /// Number of buffers required for a memory descriptor
     num_handles_s32 = dnnl_query_num_handles_s32,
-#endif
 };
 
 /// Converts query enum value from C++ API to C API type.
@@ -814,10 +861,10 @@ struct memory : public handle<dnnl_memory_t> {
     using handle::handle;
 
     /// Integer type for representing dimension sizes and indices.
-    typedef dnnl_dim_t dim;
+    using dim = dnnl_dim_t;
     /// Vector of dimensions. Implementations are free to force a limit on the
     /// vector's length.
-    typedef std::vector<dim> dims;
+    using dims = std::vector<dim>;
 
     /// Helper function that validates that an `std::vector` of dimensions can
     /// be safely converted to the C API array ::dnnl_dims_t. Throws if
@@ -835,6 +882,12 @@ struct memory : public handle<dnnl_memory_t> {
     enum class data_type {
         /// Undefined data type (used for empty memory descriptors).
         undef = dnnl_data_type_undef,
+        /// 4-bit float data type with 3-bit exponent and 0 bit mantissa.
+        f4_e3m0 = dnnl_f4_e3m0,
+        /// [MX-compliant 4-bit float data type](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf) with 2-bit exponent and 1 bit mantissa.
+        f4_e2m1 = dnnl_f4_e2m1,
+        /// [MX-compliant 8-bit compliant scale data type](https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf) with 8-bit exponent.
+        e8m0 = dnnl_e8m0,
         /// [OFP8 standard 8-bit floating-point](https://www.opencompute.org/documents/ocp-8-bit-floating-point-specification-ofp8-revision-1-0-2023-06-20-pdf)
         /// with a 5-bit exponent and a 2-bit mantissa.
         f8_e5m2 = dnnl_f8_e5m2,
@@ -878,29 +931,28 @@ struct memory : public handle<dnnl_memory_t> {
         /// A tensor in a generic format described by the stride and blocking
         /// values in each dimension.
         blocked = dnnl_blocked,
-#ifdef DNNL_EXPERIMENTAL_SPARSE
         /// Format kind for sparse tensors.
         sparse = dnnl_format_kind_sparse,
-#endif
         /// A special format kind that indicates that tensor format is opaque.
         opaque = dnnl_format_kind_opaque,
     };
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     /// Sparse encodings.
+    /// @sa @ref dev_guide_sparsity
     enum class sparse_encoding {
-            /// Undefined sparse encoding kind, used for empty memory descriptors.
-            undef = dnnl_sparse_encoding_undef,
-            /// Compressed Sparse Row (CSR) encoding.
-            csr = dnnl_csr,
-            /// An encoding that is used for an opaque storage schema for
-            /// tensors with unstructured sparsity. A memory descriptor with the
-            /// packed encoding cannot be used to create a memory object. It can
-            /// only be used to create a primitive descriptor to query the
-            /// actual memory descriptor (similar to the format tag `any`).
-            packed = dnnl_packed,
+        /// Undefined sparse encoding kind, used for empty memory descriptors.
+        undef = dnnl_sparse_encoding_undef,
+        /// Compressed Sparse Row (CSR) encoding.
+        csr = dnnl_csr,
+        /// An encoding that is used for an opaque storage schema for
+        /// tensors with unstructured sparsity. A memory descriptor with the
+        /// packed encoding cannot be used to create a memory object. It can
+        /// only be used to create a primitive descriptor to query the
+        /// actual memory descriptor (similar to the format tag `any`).
+        packed = dnnl_packed,
+        /// Coordinate Sparse (COO) encoding.
+        coo = dnnl_coo,
     };
-#endif
 
     /// Memory format tag specification.
     ///
@@ -1194,6 +1246,7 @@ struct memory : public handle<dnnl_memory_t> {
         AB16b64a2b = dnnl_AB16b64a2b,
         Ab4a = dnnl_Ab4a,
         Ab8a = dnnl_Ab8a,
+        Ab32a = dnnl_Ab32a,
         Abc16a = dnnl_Abc16a,
         ABc16a16b = dnnl_ABc16a16b,
         ABc4a4b = dnnl_ABc4a4b,
@@ -1388,6 +1441,7 @@ struct memory : public handle<dnnl_memory_t> {
         aBdeC8b4c = dnnl_aBdeC8b4c,
         aBdefc16b = dnnl_aBdefc16b,
         aCBdef16c16b = dnnl_aCBdef16c16b,
+        aCBdef8b8c = dnnl_aCBdef8b8c,
         aCBdef16b16c = dnnl_aCBdef16b16c,
         aBdefc4b = dnnl_aBdefc4b,
         aBdefc8b = dnnl_aBdefc8b,
@@ -1398,8 +1452,10 @@ struct memory : public handle<dnnl_memory_t> {
         Acb8a = dnnl_Acb8a,
         AcB8a2b = dnnl_AcB8a2b,
         AcB8a4b = dnnl_AcB8a4b,
+        aCBd8b8c = dnnl_aCBd8b8c,
         aCBd16b16c = dnnl_aCBd16b16c,
         aCBd16c16b = dnnl_aCBd16c16b,
+        aCBde8b8c = dnnl_aCBde8b8c,
         aCBde16b16c = dnnl_aCBde16b16c,
         aCBde16c16b = dnnl_aCBde16c16b,
         Acdb16a = dnnl_Acdb16a,
@@ -1412,12 +1468,15 @@ struct memory : public handle<dnnl_memory_t> {
         Acdeb8a = dnnl_Acdeb8a,
         AcdeB8a2b = dnnl_AcdeB8a2b,
         AcdeB8a4b = dnnl_AcdeB8a4b,
+        BAc8a8b = dnnl_BAc8a8b,
         BAc16a16b = dnnl_BAc16a16b,
         BAc16b16a = dnnl_BAc16b16a,
+        BAcd8a8b = dnnl_BAcd8a8b,
         BAcd16a16b = dnnl_BAcd16a16b,
         BAcd16b16a = dnnl_BAcd16b16a,
         ABcd32a32b = dnnl_ABcd32a32b,
         BAcde16b16a = dnnl_BAcde16b16a,
+        BAcde8a8b = dnnl_BAcde8a8b,
         BAcde16a16b = dnnl_BAcde16a16b,
         aBdec32b = dnnl_aBdec32b,
         Abcdef16a = dnnl_Abcdef16a,
@@ -1441,10 +1500,12 @@ struct memory : public handle<dnnl_memory_t> {
         AB8a2b = dnnl_AB8a2b,
         abDc16d = dnnl_abDc16d,
         abDc32d = dnnl_abDc32d,
+        abDC16d4c = dnnl_abDC16d4c,
         abDC32d4c = dnnl_abDC32d4c,
         abCd32c = dnnl_abCd32c,
         abdEc16e = dnnl_abdEc16e,
         abdEc32e = dnnl_abdEc32e,
+        abdEC16e4c = dnnl_abdEC16e4c,
         abdEC32e2c = dnnl_abdEC32e2c,
         abdEC32e4c = dnnl_abdEC32e4c,
         abdCe16c = dnnl_abdCe16c,
@@ -1577,6 +1638,9 @@ struct memory : public handle<dnnl_memory_t> {
         BA16a32b4a = dnnl_BA16a32b4a,
         BA16a48b4a = dnnl_BA16a48b4a,
         BA16a64b4a = dnnl_BA16a64b4a,
+        BA24b8a = dnnl_BA24b8a,
+        aCB24c8b = dnnl_aCB24c8b,
+        abDC24d8c = dnnl_abDC24d8c,
         decbA16a = dnnl_decbA16a,
         decbA8a = dnnl_decbA8a,
         defcbA16a = dnnl_defcbA16a,
@@ -1633,6 +1697,12 @@ struct memory : public handle<dnnl_memory_t> {
         ABcde8b16a = dnnl_ABcde8b16a,
         AcdeB8b16a = dnnl_AcdeB8b16a,
         AB8b8a = dnnl_AB8b8a,
+        abDC8d8c = dnnl_abDC8d8c,
+        abDC16d8c = dnnl_abDC16d8c,
+        aCB8c8b = dnnl_aCB8c8b,
+        aCB16c8b = dnnl_aCB16c8b,
+        BA8b8a = dnnl_BA8b8a,
+        BA16b8a = dnnl_BA16b8a,
 
         format_tag_last = dnnl_format_tag_last,
 
@@ -1668,6 +1738,7 @@ struct memory : public handle<dnnl_memory_t> {
         gIOhw16i16o = dnnl_gIOhw16i16o,
         gOhwi32o = dnnl_gOhwi32o,
         Goidhw16g = dnnl_Goidhw16g,
+        IOw8o8i = dnnl_IOw8o8i,
         IOw16o16i = dnnl_IOw16o16i,
         OIw16i16o = dnnl_OIw16i16o,
         OwI16i16o = dnnl_OwI16i16o,
@@ -1724,6 +1795,7 @@ struct memory : public handle<dnnl_memory_t> {
         Owi8o = dnnl_Owi8o,
         OwI8o2i = dnnl_OwI8o2i,
         OwI8o4i = dnnl_OwI8o4i,
+        IOhw8o8i = dnnl_IOhw8o8i,
         IOhw16o16i = dnnl_IOhw16o16i,
         Ohwi16o = dnnl_Ohwi16o,
         OhwI16o2i = dnnl_OhwI16o2i,
@@ -1769,6 +1841,7 @@ struct memory : public handle<dnnl_memory_t> {
         OIhw8o8i = dnnl_OIhw8o8i,
         OIhw8o4i = dnnl_OIhw8o4i,
         OIhw2i8o4i = dnnl_OIhw2i8o4i,
+        IOdhw8o8i = dnnl_IOdhw8o8i,
         IOdhw16o16i = dnnl_IOdhw16o16i,
         Odhwi16o = dnnl_Odhwi16o,
         OdhwI16o2i = dnnl_OdhwI16o2i,
@@ -1822,6 +1895,7 @@ struct memory : public handle<dnnl_memory_t> {
         OdhwI8i8o = dnnl_OdhwI8i8o,
         OIdhw8o8i = dnnl_OIdhw8o8i,
         OIdhw8o4i = dnnl_OIdhw8o4i,
+        gIOw8o8i = dnnl_gIOw8o8i,
         gIOw16o16i = dnnl_gIOw16o16i,
         gOIw16i16o = dnnl_gOIw16i16o,
         gOIw16o16i = dnnl_gOIw16o16i,
@@ -1850,6 +1924,7 @@ struct memory : public handle<dnnl_memory_t> {
         gOwI8o4i = dnnl_gOwI8o4i,
         Goiw8g = dnnl_Goiw8g,
         Goiw16g = dnnl_Goiw16g,
+        gIOhw8o8i = dnnl_gIOhw8o8i,
         gIOhw16o16i = dnnl_gIOhw16o16i,
         gOhwi16o = dnnl_gOhwi16o,
         gOhwI16o2i = dnnl_gOhwI16o2i,
@@ -1896,6 +1971,7 @@ struct memory : public handle<dnnl_memory_t> {
         gOIhw8o8i = dnnl_gOIhw8o8i,
         gOIhw8o4i = dnnl_gOIhw8o4i,
         gIOdhw16i16o = dnnl_gIOdhw16i16o,
+        gIOdhw8o8i = dnnl_gIOdhw8o8i,
         gIOdhw16o16i = dnnl_gIOdhw16o16i,
         gOdhwi16o = dnnl_gOdhwi16o,
         gOdhwI16o2i = dnnl_gOdhwI16o2i,
@@ -1936,8 +2012,10 @@ struct memory : public handle<dnnl_memory_t> {
 
         ldOi16o = abDc16d,
         ldOi32o = abDc32d,
+        ldOI16o4i = abDC16d4c,
         ldOI32o4i = abDC32d4c,
         ldgOi16o = abdEc16e,
+        ldgOI16o4i = abdEC16e4c,
         ldgOi32o = abdEc32e,
         ldgOI32o2i = abdEC32e2c,
         ldgOI32o4i = abdEC32e4c,
@@ -2684,6 +2762,23 @@ struct memory : public handle<dnnl_memory_t> {
         gIhwO24i4o = dnnl_gIhwO24i4o,
         gIdhwO8i4o = dnnl_gIdhwO8i4o,
         gIdhwO24i4o = dnnl_gIdhwO24i4o,
+        BA2a24b = dnnl_BA2a24b,
+        aCB2b24c = dnnl_aCB2b24c,
+        BA2a8b = dnnl_BA2a8b,
+        aCB2b8c = dnnl_aCB2b8c,
+        BA8a24b = dnnl_BA8a24b,
+        aCB8b24c = dnnl_aCB8b24c,
+        BA8a16b = dnnl_BA8a16b,
+        aCB8b16c = dnnl_aCB8b16c,
+        BA8a8b = dnnl_BA8a8b,
+        aCB8b8c = dnnl_aCB8b8c,
+        bcad = dnnl_bcad,
+        cabd = dnnl_cabd,
+        dabc = dnnl_dabc,
+        decbA4a = dnnl_decbA4a,
+        defcbA4a = dnnl_defcbA4a,
+        hwioG4g = dnnl_hwioG4g,
+        dhwioG4g = dnnl_dhwioG4g,
     };
 
     /// A memory descriptor.
@@ -2761,7 +2856,7 @@ struct memory : public handle<dnnl_memory_t> {
                         "strides");
             reset(md);
         }
-#ifdef DNNL_EXPERIMENTAL_SPARSE
+
         /// Function for creating a memory descriptor for CSR sparse encoding.
         ///
         /// The created memory descriptor will describe a memory object that
@@ -2780,6 +2875,7 @@ struct memory : public handle<dnnl_memory_t> {
         ///     allowed to fail without throwing an exception. In this case a
         ///     zero memory descriptor will be constructed. This flag is
         ///     optional and defaults to false.
+        /// @sa @ref dev_guide_sparsity
         static desc csr(const dims &adims, data_type adata_type, dim nnz,
                 data_type index_dt, data_type pointer_dt,
                 bool allow_empty = false) {
@@ -2792,6 +2888,39 @@ struct memory : public handle<dnnl_memory_t> {
             if (!allow_empty)
                 error::wrap_c_api(status,
                         "could not create a memory descriptor for CSR sparse "
+                        "encoding");
+            return desc {md};
+        }
+
+        /// Function for creating a memory descriptor for COO sparse encodings.
+        ///
+        /// The created memory descriptor will describe a memory object that
+        /// contains n+1 buffers for an n-dimensional tensor.
+        /// The buffers have the following meaning and assigned numbers (index):
+        ///  - 0: values
+        ///  - 1: indices for dimension 0
+        ///  - 2: indices for dimension 1 ...
+        ///  - n: indices for dimension n-1
+        ///
+        /// @param adims Tensor dimensions.
+        /// @param adata_type Data precision/type.
+        /// @param nnz Number of non-zero entries.
+        /// @param index_dt Data type of indices.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case a
+        ///     zero memory descriptor will be constructed. This flag is
+        ///     optional and defaults to false.
+        /// @sa @ref dev_guide_sparsity
+        static desc coo(const dims &adims, data_type adata_type, dim nnz,
+                data_type index_dt, bool allow_empty = false) {
+            validate_dims(adims);
+            dnnl_memory_desc_t md = nullptr;
+            dnnl_status_t status = dnnl_memory_desc_create_with_coo_encoding(
+                    &md, (int)adims.size(), adims.data(),
+                    convert_to_c(adata_type), nnz, convert_to_c(index_dt));
+            if (!allow_empty)
+                error::wrap_c_api(status,
+                        "could not create a memory descriptor for COO sparse "
                         "encoding");
             return desc {md};
         }
@@ -2816,6 +2945,7 @@ struct memory : public handle<dnnl_memory_t> {
         ///     allowed to fail without throwing an exception. In this case a
         ///     zero memory descriptor will be constructed. This flag is
         ///     optional and defaults to false.
+        /// @sa @ref dev_guide_sparsity
         static desc packed(const dims &adims, data_type adata_type, dim nnz,
                 bool allow_empty = false) {
             validate_dims(adims);
@@ -2829,13 +2959,24 @@ struct memory : public handle<dnnl_memory_t> {
                         "sparse encoding");
             return desc {md};
         }
-#endif
+
         /// Construct a memory descriptor from a C API ::dnnl_memory_desc_t
         /// handle. The resulting handle is not weak and the C handle will be
         /// destroyed during the destruction of the C++ object.
         ///
         /// @param md The C API memory descriptor.
         desc(dnnl_memory_desc_t md) : handle<dnnl_memory_desc_t>(md) {}
+
+        /// Construct a memory descriptor from a binary blob.
+        ///
+        /// @param blob A binary blob previously queried from a memory descriptor.
+        desc(const std::vector<uint8_t> &blob) {
+            dnnl_memory_desc_t md = nullptr;
+            error::wrap_c_api(
+                    dnnl_memory_desc_create_with_blob(&md, blob.data()),
+                    "could not create a memory descriptor from blob");
+            reset(md);
+        }
 
         /// Constructs a memory descriptor for a region inside an area
         /// described by this memory descriptor.
@@ -3041,7 +3182,6 @@ struct memory : public handle<dnnl_memory_t> {
             return query_dims(query::inner_idxs);
         }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
         /// Returns number of handles.
         ///
         /// @returns A number of handles.
@@ -3065,6 +3205,7 @@ struct memory : public handle<dnnl_memory_t> {
         /// Returns the sparse encoding of the memory descriptor.
         ///
         /// @returns the sparse encoding kind.
+        /// @sa @ref dev_guide_sparsity
         memory::sparse_encoding get_sparse_encoding() const {
             dnnl_sparse_encoding_t sparse_encoding;
             dnnl_status_t status = dnnl_memory_desc_query_v2(
@@ -3081,14 +3222,6 @@ struct memory : public handle<dnnl_memory_t> {
         memory::data_type get_data_type(int index = 0) const {
             return query_data_type(query::data_type, index);
         }
-#else
-        /// Returns the data type of the memory descriptor.
-        ///
-        /// @returns The data type.
-        memory::data_type get_data_type() const {
-            return query_data_type(query::data_type);
-        }
-#endif
 
         /// Returns the format kind of the memory descriptor.
         ///
@@ -3108,7 +3241,6 @@ struct memory : public handle<dnnl_memory_t> {
         /// @returns A copy of the dimensions vector.
         memory::dims get_dims() const { return query_dims(query::dims); }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
         /// Returns size of the memory descriptor in bytes.
         /// @param index Data index. Defaults to 0.
         /// @returns The number of bytes required to allocate a memory buffer
@@ -3117,13 +3249,21 @@ struct memory : public handle<dnnl_memory_t> {
         size_t get_size(int index = 0) const {
             return dnnl_memory_desc_get_size_v2(get(), index);
         }
-#else
-        /// Returns size of the memory descriptor in bytes.
-        /// @returns The number of bytes required to allocate a memory buffer
-        ///     for the memory object described by this memory descriptor
-        ///     including the padding area.
-        size_t get_size() const { return dnnl_memory_desc_get_size(get()); }
-#endif
+
+        /// Returns a binary blob associated with the given memory descriptor
+        /// @returns The memory descriptor blob associated with the memory descriptor
+        std::vector<uint8_t> get_blob() {
+            size_t size;
+            dnnl_status_t status
+                    = dnnl_memory_desc_get_blob(nullptr, &size, get());
+            error::wrap_c_api(
+                    status, "could not get memory descriptor blob size");
+
+            std::vector<uint8_t> out_blob(size);
+            status = dnnl_memory_desc_get_blob(out_blob.data(), &size, get());
+            error::wrap_c_api(status, "could not get memory descriptor blob");
+            return out_blob;
+        }
 
         /// Checks whether the memory descriptor is zero (empty).
         /// @returns @c true if the memory descriptor describes an empty
@@ -3145,7 +3285,6 @@ struct memory : public handle<dnnl_memory_t> {
         bool operator!=(const desc &other) const { return !operator==(other); }
 
     private:
-#ifdef DNNL_EXPERIMENTAL_SPARSE
         memory::data_type query_data_type(query what, int index) const {
             dnnl_data_type_t data_type;
             dnnl_status_t status = dnnl_memory_desc_query_v2(
@@ -3154,16 +3293,6 @@ struct memory : public handle<dnnl_memory_t> {
                     ? static_cast<dnnl::memory::data_type>(data_type)
                     : dnnl::memory::data_type::undef;
         }
-#else
-        memory::data_type query_data_type(query what) const {
-            dnnl_data_type_t data_type;
-            dnnl_status_t status = dnnl_memory_desc_query(
-                    get(), dnnl::convert_to_c(what), &data_type);
-            return status == dnnl_success
-                    ? static_cast<dnnl::memory::data_type>(data_type)
-                    : dnnl::memory::data_type::undef;
-        }
-#endif
 
         int query_s32(query what) const {
             int res;
@@ -3194,7 +3323,6 @@ struct memory : public handle<dnnl_memory_t> {
     /// absence of a parameter.
     memory() = default;
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     /// Constructs a memory object.
     ///
     /// Unless @p handle is equal to #DNNL_MEMORY_NONE, the constructed memory
@@ -3263,43 +3391,6 @@ struct memory : public handle<dnnl_memory_t> {
         error::wrap_c_api(status, "could not create a memory object");
         reset(result);
     }
-#else
-    /// Constructs a memory object.
-    ///
-    /// Unless @p handle is equal to #DNNL_MEMORY_NONE, the constructed memory
-    /// object will have the underlying buffer set. In this case, the buffer
-    /// will be initialized as if #dnnl::memory::set_data_handle() had been
-    /// called.
-    ///
-    /// @sa memory::set_data_handle()
-    ///
-    /// @param md Memory descriptor.
-    /// @param aengine Engine to store the data on.
-    /// @param handle Handle of the memory buffer to use.
-    ///     - A pointer to the user-allocated buffer. In this case the library
-    ///       doesn't own the buffer.
-    ///     - The #DNNL_MEMORY_ALLOCATE special value. Instructs the library to
-    ///       allocate the buffer for the memory object. In this case the
-    ///       library owns the buffer.
-    ///     - #DNNL_MEMORY_NONE to create dnnl::memory without an underlying
-    ///       buffer.
-    memory(const desc &md, const engine &aengine, void *handle) {
-        dnnl_memory_t result;
-        error::wrap_c_api(
-                dnnl_memory_create(&result, md.get(), aengine.get(), handle),
-                "could not create a memory object");
-        reset(result);
-    }
-
-    /// Constructs a memory object.
-    ///
-    /// The underlying buffer for the memory will be allocated by the library.
-    ///
-    /// @param md Memory descriptor.
-    /// @param aengine Engine to store the data on.
-    memory(const desc &md, const engine &aengine)
-        : memory(md, aengine, DNNL_MEMORY_ALLOCATE) {}
-#endif
 
     /// Returns the associated memory descriptor.
     desc get_desc() const {
@@ -3320,7 +3411,6 @@ struct memory : public handle<dnnl_memory_t> {
         return engine(c_engine, true);
     }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
     /// Returns an underlying memory buffer that corresponds to the given index.
     ///
     /// On the CPU engine, or when using USM, this is a pointer to the
@@ -3391,73 +3481,6 @@ struct memory : public handle<dnnl_memory_t> {
         error::wrap_c_api(dnnl_memory_unmap_data_v2(get(), mapped_ptr, index),
                 "could not unmap memory object data");
     }
-#else
-    /// Returns the underlying memory buffer.
-    ///
-    /// On the CPU engine, or when using USM, this is a pointer to the
-    /// allocated memory.
-    void *get_data_handle() const {
-        void *handle;
-        error::wrap_c_api(dnnl_memory_get_data_handle(get(), &handle),
-                "could not get a native handle from a memory object");
-        return handle;
-    }
-
-    /// Sets the underlying memory buffer.
-    ///
-    /// @param handle Memory buffer to use. On the CPU engine or when USM is
-    ///     used, the memory buffer is a pointer to the actual data. For OpenCL
-    ///     it is a cl_mem. It must have at least
-    ///     #dnnl::memory::desc::get_size() bytes allocated.
-    void set_data_handle(void *handle) const {
-        error::wrap_c_api(dnnl_memory_set_data_handle(get(), handle),
-                "could not set native handle of a memory object");
-    }
-
-    /// Maps a memory object and returns a host-side pointer to a memory
-    /// buffer with a copy of its contents.
-    ///
-    /// Mapping enables read/write directly from/to the memory contents for
-    /// engines that do not support direct memory access.
-    ///
-    /// Mapping is an exclusive operation - a memory object cannot be used in
-    /// other operations until it is unmapped via #dnnl::memory::unmap_data()
-    /// call.
-    ///
-    /// @note
-    ///     Any primitives working with the memory should be completed before
-    ///     the memory is mapped. Use #dnnl::stream::wait() to synchronize the
-    ///     corresponding execution stream.
-    ///
-    /// @note
-    ///     The map_data and unmap_data functions are provided mainly for
-    ///     debug and testing purposes and their performance may be suboptimal.
-    ///
-    /// @tparam T Data type to return a pointer to.
-    /// @returns Pointer to the mapped memory.
-    template <typename T = void>
-    T *map_data() const {
-        void *mapped_ptr;
-        error::wrap_c_api(dnnl_memory_map_data(get(), &mapped_ptr),
-                "could not map memory object data");
-        return static_cast<T *>(mapped_ptr);
-    }
-
-    /// Unmaps a memory object and writes back any changes made to the
-    /// previously mapped memory buffer.
-    ///
-    /// @note
-    ///     The map_data and unmap_data functions are provided mainly for
-    ///     debug and testing purposes and their performance may be
-    ///     suboptimal.
-    ///
-    /// @param mapped_ptr A pointer previously returned by
-    ///     #dnnl::memory::map_data().
-    void unmap_data(void *mapped_ptr) const {
-        error::wrap_c_api(dnnl_memory_unmap_data(get(), mapped_ptr),
-                "could not unmap memory object data");
-    }
-#endif
 
     static dnnl_data_type_t convert_to_c(data_type adata_type) {
         return static_cast<dnnl_data_type_t>(adata_type);
@@ -3729,10 +3752,10 @@ struct post_ops : public handle<dnnl_post_ops_t> {
 
     /// Appends a binary post-op.
     ///
-    /// The kind of this post operation is #dnnl_binary.
+    /// This post operation is categorized as #dnnl_binary.
     ///
     /// In the simplest case when the binary is the only post operation, the
-    /// computations would be:
+    /// computations will be:
     ///
     ///     dst[:] <- binary_op (dst[:], another_input[:])
     ///
@@ -3745,6 +3768,32 @@ struct post_ops : public handle<dnnl_post_ops_t> {
         error::wrap_c_api(dnnl_post_ops_append_binary(get(),
                                   convert_to_c(aalgorithm), src1_desc.get()),
                 "could not append a binary post-op");
+    }
+
+    /// Appends a binary post-op with ternary operators.
+    ///
+    /// This post operation is categorized as #dnnl_binary.
+    ///
+    /// In the simplest case when this is the only post operation, the
+    /// computations will be:
+    ///
+    ///     dst[:] <- binary_op (dst[:], another_input1[:], another_input2[:])
+    ///
+    /// where binary_op is configured with the given parameters. binary_op
+    /// supports broadcast semantics only for the second operand and not for the
+    /// third operand.
+    ///
+    /// @param aalgorithm Binary algorithm for the post-op.
+    /// @param src1_desc Memory descriptor of the second operand.
+    /// @param src2_desc Memory descriptor of the third operand. If the specified
+    /// algorithm is not one that requires a ternary input, src2_desc will be
+    /// ignored.
+    void append_binary(algorithm aalgorithm, const memory::desc &src1_desc,
+            const memory::desc &src2_desc) {
+        error::wrap_c_api(
+                dnnl_post_ops_append_binary_v2(get(), convert_to_c(aalgorithm),
+                        src1_desc.get(), src2_desc.get()),
+                "could not append a binary post-op with ternary operators");
     }
 
     /// Returns the parameters of a binary post-op.
@@ -3764,6 +3813,33 @@ struct post_ops : public handle<dnnl_post_ops_t> {
         error::wrap_c_api(dnnl_memory_desc_clone(&cloned_md, cdesc),
                 "could not clone a memory descriptor");
         src1_desc = memory::desc(cloned_md);
+    }
+
+    /// Returns the parameters of a binary post-op with ternary operators.
+    ///
+    /// @param index Index of the binary post-op.
+    /// @param aalgorithm Output binary algorithm kind.
+    /// @param src1_desc Output memory descriptor of the second operand.
+    /// @param src2_desc Output memory descriptor of the third operand.
+    void get_params_binary(int index, algorithm &aalgorithm,
+            memory::desc &src1_desc, memory::desc &src2_desc) const {
+        dnnl_alg_kind_t c_alg;
+        const_dnnl_memory_desc_t cdesc1, cdesc2;
+        error::wrap_c_api(dnnl_post_ops_get_params_binary_v2(
+                                  get(), index, &c_alg, &cdesc1, &cdesc2),
+                "could not get parameters of a binary post-op with ternary "
+                "operators");
+        aalgorithm = static_cast<dnnl::algorithm>(c_alg);
+        dnnl_memory_desc_t cloned_md1 = nullptr;
+        dnnl_memory_desc_t cloned_md2 = nullptr;
+
+        error::wrap_c_api(dnnl_memory_desc_clone(&cloned_md1, cdesc1),
+                "could not clone a memory descriptor");
+        src1_desc = memory::desc(cloned_md1);
+
+        error::wrap_c_api(dnnl_memory_desc_clone(&cloned_md2, cdesc2),
+                "could not clone a memory descriptor");
+        src2_desc = memory::desc(cloned_md2);
     }
 
     /// Appends a prelu forward post-op.
@@ -3864,6 +3940,28 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
     primitive_attr(dnnl_primitive_attr_t attr)
         : handle<dnnl_primitive_attr_t>(attr) {}
 
+    /// Returns the parameters of a dropout attribute.
+    ///
+    /// @param mask_desc Output memory descriptor of a dropout mask.
+    void get_dropout(memory::desc &mask_desc) const {
+        const_dnnl_memory_desc_t cdesc;
+        error::wrap_c_api(dnnl_primitive_attr_get_dropout(get(), &cdesc),
+                "could not get parameters of a dropout attribute");
+        dnnl_memory_desc_t cloned_md = nullptr;
+        error::wrap_c_api(dnnl_memory_desc_clone(&cloned_md, cdesc),
+                "could not clone a memory descriptor");
+        mask_desc = memory::desc(cloned_md);
+    }
+
+    /// Sets dropout probability.
+    ///
+    /// @param mask_desc Output memory descriptor of a dropout mask.
+    void set_dropout(const memory::desc &mask_desc) {
+        error::wrap_c_api(
+                dnnl_primitive_attr_set_dropout(get(), mask_desc.get()),
+                "could not set dropout primitive attribute");
+    }
+
     /// Returns the fpmath mode
     fpmath_mode get_fpmath_mode() const {
         dnnl_fpmath_mode_t result;
@@ -3931,6 +4029,27 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
                 "could not set deterministic primitive attribute");
     }
 
+    /// Returns the rounding mode attribute value
+    ///
+    /// @param arg Argument for which rounding mode query applies.
+    /// @returns The rounding mode applied to the specified argument.
+    rounding_mode get_rounding_mode(int arg) const {
+        dnnl_rounding_mode_t result;
+        error::wrap_c_api(dnnl_primitive_attr_get_rounding(get(), arg, &result),
+                "could not get rounding mode primitive attribute");
+        return rounding_mode(result);
+    }
+
+    /// Sets the rounding mode attribute value for a given argument
+    ///
+    /// @param arg Argument for which to set rounding mode.
+    /// @param mode Rounding mode to apply.
+    void set_rounding_mode(int arg, rounding_mode mode) {
+        error::wrap_c_api(dnnl_primitive_attr_set_rounding(
+                                  get(), arg, convert_to_c(mode)),
+                "could not set rounding mode primitive attribute");
+    }
+
     /// Returns the scratchpad mode.
     scratchpad_mode get_scratchpad_mode() const {
         dnnl_scratchpad_mode_t result;
@@ -3984,6 +4103,7 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
     ///     correspondence between the tensor dimensions and the scales array.
     ///     The set i-th dimension indicates a number of groups of scaling
     ///     factors used for that logical dimension in a memory indicated by @p arg.
+    /// @param data_type Scaling factors data_type.
     void set_scales(int arg, int mask, const memory::dims &groups,
             memory::data_type data_type = memory::data_type::f32) {
         error::wrap_c_api(dnnl_primitive_attr_set_scales(get(), arg, mask,
@@ -4028,6 +4148,7 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
     ///     correspondence between the tensor dimensions and the zero_points array.
     ///     The set i-th dimension indicates a number of groups of zero point
     ///     factors used for that logical dimension in a memory indicated by @p arg.
+    /// @param data_type Zero point factors data_type.
     void set_zero_points(int arg, int mask, const memory::dims &groups,
             memory::data_type data_type = memory::data_type::s32) {
         error::wrap_c_api(dnnl_primitive_attr_set_zero_points(get(), arg, mask,
@@ -4039,7 +4160,7 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
     /// Returns post-ops previously set via set_post_ops().
     ///
     /// @returns Post-ops.
-    const post_ops get_post_ops() const {
+    post_ops get_post_ops() const {
         const_dnnl_post_ops_t const_c_post_ops;
         error::wrap_c_api(
                 dnnl_primitive_attr_get_post_ops(get(), &const_c_post_ops),
@@ -4058,7 +4179,7 @@ struct primitive_attr : public handle<dnnl_primitive_attr_t> {
     ///     by the respective primitive descriptor constructor.
     ///
     /// @param ops Post-ops object to copy post-ops from.
-    void set_post_ops(const post_ops ops) {
+    void set_post_ops(const post_ops &ops) {
         error::wrap_c_api(dnnl_primitive_attr_set_post_ops(get(), ops.get()),
                 "could not set post-ops primitive attribute");
     }
@@ -4899,8 +5020,10 @@ struct reorder : public primitive {
                     dst_engine.get(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a reorder "
-                        "primitive");
+                        "could not create a primitive descriptor for "
+                        "the reorder primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(status == dnnl_success ? result : dnnl_primitive_desc_t());
         }
 
@@ -4927,8 +5050,10 @@ struct reorder : public primitive {
                     dst.get_engine().get(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a reorder "
-                        "primitive");
+                        "could not create a primitive descriptor for "
+                        "the reorder primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(status == dnnl_success ? result : dnnl_primitive_desc_t());
         }
 
@@ -5052,8 +5177,10 @@ struct concat : public primitive {
                     concat_dimension, c_srcs.data(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a concat "
-                        "primitive");
+                        "could not create a primitive descriptor for "
+                        "the concat primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(status == dnnl_success ? result : dnnl_primitive_desc_t());
         }
 
@@ -5086,8 +5213,10 @@ struct concat : public primitive {
                     concat_dimension, c_api_srcs.data(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a concat "
-                        "primitive");
+                        "could not create a primitive descriptor for "
+                        "the concat primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(status == dnnl_success ? result : dnnl_primitive_desc_t());
         }
 
@@ -5168,8 +5297,10 @@ struct sum : public primitive {
                     scales.data(), c_api_srcs.data(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a sum "
-                        "primitive");
+                        "could not create a primitive descriptor for "
+                        "the sum primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(status == dnnl_success ? result : dnnl_primitive_desc_t());
         }
 
@@ -5203,8 +5334,10 @@ struct sum : public primitive {
                     scales.data(), c_api_srcs.data(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a sum "
-                        "primitive");
+                        "could not create a primitive descriptor for "
+                        "the sum primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(status == dnnl_success ? result : dnnl_primitive_desc_t());
         }
 
@@ -5544,8 +5677,10 @@ struct convolution_forward : public primitive {
                             &padding_l[0], &padding_r[0], attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "convolution forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the convolution forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -5736,8 +5871,10 @@ struct convolution_backward_data : public primitive {
                             hint_fwd_pd.get(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "convolution backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the convolution backward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -6042,8 +6179,10 @@ struct convolution_backward_weights : public primitive {
                             &padding_r[0], hint_fwd_pd.get(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "convolution weights update primitive");
+                        "could not create a primitive descriptor for "
+                        "the convolution weights update primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -6338,8 +6477,10 @@ struct deconvolution_forward : public primitive {
                             &padding_l[0], &padding_r[0], attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "deconvolution forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the deconvolution forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -6528,8 +6669,10 @@ struct deconvolution_backward_data : public primitive {
                             hint_fwd_pd.get(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "deconvolution backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the deconvolution backward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -6827,8 +6970,10 @@ struct deconvolution_backward_weights : public primitive {
                             &padding_r[0], hint_fwd_pd.get(), attr.get());
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "deconvolution weights update primitive");
+                        "could not create a primitive descriptor for "
+                        "the deconvolution weights update primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -6906,8 +7051,10 @@ struct lrn_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a lrn "
-                        "forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the lrn forward propagation primitive. Run workload "
+                        "with environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(pd);
         }
 
@@ -7013,8 +7160,10 @@ struct lrn_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a lrn "
-                        "backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the lrn backward propagation primitive. Run workload "
+                        "with environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(pd);
         }
 
@@ -7226,8 +7375,10 @@ struct eltwise_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for an "
-                        "eltwise forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the eltwise forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -7403,8 +7554,10 @@ struct eltwise_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for an "
-                        "eltwise backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the eltwise backward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -7476,8 +7629,10 @@ struct softmax_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a softmax "
-                        "forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the softmax forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
 
@@ -7567,8 +7722,10 @@ struct softmax_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a softmax "
-                        "backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the softmax backward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
 
@@ -7685,8 +7842,11 @@ struct batch_normalization_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a batch "
-                        "normalization forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the batch normalization forward propagation "
+                        "primitive. Run workload with environment variable "
+                        "ONEDNN_VERBOSE=all to get additional diagnostic "
+                        "information.");
             reset(pd);
         }
 
@@ -7813,8 +7973,11 @@ struct batch_normalization_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a batch "
-                        "normalization backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the batch normalization backward propagation "
+                        "primitive. Run workload with environment variable "
+                        "ONEDNN_VERBOSE=all to get additional diagnostic "
+                        "information.");
             reset(pd);
         }
 
@@ -7958,8 +8121,11 @@ struct group_normalization_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a group "
-                        "normalization forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the group normalization forward propagation "
+                        "primitive. Run workload with environment variable "
+                        "ONEDNN_VERBOSE=all to get additional diagnostic "
+                        "information.");
             reset(pd);
         }
 
@@ -8090,8 +8256,11 @@ struct group_normalization_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a group "
-                        "normalization backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the group normalization backward propagation "
+                        "primitive. Run workload with environment variable "
+                        "ONEDNN_VERBOSE=all to get additional diagnostic "
+                        "information.");
             reset(pd);
         }
 
@@ -8396,8 +8565,11 @@ struct layer_normalization_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a layer "
-                        "normalization forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the layer normalization forward propagation "
+                        "primitive. Run workload with environment variable "
+                        "ONEDNN_VERBOSE=all to get additional diagnostic "
+                        "information.");
             reset(pd);
         }
     };
@@ -8665,8 +8837,11 @@ struct layer_normalization_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a layer "
-                        "normalization backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the layer normalization backward propagation "
+                        "primitive. Run workload with environment variable "
+                        "ONEDNN_VERBOSE=all to get additional diagnostic "
+                        "information.");
             reset(pd);
         }
     };
@@ -8805,8 +8980,10 @@ struct inner_product_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for an inner "
-                        "product forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the inner product forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -8872,8 +9049,10 @@ struct inner_product_backward_data : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for an inner "
-                        "product backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the inner product backward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
 
@@ -9033,8 +9212,10 @@ struct inner_product_backward_weights : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for an inner "
-                        "product weights gradient primitive");
+                        "could not create a primitive descriptor for "
+                        "the inner product weights gradient primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -9335,8 +9516,10 @@ protected:
                         weights_iter_desc.get(), bias_desc.get(),
                         dst_layer_desc.get(), dst_iter_desc.get(),
                         convert_to_c(flags), alpha, beta, attr.get());
-                msg = "could not create a primitive descriptor for a vanilla "
-                      "RNN forward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the vanilla RNN forward propagation primitive. Run "
+                      "workload with environment variable ONEDNN_VERBOSE=all "
+                      "to get additional diagnostic information.";
                 break;
             case algorithm::vanilla_lstm:
                 status = dnnl_lstm_forward_primitive_desc_create(&pd,
@@ -9349,8 +9532,10 @@ protected:
                         dst_layer_desc.get(), dst_iter_desc.get(),
                         optional_arg(dst_iter_c_desc), convert_to_c(flags),
                         attr.get());
-                msg = "could not create a primitive descriptor for an LSTM "
-                      "forward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the LSTM forward propagation primitive. Run workload "
+                      "with environment variable ONEDNN_VERBOSE=all to get "
+                      "additional diagnostic information.";
                 break;
             case algorithm::vanilla_gru:
                 status = dnnl_gru_forward_primitive_desc_create(&pd,
@@ -9360,8 +9545,10 @@ protected:
                         weights_iter_desc.get(), bias_desc.get(),
                         dst_layer_desc.get(), dst_iter_desc.get(),
                         convert_to_c(flags), attr.get());
-                msg = "could not create a primitive descriptor for a GRU "
-                      "forward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the GRU forward propagation primitive. Run workload "
+                      "with environment variable ONEDNN_VERBOSE=all to get "
+                      "additional diagnostic information.";
                 break;
             case algorithm::lbr_gru:
                 status = dnnl_lbr_gru_forward_primitive_desc_create(&pd,
@@ -9371,8 +9558,10 @@ protected:
                         weights_iter_desc.get(), bias_desc.get(),
                         dst_layer_desc.get(), dst_iter_desc.get(),
                         convert_to_c(flags), attr.get());
-                msg = "could not create a primitive descriptor for an LBR GRU "
-                      "forward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the LBR GRU forward propagation primitive. Run workload "
+                      "with environment variable ONEDNN_VERBOSE=all to get "
+                      "additional diagnostic information.";
                 break;
             case algorithm::vanilla_augru:
                 status = dnnl_augru_forward_primitive_desc_create(&pd,
@@ -9382,8 +9571,10 @@ protected:
                         weights_layer_desc.get(), weights_iter_desc.get(),
                         bias_desc.get(), dst_layer_desc.get(),
                         dst_iter_desc.get(), convert_to_c(flags), attr.get());
-                msg = "could not create a primitive descriptor for an AUGRU "
-                      "forward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the AUGRU forward propagation primitive. Run workload "
+                      "with environment variable ONEDNN_VERBOSE=all to get "
+                      "additional diagnostic information.";
                 break;
             case algorithm::lbr_augru:
                 status = dnnl_lbr_augru_forward_primitive_desc_create(&pd,
@@ -9393,8 +9584,10 @@ protected:
                         weights_layer_desc.get(), weights_iter_desc.get(),
                         bias_desc.get(), dst_layer_desc.get(),
                         dst_iter_desc.get(), convert_to_c(flags), attr.get());
-                msg = "could not create a primitive descriptor for an LBR "
-                      "AUGRU forward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the LBR AUGRU forward propagation primitive. Run "
+                      "workload with environment variable ONEDNN_VERBOSE=all "
+                      "to get additional diagnostic information.";
                 break;
             default: status = dnnl_unimplemented;
         }
@@ -9452,8 +9645,10 @@ protected:
                         diff_dst_layer_desc.get(), diff_dst_iter_desc.get(),
                         convert_to_c(flags), alpha, beta, hint_fwd_pd.get(),
                         attr.get());
-                msg = "could not create a primitive descriptor for a vanilla "
-                      "RNN backward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the vanilla RNN backward propagation primitive. Run "
+                      "workload with environment variable ONEDNN_VERBOSE=all "
+                      "to get additional diagnostic information.";
                 break;
             case algorithm::vanilla_lstm:
                 status = dnnl_lstm_backward_primitive_desc_create(&pd,
@@ -9475,8 +9670,10 @@ protected:
                         diff_dst_iter_desc.get(),
                         optional_arg(diff_dst_iter_c_desc), convert_to_c(flags),
                         hint_fwd_pd.get(), attr.get());
-                msg = "could not create a primitive descriptor for an LSTM "
-                      "backward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the LSTM backward propagation primitive. Run workload "
+                      "with environment variable ONEDNN_VERBOSE=all to get "
+                      "additional diagnostic information.";
                 break;
             case algorithm::vanilla_gru:
                 status = dnnl_gru_backward_primitive_desc_create(&pd,
@@ -9490,8 +9687,10 @@ protected:
                         diff_weights_iter_desc.get(), diff_bias_desc.get(),
                         diff_dst_layer_desc.get(), diff_dst_iter_desc.get(),
                         convert_to_c(flags), hint_fwd_pd.get(), attr.get());
-                msg = "could not create a primitive descriptor for a GRU "
-                      "backward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the GRU backward propagation primitive. Run workload "
+                      "with environment variable ONEDNN_VERBOSE=all to get "
+                      "additional diagnostic information.";
                 break;
             case algorithm::lbr_gru:
                 status = dnnl_lbr_gru_backward_primitive_desc_create(&pd,
@@ -9505,8 +9704,10 @@ protected:
                         diff_weights_iter_desc.get(), diff_bias_desc.get(),
                         diff_dst_layer_desc.get(), diff_dst_iter_desc.get(),
                         convert_to_c(flags), hint_fwd_pd.get(), attr.get());
-                msg = "could not create a primitive descriptor for an LBR GRU "
-                      "backward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the LBR GRU backward propagation primitive. Run "
+                      "workload with environment variable ONEDNN_VERBOSE=all "
+                      "to get additional diagnostic information.";
                 break;
             case algorithm::vanilla_augru:
                 status = dnnl_augru_backward_primitive_desc_create(&pd,
@@ -9522,8 +9723,10 @@ protected:
                         diff_weights_iter_desc.get(), diff_bias_desc.get(),
                         diff_dst_layer_desc.get(), diff_dst_iter_desc.get(),
                         convert_to_c(flags), hint_fwd_pd.get(), attr.get());
-                msg = "could not create a primitive descriptor for an AUGRU "
-                      "backward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the AUGRU backward propagation primitive. Run workload "
+                      "with environment variable ONEDNN_VERBOSE=all to get "
+                      "additional diagnostic information.";
                 break;
             case algorithm::lbr_augru:
                 status = dnnl_lbr_augru_backward_primitive_desc_create(&pd,
@@ -9539,8 +9742,10 @@ protected:
                         diff_weights_iter_desc.get(), diff_bias_desc.get(),
                         diff_dst_layer_desc.get(), diff_dst_iter_desc.get(),
                         convert_to_c(flags), hint_fwd_pd.get(), attr.get());
-                msg = "could not create a primitive descriptor for an LBR "
-                      "AUGRU backward propagation primitive";
+                msg = "could not create a primitive descriptor for "
+                      "the LBR AUGRU backward propagation primitive. Run "
+                      "workload with environment variable ONEDNN_VERBOSE=all "
+                      "to get additional diagnostic information.";
                 break;
             default: status = dnnl_unimplemented;
         }
@@ -12278,8 +12483,10 @@ struct shuffle_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a shuffle "
-                        "forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the shuffle forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
 
@@ -12365,8 +12572,10 @@ struct shuffle_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a shuffle "
-                        "backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the shuffle backward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
 
@@ -12457,8 +12666,46 @@ struct binary : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a binary "
-                        "operation primitive");
+                        "could not create a primitive descriptor for "
+                        "the binary operation primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
+            reset(pd);
+        }
+
+        /// Constructs a primitive descriptor for an elementwise binary operator
+        /// primitive with support of ternary operators.
+        ///
+        /// @param aengine Engine to use.
+        /// @param aalgorithm Elementwise binary algorithm.
+        /// @param src0 Memory descriptor for source tensor #0.
+        /// @param src1 Memory descriptor for source tensor #1.
+        /// @param src2 Memory descriptor for source tensor #2 for ternary
+        ///     operations. Might be empty.
+        /// @param dst Memory descriptor for destination tensor.
+        /// @param attr Primitive attributes to use. Attributes are optional
+        ///     and default to empty attributes.
+        /// @param allow_empty A flag signifying whether construction is
+        ///     allowed to fail without throwing an exception. In this case an
+        ///     empty object will be produced. This flag is optional and
+        ///     defaults to false.
+        primitive_desc(const engine &aengine, algorithm aalgorithm,
+                const memory::desc &src0, const memory::desc &src1,
+                const memory::desc &src2, const memory::desc &dst,
+                const primitive_attr &attr = default_attr(),
+                bool allow_empty = false) {
+
+            dnnl_primitive_desc_t pd = nullptr;
+            dnnl_status_t status = dnnl_binary_primitive_desc_create_v2(&pd,
+                    aengine.get(), dnnl::convert_to_c(aalgorithm), src0.get(),
+                    src1.get(), src2.get(), dst.get(), attr.get());
+
+            if (!allow_empty)
+                error::wrap_c_api(status,
+                        "could not create a primitive descriptor for "
+                        "the binary v2 operation primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(pd);
         }
 
@@ -12477,6 +12724,9 @@ struct binary : public primitive {
 
         /// Returns the memory descriptor for source #1.
         memory::desc src1_desc() const { return base::src_desc(1); }
+
+        /// Returns the memory descriptor for source #2.
+        memory::desc src2_desc() const { return base::src_desc(2); }
 
         /// @copydoc dnnl::primitive_desc_base::dst_desc()const
         memory::desc dst_desc() const { return base::dst_desc(0); }
@@ -12597,8 +12847,10 @@ struct matmul : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a matmul "
-                        "primitive");
+                        "could not create a primitive descriptor for "
+                        "the matmul primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(pd);
         }
     };
@@ -12760,8 +13012,10 @@ struct resampling_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "resampling forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the resampling forward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -12884,8 +13138,10 @@ struct resampling_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "resampling backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the resampling backward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
     };
@@ -13221,8 +13477,10 @@ struct prelu_forward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a prelu "
-                        "forward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the prelu forward propagation primitive. Run workload "
+                        "with environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(pd);
         }
 
@@ -13306,8 +13564,10 @@ struct prelu_backward : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a prelu "
-                        "backward propagation primitive");
+                        "could not create a primitive descriptor for "
+                        "the prelu backward propagation primitive. Run "
+                        "workload with environment variable ONEDNN_VERBOSE=all "
+                        "to get additional diagnostic information.");
             reset(pd);
         }
 
@@ -13406,8 +13666,10 @@ struct reduction : public primitive {
 
             if (!allow_empty)
                 error::wrap_c_api(status,
-                        "could not create a primitive descriptor for a "
-                        "reduction primitive descriptor");
+                        "could not create a primitive descriptor for "
+                        "the reduction primitive. Run workload with "
+                        "environment variable ONEDNN_VERBOSE=all to get "
+                        "additional diagnostic information.");
             reset(pd);
         }
 
@@ -13553,6 +13815,10 @@ enum class cpu_isa {
     avx10_1_512_amx_fp16 = dnnl_cpu_isa_avx10_1_512_amx_fp16,
     /// @copydoc dnnl_cpu_isa_avx512_core_amx_fp16
     avx512_core_amx_fp16 = dnnl_cpu_isa_avx512_core_amx_fp16,
+    /// @copydoc dnnl_cpu_isa_avx10_2_512
+    avx10_2_512 = dnnl_cpu_isa_avx10_2_512,
+    /// @copydoc dnnl_cpu_isa_avx10_2_512_amx_2
+    avx10_2_512_amx_2 = dnnl_cpu_isa_avx10_2_512_amx_2,
 };
 
 /// @copydoc dnnl_set_max_cpu_isa()
@@ -13761,4 +14027,5 @@ namespace dnnl = ::dnnl;
 
 /// @} dnnl_api
 
+// NOLINTEND(readability-identifier-naming)
 #endif /* ONEAPI_DNNL_DNNL_HPP */

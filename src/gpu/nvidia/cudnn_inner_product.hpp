@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,9 +22,9 @@
 
 #include "common/c_types_map.hpp"
 #include "common/inner_product_pd.hpp"
-#include "common/primitive.hpp"
+#include "gpu/gpu_primitive.hpp"
 #include "gpu/nvidia/cudnn_inner_product_impl.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/engine.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -32,22 +32,24 @@ namespace impl {
 namespace gpu {
 namespace nvidia {
 
-struct cudnn_inner_product_fwd_t : public primitive_t {
+struct cudnn_inner_product_fwd_t : public gpu::primitive_t {
 public:
-    using primitive_t::primitive_t;
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public inner_product_fwd_pd_t {
         using inner_product_fwd_pd_t::inner_product_fwd_pd_t;
 
-        bool attr_scales_ok() const {
-            const auto &scales = attr()->scales_;
-            const auto &supported_args
-                    = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST};
-            if (!scales.has_default_values(supported_args)) return false;
-            // cuDNN does not support scaling per dimension.
-            for (auto arg : supported_args)
-                if (scales.get(arg).mask_ != 0) return false;
-            return true;
+        bool attr_scales_ok(const std::vector<int> &supported_args
+                = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST}) const {
+            bool ok = attr()->scales_.has_default_values(supported_args);
+            for (int arg : supported_args) {
+                if (attr()->scales_.has_default_values(arg)) continue;
+
+                const auto &mask = attr()->scales_.get_mask(arg);
+                // cuDNN does not support scaling per dimension.
+                ok = ok && (mask == 0);
+            }
+            return ok;
         }
 
         std::shared_ptr<cudnn_inner_product_impl_base_t> inner_product_impl_;
@@ -59,9 +61,9 @@ public:
     }
 };
 
-struct cudnn_inner_product_bwd_data_t : public primitive_t {
+struct cudnn_inner_product_bwd_data_t : public gpu::primitive_t {
 public:
-    using primitive_t::primitive_t;
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public inner_product_bwd_data_pd_t {
         using inner_product_bwd_data_pd_t::inner_product_bwd_data_pd_t;
@@ -75,9 +77,9 @@ public:
     }
 };
 
-struct cudnn_inner_product_bwd_weights_t : public primitive_t {
+struct cudnn_inner_product_bwd_weights_t : public gpu::primitive_t {
 public:
-    using primitive_t::primitive_t;
+    using gpu::primitive_t::primitive_t;
     struct pd_t : public inner_product_bwd_weights_pd_t {
         using inner_product_bwd_weights_pd_t::inner_product_bwd_weights_pd_t;
 

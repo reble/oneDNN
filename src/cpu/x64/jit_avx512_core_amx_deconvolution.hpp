@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2024 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -35,9 +35,7 @@ namespace x64 {
 
 struct jit_avx512_core_amx_deconvolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_deconvolution_fwd_pd_t {
-        pd_t(const deconvolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_deconvolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_deconvolution_fwd_pd_t::cpu_deconvolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(
                 JIT_IMPL_NAME_HELPER("jit_deconvolution:", jcp_.isa, ""),
@@ -62,7 +60,7 @@ struct jit_avx512_core_amx_deconvolution_fwd_t : public primitive_t {
                     && IMPLICATION(with_bias(),
                             utils::one_of(bias_md_.data_type, f32, s32, s8, u8))
                     && attr()->has_default_values(
-                            smask_t::scales_runtime | smask_t::post_ops)
+                            smask_t::scales | smask_t::post_ops)
                     && attr_scales_ok();
 
             VDISPATCH_DECONVOLUTION(is_fwd(), VERBOSE_BAD_PROPKIND);
@@ -75,6 +73,7 @@ struct jit_avx512_core_amx_deconvolution_fwd_t : public primitive_t {
             VDISPATCH_DECONVOLUTION(
                     !has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
 
+            // TODO: make `init_conf` assign initialized object to `jcp_`
             CHECK(jit_avx512_core_amx_bwd_data_kernel_t::init_conf(jcp_,
                     *desc(), dst_md_, weights_md_, src_md_, &bias_md_, attr_,
                     dnnl_get_max_threads()));
@@ -86,7 +85,7 @@ struct jit_avx512_core_amx_deconvolution_fwd_t : public primitive_t {
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     jit_avx512_core_amx_deconvolution_fwd_t(const pd_t *apd)

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ using namespace Xbyak;
 using namespace data_type;
 
 template <cpu_isa_t isa>
-struct jit_pp_kernel_t : public pp_kernel_t, public jit_generator {
+struct jit_pp_kernel_t : public pp_kernel_t, public jit_generator_t {
     DECLARE_CPU_JIT_AUX_FUNCTIONS(inner_product_utils::jit_pp_kernel_t);
 
     jit_pp_kernel_t(size_t OC, size_t MB, dim_t dst_mb_stride,
@@ -54,7 +54,9 @@ struct jit_pp_kernel_t : public pp_kernel_t, public jit_generator {
             size_t first_mb_matrix_addr_off, const exec_ctx_t &ctx,
             const memory_desc_t &dst_md) const override;
 
-    status_t create_kernel() override { return jit_generator::create_kernel(); }
+    status_t create_kernel() override {
+        return jit_generator_t::create_kernel();
+    }
 
 private:
     using Vmm = typename utils::conditional3<isa == sse41, Xbyak::Xmm,
@@ -178,7 +180,7 @@ private:
     int compute_vreg_bias_shift_ = 0;
     int compute_vreg_prev_dst_shift_ = 0;
 
-    const size_t vlen = cpu_isa_traits<isa>::vlen / sizeof(float);
+    const size_t vlen = cpu_isa_traits_t<isa>::vlen / sizeof(float);
     static constexpr int reg64_size_ = sizeof(int64_t);
     static constexpr int reg_binary_post_op_oc_off_ = 0;
     static constexpr int reg_binary_post_op_offset_ = 1 * reg64_size_;
@@ -270,7 +272,7 @@ jit_pp_kernel_t<isa>::jit_pp_kernel_t(size_t OC, size_t MB, dim_t dst_mb_stride,
         const memory_desc_t *dst_md, bool skip_sum)
     : pp_kernel_t(
             OC, MB, dst_mb_stride, attr, bias_dt, acc_dt, dst_md, skip_sum)
-    , jit_generator(jit_name(), nullptr, MAX_CODE_SIZE, true, isa) {
+    , jit_generator_t(jit_name(), isa) {
     assert(IMPLICATION(this->dst_data_type_ == bf16, mayiuse(avx512_core)));
 
     if (this->do_scale_) vreg_scale = Vmm(idx_compute_vreg_start_++);
@@ -288,7 +290,7 @@ jit_pp_kernel_t<isa>::jit_pp_kernel_t(size_t OC, size_t MB, dim_t dst_mb_stride,
 
     if (this->do_bias()) compute_vreg_bias_shift_ = compute_vregs_per_iter_++;
 
-    if (!attr->scales_.get(DNNL_ARG_DST).has_default_values()) {
+    if (!attr->scales_.has_default_values(DNNL_ARG_DST)) {
         this->do_dst_scale_ = true;
         vreg_dst_scale = Vmm(idx_compute_vreg_start_++);
     }
@@ -1192,7 +1194,8 @@ void jit_pp_kernel_t<isa>::generate() {
     if (this->do_binary_ || this->do_prelu_) add(rsp, stack_space_needed_);
     postamble();
 
-    if (this->do_eltwise_) postops_injector_->prepare_table();
+    if (this->do_eltwise_)
+        postops_injector_->prepare_table(/* generate = */ true);
 }
 
 template <cpu_isa_t isa>
@@ -1236,7 +1239,7 @@ void jit_pp_kernel_t<isa>::operator()(void *dst, const void *acc,
 
     args.post_ops_binary_rhs_arg_vec = post_ops_binary_rhs_arg_vec;
     args.dst_orig = dst_orig;
-    jit_generator::operator()(&args);
+    jit_generator_t::operator()(&args);
 }
 
 pp_kernel_t *jit_pp_kernel_create(size_t OC, size_t MB, dim_t dst_mb_stride,

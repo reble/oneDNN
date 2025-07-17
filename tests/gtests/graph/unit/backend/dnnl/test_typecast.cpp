@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@
 namespace graph = dnnl::impl::graph;
 namespace utils = dnnl::graph::tests::unit::utils;
 
-TEST(test_typecase_execute, Typecast) {
+TEST(test_typecast_execute, Typecast) {
     graph::engine_t *engine = get_engine();
 
     std::vector<float> f32_val {
@@ -62,8 +62,8 @@ TEST(test_typecase_execute, Typecast) {
     ASSERT_EQ(p.compile(&cp, inputs, outputs, engine), graph::status::success);
 
     graph::stream_t *stream = get_stream();
-    test_tensor f32_ts(f32_lt, engine, f32_val);
-    test_tensor bf16_ts(bf16_lt, engine, bf16_val);
+    test_tensor_t f32_ts(f32_lt, engine, f32_val);
+    test_tensor_t bf16_ts(bf16_lt, engine, bf16_val);
 
     // f32 --> bf16
     ASSERT_EQ(cp.execute(stream, {f32_ts.get()}, {bf16_ts.get()}),
@@ -71,7 +71,7 @@ TEST(test_typecase_execute, Typecast) {
     stream->wait();
 }
 
-TEST(test_typecase_compile, TypecastNegativeInput) {
+TEST(test_typecast_compile, TypecastNegativeInput) {
     graph::engine_t *engine = get_engine();
 
     graph::op_t typecast_op(graph::op_kind::TypeCast);

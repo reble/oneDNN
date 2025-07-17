@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@
 
 namespace dnnl {
 
-struct brgemm_params_t : test_params {
+struct brgemm_params_t : test_params_t {
     impl::data_type_t dt_a;
     impl::data_type_t dt_b;
     impl::cpu::x64::brgemm_batch_kind_t batch_kind;
@@ -187,31 +187,48 @@ private:
         //initialize brgemm kernel
         char palette[64];
         char tile_buffer[1024];
-        x64::brgemm_t desc;
+        x64::brgemm_desc_t desc;
         auto res = brgemm_desc_init(&desc, x64::cpu_isa_t::isa_undef,
                 p.batch_kind, p.dt_a, p.dt_b, p.tr_a(), p.tr_b(), p.layout,
                 p.alpha, p.beta, p.lda, p.ldb, p.ldc, p.M, p.N, p.K);
         if (res != dnnl_success) return res;
 
-        if (desc.is_tmm) res = brgemm_init_tiles(desc, palette);
-        if (!desc.is_tmm) brgemm_desc_set_attr(&desc, p.attrs);
+        if (!desc.is_tmm) {
+            res = brgemm_desc_set_attr(&desc, p.attrs);
+            if (res != dnnl_success) return res;
+        }
 
+        res = brgemm_desc_finalize(&desc);
         if (res != dnnl_success) return res;
+
+        if (desc.is_tmm) {
+            res = brgemm_init_tiles(desc, palette);
+            if (res != dnnl_success) return res;
+        }
 
         x64::brgemm_kernel_t *_t_ptr;
         res = brgemm_kernel_create(&_t_ptr, desc);
+        if (res != dnnl_success) return res;
 
         x64::brgemm_batch_element_t batch_element;
         batch_element.ptr.A = A;
         batch_element.ptr.B = B;
         batch_element.vvpad.top = 0;
         batch_element.vvpad.bottom = 0;
-        if (desc.is_tmm) amx_tile_configure(palette);
+        if (desc.is_tmm) {
+            res = amx_tile_configure(palette);
+            if (res != dnnl_success) return res;
+        }
         brgemm_kernel_execute(_t_ptr, p.bs, &batch_element, C,
                 desc.is_tmm ? tile_buffer : nullptr);
 
-        brgemm_kernel_destroy(_t_ptr);
-        if (desc.is_tmm) amx_tile_release();
+        res = brgemm_kernel_destroy(_t_ptr);
+        if (res != dnnl_success) return res;
+
+        if (desc.is_tmm) {
+            res = amx_tile_release();
+            if (res != dnnl_success) return res;
+        }
 
         return res;
     }
@@ -262,7 +279,7 @@ private:
     }
 
     std::shared_ptr<engine> eng_;
-    test_gemm_data gemm_data_;
+    test_gemm_data_t gemm_data_;
     std::shared_ptr<test_memory> b_mem_reordered_;
 };
 

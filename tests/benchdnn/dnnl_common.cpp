@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include <algorithm> // for std::reverse and std::copy
 #include <functional> // for std::bind and std::placeholders
 #include <list>
+#include <numeric>
 #include <string> // for std::string
 #include <utility> // for std::pair
 #include <vector> // for std::vector
@@ -46,6 +47,7 @@
 #include "dnnl_memory.hpp"
 
 #include "utils/cold_cache.hpp"
+#include "utils/dnnl_query.hpp"
 #include "utils/fill.hpp"
 #include "utils/stream_kind.hpp"
 
@@ -125,6 +127,7 @@ int get_cache_blob(std::vector<uint8_t> &cache_blob, dnnl_primitive_t prim) {
 
 struct lru_cache_t {
     lru_cache_t(size_t capacity) : capacity_(capacity) {}
+    ~lru_cache_t() = default;
 
     const std::vector<uint8_t> &get(const std::vector<uint8_t> &key) {
         auto it = cache_mapper_.find(key);
@@ -140,7 +143,7 @@ struct lru_cache_t {
             cache_mapper_.erase(cache_list_.back().key_);
             cache_list_.pop_back();
         }
-        cache_list_.push_front(entry_t(key, value));
+        cache_list_.emplace_front(key, value);
         cache_mapper_.insert({key, cache_list_.begin()});
     }
 
@@ -172,12 +175,32 @@ lru_cache_t &get_test_cache() {
 
 int test_persistent_cache_api(
         benchdnn_dnnl_wrapper_t<dnnl_primitive_t> &prim, res_t *res) {
+
+    auto pd = query_pd(prim);
+
+    // 0. check memory descriptor serialization API
+    // Limiting to weights md should have good md kind coverage and
+    // limit overhead
+    {
+        dnnl_memory_desc_t new_md;
+        size_t sz = 0;
+        auto wei_md = query_md(pd, dnnl_query_weights_md);
+        dnnl_memory_desc_get_blob(nullptr, &sz, wei_md);
+
+        std::vector<uint8_t> md_blob(sz);
+        dnnl_memory_desc_get_blob(md_blob.data(), &sz, wei_md);
+        dnnl_memory_desc_create_with_blob(&new_md, md_blob.data());
+        auto mew_mdw = make_benchdnn_dnnl_wrapper(new_md);
+
+        if (dnnl_memory_desc_equal(wei_md, new_md) == 0)
+            return res->state = FAILED, FAIL;
+    }
+
+    // Start testing persistent cache API.
     if (!is_gpu() || (is_gpu() && DNNL_GPU_RUNTIME != DNNL_RUNTIME_OCL)) {
         return OK;
     }
 
-    auto pd = query_pd(prim);
-    // Start testing persistent cache API.
     // 1. Disable primitive cache to make sure that the next primitive will
     // be created from the cache blob and not fetched from the primitive cache.
     const auto old_capacity = set_primitive_cache_capacity_without_clearing(0);
@@ -205,12 +228,15 @@ int test_persistent_cache_api(
         st = get_cache_blob(cache_blob, prim);
         if (st != OK) return res->state = FAILED, FAIL;
 
-        // The cross-engine reorder is a special primitive that may contain no
-        // kernels therefore the cache blob will always be empty, which is
-        // the correct behavior.
+        // The cross-engine and direct copy reorders are special primitives that
+        // may contain no kernels therefore the cache blob will always be empty,
+        // which is the correct behavior.
         if (cache_blob.empty()) {
             set_primitive_cache_capacity_without_clearing(old_capacity);
-            if (res->impl_name.find("cross_engine") != std::string::npos)
+            if (query_prim_kind(pd) == dnnl_reorder
+                    && (res->impl_name.find("cross_engine") != std::string::npos
+                            || res->impl_name.find("direct_copy")
+                                    != std::string::npos))
                 return OK;
 
             BENCHDNN_PRINT(
@@ -245,11 +271,14 @@ int default_num_streams = 1;
 int num_streams = default_num_streams;
 
 void init_isa_settings() {
-    if (hints.get() == isa_hints_t::no_hints)
+    if (hints.get() == isa_hints_t::no_hints) {
         DNN_SAFE_V(dnnl_set_cpu_isa_hints(dnnl_cpu_isa_no_hints));
-    else if (hints.get() == isa_hints_t::prefer_ymm)
-        DNN_SAFE_V(dnnl_set_cpu_isa_hints(dnnl_cpu_isa_prefer_ymm));
-    else {
+    } else if (hints.get() == isa_hints_t::prefer_ymm) {
+        auto status = dnnl_set_cpu_isa_hints(dnnl_cpu_isa_prefer_ymm);
+        // Unimplemented is a valid status for non-x64
+        if (status == dnnl_success || status == dnnl_unimplemented) return;
+        DNN_SAFE_V(status);
+    } else {
         // Do nothing when hints == none
         assert(hints.get() == isa_hints_t::none);
     }
@@ -329,7 +358,7 @@ void execute_unmap_args(
 
 // Map the memory back after execute
 void execute_map_args(const args_t &args) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return;
 
     for (int i = 0; i < args.size(); ++i)
         if (!args.dnn_mem(i).is_mapped()) args.dnn_mem(i).map();
@@ -340,13 +369,47 @@ int execute_and_wait(perf_function_t &exec_func, const dnnl_engine_t &engine,
     stream_t stream(engine);
     std::vector<dnnl_exec_arg_t> dnnl_args;
 
-    execute_unmap_args(args, dnnl_args);
+    TIME_EXECUTE(execute_unmap_args(args, dnnl_args));
 
-    auto status = exec_func(stream, dnnl_args);
-    DNN_SAFE(dnnl_stream_wait(stream), CRIT);
+    dnnl_status_t status = dnnl_runtime_error;
+    bool run_regular_exec = true;
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_DPCPP
+    while (execution_mode == execution_mode_t::graph && is_gpu(engine)) {
+        void *queue_ptr;
+        DNN_SAFE(dnnl_sycl_interop_stream_get_queue(stream, &queue_ptr), CRIT);
+        sycl::queue queue = *static_cast<sycl::queue *>(queue_ptr);
+        const bool can_run_sycl_graph = queue.get_device().get_backend()
+                == sycl::backend::ext_oneapi_level_zero;
+        if (!can_run_sycl_graph) break;
+
+        BENCHDNN_PRINT(
+                2, "%s\n", "[INFO] Using experimental SYCL graph execution.");
+        sycl::ext::oneapi::experimental::command_graph graph {
+                queue.get_context(), queue.get_device(),
+                {sycl::ext::oneapi::experimental::property::graph::
+                                assume_buffer_outlives_graph {}}};
+
+        graph.begin_recording(queue);
+        status = exec_func(stream, dnnl_args);
+        graph.end_recording(queue);
+        DNN_SAFE(dnnl_stream_wait(stream), CRIT);
+
+        auto exec = graph.finalize();
+        queue.ext_oneapi_graph(exec).wait();
+
+        // SYCL graph feature completed submission and execution, no need to
+        // have a regular run.
+        run_regular_exec = false;
+        break;
+    }
+#endif
+    if (run_regular_exec) {
+        TIME_EXECUTE(status = exec_func(stream, dnnl_args));
+        TIME_EXECUTE(DNN_SAFE(dnnl_stream_wait(stream), CRIT));
+    }
     if (res) res->state = EXECUTED;
 
-    execute_map_args(args);
+    TIME_EXECUTE(execute_map_args(args));
     if (status != dnnl_success) {
         if (res) res->state = FAILED;
         return FAIL;
@@ -377,8 +440,8 @@ void reset_gpu_profiling(dnnl_stream_t stream) {
 #endif
 }
 
-void get_gpu_profiling_info(dnnl_stream_t stream, std::vector<uint64_t> &nsecs,
-        std::vector<uint64_t> &cycles) {
+int get_gpu_profiling_info(dnnl_stream_t stream, std::vector<uint64_t> &nsecs,
+        std::vector<uint64_t> &cycles, int expected_num_entries) {
 #if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL \
         || DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
     dnnl_profiling_data_kind_t undef_kind {};
@@ -396,15 +459,29 @@ void get_gpu_profiling_info(dnnl_stream_t stream, std::vector<uint64_t> &nsecs,
 #endif
 
     int num_entries = 0;
-    DNN_SAFE_V(dnnl_query_profiling_data(
-            stream, undef_kind, &num_entries, nullptr));
+    DNN_SAFE(dnnl_query_profiling_data(
+                     stream, undef_kind, &num_entries, nullptr),
+            CRIT);
+    if (expected_num_entries != -1 && num_entries != expected_num_entries) {
+        BENCHDNN_PRINT(0,
+                "ERROR: profiling entries mismatch, expected: %d entries but "
+                "got %d entries\n",
+                expected_num_entries, num_entries);
+        return FAIL;
+    }
+    DNN_SAFE(dnnl_query_profiling_data(
+                     stream, time_kind, &num_entries, nsecs.data()),
+            CRIT);
     nsecs.resize(num_entries);
     cycles.resize(num_entries);
-    DNN_SAFE_V(dnnl_query_profiling_data(
-            stream, time_kind, &num_entries, nsecs.data()));
-    DNN_SAFE_V(dnnl_query_profiling_data(
-            stream, cycles_kind, &num_entries, cycles.data()));
+    DNN_SAFE(dnnl_query_profiling_data(
+                     stream, time_kind, &num_entries, nsecs.data()),
+            CRIT);
+    DNN_SAFE(dnnl_query_profiling_data(
+                     stream, cycles_kind, &num_entries, cycles.data()),
+            CRIT);
 #endif
+    return OK;
 }
 
 void notify_gpu_profiling_complete(dnnl_stream_t stream) {
@@ -420,7 +497,7 @@ void finalize() {
 
 inline int measure_perf_individual(timer::timer_t &t, dnnl_stream_t stream,
         perf_function_t &perf_func, std::vector<dnnl_exec_arg_t> &dnnl_args) {
-    cold_cache_t cold_cache(dnnl_args);
+    cold_cache_t cold_cache(dnnl_args, stream);
 
     t.reset();
     while (true) {
@@ -452,8 +529,8 @@ inline int measure_perf_aggregate(timer::timer_t &t,
         // kernel has not been built and skews the results.
         DNN_SAFE(perf_func(v_stream[j], dnnl_args[j]), WARN);
         DNN_SAFE(dnnl_stream_wait(v_stream[j]), CRIT);
+        cold_cache[j] = cold_cache_t(dnnl_args[j], v_stream[j]);
         if (use_profiling) reset_gpu_profiling(v_stream[j]);
-        cold_cache[j] = cold_cache_t(dnnl_args[j]);
     }
 
     bool is_first_loop = true;
@@ -462,11 +539,14 @@ inline int measure_perf_aggregate(timer::timer_t &t,
 
     t.reset();
     while (true) {
+        // Keep separate var due to a `break` inside the loop.
+        int execute_count = 0;
         // Keep inner loop over streams for better submission overlapping.
         for_(int i = 0; i < cur_batch_times; i++)
         for (size_t j = 0; j < v_stream.size(); j++) {
             if (!cold_cache[j].update_dnnl_args(dnnl_args[j])) break;
             DNN_SAFE(perf_func(v_stream[j], dnnl_args[j]), WARN);
+            execute_count++;
         }
 
         for (size_t j = 0; j < v_stream.size(); j++) {
@@ -478,7 +558,9 @@ inline int measure_perf_aggregate(timer::timer_t &t,
             std::vector<std::vector<uint64_t>> v_cycles(num_streams);
             bool nsecs_is_empty = false;
             for (size_t j = 0; j < v_stream.size(); j++) {
-                get_gpu_profiling_info(v_stream[j], v_nsecs[j], v_cycles[j]);
+                SAFE(get_gpu_profiling_info(v_stream[j], v_nsecs[j],
+                             v_cycles[j], execute_count),
+                        CRIT);
                 reset_gpu_profiling(v_stream[j]);
 
                 // Profiling should have information to report, otherwise, stop.
@@ -543,7 +625,10 @@ int measure_perf(const thr_ctx_t &ctx, res_t *res, perf_function_t &perf_func,
         for (int i = 0; i < args.size(); i++) {
             int arg = args.arg(i);
             const auto &m = args.dnn_mem(i);
-            mem_map[j].emplace(arg, dnn_mem_t(m.md_, engine));
+            // Memory must be filled with some data for meaningful performance
+            // numbers.
+            mem_map[j].emplace(
+                    arg, dnn_mem_t(m.md_, engine, /* prefill = */ true));
             SAFE(mem_map[j].at(arg).reorder(m), WARN);
         }
         v_args[j] = args_t(mem_map[j]);
@@ -584,12 +669,14 @@ int measure_perf(
 std::vector<float> prepare_po_vals(const dnn_mem_t &dst_m, const args_t &args,
         const std::vector<std::pair<int, int>> &v_po_masks,
         const size_t dst_off) {
+    if (v_po_masks.empty()) return std::vector<float>();
+
     std::vector<float> v_vals(v_po_masks.size());
 
     for (size_t d = 0; d < v_po_masks.size(); ++d) {
-        const auto po_offset
-                = dst_m.get_scale_idx(dst_off, v_po_masks[d].second);
-        const float val = args.find(v_po_masks[d].first).get_elem(po_offset);
+        const auto po_offset = dst_m.get_idx(dst_off, v_po_masks[d].second);
+        const float val
+                = args.find(v_po_masks[d].first).get_f32_elem(po_offset);
         v_vals[d] = val;
     }
     return v_vals;
@@ -612,20 +699,29 @@ void skip_unimplemented_data_type(
             || (is_cpu() && has_data_type_support(dnnl_bf16)
                     && IMPLICATION(!(dir & FLAG_INF),
                             has_training_support(dnnl_bf16)));
-    const bool has_f16_support = (is_gpu() && (dir & FLAG_FWD))
+    const bool has_f16_support = is_gpu()
             || (is_cpu() && has_data_type_support(dnnl_f16)
                     && IMPLICATION(
                             !(dir & FLAG_INF), has_training_support(dnnl_f16)));
+    const bool has_e8m0_support
+            = is_gpu() || (is_cpu() && has_data_type_support(dnnl_e8m0));
+    const bool has_f4_e2m1_support
+            = is_gpu() || (is_cpu() && has_data_type_support(dnnl_f4_e2m1));
+    const bool has_f4_e3m0_support
+            = is_gpu() || (is_cpu() && has_data_type_support(dnnl_f4_e3m0));
     const bool has_f8_e5m2_support = is_gpu()
             || (is_cpu() && has_data_type_support(dnnl_f8_e5m2)
                     && (dir & FLAG_INF));
     const bool has_f8_e4m3_support = is_gpu()
             || (is_cpu() && has_data_type_support(dnnl_f8_e4m3)
-                    && (dir & FLAG_FWD));
+                    && (dir & FLAG_INF));
 #else
     const bool has_bf16_support = is_gpu();
     // f16 is supported on GPU for inference only.
     const bool has_f16_support = is_gpu() && (dir & FLAG_FWD);
+    const bool has_f4_e2m1_support = is_gpu();
+    const bool has_f4_e3m0_support = false;
+    const bool has_e8m0_support = is_gpu();
     const bool has_f8_e5m2_support = is_gpu();
     const bool has_f8_e4m3_support = is_gpu();
 #endif
@@ -636,12 +732,16 @@ void skip_unimplemented_data_type(
             case dnnl_bf16: need_skip = !has_bf16_support; break;
             case dnnl_f16: need_skip = !has_f16_support; break;
             case dnnl_f64: need_skip = !has_f64_support; break;
+            case dnnl_e8m0: need_skip = !has_e8m0_support; break;
+            case dnnl_f4_e2m1: need_skip = !has_f4_e2m1_support; break;
+            case dnnl_f4_e3m0: need_skip = !has_f4_e3m0_support; break;
             case dnnl_f8_e5m2: need_skip = !has_f8_e5m2_support; break;
             case dnnl_f8_e4m3: need_skip = !has_f8_e4m3_support; break;
             default: break;
         }
         if (need_skip) {
-            res->state = SKIPPED, res->reason = DATA_TYPE_NOT_SUPPORTED;
+            res->state = SKIPPED;
+            res->reason = skip_reason::data_type_not_supported;
             return;
         }
     }
@@ -665,7 +765,8 @@ void skip_unimplemented_sum_po(const attr_t &attr, res_t *res,
             if (e.sum.zero_point != 0) {
                 // Sum with zero-point is only supported for int8
                 if (!is_integral_dt(src_dt)) {
-                    res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+                    res->state = SKIPPED;
+                    res->reason = skip_reason::case_not_supported;
                     return;
                 } else {
                     // Only quantized sum operand can have zero point
@@ -673,7 +774,8 @@ void skip_unimplemented_sum_po(const attr_t &attr, res_t *res,
                             = e.sum.dt == dnnl_data_type_undef ? dst_dt
                                                                : e.sum.dt;
                     if (!is_integral_dt(e_sum_dt)) {
-                        res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+                        res->state = SKIPPED;
+                        res->reason = skip_reason::case_not_supported;
                         return;
                     }
                 }
@@ -681,21 +783,38 @@ void skip_unimplemented_sum_po(const attr_t &attr, res_t *res,
 
             // Sum with zero-point is not supported on GPU
             if (is_gpu() && e.sum.zero_point != 0) {
-                res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+                res->state = SKIPPED;
+                res->reason = skip_reason::case_not_supported;
                 break;
             }
             // Each sum must have same data on CPU
             if (is_cpu() && e.sum.dt != sum_dt) {
-                res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+                res->state = SKIPPED;
+                res->reason = skip_reason::case_not_supported;
                 break;
             }
             // Sum must have data type with the same size like dst on both
             if (dst_dt != dnnl_data_type_undef && sum_dt != dnnl_data_type_undef
                     && dnnl_data_type_size(dst_dt)
                             != dnnl_data_type_size(e.sum.dt)) {
-                res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+                res->state = SKIPPED;
+                res->reason = skip_reason::case_not_supported;
                 return;
             }
+        }
+    }
+}
+
+void skip_unimplemented_binary_po(const attr_t &attr, res_t *res) {
+    const auto &po = attr.post_ops;
+    if (po.is_def()) return;
+
+    if (is_gpu()) {
+        const int select_idx = po.find(attr_t::post_ops_t::kind_t::SELECT);
+        if (select_idx != -1) {
+            res->state = SKIPPED;
+            res->reason = skip_reason::case_not_supported;
+            return;
         }
     }
 }
@@ -713,14 +832,18 @@ void skip_unimplemented_prelu_po(
         case dnnl_deconvolution:
         case dnnl_inner_product:
         case dnnl_matmul: return; break;
-        default: res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED; break;
+        default:
+            res->state = SKIPPED;
+            res->reason = skip_reason::case_not_supported;
+            break;
     }
 }
 
 void skip_unimplemented_arg_scale(const attr_t &attr, res_t *res) {
     for (const auto &arg_s : attr.scales.scales) {
         if (arg_s.second.policy != policy_t::COMMON) {
-            res->state = SKIPPED, res->reason = CASE_NOT_SUPPORTED;
+            res->state = SKIPPED;
+            res->reason = skip_reason::case_not_supported;
             return;
         }
     }
@@ -737,13 +860,15 @@ void skip_invalid_inplace(res_t *res, dnnl_data_type_t sdt,
     // General limitation of in-place mode is having same amount of memory on
     // input and output.
     if (sdt != ddt) {
-        res->state = SKIPPED, res->reason = INVALID_CASE;
+        res->state = SKIPPED;
+        res->reason = skip_reason::invalid_case;
         return;
     }
 
     if (dtag == tag::any) return;
     if (stag != dtag) {
-        res->state = SKIPPED, res->reason = INVALID_CASE;
+        res->state = SKIPPED;
+        res->reason = skip_reason::invalid_case;
         return;
     }
 }
@@ -758,6 +883,23 @@ int check_same_pd(const dnnl_primitive_desc_t &pd_no_attr, res_t *res) {
             "ERROR: attributes caused impl fallback from [%s] to [%s]\n",
             pd_no_attr_name.c_str(), res->impl_name.c_str());
     return FAIL;
+}
+
+// Checks if unexpected reference implementation was hit.
+int check_ref_impl_hit(res_t *res) {
+    if (!check_ref_impl) return OK;
+
+    // Nvidia, AMD and Generic backends use reference implementations to fill
+    // gaps in feature support.
+    if (is_nvidia_gpu() || is_amd_gpu() || is_generic_gpu()) return OK;
+
+    const auto &impl_name = res->impl_name;
+    if (impl_name.find("ref") != std::string::npos) {
+        res->state = FAILED;
+        res->reason = "Ref Impl Not Expected";
+        return FAIL;
+    }
+    return OK;
 }
 
 bool is_cpu(const dnnl_engine_t &engine) {
@@ -780,7 +922,7 @@ bool is_opencl_engine(const dnnl_engine_t &engine) {
 }
 
 bool is_nvidia_gpu(const dnnl_engine_t &engine) {
-#ifdef DNNL_WITH_SYCL
+#if defined(DNNL_WITH_SYCL) && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
     if (!is_gpu(engine)) return false;
     constexpr int nvidia_vendor_id = 0x10DE;
     auto eng = dnnl::engine(engine, true);
@@ -793,7 +935,7 @@ bool is_nvidia_gpu(const dnnl_engine_t &engine) {
 }
 
 bool is_amd_gpu(const dnnl_engine_t &engine) {
-#ifdef DNNL_WITH_SYCL
+#if defined(DNNL_WITH_SYCL) && DNNL_GPU_VENDOR == DNNL_VENDOR_AMD
     if (!is_gpu(engine)) return false;
     constexpr int amd_vendor_id = 0x1002;
     auto eng = dnnl::engine(engine, true);
@@ -805,6 +947,14 @@ bool is_amd_gpu(const dnnl_engine_t &engine) {
     return false;
 }
 
+bool is_generic_gpu(const dnnl_engine_t &engine) {
+#if defined(DNNL_WITH_SYCL) && DNNL_GPU_VENDOR == DNNL_VENDOR_GENERIC
+    return is_gpu(engine);
+#endif
+
+    return false;
+}
+
 bool is_f64_supported(const dnnl_engine_t &engine) {
     if (!is_gpu(engine)) return false;
     if (is_nvidia_gpu(engine) || is_amd_gpu(engine)) return false;
@@ -812,11 +962,7 @@ bool is_f64_supported(const dnnl_engine_t &engine) {
     if (is_sycl_engine(engine)) {
         auto eng = dnnl::engine(engine, true);
         auto dev = dnnl::sycl_interop::get_device(eng);
-#ifdef DNNL_SYCL_INTEROP_USE_SYCL121
-        return dev.has_extension("cl_khr_fp64");
-#else
         return dev.has(::sycl::aspect::fp64);
-#endif
     }
 #endif
 #if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
@@ -839,10 +985,10 @@ bool is_f64_supported(const dnnl_engine_t &engine) {
     return false;
 }
 
-#if defined(_WIN32) && !defined(__GNUC__)
+#if defined(_WIN32)
 #include "windows.h"
 
-static size_t get_cpu_ram_size() {
+size_t get_cpu_ram_size() {
     MEMORYSTATUSEX s {};
     s.dwLength = sizeof(s);
     GlobalMemoryStatusEx(&s);
@@ -852,7 +998,7 @@ static size_t get_cpu_ram_size() {
 #include <unistd.h>
 #include <sys/sysctl.h>
 
-static size_t get_cpu_ram_size() {
+size_t get_cpu_ram_size() {
 #ifdef __APPLE__
     int query_ram[] = {CTL_HW, HW_MEMSIZE};
 #else
@@ -868,14 +1014,14 @@ static size_t get_cpu_ram_size() {
 #else
 #include <sys/sysinfo.h>
 
-static size_t get_cpu_ram_size() {
+size_t get_cpu_ram_size() {
     struct sysinfo s {};
     sysinfo(&s);
     return s.totalram;
 }
 #endif
 
-static int get_gpu_ram_sizes(size_t &ram_size, size_t &max_alloc_size) {
+int get_gpu_ram_sizes(size_t &ram_size, size_t &max_alloc_size) {
     if (!is_gpu()) return OK;
     if (ram_size > 0 && max_alloc_size > 0) return OK;
 
@@ -958,37 +1104,23 @@ int get_gpu_cache_size(size_t &cache_size) {
     return OK;
 }
 
-struct check_mem_size_args_t {
-    check_mem_size_args_t(const_dnnl_primitive_desc_t pd, bool want_input)
-        : pd(pd)
-        , want_input(want_input)
-        , is_scratchpad(false)
-        , total_size_device(0)
-        , total_size_cpu(0)
-        , scratchpad_size(0) {}
+// The function logic is the following:
+// `checkit` function verifies that the bare minimum (the library and the stock
+// reference) memory requirements are complied with the limits.
+// If no, drop the case, can't run it.
+// If yes, the second call to this function with `prim_ref` specified will
+// check memory requirements for prim_ref, update according memory parts and
+// verify updated numbers if they are complied.
+// If yes, good to go with a `prim_ref`.
+// If no, indicate that the system won't make it and drop `prim_ref` falling
+// back to stock reference.
+int check_total_size(res_t *res, dnnl_primitive_t prim_ref) {
+    // Skip the check if it is disabled.
+    if (!mem_check) return OK;
 
-    // Input args.
-    const_dnnl_primitive_desc_t pd;
-    bool want_input;
-    bool is_scratchpad;
+    // Skip the check if the test object won't be executed.
+    if (!has_bench_mode_bit(mode_bit_t::exec)) return OK;
 
-    // Output args:
-    // `sizes` used to validate OpenCL memory requirements.
-    std::vector<size_t> sizes;
-    // `total_size_device` specifies memory allocated on device for a test obj.
-    size_t total_size_device;
-    // `total_size_cpu` specifies:
-    // * Memory allocated for reference ocmputations (`C` mode only).
-    // * Memory allocated for comparison results (`C` mode only).
-    // * Memory allocated for mapping device memory (GPU backend only).
-    // * Memory allocated on CPU for a test obj (CPU backend only).
-    size_t total_size_cpu;
-    // `scratchpad_size` specifies a scratchpad size for specific checks.
-    size_t scratchpad_size;
-};
-
-static int check_total_size(
-        const check_mem_size_args_t &check_mem_size_args, res_t *res) {
     static size_t cpu_device_capacity = get_cpu_ram_size();
     static size_t gpu_device_capacity = 0;
     static size_t gpu_max_alloc_capacity = 0;
@@ -996,28 +1128,31 @@ static int check_total_size(
 
     const size_t device_max_capacity
             = is_cpu() ? cpu_device_capacity : gpu_device_capacity;
-    const size_t cpu_max_capacity = cpu_device_capacity;
 
     // 0.75f is taken randomly and is subject to change in future.
     const double capacity_factor = 0.75;
     const double benchdnn_device_limit = capacity_factor * device_max_capacity;
-    const double benchdnn_cpu_limit = capacity_factor * cpu_max_capacity;
+    const double benchdnn_cpu_limit = capacity_factor * cpu_device_capacity;
+    // Note: used to be 0.90 until large f64 conv cases on Xe2-LPG emerged.
+    const double benchdnn_combined_limit = 0.80 * cpu_device_capacity;
     assert(benchdnn_device_limit > 0 && benchdnn_cpu_limit > 0);
 
-    auto GB = [](double bytes) { return bytes / powf(2, 30); };
     auto dir_c_str = [&res]() {
-        return (res->mem_check_dir & FLAG_FWD) ? "FWD" : "BWD";
+        assert(res->mem_size_args.dir != DIR_UNDEF);
+        return (res->mem_size_args.dir & FLAG_FWD) ? "FWD" : "BWD";
     };
+
+    const check_mem_size_args_t &check_mem_size_args = res->mem_size_args;
 
     if (is_gpu()) {
         const bool fits_device_ram = check_mem_size_args.total_size_device
                 <= benchdnn_device_limit;
         if (!fits_device_ram) {
-            BENCHDNN_PRINT(2,
+            BENCHDNN_PRINT(1,
                     "[CHECK_MEM][%s]: Not enough device RAM for a problem.\n",
                     dir_c_str());
             res->state = SKIPPED;
-            res->reason = NOT_ENOUGH_RAM;
+            res->reason = skip_reason::not_enough_ram;
         }
 
         const bool all_allocation_fit_limit = std::all_of(
@@ -1025,34 +1160,100 @@ static int check_total_size(
                 check_mem_size_args.sizes.cend(), [&](size_t s) {
                     const bool fit = s < gpu_max_alloc_capacity;
                     if (!fit) {
-                        BENCHDNN_PRINT(2,
-                                "[CHECK_MEM][%s]: Allocation of size %g GB "
-                                "doesn't fit allocation limit of %g GB.\n",
-                                dir_c_str(), GB(s), GB(gpu_max_alloc_capacity));
+                        BENCHDNN_PRINT(1,
+                                "[CHECK_MEM][%s]: Allocation of size %s "
+                                "doesn't fit allocation limit of %s.\n",
+                                dir_c_str(), smart_bytes(s).c_str(),
+                                smart_bytes(gpu_max_alloc_capacity).c_str());
                     }
                     return fit;
                 });
         if (!all_allocation_fit_limit) {
             res->state = SKIPPED;
-            res->reason = NOT_ENOUGH_RAM;
+            res->reason = skip_reason::not_enough_ram;
         }
 
-        BENCHDNN_PRINT((!fits_device_ram ? 2 : 6),
-                "[CHECK_MEM][%s]: Requested: %g GB; benchdnn_device_limit: %g "
-                "GB; device_RAM_capacity: %g GB; gpu_max_alloc: %g GB;\n",
-                dir_c_str(), GB(check_mem_size_args.total_size_device),
-                GB(benchdnn_device_limit), GB(gpu_device_capacity),
-                GB(gpu_max_alloc_capacity));
+        BENCHDNN_PRINT((!fits_device_ram ? 1 : 6),
+                "[CHECK_MEM][%s]: Requested: %s; benchdnn_device_limit: %s; "
+                "device_RAM_capacity: %s; gpu_max_alloc: %s;\n",
+                dir_c_str(),
+                smart_bytes(check_mem_size_args.total_size_device).c_str(),
+                smart_bytes(benchdnn_device_limit).c_str(),
+                smart_bytes(gpu_device_capacity).c_str(),
+                smart_bytes(gpu_max_alloc_capacity).c_str());
     }
 
-    size_t total_size_cpu = check_mem_size_args.total_size_cpu;
-    if (is_cpu()) total_size_cpu += check_mem_size_args.total_size_device;
-    bool fits_cpu_ram = total_size_cpu <= benchdnn_cpu_limit;
+    // Note: in theory, `total_size_ref` itself can be smaller for a `prim_ref`
+    // because stock reference uses f32 for estimation and best `prim_ref` tries
+    // requested data types first which can be lower precision data types which
+    // require less memory. However, during the filling both memories - the
+    // original f32 and prim_ref memory are alive - and they might be huge. To
+    // avoid potential overflow at that exact moment, ref sizes are combined.
+    size_t total_size_ref = check_mem_size_args.total_size_ref;
+    // Note: `prim_ref` can require extra memory buffer for comparison to
+    // convert output to `abx` format.
+    size_t total_size_compare = check_mem_size_args.total_size_compare;
+    if (prim_ref) {
+        // Collect memory sizes of prim_ref.
+        check_mem_size_args_t prim_ref_mem_size_args;
+        collect_mem_size(prim_ref_mem_size_args, query_pd(prim_ref), DIR_UNDEF,
+                /* need_skip = */ false);
+        // Add prim_ref reference size number.
+        total_size_ref += std::accumulate(prim_ref_mem_size_args.sizes.begin(),
+                prim_ref_mem_size_args.sizes.end(), 0ULL);
+        // Update compare size number. It's twice of original memory since both
+        // tensors expected to be of the same size.
+        const auto const_pd = query_pd(prim_ref);
+        const auto prop_kind = query_prop_kind(const_pd);
+        const bool is_fwd = is_fwd_prop_kind(prop_kind);
+        const_dnnl_memory_desc_t output_md {};
+        if (is_fwd) {
+            output_md = query_md(const_pd, dnnl_query_dst_md, 0);
+        } else {
+            const auto diff_src_md
+                    = query_md(const_pd, dnnl_query_diff_src_md, 0);
+            const auto diff_wei_md
+                    = query_md(const_pd, dnnl_query_diff_weights_md, 0);
+            const auto diff_src_md_size
+                    = dnnl_memory_desc_get_size(diff_src_md);
+            output_md = diff_src_md_size > 0 ? diff_src_md : diff_wei_md;
+        }
+
+        if (query_md_data_type(output_md) != dnnl_f32
+                || !check_md_consistency_with_tag(output_md, tag::abx)) {
+            total_size_compare *= 2;
+        }
+    }
+
+    size_t total_size_cpu = total_size_ref + total_size_compare
+            + check_mem_size_args.total_size_mapped;
+
+    // If the problem runs on CPU, the combined memory represents requirements
+    // for the library and for the reference paths.
+    // If the problem runs on a device, the combined memory represents potential
+    // requirement for integrated devices that use CPU pool for both memories.
+    // The second case has higher limit because TODO:<the_reason>.
+    size_t cpu_and_device_size
+            = total_size_cpu + check_mem_size_args.total_size_device;
+    bool fits_cpu_ram = cpu_and_device_size
+            <= (is_cpu() ? benchdnn_cpu_limit : benchdnn_combined_limit);
+
+    // Save the expected value to set at `doit`, otherwise, the check doesn't
+    // work correctly. See `zmalloc_expected_size` comment.
+    res->mem_size_args.zmalloc_expected_size
+            = is_cpu() ? cpu_and_device_size : total_size_cpu;
 
     if (!fits_cpu_ram) {
-        BENCHDNN_PRINT(2,
-                "[CHECK_MEM][%s]: Not enough CPU RAM for a problem.\n",
-                dir_c_str());
+        std::string prim_ref_msg
+                = prim_ref ? " with CPU primitive reference" : "";
+        BENCHDNN_PRINT(1,
+                "[CHECK_MEM][%s]: Not enough CPU RAM for a problem%s.\n",
+                dir_c_str(), prim_ref_msg.c_str());
+        res->state = SKIPPED;
+        res->reason = skip_reason::not_enough_ram;
+    }
+
+    if (!fits_cpu_ram) {
         // Try to catch a huge scratchpad size requested by the library.
         // Use following logic:
         //     scratch_size
@@ -1061,25 +1262,41 @@ static int check_total_size(
         //
         // 0.75 value supposed to be experimental and might be adjusted.
         static constexpr float scratch_trh = 0.75f;
-        if (check_mem_size_args.scratchpad_size
-                > scratch_trh * total_size_cpu) {
-            BENCHDNN_PRINT(2,
+        if (is_cpu()
+                && check_mem_size_args.scratchpad_size
+                        > scratch_trh * check_mem_size_args.total_size_device) {
+            BENCHDNN_PRINT(1,
                     "[CHECK_MEM][%s]: CPU scratchpad size `%zu` exceeded a "
                     "given threshold `%zu`.\n",
                     dir_c_str(), check_mem_size_args.scratchpad_size,
-                    (size_t)(scratch_trh * total_size_cpu));
+                    (size_t)(scratch_trh
+                            * check_mem_size_args.total_size_device));
             res->state = FAILED;
-        } else {
-            res->state = SKIPPED;
         }
-        res->reason = NOT_ENOUGH_RAM;
     }
 
-    BENCHDNN_PRINT((!fits_cpu_ram ? 2 : 6),
-            "[CHECK_MEM][%s]: Requested: %g GB; benchdnn_CPU_limit: %g GB; "
-            "CPU_RAM_capacity: %g GB;\n",
-            dir_c_str(), GB(total_size_cpu), GB(benchdnn_cpu_limit),
-            GB(cpu_device_capacity));
+    BENCHDNN_PRINT((!fits_cpu_ram ? 1 : 6),
+            "[CHECK_MEM][%s]: benchdnn_CPU_limit: %s; CPU_RAM_capacity: %s;\n",
+            dir_c_str(), smart_bytes(benchdnn_cpu_limit).c_str(),
+            smart_bytes(cpu_device_capacity).c_str());
+
+    std::string sizes_str;
+    for (const auto sz : check_mem_size_args.sizes) {
+        const bool is_scratchpad = sz == check_mem_size_args.scratchpad_size;
+        sizes_str += smart_bytes(sz) + (is_scratchpad ? " (Scratchpad)" : "")
+                + ", ";
+    }
+    BENCHDNN_PRINT(6, "[CHECK_MEM][%s]: Sizes: {%s};\n", dir_c_str(),
+            sizes_str.c_str());
+
+    std::string total_size_device_str = is_cpu()
+            ? smart_bytes(check_mem_size_args.total_size_device) + " (Lib), "
+            : "";
+    BENCHDNN_PRINT((!fits_cpu_ram ? 1 : 6),
+            "[CHECK_MEM][%s]: Requested: %s%s (Service), %s (combined);\n",
+            dir_c_str(), total_size_device_str.c_str(),
+            smart_bytes(total_size_cpu).c_str(),
+            smart_bytes(cpu_and_device_size).c_str());
 
     return res->state == FAILED ? FAIL : OK;
 }
@@ -1104,37 +1321,42 @@ void add_md_size(const_dnnl_memory_desc_t md,
     // However due to a driver issue oneDNN pretends that shared USM is not
     // accessible on the host, hence map will allocate an extra memory.
     const bool mapped_mem_factor = !is_cpu()
-            && !has_bench_mode_modifier(mode_modifier_t::no_host_memory);
+            && !has_bench_mode_modifier(mode_modifier_t::no_ref_memory);
 
     // Mapped memory for GPU backend on CPU.
-    check_mem_size_args.total_size_cpu += mapped_mem_factor * mem_size;
+    check_mem_size_args.total_size_mapped += mapped_mem_factor * mem_size;
 
-    if (check_mem_size_args.is_scratchpad) {
-        check_mem_size_args.scratchpad_size += mem_size;
-    } else {
-        const bool is_corr = has_bench_mode_bit(mode_bit_t::corr);
-        const bool is_bitwise = has_bench_mode_bit(mode_bit_t::bitwise);
-        // Reference memories are always tag::abx fp32, hence need re-creating
-        // memory descriptor and take its size.
-        auto ref_md = dnn_mem_t::init_md(
-                query_md_ndims(md), query_md_dims(md), dnnl_f32, tag::abx);
-        const auto ref_md_size = dnnl_memory_desc_get_size(ref_md);
-        // A memory copy for ref_compute, happens only in correctness.
-        check_mem_size_args.total_size_cpu += is_corr * ref_md_size;
+    const bool is_corr = has_bench_mode_bit(mode_bit_t::corr);
+    const bool is_bitwise = has_bench_mode_bit(mode_bit_t::bitwise);
+    // Reference memories are always tag::abx fp32, hence need re-creating
+    // memory descriptor and take its size.
+    auto ref_md = dnn_mem_t::init_md(
+            query_md_ndims(md), query_md_dims(md), dnnl_f32, tag::abx);
+    const auto ref_md_size = dnnl_memory_desc_get_size(ref_md);
 
-        // Comparison function allocates an additional tag::abx f32 memory.
-        // This allocation holds for correctness and bitwise modes.
-        const bool compare_mem_factor
-                = !check_mem_size_args.want_input && (is_corr || is_bitwise);
-        check_mem_size_args.total_size_cpu += compare_mem_factor * ref_md_size;
+    const size_t ref_mem_idx = check_mem_size_args.want_input ? 0 : 1;
+    check_mem_size_args.total_ref_md_size[ref_mem_idx] = ref_md_size;
 
-        // Bitwise comparison allocates an additional tag::abx f32 memory from
-        // the first run to compare results against it.
-        const bool bitwise_compare_mem_factor
-                = !check_mem_size_args.want_input && is_bitwise;
-        check_mem_size_args.total_size_cpu
-                += bitwise_compare_mem_factor * ref_md_size;
-    }
+    // A memory copy for ref_compute, happens only in correctness.
+    check_mem_size_args.total_size_ref += is_corr * ref_md_size;
+
+    // Comparison function allocates an additional tag::abx f32 memory.
+    // This allocation holds for correctness and bitwise modes.
+    const bool compare_mem_factor
+            = !check_mem_size_args.want_input && (is_corr || is_bitwise);
+    check_mem_size_args.total_size_compare += compare_mem_factor * ref_md_size;
+
+    // Bitwise comparison allocates an additional tag::abx f32 memory from
+    // the first run to compare results against it.
+    const bool bitwise_compare_mem_factor
+            = !check_mem_size_args.want_input && is_bitwise;
+    check_mem_size_args.total_size_compare
+            += bitwise_compare_mem_factor * ref_md_size;
+}
+
+bool is_fwd_training(dnnl_prop_kind_t prop_kind) {
+    return prop_kind == dnnl_forward_training
+            || prop_kind == dnnl_prop_kind_undef;
 }
 
 bool is_fwd_prop_kind(dnnl_prop_kind_t prop_kind) {
@@ -1143,7 +1365,7 @@ bool is_fwd_prop_kind(dnnl_prop_kind_t prop_kind) {
             || prop_kind == dnnl_prop_kind_undef;
 }
 
-static void get_memory_bytes(check_mem_size_args_t &check_mem_size_args) {
+void get_memory_bytes(check_mem_size_args_t &check_mem_size_args) {
     auto const_pd = check_mem_size_args.pd;
     const int n_idx = check_mem_size_args.want_input
             ? query_n_inputs(const_pd)
@@ -1183,6 +1405,14 @@ static void get_memory_bytes(check_mem_size_args_t &check_mem_size_args) {
                         = DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_SRC_1;
                 const auto &po_md = query_md(const_pd, po_arg);
                 add_md_size(po_md, check_mem_size_args);
+
+                if (query_post_ops_has_binary_alg_kind(
+                            const_attr_po, idx, dnnl_binary_select)) {
+                    int po_arg_src2 = DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
+                            | DNNL_ARG_SRC_2;
+                    const auto &po_md_src2 = query_md(const_pd, po_arg_src2);
+                    add_md_size(po_md_src2, check_mem_size_args);
+                }
             }
         }
     }
@@ -1191,65 +1421,69 @@ static void get_memory_bytes(check_mem_size_args_t &check_mem_size_args) {
 int check_mem_size(const_dnnl_memory_desc_t md, res_t *res) {
     if (!mem_check) return OK;
 
-    check_mem_size_args_t check_mem_size_args(nullptr, false);
     const auto md_size = dnnl_memory_desc_get_size(md);
-    check_mem_size_args.total_size_device = md_size;
-    check_mem_size_args.sizes.push_back(md_size);
-
-    return check_total_size(check_mem_size_args, res);
+    res->mem_size_args.total_size_device = md_size;
+    res->mem_size_args.sizes.push_back(md_size);
+    return check_total_size(res);
 }
 
-int check_mem_size(
-        const_dnnl_primitive_desc_t const_pd, res_t *res, dir_t dir) {
+int collect_mem_size(check_mem_size_args_t &mem_size_args,
+        const_dnnl_primitive_desc_t const_pd, dir_t dir, bool need_skip) {
     // Skip the check if it is disabled.
     if (!mem_check) return OK;
 
     // Skip the check if the test object won't be executed.
     if (!has_bench_mode_bit(mode_bit_t::exec)) return OK;
 
-    // Skip the check if it has already happened for provided `dir`. Saves from
-    // repreated run when the second test object is created to test the
-    // primitive cache, but allows to verify both objects when a double-run
-    // driver executes fwd-for-bwd first and bwd after.
-    if (res->mem_check_dir == dir) return OK;
-    res->mem_check_dir = dir;
+    // Skip the check if it has already happened for the passed `dir`.
+    // It saves from a repeated run when the second test object is created to
+    // validate the primitive cache. At the same time it allows to verify both
+    // test objects when a double-run driver executes the fwd-for-bwd object
+    // first and the bwd object after.
+    // ANCHOR: MEM_CHECK_ARGS_DIR;
+    if (need_skip && mem_size_args.dir == dir) return OK;
 
     // Get input sizes.
-    check_mem_size_args_t check_mem_size_args(const_pd, /* input = */ true);
+    check_mem_size_args_t check_mem_size_args(
+            const_pd, /* input = */ true, dir);
     get_memory_bytes(check_mem_size_args);
 
     // Get scratchpad size.
-    // Since scratchpad modes are mutually excluded, it takes sizes of both
-    // modes as either of them will report 0 size depending on the mode.
-    const auto library_scratchpad_size = query_mem_consumption(const_pd);
-    if (library_scratchpad_size > 0) {
-        // Update same fields as `add_md_size` would. See details there.
-        check_mem_size_args.sizes.push_back(library_scratchpad_size);
-        check_mem_size_args.total_size_device += library_scratchpad_size;
-        check_mem_size_args.scratchpad_size += library_scratchpad_size;
-    } else {
-        check_mem_size_args.is_scratchpad = true;
-        const auto &scratchpad_md = query_md(const_pd, DNNL_ARG_SCRATCHPAD);
-        add_md_size(scratchpad_md, check_mem_size_args);
-        check_mem_size_args.is_scratchpad = false;
-    }
+    // Since scratchpad modes are mutually excluded, get sizes of both modes as
+    // either of them will report 0 size depending on the mode, and take the
+    // biggest from them.
+    const size_t library_scratchpad_size
+            = static_cast<size_t>(query_mem_consumption(const_pd));
+    const auto &scratchpad_md = query_md(const_pd, DNNL_ARG_SCRATCHPAD);
+    const size_t user_scratchpad_size
+            = dnnl_memory_desc_get_size(scratchpad_md);
+    const size_t scratchpad_size
+            = MAX2(library_scratchpad_size, user_scratchpad_size);
+    // Update same fields as `add_md_size` would. See details there.
+    check_mem_size_args.sizes.push_back(scratchpad_size);
+    check_mem_size_args.total_size_device += scratchpad_size;
+    check_mem_size_args.scratchpad_size = scratchpad_size;
 
     // Get output sizes.
     check_mem_size_args.want_input = false;
     get_memory_bytes(check_mem_size_args);
 
-    return check_total_size(check_mem_size_args, res);
+    // Copy memory stats. It's required to accumulate them before performing
+    // the check.
+    mem_size_args = check_mem_size_args;
+    return OK;
 }
 
 int get_memory_footprint(const_dnnl_primitive_desc_t const_pd, res_t *res) {
     check_mem_size_args_t check_mem_in_size_args(
-            const_pd, /* want_input = */ true);
+            const_pd, /* want_input = */ true, DIR_UNDEF);
     get_memory_bytes(check_mem_in_size_args); // Get input bytes.
     check_mem_size_args_t check_mem_out_size_args(
-            const_pd, /* want_input = */ false);
+            const_pd, /* want_input = */ false, DIR_UNDEF);
     get_memory_bytes(check_mem_out_size_args); // Get output bytes.
 
-    // Update read bytes with dst bytes in case of sum post-op.
+    // Sum post-ops include dst bytes as an input. Not included in get_memory_bytes
+    // since it would cause `collect_mem_size` to double-count dst bytes.
     auto const_attr_po = query_post_ops(const_pd);
     auto po_len = dnnl_post_ops_len(const_attr_po);
     for (int idx = 0; idx < po_len; ++idx) {
@@ -1257,11 +1491,36 @@ int get_memory_footprint(const_dnnl_primitive_desc_t const_pd, res_t *res) {
         if (kind == dnnl_sum) {
             const auto &dst_md = query_md(const_pd, DNNL_ARG_DST);
             add_md_size(dst_md, check_mem_in_size_args);
-        } else if (kind == dnnl_binary) {
-            int po_arg = DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx) | DNNL_ARG_SRC_1;
-            const auto &po_md = query_md(const_pd, po_arg);
-            add_md_size(po_md, check_mem_in_size_args);
         }
+    }
+
+    // Forward nearest neighbor down sampling (one or more bigger source
+    // dimensions than in destination) cases by the nature of the operation
+    // read only a part of a source tensor. Here we adjust the `ibytes` variable
+    // so that reported bandwidth numbers reflect the reality, otherwise
+    // final numbers are much higher than they should be.
+    dnnl_primitive_kind_t kind = query_prim_kind(const_pd);
+    dnnl_alg_kind_t alg = query_alg_kind(const_pd);
+    dnnl_prop_kind_t prop = query_prop_kind(const_pd);
+    if (is_fwd_prop_kind(prop) && kind == dnnl_resampling
+            && alg == dnnl_resampling_nearest) {
+        auto src_md = query_md(const_pd, DNNL_ARG_SRC);
+        auto dst_md = query_md(const_pd, DNNL_ARG_DST);
+        auto ndims = query_md_ndims(src_md);
+        auto src_pdims = query_md_padded_dims(src_md);
+        auto dst_pdims = query_md_padded_dims(dst_md);
+        dnnl_dim_t total_elems = 1;
+        dnnl_dim_t read_elems = 1;
+        for (int i = 0; i < ndims; i++) {
+            if (dst_pdims[i] < src_pdims[i]) {
+                total_elems *= src_pdims[i];
+                read_elems *= dst_pdims[i];
+            }
+        }
+        const auto src_size = dnnl_memory_desc_get_size(src_md);
+        const auto fixed_src_size = src_size / static_cast<size_t>(total_elems)
+                * static_cast<size_t>(read_elems);
+        check_mem_in_size_args.total_size_device += fixed_src_size - src_size;
     }
 
     res->ibytes = check_mem_in_size_args.total_size_device;
@@ -1285,6 +1544,32 @@ memory_kind_ext_t str2memory_kind(const char *str) {
     return memory_kind_ext_t::usm;
 }
 
+const char *execution_mode2str(execution_mode_t mode) {
+#define EXECUTION_MODE_TO_STR(name, ...) \
+    if (execution_mode_t::name == mode) return #name;
+
+    EXECUTION_MODE_TO_STR(direct);
+    EXECUTION_MODE_TO_STR(graph);
+#undef EXECUTION_MODE_STR
+
+    BENCHDNN_PRINT(0, "%s", "Error: execution mode value is not recognized.\n");
+    SAFE_V(FAIL);
+    return "";
+}
+
+execution_mode_t str2execution_mode(const char *str) {
+#define STR_TO_EXECUTION_MODE(name, ...) \
+    if (!strcasecmp(#name, str)) return execution_mode_t::name;
+
+    STR_TO_EXECUTION_MODE(direct);
+    STR_TO_EXECUTION_MODE(graph);
+#undef STR_TO_EXECUTION_MODE
+
+    BENCHDNN_PRINT(0, "%s", "Error: execution mode value is not recognized.\n");
+    SAFE_V(FAIL);
+    return execution_mode_t::direct;
+}
+
 static void maybe_print_cpu_engine_error_message() {
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_SYCL
     fprintf(stderr,
@@ -1304,17 +1589,11 @@ engine_t::engine_t(dnnl_engine_kind_t engine_kind) : is_owner_(true) {
     dnnl_status_t status = dnnl_engine_create(&engine_, engine_kind, idx);
     if (engine_kind == dnnl_cpu && status != dnnl_success)
         maybe_print_cpu_engine_error_message();
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) {
-        if (engine_tgt_kind != dnnl_gpu) {
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) {
+        if (has_bench_mode_bit(mode_bit_t::corr)) {
             BENCHDNN_PRINT(0, "%s\n",
-                    "Error: the modifier to disable host memory usage is "
-                    "supported for GPU engine only.");
-            status = dnnl_invalid_arguments;
-        }
-        if (!has_bench_mode_bit(mode_bit_t::perf)) {
-            BENCHDNN_PRINT(0, "%s\n",
-                    "Error: the modifier to disable host memory usage is "
-                    "supported for performance mode only.");
+                    "Error: the modifier to disable host memory usage "
+                    "cannot be used for correctness testing.");
             status = dnnl_invalid_arguments;
         }
     }
@@ -1406,16 +1685,30 @@ float reorder_rescale_factor() {
     return factor;
 }
 
-dims_t md2dims(const_dnnl_memory_desc_t md, int mask, bool extend_by_ones) {
+dims_t md2dims(const_dnnl_memory_desc_t md, int mask, bool extend_by_ones,
+        const std::vector<int64_t> &groups) {
     auto ndims = query_md_ndims(md);
     dims_t dims;
     for (int d = 0; d < ndims; ++d) {
-        if (mask & (1 << d))
+        if (mask & (1 << d)) {
             dims.push_back(query_md_dims(md)[d]);
-        else if (extend_by_ones)
+            // Note: groups are done for matmul's last two dimensions.
+            const auto group_dim = d - (ndims - 2);
+            if (!groups.empty() && group_dim >= 0) {
+                // If groups are passed, divide dims on the correspondent group
+                // size. It's needed to pass proper memory objects.
+                assert(dims.back() % groups[group_dim] == 0);
+                dims.back() /= groups[group_dim];
+            }
+        } else if (extend_by_ones) {
             dims.push_back(1);
+        }
     }
     return dims;
+}
+
+dims_t md2dims(const_dnnl_memory_desc_t md, int mask, bool extend_by_ones) {
+    return md2dims(md, mask, extend_by_ones, {});
 }
 
 dnnl_data_type_t deduce_cfg_data_type(
@@ -1427,6 +1720,7 @@ dnnl_data_type_t deduce_cfg_data_type(
         switch (attr.fpmath_mode.mode) {
             case dnnl_fpmath_mode_strict: break;
             case dnnl_fpmath_mode_bf16: dt_ = dnnl_bf16; break;
+            case dnnl_fpmath_mode_f16: dt_ = dnnl_f16; break;
             case dnnl_fpmath_mode_tf32: dt_ = dnnl_bf16; break;
             default: assert(!"unsupported_fpmath_mode"); SAFE_V(CRIT);
         }
@@ -1440,6 +1734,31 @@ dnnl_data_type_t deduce_cfg_data_type(
     }
 
     return dt_;
+}
+
+// The function removes arguments that are unnecessary. Such arguments may come
+// from the forward-for-backward primitive running. The library map removes them
+// when allocating memories for the backward primitive and the reference map
+// should do the same.
+void erase_unused_args(
+        dnn_mem_map_t &ref_mem_map, const dnn_mem_map_t &mem_map) {
+    // Collection of keys is required as evicting members along the way
+    // invalidates references in the modified object and makes further
+    // traversing over the object undefined.
+    std::vector<int> keys_to_erase;
+    keys_to_erase.reserve(ref_mem_map.size());
+
+    for (const auto &pair : ref_mem_map) {
+        const auto key = pair.first;
+        if (mem_map.find(key) == mem_map.end()) {
+            // Correspondent argument is not found in a library mem map.
+            // It means it should be removed.
+            keys_to_erase.push_back(key);
+        }
+    }
+    for (const auto &k : keys_to_erase) {
+        ref_mem_map.erase(k);
+    }
 }
 
 // This function handles cases when optimized CPU primitive is used as a
@@ -1469,25 +1788,28 @@ int update_ref_mem_map_from_prim(dnnl_primitive_t prim_ref,
     auto const_ref_pd = query_pd(prim_ref);
     const auto &ref_md = query_md(const_ref_pd, exec_arg);
     const auto &ref_engine = get_cpu_engine();
-    dnn_mem_t prim_ref_mem(ref_md, ref_engine);
+    // Since this goes to the library, it's desired to verify CPU implementation
+    // handles memories correctly.
+    dnn_mem_t prim_ref_mem(ref_md, ref_engine, /* prefill = */ true);
 
     // When queried memory comes empty, it may be attributes as library doesn't
     // have dedicated query mechanism for those. Process potential outcomes:
     while (query_md_ndims(ref_md) == 0) {
         bool is_scales_arg = (exec_arg & DNNL_ARG_ATTR_SCALES);
-        // Ref memory for scales is f32, the library expects it same data type.
-        // Skip replacement.
+        // Scales received data type support in the library. The reference
+        // primitive expects them in the same data type.
         if (is_scales_arg) {
-            skip_replace = true;
+            prim_ref_mem = dnn_mem_t(library_mem.md_, library_mem.dt(),
+                    tag::abx, ref_engine, /* prefill = */ true);
             break;
         }
 
         bool is_zero_point_arg = (exec_arg & DNNL_ARG_ATTR_ZERO_POINTS);
-        // Ref memory for zps is f32, but the library expects it in s32. Update
-        // the memory and proceed to replacement.
+        // Zero-points received data type support in the library. The reference
+        // primitive expects them in the same data type.
         if (is_zero_point_arg) {
-            prim_ref_mem = dnn_mem_t(
-                    library_mem.md_, dnnl_s32, tag::abx, ref_engine);
+            prim_ref_mem = dnn_mem_t(library_mem.md_, library_mem.dt(),
+                    tag::abx, ref_engine, /* prefill = */ true);
             break;
         }
 
@@ -1499,8 +1821,8 @@ int update_ref_mem_map_from_prim(dnnl_primitive_t prim_ref,
         // The library doesn't return a memory desc for prelu post-op. Prelu
         // requires `tag::axb` format, thus, need to put a desc into ref prim.
         if (is_prelu_arg) {
-            prim_ref_mem = dnn_mem_t(
-                    library_mem.md_, dnnl_f32, tag::axb, ref_engine);
+            prim_ref_mem = dnn_mem_t(library_mem.md_, dnnl_f32, tag::axb,
+                    ref_engine, /* prefill = */ true);
             break;
         }
 
@@ -1514,7 +1836,12 @@ int update_ref_mem_map_from_prim(dnnl_primitive_t prim_ref,
     // Avoid replacing memories that have already been properly filled.
     if (skip_replace) return OK;
 
-    if (!is_scratchpad) SAFE(prim_ref_mem.reorder(ref_mem, swapped_dt), WARN);
+    if (!is_scratchpad) {
+        const auto prim_ref_swapped_dt = query_md_data_type(ref_md) == dnnl_f32
+                ? dnnl_data_type_undef
+                : swapped_dt;
+        SAFE(prim_ref_mem.reorder(ref_mem, prim_ref_swapped_dt), WARN);
+    }
     ref_mem_map[exec_arg] = std::move(prim_ref_mem);
 
     return OK;
@@ -1538,17 +1865,41 @@ int init_ref_memory_args_default_case(int exec_arg, dnn_mem_t &mem,
     const bool is_post_ops_arg = (exec_arg & post_ops_range);
     const bool is_scales_arg = (exec_arg & DNNL_ARG_ATTR_SCALES);
     const bool is_zero_point_arg = (exec_arg & DNNL_ARG_ATTR_ZERO_POINTS);
+    const bool is_dropout_p = (exec_arg == DNNL_ARG_ATTR_DROPOUT_PROBABILITY);
+    const bool is_dropout_seed = (exec_arg == DNNL_ARG_ATTR_DROPOUT_SEED);
+    const bool is_rounding_seed = (exec_arg == DNNL_ARG_ATTR_ROUNDING_SEED);
 
     if (is_post_ops_arg) {
-        if (exec_arg & DNNL_ARG_SRC_1) {
-            const int bin_po_idx
-                    = exec_arg / DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE - 1;
-            assert(bin_po_idx < attr.post_ops.len());
+        const int bin_po_idx
+                = exec_arg / DNNL_ARG_ATTR_MULTIPLE_POST_OP_BASE - 1;
+        assert(bin_po_idx < attr.post_ops.len());
+        const bool exact_match_for_src1_arg = !(exec_arg
+                ^ (DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_po_idx)
+                        | DNNL_ARG_SRC_1));
+        const bool exact_match_for_src2_arg = !(exec_arg
+                ^ (DNNL_ARG_ATTR_MULTIPLE_POST_OP(bin_po_idx)
+                        | DNNL_ARG_SRC_2));
+
+        if (exact_match_for_src1_arg) {
             const auto alg = attr.post_ops.entry[bin_po_idx].kind;
-            // Binary post-op filling.
-            fill_cfg_t def_binary_cfg(mem.dt(), -16.f, 16.f, /* int = */ true,
-                    alg, "def_binary_post_op");
+            // Binary post-op filling for src1 tensor
+            fill_cfg_t def_binary_cfg(mem.dt(), -16.f, 16.f,
+                    /* int = */ true, alg, "def_binary_post_op_src1");
             const auto it = fill_cfg_map.find(DNNL_ARG_SRC_1);
+            const bool has_external_cfg = it != fill_cfg_map.end();
+            const fill_cfg_t &binary_fill_cfg
+                    = has_external_cfg ? (*it).second : def_binary_cfg;
+            TIME_FILL(SAFE(fill_random_real(mem, ref_mem, res, binary_fill_cfg),
+                    WARN));
+        } else if (exact_match_for_src2_arg) {
+            assert(attr.post_ops.entry[bin_po_idx]
+                            .is_binary_kind_with_ternary_op());
+            const auto alg = attr.post_ops.entry[bin_po_idx].kind;
+            // Binary post-op filling for src2 conditional tensor
+            // Use values bigger than 1 to ensure it works correctly.
+            fill_cfg_t def_binary_cfg(mem.dt(), 0, 16.f,
+                    /* int = */ true, alg, "def_binary_post_op_src2");
+            const auto it = fill_cfg_map.find(DNNL_ARG_SRC_2);
             const bool has_external_cfg = it != fill_cfg_map.end();
             const fill_cfg_t &binary_fill_cfg
                     = has_external_cfg ? (*it).second : def_binary_cfg;
@@ -1572,6 +1923,15 @@ int init_ref_memory_args_default_case(int exec_arg, dnn_mem_t &mem,
         int local_exec_arg = exec_arg ^ DNNL_ARG_ATTR_ZERO_POINTS;
         TIME_FILL(SAFE(
                 fill_zero_points(attr, local_exec_arg, mem, ref_mem), WARN));
+    } else if (is_dropout_p) {
+        ref_mem.set_f32_elem(0, attr.dropout.p);
+        TIME_FILL(SAFE(mem.reorder(ref_mem), WARN));
+    } else if (is_dropout_seed) {
+        ref_mem.set_elem(0, attr.dropout.seed);
+        TIME_FILL(SAFE(mem.reorder(ref_mem), WARN));
+    } else if (is_rounding_seed) {
+        ref_mem.set_elem(0, attr.rounding_mode.seed);
+        TIME_FILL(SAFE(mem.reorder(ref_mem), WARN));
     }
 
     return OK;
@@ -1609,11 +1969,17 @@ int check_bitwise(dnnl_primitive_t prim, const std::vector<data_kind_t> &kinds,
         assert(arg > 0);
 
         auto &mem = args.find(arg);
-        SAFE_V(bool(mem) ? OK : FAIL);
+        if (!mem) {
+            BENCHDNN_PRINT(0, "%s\n",
+                    "Error: output memory was not found among arguments.");
+            res->state = FAILED;
+            return FAIL;
+        }
         // A memory used as reference for comparison, must be allocated on the
         // CPU engine.
-        run1_mem_map.emplace(
-                arg, dnn_mem_t(mem.md_, dnnl_f32, tag::abx, get_cpu_engine()));
+        run1_mem_map.emplace(arg,
+                dnn_mem_t(mem.md_, dnnl_f32, tag::abx, get_cpu_engine(),
+                        /* prefill = */ false));
         SAFE(run1_mem_map.at(arg).reorder(mem), WARN);
     }
 
@@ -1634,9 +2000,20 @@ int check_bitwise(dnnl_primitive_t prim, const std::vector<data_kind_t> &kinds,
                 ? (has_multiple_args ? DNNL_ARG_MULTIPLE_SRC : DNNL_ARG_SRC)
                 : DNNL_ARG_DIFF_DST;
         auto &in_mem = const_cast<dnn_mem_t &>(args.find(query_arg));
-        SAFE_V(bool(in_mem) ? OK : FAIL);
+        if (!in_mem) {
+            BENCHDNN_PRINT(0, "%s\n",
+                    "Error: input memory was not found among arguments.");
+            res->state = FAILED;
+            return FAIL;
+        }
         const auto &orig_in_mem = args.find(-query_arg);
-        SAFE_V(bool(orig_in_mem) ? OK : FAIL);
+        if (!orig_in_mem) {
+            BENCHDNN_PRINT(0, "%s\n",
+                    "Error: original input memory was not found among "
+                    "arguments.");
+            res->state = FAILED;
+            return FAIL;
+        }
         SAFE(in_mem.reorder(orig_in_mem), WARN);
     }
 

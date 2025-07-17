@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -84,6 +84,9 @@ struct layer_normalization_pd_t : public primitive_desc_t {
     bool use_global_stats() const {
         return desc_.flags & normalization_flags::use_global_stats;
     }
+    bool skip_mean() const {
+        return desc_.flags & normalization_flags::rms_norm;
+    }
 
     bool is_fwd() const {
         return utils::one_of(desc_.prop_kind, prop_kind::forward_training,
@@ -107,11 +110,11 @@ protected:
     memory_desc_t stat_md_;
     memory_desc_t scaleshift_md_;
 
-    layer_normalization_pd_t(const layer_normalization_desc_t *adesc,
+    layer_normalization_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const layer_normalization_fwd_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<layer_normalization_desc_t>(adesc))
         , hint_fwd_pd_(hint_fwd_pd)
         , src_md_(desc_.src_desc)
         , stat_md_(desc_.stat_desc)
@@ -156,22 +159,26 @@ private:
     const memory_desc_t &src_desc() const { return desc_.src_desc; }
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct layer_normalization_fwd_pd_t : public layer_normalization_pd_t {
-    typedef layer_normalization_fwd_pd_t base_class;
-    typedef layer_normalization_fwd_pd_t hint_class;
+    using base_class = layer_normalization_fwd_pd_t;
+    using hint_class = layer_normalization_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg == DNNL_ARG_SRC) return arg_usage_t::input;
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
 
         if (utils::one_of(arg, DNNL_ARG_MEAN, DNNL_ARG_VARIANCE)) {
+            if (arg == DNNL_ARG_MEAN && skip_mean()) return arg_usage_t::unused;
             if (stats_are_src()) return arg_usage_t::input;
             if (!stats_are_src() && is_training()) return arg_usage_t::output;
             return arg_usage_t::unused;
         }
 
-        if (arg == DNNL_ARG_SCALE && use_scale()) return arg_usage_t::input;
-        if (arg == DNNL_ARG_SHIFT && use_shift()) return arg_usage_t::input;
+        if (arg == DNNL_ARG_SCALE)
+            return use_scale() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_SHIFT)
+            return use_shift() ? arg_usage_t::input : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -211,16 +218,20 @@ struct layer_normalization_fwd_pd_t : public layer_normalization_pd_t {
     }
 
     int n_inputs() const override {
-        return 1 + 2 * stats_are_src() + use_scale() + use_shift();
+        return 1 + (2 - skip_mean()) * stats_are_src() + use_scale()
+                + use_shift() + n_binary_po_inputs();
     }
     int n_outputs() const override {
-        return 1 + 2 * (!stats_are_src()) * is_training();
+        // Originally as '1 + 2 * (!stats_are_src()) * is_training()',
+        // had to be worked around MSVC bug not copying inlined bodies
+        // of stats_are_src() and is_training().
+        return (!stats_are_src() && is_training()) ? 3 - skip_mean() : 1;
     }
 
 protected:
     memory_desc_t dst_md_;
 
-    layer_normalization_fwd_pd_t(const layer_normalization_desc_t *adesc,
+    layer_normalization_fwd_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const layer_normalization_fwd_pd_t *hint_fwd_pd)
         : layer_normalization_pd_t(adesc, attr, hint_fwd_pd)
@@ -244,34 +255,47 @@ protected:
         return false;
     }
 
-    bool attr_scales_ok() const {
+    bool attr_scales_ok(const std::vector<int> &supported_args
+            = {DNNL_ARG_SRC, DNNL_ARG_DST}) const {
+        using namespace data_type;
         const auto &scales = attr()->scales_;
-        bool ok = true;
-        for (const auto &e : scales.scales_) {
-            ok = ok && e.second.mask_ == 0;
+        bool ok = scales.has_default_values(supported_args);
+
+        for (const auto &arg : supported_args) {
+            if (!scales.has_default_values(arg)) {
+                // TODO: disallow non-int8 scales?
+                // const data_type_t dt = arg_md(arg)->data_type;
+                // ok = ok && utils::one_of(dt, s8, u8);
+                ok = ok && scales.get_mask(arg) == 0;
+            }
         }
         return ok;
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct layer_normalization_bwd_pd_t : public layer_normalization_pd_t {
-    typedef layer_normalization_bwd_pd_t base_class;
-    typedef layer_normalization_fwd_pd_t hint_class;
+    using base_class = layer_normalization_bwd_pd_t;
+    using hint_class = layer_normalization_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
-        if (utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_MEAN, DNNL_ARG_VARIANCE,
-                    DNNL_ARG_DIFF_DST))
+        if (utils::one_of(
+                    arg, DNNL_ARG_SRC, DNNL_ARG_VARIANCE, DNNL_ARG_DIFF_DST))
             return arg_usage_t::input;
 
-        if (arg == DNNL_ARG_SCALE && use_scale()) return arg_usage_t::input;
-        if (arg == DNNL_ARG_SHIFT && use_shift()) return arg_usage_t::input;
+        if (arg == DNNL_ARG_MEAN)
+            return skip_mean() ? arg_usage_t::unused : arg_usage_t::input;
+
+        if (arg == DNNL_ARG_SCALE)
+            return use_scale() ? arg_usage_t::input : arg_usage_t::unused;
 
         if (arg == DNNL_ARG_DIFF_SRC) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_DIFF_SCALE && use_scale())
-            return arg_usage_t::output;
-        if (arg == DNNL_ARG_DIFF_SHIFT && use_shift())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_DIFF_SCALE)
+            return use_scale() ? arg_usage_t::output : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_SHIFT)
+            return use_shift() ? arg_usage_t::output : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -320,7 +344,7 @@ struct layer_normalization_bwd_pd_t : public layer_normalization_pd_t {
         return index == 0 ? &diff_scaleshift_md_ : &glob_zero_md;
     }
 
-    int n_inputs() const override { return 4 + use_scale() + use_shift(); }
+    int n_inputs() const override { return 4 - skip_mean() + use_scale(); }
     int n_outputs() const override {
         return 1
                 + (desc_.prop_kind == prop_kind::backward)
@@ -332,7 +356,7 @@ protected:
     memory_desc_t diff_dst_md_;
     memory_desc_t diff_scaleshift_md_;
 
-    layer_normalization_bwd_pd_t(const layer_normalization_desc_t *adesc,
+    layer_normalization_bwd_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const layer_normalization_fwd_pd_t *hint_fwd_pd)
         : layer_normalization_pd_t(adesc, attr, hint_fwd_pd)
@@ -364,6 +388,7 @@ protected:
         return false;
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,34 +15,42 @@
 *******************************************************************************/
 
 #include "graph_memory.hpp"
+#include "allocator.hpp"
+
+#include "oneapi/dnnl/dnnl_graph.hpp"
+
+// 0.75f is taken randomly and is subject to change in future.
+static constexpr float capacity_factor = 0.75f;
 
 namespace graph {
 
+size_t get_benchdnn_cpu_limit() {
+    static size_t cpu_device_capacity = get_cpu_ram_size();
+    const double benchdnn_cpu_limit = capacity_factor * cpu_device_capacity;
+    assert(benchdnn_cpu_limit > 0);
+    return benchdnn_cpu_limit;
+}
+
+size_t get_benchdnn_device_limit() {
+    if (is_cpu()) return 0;
+    static size_t gpu_device_capacity = 0;
+    static size_t gpu_max_alloc_capacity = 0;
+    SAFE(get_gpu_ram_sizes(gpu_device_capacity, gpu_max_alloc_capacity), WARN);
+
+    const double benchdnn_device_limit = capacity_factor * gpu_device_capacity;
+    assert(benchdnn_device_limit > 0);
+    return benchdnn_device_limit;
+}
+
+// Constructs memories for all inputs and outputs needed for comparison.
 dnn_graph_mem_t::dnn_graph_mem_t(const dnn_mem_t &mem,
-        const deserialized_lt &lt, const bool is_op_input,
-        const bool is_fake_output) {
+        const deserialized_lt_t &lt, const bool is_op_input,
+        const bool use_graph_layout)
+    : graph_dims_(lt.shape_), graph_strides_(lt.stride_) {
+    const auto &g_eng = lt.is_host_scalar()
+            ? get_graph_host_engine().operator const dnnl::engine &()
+            : get_graph_engine().operator const dnnl::engine &();
 
-    // Init memory for all inputs and outputs that needs comparison
-    const auto &prim_dt = mem.dt();
-    const auto &graph_dt = static_cast<dnnl_data_type_t>(lt.get_data_type());
-    const bool is_boolean
-            = lt.get_data_type() == logical_tensor::data_type::boolean;
-
-    // Use data type from graph path to represent boolean
-    const auto &c_data_type = is_boolean ? prim_dt : graph_dt;
-
-    // Get memory tag of primitive memory
-    int ndims = mem.ndims();
-    dims_t strides(mem.strides(), mem.strides() + ndims);
-    std::string mtag = strides2memory_tag(ndims, strides);
-
-    graph_dims_ = lt.shape_;
-    graph_strides_ = lt.stride_;
-
-    // We create memory for graph path in two steps:
-    // 1. Create memory objects.
-    // 2. Do memory copy if needed.
-    //
     // For inputs, graph path needs data from reference path,
     // and the data movement requires both memories have the same
     // shape, so the tag of graph path is used to create the memory.
@@ -51,50 +59,124 @@ dnn_graph_mem_t::dnn_graph_mem_t(const dnn_mem_t &mem,
     // otherwise use shape & tag from ref path side
 
     // Create memory for graph path
-    const auto data_type = static_cast<dnnl::memory::data_type>(c_data_type);
+    const auto &graph_dt = convert_dt(lt.get_data_type());
+    const auto data_type = static_cast<dnnl::memory::data_type>(graph_dt);
+
+    if (graph_dims_.empty()) {
+        // As graph strides are deduced from graph dims, they should be in
+        // compliance with each other.
+        assert(graph_strides_.empty());
+
+        graph_dims_.push_back(1);
+        graph_strides_.push_back(1);
+    }
+
     if (is_op_input) {
-        if (graph_dims_.empty()) graph_dims_.push_back(1);
-        if (graph_strides_.empty()) graph_strides_.push_back(1);
-
-        // create graph memory
+        // Create graph memory with memory description from graph path.
         dnnl::memory::desc md(graph_dims_, data_type, graph_strides_);
-        mem_ = dnn_mem_t(md.get(), ::get_test_engine());
+        mem_ = dnn_mem_t(md.get(), g_eng.get(), /* prefill = */ true);
 
-        const auto prim_to_graph_memcpy = [](dnn_mem_t &graph_mem,
-                                                  const dnn_mem_t &prim_mem) {
-            const void *prim_data_handle = static_cast<const void *>(prim_mem);
-            void *graph_data_handle = graph_mem.get_mapped_pointer<void>();
-            std::memcpy(graph_data_handle, prim_data_handle, graph_mem.size());
-        };
-
-        // Not do reorder for boolean data tensor
-        if (!is_boolean && prim_dt != c_data_type) {
-            dnn_mem_t c_mem(
-                    ndims, mem.dims(), c_data_type, mtag, ::get_test_engine());
-            SAFE_V(c_mem.reorder(mem));
-            prim_to_graph_memcpy(mem_, c_mem);
-        } else {
-            prim_to_graph_memcpy(mem_, mem);
+        if (!has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) {
+            // Fill data from reference memories.
+            fill_mem_with_data(mem, g_eng);
         }
+
     } else {
-        if (is_fake_output) {
+        if (use_graph_layout) {
+            // For some cases such as fake outputs and no reference memory
+            // mode, which means the output does not have correctponding
+            // argument in primitives, we need to create them with memory
+            // description from graph path.
             dnnl::memory::desc md(graph_dims_, data_type, graph_strides_);
-            mem_ = dnn_mem_t(md.get(), ::get_test_engine());
+            mem_ = dnn_mem_t(md.get(), g_eng.get(), /* prefill = */ true);
+
         } else {
-            mem_ = dnn_mem_t(mem.md_, c_data_type, mtag, ::get_test_engine());
+            // Use information from the reference memory descriptor to create
+            // memories. As we need to reorder output from both paths to abx
+            // for comparison, the memory tag of graph path output should align
+            // the reference path.
+
+            // Get memory tag of primitive memory
+            int ndims = mem.ndims();
+            dims_t strides(mem.strides(), mem.strides() + ndims);
+            std::string mtag = strides2memory_tag(ndims, strides);
+
+            mem_ = dnn_mem_t(
+                    mem.md_, graph_dt, mtag, g_eng.get(), /* prefill = */ true);
         }
     }
 }
 
+int dnn_graph_mem_t::fill_mem_with_data(
+        const dnn_mem_t &mem, const dnnl::engine &eng) {
+    const auto &src_eng = mem.engine();
+    const auto &dst_eng = eng.get();
+
+    const auto &src_dt = mem.dt();
+    const auto &dst_dt = mem_.dt();
+    if (src_dt == dst_dt && mem.size() != mem_.size()) {
+        BENCHDNN_PRINT(0, "%s\n",
+                "Error: failed to fill graph memory with given memory\n");
+        SAFE(FAIL, WARN);
+    }
+
+    int ndims = mem.ndims();
+    const auto prim_to_graph_memcpy = [](dnn_mem_t &graph_mem,
+                                              const dnn_mem_t &prim_mem) {
+        const void *prim_data_handle = static_cast<const void *>(prim_mem);
+        void *graph_data_handle = graph_mem.get_mapped_pointer<void>();
+        std::memcpy(graph_data_handle, prim_data_handle, graph_mem.size());
+    };
+
+    if (src_dt != dst_dt || src_eng != dst_eng) {
+        // If dt or eng is different, need to transfer data under same dt or
+        // engine to perform a data copy.
+        dnn_mem_t c_mem(ndims, mem.dims(), dst_dt, mem.strides(), dst_eng,
+                /* prefill = */ true);
+        SAFE_V(c_mem.reorder(mem));
+        prim_to_graph_memcpy(mem_, c_mem);
+    } else {
+        prim_to_graph_memcpy(mem_, mem);
+    }
+
+    return OK;
+}
+
 dnnl::graph::tensor dnn_graph_mem_t::make_graph_tensor(
-        const deserialized_lt &lt) const {
+        const deserialized_lt_t &lt) const {
     void *data_handle;
     dnnl_memory_get_data_handle(mem_.m_, &data_handle);
     dnnl::graph::logical_tensor graph_lt(lt.id_, lt.get_data_type(), lt.shape_,
             str2layout(lt.layout_type_), lt.get_property_type());
-    dnnl::graph::tensor ret(graph_lt, get_graph_engine(), data_handle);
+    const auto &g_eng = get_graph_engine().operator const dnnl::engine &();
 
-    return ret;
+    if (lt.is_host_scalar()) {
+        return dnnl::graph::tensor::make_scalar_tensor(graph_lt, data_handle);
+    } else {
+        return dnnl::graph::tensor(graph_lt, g_eng, data_handle);
+    }
+}
+
+void flush_temp_memory() {
+    using namespace dnnl::graph;
+    // flush the constant tensor cache.
+    const auto kind = engine_tgt_kind == dnnl_cpu ? engine::kind::cpu
+                                                  : engine::kind::gpu;
+    static size_t ct_capacity = get_constant_tensor_cache_capacity(kind);
+    if (ct_capacity > 0) set_constant_tensor_cache_capacity(kind, ct_capacity);
+
+        // flush the compiled partition cache.
+#ifndef DNNL_GRAPH_DISABLE_COMPILED_PARTITION_CACHE
+    static int cp_capacity = get_compiled_partition_cache_capacity();
+    set_compiled_partition_cache_capacity(0); // clear the cache
+    set_compiled_partition_cache_capacity(
+            cp_capacity); // reset the cache capacity.
+#endif
+
+    if (!has_bench_mode_bit(mode_bit_t::corr)) {
+        auto &graph_mem_mgr = graph_mem_manager_t::get_instance();
+        graph_mem_mgr.clear_memory_pool();
+    }
 }
 
 } // namespace graph

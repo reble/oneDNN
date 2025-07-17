@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2019-2023 Intel Corporation
+# Copyright 2019-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,31 +14,23 @@
 # limitations under the License.
 #===============================================================================
 
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.13)
 
 if("${CMAKE_BUILD_TYPE}" STREQUAL "")
     message(STATUS "CMAKE_BUILD_TYPE is unset, defaulting to Release")
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING
         "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel ...")
 endif()
+string(TOUPPER "${CMAKE_BUILD_TYPE}" UPPERCASE_CMAKE_BUILD_TYPE)
 
 project (DNNL_EXAMPLES)
 
 set(DNNL_CPU_RUNTIME "@DNNL_CPU_RUNTIME@")
 set(DNNL_GPU_RUNTIME "@DNNL_GPU_RUNTIME@")
 
-if(POLICY CMP0015)
-    cmake_policy(SET CMP0015 NEW)
-endif()
-
-# Use <PackageName>_ROOT env. variable as a prefix
-if(POLICY CMP0074)
-    cmake_policy(SET CMP0074 NEW)
-endif()
-
 set(DNNL_INSTALL_MODE "@DNNL_INSTALL_MODE@")
 set(IS_NEW_DIR_LAYOUT FALSE)
-if(DNNL_INSTALL_MODE STREQUAL "BUNDLE_V2")
+if(DNNL_INSTALL_MODE STREQUAL "BUNDLE")
     set(IS_NEW_DIR_LAYOUT TRUE)
 endif()
 
@@ -83,25 +75,8 @@ if(CMAKE_BASE_NAME MATCHES "^(icx|icpx)$")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-recommended-option -Wno-unknown-warning-option")
 endif()
 
-function(find_libm var)
-    # This is to account for the linker cache in OSX11.  might work
-    # with lower than 3.9.4, but was not able to test with anything
-    # between 2.8 and 3.9. See here for more details:
-    # https://gitlab.kitware.com/cmake/cmake/-/issues/20863
-    if (APPLE AND (${CMAKE_HOST_SYSTEM_VERSION} VERSION_GREATER "20.0.0")
-           AND (${CMAKE_VERSION} VERSION_LESS "3.9.4"))
-        message(INFO "Using OSX11 and above with CMAKE older than 3.18 can cause linking issues.")
-        set(OSX11_AND_OLDER_CMAKE TRUE)
-    endif()
-
-    if(UNIX AND (NOT (APPLE AND OSX11_AND_OLDER_CMAKE)))
-        find_library(${var} m REQUIRED)
-    endif()
-endfunction()
-
-
 if(UNIX OR MINGW)
-    find_libm(LIBM)
+    find_library(LIBM m REQUIRED)
     set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=c99")
 
     if(NOT DNNL_WITH_SYCL)
@@ -115,27 +90,35 @@ if(UNIX OR MINGW)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -w")
 endif()
 
-if(WIN32 AND ${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
+if(${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
     add_definitions(/Qpar)
     add_definitions(/openmp)
 else()
     find_package(OpenMP)
-    #newer version for findOpenMP (>= v. 3.9)
-    if(CMAKE_VERSION VERSION_LESS "3.9" AND OPENMP_FOUND)
-        if(${CMAKE_MAJOR_VERSION} VERSION_LESS "3" AND
-                ${CMAKE_CXX_COMPILER_ID} STREQUAL "Intel")
-            # Override FindOpenMP flags for Intel Compiler (otherwise deprecated)
-            set(OpenMP_CXX_FLAGS "-fopenmp")
-            set(OpenMP_C_FLAGS "-fopenmp")
-        endif()
-        set(OpenMP_C_FOUND true)
-        set(OpenMP_CXX_FOUND true)
-    endif()
     if(OpenMP_C_FOUND)
         set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${OpenMP_C_FLAGS}")
     endif()
     if(OpenMP_CXX_FOUND)
         set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
+    endif()
+endif()
+
+if(UPPERCASE_CMAKE_BUILD_TYPE STREQUAL "DEBUG" AND NOT APPLE)
+    if(${CMAKE_CXX_COMPILER_ID} MATCHES "IntelLLVM" OR CMAKE_BASE_NAME MATCHES "(icx|icpx|dpcpp)" OR DNNL_WITH_SYCL)
+        # When using Debug build mode CMake adds '-debug' or '-g' without
+        # any optimization-level option that will turn off most compiler
+        # optimizations similar to use of '-Od' or '-O0'.
+        # Here we disable the warning and remark about this issue.
+        set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-debug-disables-optimization -Rno-debug-disables-optimization")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-debug-disables-optimization -Rno-debug-disables-optimization")
+        if(WIN32)
+            # Disabling OMP SIMD feature on Windows ICX debug builds and
+            # suppressing the warning: Using /MTd or /MDd with '#pragma omp simd'
+            # may lead to unexpected fails due to the debugging version of iterators
+            # that cannot be vectorized correctly.
+            set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Qopenmp-simd- -Wno-debug-option-simd")
+            set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Qopenmp-simd- -Wno-debug-option-simd")
+        endif()
     endif()
 endif()
 
@@ -147,7 +130,6 @@ if(WIN32 AND DNNL_WITH_SYCL)
     # XXX: compiler always pulls in release C++ runtime by default, until
     # this is fixed we have to explicitly drop release C++ runtime for
     # debug build types.
-    string(TOUPPER "${CMAKE_BUILD_TYPE}" UPPERCASE_CMAKE_BUILD_TYPE)
     if(UPPERCASE_CMAKE_BUILD_TYPE STREQUAL "DEBUG" AND NOT CMAKE_BASE_NAME MATCHES "(icx|dpcpp)")
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Xlinker /NODEFAULTLIB:msvcrt")
     endif()
@@ -171,7 +153,7 @@ elseif(APPLE)
     set(CTESTCONFIG_PATH "${DNNLROOT}/lib")
 endif()
 
-# Common configuration for tests / test cases on Windows and Apple
+# Configuration for tests / test cases on Windows
 function(maybe_configure_test name kind)
     if(WIN32)
         string(REPLACE  ";" "\;" PATH "${CTESTCONFIG_PATH};$ENV{PATH}")
@@ -179,14 +161,6 @@ function(maybe_configure_test name kind)
         if(CMAKE_GENERATOR MATCHES "Visual Studio")
             configure_file(template.vcxproj.user ${name}.vcxproj.user @ONLY)
         endif()
-    elseif(APPLE)
-        # When LIBRARY_PATH is set (e.g. when using compiler env. scripts)
-        # cmake may stop passing `rpath` linker option. The hack below adds the
-        # LIBRARY_PATH to DYLD_LIBRARY_PATH to make the executable find its
-        # dependencies.
-        # TODO: the problem may be in older version of cmake (2.8.11), revisit.
-        set_property(${kind} ${name} PROPERTY ENVIRONMENT
-                "DYLD_LIBRARY_PATH=${CTESTCONFIG_PATH}:$ENV{LIBRARY_PATH}:$ENV{DYLD_LIBRARY_PATH}")
     endif()
 endfunction()
 

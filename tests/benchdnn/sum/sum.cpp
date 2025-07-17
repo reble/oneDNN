@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -52,7 +52,7 @@ dnnl_status_t init_pd(init_pd_args_t<prb_t> &init_pd_args) {
     }
 
     auto dnnl_attr = make_benchdnn_dnnl_wrapper(
-            create_dnnl_attr(prb->attr, attr_args_t()));
+            create_dnnl_attr(prb->attr, attr_args_t(), prb->ndims));
 
     std::vector<dnnl_memory_desc_t> src_d(
             src_d_wrappers.begin(), src_d_wrappers.end());
@@ -72,6 +72,10 @@ int fill_src(int input_idx, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
     if (has_bench_mode_bit(mode_bit_t::bitwise)) {
         return fill_random_real(mem_dt, mem_fp, nullptr);
     }
+    if (has_bench_mode_bit(mode_bit_t::perf)) {
+        return fill_random_real(
+                mem_dt, mem_fp, nullptr, get_perf_fill_cfg(mem_dt.dt()));
+    }
 
     const auto dt = mem_dt.dt();
     const int range = 16;
@@ -82,7 +86,7 @@ int fill_src(int input_idx, dnn_mem_t &mem_dt, dnn_mem_t &mem_fp) {
         const float value = (dt == dnnl_bf16 || dt == dnnl_f16)
                 ? (f_min + gen) / range
                 : (f_min + gen) * (1.0f + 4.0f / range);
-        mem_fp.set_elem(i, round_to_nearest_representable(dt, value));
+        mem_fp.set_f32_elem(i, round_to_nearest_representable(dt, value));
     });
 
     SAFE(mem_dt.reorder(mem_fp), WARN);
@@ -95,6 +99,7 @@ void skip_unimplemented_prb(const prb_t *prb, res_t *res) {
     dts.push_back(prb->ddt);
     skip_unimplemented_data_type(dts, prb->dir, res);
     skip_unimplemented_sum_po(prb->attr, res, dnnl_sum, prb->sdt[0]);
+    skip_unimplemented_binary_po(prb->attr, res);
     skip_unimplemented_prelu_po(prb->attr, res, dnnl_sum);
 }
 
@@ -123,7 +128,7 @@ std::vector<int> supported_exec_args(dir_t dir) {
 int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         dnnl_primitive_t prim, const prb_t *prb, res_t *res,
         dnnl_primitive_t prim_ref) {
-    if (has_bench_mode_modifier(mode_modifier_t::no_host_memory)) return OK;
+    if (has_bench_mode_modifier(mode_modifier_t::no_ref_memory)) return OK;
 
     const auto &ref_engine = get_cpu_engine();
 
@@ -140,7 +145,8 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
         // use switch below to define a memory desc for it.
         if (exec_arg != DNNL_ARG_SCRATCHPAD) {
             ref_mem_map.emplace(exec_arg,
-                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine));
+                    dnn_mem_t(mem.md_, dnnl_f32, tag::abx, ref_engine,
+                            /* prefill = */ false));
         }
         auto &ref_mem = ref_mem_map[exec_arg];
 
@@ -170,14 +176,21 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     return OK;
 }
 
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
-    return check_caches(v_prim[0], prb, res);
+    if (has_bench_mode_bit(mode_bit_t::exec)) {
+        SAFE(check_total_size(res), WARN);
+    }
+    if (has_bench_mode_bit(mode_bit_t::corr)) {
+        SAFE(check_caches(v_prim[0], prb, res), WARN);
+    }
+    return OK;
 }
 
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
+    set_zmalloc_max_expected_size(res->mem_size_args.zmalloc_expected_size);
+
     const auto &prim = v_prim[0];
 
     dnn_mem_map_t mem_map, ref_mem_map;
@@ -189,7 +202,7 @@ int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
 
     SAFE(execute_and_wait(prim, args, res), WARN);
 
-    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res);
+    check_correctness(prb, {DST}, args, ref_args, setup_cmp, res, prb->dir);
     SAFE(check_bitwise(prim, {DST}, args, prb->attr, prb->inplace, res), WARN);
 
     return measure_perf(prb->ctx_exe, res, prim, args);

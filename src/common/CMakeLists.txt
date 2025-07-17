@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2019-2023 Intel Corporation
+# Copyright 2019-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ file(GLOB SOURCES
 if(DNNL_ENABLE_JIT_PROFILING OR DNNL_ENABLE_ITT_TASKS)
     if(DNNL_TARGET_ARCH STREQUAL "AARCH64" OR DNNL_TARGET_ARCH STREQUAL "X64")
         file(GLOB ITT_SOURCES
-            ${CMAKE_CURRENT_SOURCE_DIR}/ittnotify/*.[ch]
+            ${PROJECT_SOURCE_DIR}/third_party/ittnotify/*.c
             )
         list(APPEND SOURCES ${ITT_SOURCES})
 
@@ -33,10 +33,10 @@ if(DNNL_ENABLE_JIT_PROFILING OR DNNL_ENABLE_ITT_TASKS)
             set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DITT_API_IPT_SUPPORT")
             if(UNIX OR MINGW)
                 enable_language(ASM)
-                set(ITT_PT ${CMAKE_CURRENT_SOURCE_DIR}/ittnotify/ittptmark64.S)
+                set(ITT_PT ${PROJECT_SOURCE_DIR}/third_party/ittnotify/ittptmark64.S)
             else()
                 enable_language(ASM_MASM)
-                set(ITT_PT ${CMAKE_CURRENT_SOURCE_DIR}/ittnotify/ittptmark64.asm)
+                set(ITT_PT ${PROJECT_SOURCE_DIR}/third_party/ittnotify/ittptmark64.asm)
             endif()
             list(APPEND SOURCES ${ITT_PT})
         endif()
@@ -46,6 +46,10 @@ endif()
 if(NOT DNNL_CPU_RUNTIME STREQUAL "THREADPOOL")
     # avoid building and linking empty objects
     list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/stream_threadpool.cpp")
+endif()
+
+if(NOT DNNL_EXPERIMENTAL_LOGGING)
+    list(REMOVE_ITEM SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/logging.cpp")
 endif()
 
 set(OBJ_LIB ${LIB_PACKAGE_NAME}_common)

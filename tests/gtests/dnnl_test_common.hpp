@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -101,7 +101,7 @@ dnnl::engine::kind get_test_engine_kind();
 dnnl::engine get_test_engine();
 #endif
 
-inline int get_vendor_id(const std::string &vendor) {
+inline uint32_t get_vendor_id(const std::string &vendor) {
     if (vendor == "nvidia") {
         return 0x10DE;
     } else if (vendor == "amd") {
@@ -109,7 +109,7 @@ inline int get_vendor_id(const std::string &vendor) {
     } else if (vendor == "intel") {
         return 0x8086;
     } else {
-        return -1;
+        return 0x0;
     }
 }
 
@@ -215,39 +215,39 @@ inline bool unsupported_prop_kind(
 #endif
 
 template <typename data_t>
-struct data_traits {};
+struct data_traits_t {};
 template <>
-struct data_traits<float16_t> {
+struct data_traits_t<float16_t> {
     static const auto data_type = memory::data_type::f16;
 
     using uint_type = uint16_t;
 };
 template <>
-struct data_traits<bfloat16_t> {
+struct data_traits_t<bfloat16_t> {
     static const auto data_type = memory::data_type::bf16;
 
     using uint_type = uint16_t;
 };
 template <>
-struct data_traits<float> {
+struct data_traits_t<float> {
     static const auto data_type = memory::data_type::f32;
 
     using uint_type = uint32_t;
 };
 template <>
-struct data_traits<uint8_t> {
+struct data_traits_t<uint8_t> {
     static const auto data_type = memory::data_type::u8;
 
     using uint_type = uint8_t;
 };
 template <>
-struct data_traits<int8_t> {
+struct data_traits_t<int8_t> {
     static const auto data_type = memory::data_type::s8;
 
     using uint_type = uint8_t;
 };
 template <>
-struct data_traits<int32_t> {
+struct data_traits_t<int32_t> {
     static const auto data_type = memory::data_type::s32;
 
     using uint_type = uint32_t;
@@ -297,15 +297,15 @@ inline memory::dim right_padding(memory::dim i, memory::dim o, memory::dim k,
 
 template <typename data_t>
 struct acc_t {
-    typedef data_t type;
+    using type = data_t;
 };
 template <>
 struct acc_t<int8_t> {
-    typedef int type;
+    using type = int;
 };
 template <>
 struct acc_t<uint8_t> {
-    typedef int type;
+    using type = int;
 };
 
 // Smart pointer for map/unmap operations with unique_ptr semantics
@@ -314,9 +314,8 @@ struct mapped_ptr_t {
     using nonconst_type = typename std::remove_cv<T>::type;
 
     mapped_ptr_t(std::nullptr_t) : mem_(nullptr), ptr_(nullptr) {}
-    mapped_ptr_t(const memory *mem) : mem_(mem) {
-        ptr_ = mem->map_data<nonconst_type>();
-    }
+    mapped_ptr_t(const memory *mem)
+        : mem_(mem), ptr_(mem->map_data<nonconst_type>()) {}
     mapped_ptr_t(mapped_ptr_t &&other) : mem_(other.mem_), ptr_(other.ptr_) {
         other.mem_ = nullptr;
         other.ptr_ = nullptr;
@@ -368,12 +367,12 @@ void check_zero_tail(int set_zero_flag, const memory &src) {
 
     for (memory::dim i = 0; i < nelems; ++i) {
         memory::dim off = 0;
-        bool flag = 0;
+        bool flag = false;
         for (int j = 0; j < ndims; ++j) {
             off += idx[j] * str[j];
-            if (idx[j] >= dims[ndims - j - 1]) flag = 1;
+            if (idx[j] >= dims[ndims - j - 1]) flag = true;
         }
-        if (flag == 1) {
+        if (flag == true) {
             memory::dim blk_off = mdw.off_l(off, true);
             if (set_zero_flag) {
                 src_data[blk_off] = 0.0;
@@ -391,18 +390,18 @@ void check_zero_tail(int set_zero_flag, const memory &src) {
     }
 }
 
-inline memory::desc create_md(memory::dims dims, memory::data_type data_type,
-        memory::format_tag fmt_tag) {
+inline memory::desc create_md(const memory::dims &dims,
+        memory::data_type data_type, memory::format_tag fmt_tag) {
     return memory::desc(dims, data_type, fmt_tag);
 }
 
 template <typename data_t>
 static inline data_t set_value(
         memory::dim index, data_t mean, data_t deviation, double sparsity) {
-    if (data_traits<data_t>::data_type == memory::data_type::f16
-            || data_traits<data_t>::data_type == memory::data_type::bf16) {
+    if (data_traits_t<data_t>::data_type == memory::data_type::f16
+            || data_traits_t<data_t>::data_type == memory::data_type::bf16) {
         return data_t(set_value<float>(index, mean, deviation, sparsity));
-    } else if (data_traits<data_t>::data_type == memory::data_type::f32) {
+    } else if (data_traits_t<data_t>::data_type == memory::data_type::f32) {
         const memory::dim group_size = (memory::dim)(1. / sparsity);
         const memory::dim group = index / group_size;
         const memory::dim in_group = index % group_size;
@@ -410,10 +409,10 @@ static inline data_t set_value(
         return fill ? static_cast<data_t>(
                        mean + deviation * sinf(float(index % 37)))
                     : data_t {0};
-    } else if (data_traits<data_t>::data_type == memory::data_type::s32
-            || data_traits<data_t>::data_type == memory::data_type::s8) {
+    } else if (data_traits_t<data_t>::data_type == memory::data_type::s32
+            || data_traits_t<data_t>::data_type == memory::data_type::s8) {
         return data_t(index * 13 % 21 - 10);
-    } else if (data_traits<data_t>::data_type == memory::data_type::u8) {
+    } else if (data_traits_t<data_t>::data_type == memory::data_type::u8) {
         return data_t(index * 13 % 17);
     }
     assert(!"not expected");
@@ -437,7 +436,14 @@ static void fill_data(const memory::dim nelems, const memory &mem, data_t mean,
 
 inline void fill_data(memory::data_type dt, const memory &mem, float mean,
         float deviation, double sparsity = 1.) {
-    size_t nelems = mem.get_desc().get_size() / memory::data_type_size(dt);
+    const auto dt_size = memory::data_type_size(dt);
+    if (dt_size <= 0) {
+        assert(!"unexpected data type");
+        return;
+    }
+
+    memory::dim nelems
+            = static_cast<memory::dim>(mem.get_desc().get_size() / dt_size);
     switch (dt) {
         case memory::data_type::f32:
             fill_data<float>(nelems, mem, mean, deviation, sparsity);
@@ -494,11 +500,11 @@ static void compare_data(
         const memory &ref, const memory &dst, data_t threshold = (data_t)1e-4) {
     using data_type = memory::data_type;
 
-    ASSERT_TRUE(data_traits<data_t>::data_type == data_type::f32
-            || data_traits<data_t>::data_type == data_type::f16
-            || data_traits<data_t>::data_type == data_type::bf16
-            || data_traits<data_t>::data_type == data_type::s32
-            || data_traits<data_t>::data_type == data_type::s8);
+    ASSERT_TRUE(data_traits_t<data_t>::data_type == data_type::f32
+            || data_traits_t<data_t>::data_type == data_type::f16
+            || data_traits_t<data_t>::data_type == data_type::bf16
+            || data_traits_t<data_t>::data_type == data_type::s32
+            || data_traits_t<data_t>::data_type == data_type::s8);
 
     /* Note: size_t incompatible with MSVC++ */
     auto ref_desc = ref.get_desc();
@@ -530,9 +536,9 @@ static void compare_data(
         data_t ref = ref_data[mdw_ref.off_l(i, true)];
         data_t got = dst_data[mdw_dst.off_l(i, true)];
 
-        if (data_traits<data_t>::data_type == data_type::f32
-                || data_traits<data_t>::data_type == data_type::f16
-                || data_traits<data_t>::data_type == data_type::bf16) {
+        if (data_traits_t<data_t>::data_type == data_type::f32
+                || data_traits_t<data_t>::data_type == data_type::f16
+                || data_traits_t<data_t>::data_type == data_type::bf16) {
             const float threshold_f32 = static_cast<float>(threshold);
             const float ref_f32 = static_cast<float>(ref);
             const float got_f32 = static_cast<float>(got);
@@ -559,7 +565,8 @@ inline dnnl_status_t get_conv_impl_status(
         const_dnnl_primitive_desc_t pd, const char *match_str) {
     const char *conv_str = query_impl_info(pd);
 
-    if (strstr(conv_str, match_str) != NULL) return dnnl_status_t::dnnl_success;
+    if (strstr(conv_str, match_str) != nullptr)
+        return dnnl_status_t::dnnl_success;
     return dnnl_status_t::dnnl_unimplemented;
 };
 
@@ -601,7 +608,7 @@ struct test_convolution_attr_t {
 
         bool is_def() const { return policy != NONE; }
 
-        scale_t(float s, policy_t p = NONE) : scale(s) { policy = p; }
+        scale_t(float s, policy_t p = NONE) : policy(p), scale(s) {}
 
         policy_t policy;
         float scale;
@@ -625,7 +632,7 @@ struct test_convolution_attr_t {
 
     test_convolution_attr_t(
             float s, scale_t::policy_t p = scale_t::policy_t::NONE)
-        : src_scale(s, p), wei_scale(s, p), dst_scale(s, p), dnnl_attr() {}
+        : src_scale(s, p), wei_scale(s, p), dst_scale(s, p) {}
 
     test_convolution_attr_t() : test_convolution_attr_t(1.f) {}
 
@@ -665,7 +672,8 @@ struct test_convolution_eltwise_params_t {
 
 template <typename F>
 bool catch_expected_failures(const F &f, bool expect_to_fail,
-        dnnl_status_t expected_status, bool ignore_unimplemented = false) {
+        dnnl_status_t expected_status, bool ignore_unimplemented = false,
+        const char *filename = __FILE__, int64_t line_num = __LINE__) {
     try {
         f();
     } catch (const dnnl::error &e) {
@@ -675,7 +683,8 @@ bool catch_expected_failures(const F &f, bool expect_to_fail,
             // Ignore unimplemented
             if (ignore_unimplemented && (e.status == dnnl_unimplemented)) {
                 // Print unimplemented but do not treat as error
-                std::cout << "[  UNIMPL  ] "
+                std::cout << "(" << filename << ":" << line_num << ") "
+                          << "[  UNIMPL  ] "
                           << "Implementation not found" << std::endl;
                 reset_failed_malloc_counter();
                 return true;
@@ -694,7 +703,8 @@ bool catch_expected_failures(const F &f, bool expect_to_fail,
                         expected_status, ignore_unimplemented);
             } else {
                 if (expect_to_fail && (e.status != expected_status))
-                    std::cout << "expect failure status mismatch: expect("
+                    std::cout << "(" << filename << ":" << line_num << ") "
+                              << "Expect failure status mismatch: expect("
                               << dnnl_status2str(expected_status) << ") get("
                               << dnnl_status2str(e.status)
                               << "). Re-throwing...\n";
@@ -711,7 +721,8 @@ bool catch_expected_failures(const F &f, bool expect_to_fail,
 
     // Throw an exception if the failure is expected but did not happen
     if (expect_to_fail) {
-        std::cout << "expect failure with status("
+        std::cout << "(" << filename << ":" << line_num << ") "
+                  << "Expect failure with status("
                   << dnnl_status2str(expected_status) << "), "
                   << "but operation succeed. Throwing an exception...\n";
         throw std::exception();
@@ -774,7 +785,7 @@ static char *test_malloc(size_t size) {
 #else
     int rc = ::posix_memalign(&ptr, align, padded_size);
 #endif /* _WIN32 */
-    return rc == 0 ? (char *)ptr + TEST_MALLOC_OFFSET : 0;
+    return rc == 0 ? (char *)ptr + TEST_MALLOC_OFFSET : nullptr;
 }
 
 static void test_free(char *ptr) {
@@ -787,13 +798,14 @@ static void test_free(char *ptr) {
 }
 #undef TEST_MALLOC_OFFSET
 
+//NOLINTNEXTLINE(readability-identifier-naming)
 class test_memory {
 public:
-    test_memory(const memory::desc &d, const dnnl::engine &e) {
+    test_memory(const memory::desc &d, const dnnl::engine &e)
+        : size_(d.get_size()) {
         bool is_cpu_native = (e.get_kind() == dnnl::engine::kind::cpu)
                 && DNNL_CPU_RUNTIME != DNNL_RUNTIME_SYCL;
 
-        size_ = d.get_size();
         if (is_cpu_native) {
             data_.reset(test_malloc(size_), test_free);
             mem_ = test::make_memory(d, e, data_.get());
@@ -822,7 +834,7 @@ mapped_ptr_t<T> map_memory(const test_memory &mem) {
 }
 
 inline std::string to_string(dnnl_engine_kind_t engine_kind) {
-    std::stringstream ss;
+    dnnl::impl::stringstream_t ss;
     if (engine_kind == dnnl_cpu)
         ss << "cpu";
     else if (engine_kind == dnnl_gpu)
@@ -834,7 +846,7 @@ inline std::string to_string(dnnl_engine_kind_t engine_kind) {
 }
 
 inline std::string to_string(dnnl_stream_flags_t stream_flags) {
-    std::stringstream ss;
+    dnnl::impl::stringstream_t ss;
     if (stream_flags & dnnl_stream_default_flags)
         ss << "default";
     else if (stream_flags & dnnl_stream_in_order)
@@ -847,12 +859,13 @@ inline std::string to_string(dnnl_stream_flags_t stream_flags) {
 
 // testing all available C++ primitive descriptor constructors
 struct allows_attr_t {
-    bool po_sum;
-    bool po_eltwise;
-    bool po_binary;
-    bool po_prelu;
-    bool zp;
-    bool scales;
+    bool po_sum = false;
+    bool po_eltwise = false;
+    bool po_binary = false;
+    bool po_prelu = false;
+    bool zp = false;
+    bool scales = false;
+    int scales_arg = DNNL_ARG_SRC;
 };
 
 using engine = dnnl::engine;
@@ -891,17 +904,33 @@ void test_fwd_pd_attr_po_eltwise(const engine &eng, bool supports_po_eltwise,
 
 template <typename pd_t, typename... prim_params_t>
 void test_fwd_pd_attr_po_binary(const engine &eng, bool supports_po_binary,
-        const prim_params_t &...prim_params) {
-    dnnl::post_ops ops_binary;
-    dnnl::memory::desc src1_desc(
-            {16}, memory::data_type::s8, memory::format_tag::x);
-    ops_binary.append_binary(dnnl::algorithm::binary_mul, src1_desc);
-    dnnl::primitive_attr attr_po_binary;
-    attr_po_binary.set_post_ops(ops_binary);
-    if (supports_po_binary)
-        EXPECT_NO_THROW(pd_t pd(eng, prim_params..., attr_po_binary));
-    else
-        EXPECT_ANY_THROW(pd_t pd(eng, prim_params..., attr_po_binary));
+        const pd_t &pd, const prim_params_t &...prim_params) {
+    dnnl::primitive_attr attr_po_binary_good, attr_po_binary_bad;
+    dnnl::post_ops ops_binary_good, ops_binary_bad;
+
+    int dst_ndims = pd.dst_desc().get_ndims();
+    dnnl::memory::dims dims_good(dst_ndims, 1);
+    dnnl::memory::dims dims_bad(
+            dst_ndims > 1 ? dst_ndims - 1 : dst_ndims + 1, 1);
+
+    dnnl::memory::desc src1_desc_good(
+            dims_good, memory::data_type::f32, /* strides */ dims_good);
+    dnnl::memory::desc src1_desc_bad(
+            dims_bad, memory::data_type::s8, /* strides */ dims_bad);
+
+    ops_binary_good.append_binary(dnnl::algorithm::binary_mul, src1_desc_good);
+    ops_binary_bad.append_binary(dnnl::algorithm::binary_mul, src1_desc_bad);
+
+    attr_po_binary_good.set_post_ops(ops_binary_good);
+    attr_po_binary_bad.set_post_ops(ops_binary_bad);
+
+    if (!supports_po_binary) {
+        EXPECT_ANY_THROW(pd_t pd(eng, prim_params..., attr_po_binary_good));
+        return;
+    }
+
+    EXPECT_ANY_THROW(pd_t pd(eng, prim_params..., attr_po_binary_bad));
+    EXPECT_NO_THROW(pd_t pd(eng, prim_params..., attr_po_binary_good));
 }
 
 template <typename pd_t, typename... prim_params_t>
@@ -928,11 +957,13 @@ void test_fwd_pd_attr_zp(const engine &eng, bool supports_zero_point,
         EXPECT_ANY_THROW(pd_t pd(eng, prim_params..., attr_zp));
 }
 
+// Note: `arg` is needed to specify `DNNL_ARG_MULTIPLE_SRC` as a value for
+// supported scale for concat and sum.
 template <typename pd_t, typename... prim_params_t>
-void test_fwd_pd_attr_scales(const engine &eng, bool supports_scales,
+void test_fwd_pd_attr_scales(const engine &eng, bool supports_scales, int arg,
         const prim_params_t &...prim_params) {
     dnnl::primitive_attr attr_scales;
-    attr_scales.set_scales_mask(DNNL_ARG_SRC, 0);
+    attr_scales.set_scales_mask(arg, 0);
 
     if (supports_scales) { // Currently only used with binary ops
         EXPECT_NO_THROW(pd_t pd(eng, prim_params..., attr_scales));
@@ -967,10 +998,11 @@ void test_fwd_pd_constructors(const pd_t &pd, const allows_attr_t &aa,
     // following ctors w/ attrs may throw based on pd support
     test_fwd_pd_attr_po_sum<pd_t>(eng, aa.po_sum, prim_params...);
     test_fwd_pd_attr_po_eltwise<pd_t>(eng, aa.po_eltwise, prim_params...);
-    test_fwd_pd_attr_po_binary<pd_t>(eng, aa.po_binary, prim_params...);
+    test_fwd_pd_attr_po_binary<pd_t>(eng, aa.po_binary, pd, prim_params...);
     test_fwd_pd_attr_po_prelu<pd_t>(eng, aa.po_prelu, prim_params...);
     test_fwd_pd_attr_zp<pd_t>(eng, aa.zp, prim_params...);
-    test_fwd_pd_attr_scales<pd_t>(eng, aa.scales, prim_params...);
+    test_fwd_pd_attr_scales<pd_t>(
+            eng, aa.scales, aa.scales_arg, prim_params...);
     // check allow empty, should not throw
     test_fwd_pd_allow_empty<pd_t>(test_pd, prim_params...);
 }
@@ -1059,10 +1091,9 @@ void test_bwd_pd_allow_empty(const pd_t &pd, const hint_pd_t &hint,
 
 // Note: requires a valid primitive descriptor!
 template <typename pd_t, typename hint_pd_t, typename... prim_params_t>
-void test_bwd_pd_constructors(const pd_t &pd, const hint_pd_t &hint,
+void test_bwd_pd_constructors(const pd_t &pd, const hint_pd_t &hint_pd,
         const allows_attr_t &aa, const prim_params_t &...prim_params) {
     auto test_pd = pd_t();
-    auto hint_pd = hint;
     auto eng = pd.get_engine();
     // ctor from C pd, should not throw
     ASSERT_NO_THROW(test_pd = pd_t(pd.get()));
@@ -1080,7 +1111,7 @@ void test_bwd_pd_constructors(const pd_t &pd, const hint_pd_t &hint,
     test_bwd_pd_allow_empty<pd_t>(test_pd, hint_pd, prim_params...);
 }
 
-inline dnnl::stream make_stream(dnnl::engine engine,
+inline dnnl::stream make_stream(const dnnl::engine &engine,
         dnnl::stream::flags flags = dnnl::stream::flags::default_flags) {
 #if DNNL_CPU_THREADING_RUNTIME == DNNL_RUNTIME_THREADPOOL
     if (engine.get_kind() == dnnl::engine::kind::cpu)

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -40,6 +40,11 @@ const size_t DNNL_CPU_MEMALIGNMENT = 64;
 const size_t DNNL_SYCL_MEMALIGNMENT = 64;
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include "oneapi/dnnl/dnnl_ocl.hpp"
+const size_t DNNL_OCL_MEMALIGNMENT = 0;
+#endif
+
 #if DNNL_CPU_RUNTIME == DNNL_RUNTIME_THREADPOOL
 #include "oneapi/dnnl/dnnl_threadpool.hpp"
 #endif
@@ -64,6 +69,10 @@ void *dnnl_allocator_t::malloc(size_t size, const dnnl::engine &p_engine,
         return alc->allocate(size, dnnl::sycl_interop::get_device(p_engine),
                 dnnl::sycl_interop::get_context(p_engine),
                 {type, DNNL_SYCL_MEMALIGNMENT});
+#elif DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+        return alc->allocate(size, dnnl::ocl_interop::get_device(p_engine),
+                dnnl::ocl_interop::get_context(p_engine),
+                {type, DNNL_OCL_MEMALIGNMENT});
 #else
         return nullptr;
 #endif
@@ -81,7 +90,8 @@ void dnnl_allocator_t::free(
         return alc->deallocate(p);
 #endif
     } else if (p_engine.get_kind() == dnnl::engine::kind::gpu) {
-#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL \
+        || DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
         assert(!"use event based free");
 #endif
     }
@@ -103,6 +113,18 @@ void dnnl_allocator_t::free(void *p, const dnnl::engine &p_engine,
                 dnnl::sycl_interop::get_context(p_engine), deps);
 #endif
     }
+}
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+void dnnl_allocator_t::free(void *p, const dnnl::engine &p_engine,
+        const allocator_t *alc, const cl_event &deps) {
+    if (p_engine.get_kind() != dnnl::engine::kind::gpu) {
+        assert(!"the engine kind should be gpu");
+        return;
+    }
+    alc->deallocate(p, dnnl::ocl_interop::get_device(p_engine),
+            dnnl::ocl_interop::get_context(p_engine), deps);
 }
 #endif
 
@@ -142,6 +164,11 @@ dnnl::engine make_dnnl_engine(const engine_t &g_engine) {
     return engine;
 }
 
+// The function will throw expection if cpu runtime is none.
+dnnl::engine make_host_engine() {
+    return dnnl::engine(dnnl::engine::kind::cpu, 0);
+}
+
 dnnl::stream make_dnnl_stream(
         const dnnl::engine &p_engine, const stream_t &g_stream) {
     UNUSED(p_engine);
@@ -152,7 +179,9 @@ dnnl::stream make_dnnl_stream(
 
 dnnl::memory::desc make_dnnl_memory_desc(const logical_tensor_t &lt) {
     const logical_tensor_wrapper_t ltw(lt);
-    const auto dtype = static_cast<dnnl::memory::data_type>(ltw.data_type());
+    const auto dtype = ltw.data_type() == graph::data_type::boolean
+            ? data_type::u8
+            : static_cast<data_type>(ltw.data_type());
 
     if (ltw.is_opaque()) {
 #ifdef DNNL_GRAPH_LAYOUT_DEBUG
@@ -164,7 +193,7 @@ dnnl::memory::desc make_dnnl_memory_desc(const logical_tensor_t &lt) {
         }
 #endif // DNNL_GRAPH_LAYOUT_DEBUG
 
-        const auto &td = dnnl_backend::get_singleton().get_mem_desc(
+        const auto &td = dnnl_backend_t::get_singleton().get_mem_desc(
                 static_cast<size_t>(ltw.layout_id()));
         return graph::utils::any_cast<memory::desc>(td.value());
     } else if (ltw.is_any()) {
@@ -211,6 +240,9 @@ dnnl::memory make_dnnl_memory(const dnnl::memory::desc &md,
 #if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
         return dnnl::sycl_interop::make_memory(
                 md, p_engine, dnnl::sycl_interop::memory_kind::usm, handle);
+#elif DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+        return dnnl::ocl_interop::make_memory(
+                md, p_engine, dnnl::ocl_interop::memory_kind::usm, handle);
 #else
         return dnnl::memory(md, p_engine, handle);
 #endif
@@ -497,7 +529,7 @@ status_t fill_layout_info(logical_tensor_t *lt, const memory::desc &md) {
                     md.get_strides().data(), md.get_ndims());
         } else {
             graph::utils::optional_t<size_t> layout_id
-                    = dnnl_backend::get_singleton().set_mem_desc(md);
+                    = dnnl_backend_t::get_singleton().set_mem_desc(md);
             lt->layout.layout_id = layout_id.value();
             lt->layout_type = layout_type::opaque;
         }
@@ -539,7 +571,7 @@ status_t fill_layout_info(
             val->set_strides(md.get_strides());
         } else {
             val->set_layout_id(
-                    dnnl_backend::get_singleton().set_mem_desc(md).value());
+                    dnnl_backend_t::get_singleton().set_mem_desc(md).value());
         }
     }
     return status::success;
@@ -621,7 +653,7 @@ dnnl::memory::format_tag get_format_tag(const dnnl::memory::desc &md) {
     return format_tag;
 }
 
-size_t generate_constant_cache_key(
+size_t generate_constant_md_hash(
         size_t part_id, const std::vector<dnnl::memory::desc> &const_mds) {
     size_t key = 0;
     key = hash_combine(key, part_id);

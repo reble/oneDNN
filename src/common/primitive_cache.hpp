@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,14 +51,16 @@ struct primitive_cache_iface_t {
     int get_size() const;
 
     std::shared_ptr<primitive_desc_t> get_pd(const key_t &key);
-    result_t get_or_create(
-            const key_t &key, create_func_t create, void *create_context);
+    result_t get_or_create(const key_t &key, create_func_t create,
+            void *create_context, bool force_create);
 
 private:
     primitive_cache_t &cache_;
 };
 
 primitive_cache_iface_t primitive_cache();
+status_t set_primitive_cache_capacity(
+        int primitive_capacity, int kernel_capacity);
 
 // Undocumented API for testing.
 status_t DNNL_API get_primitive_cache_size(int *size);

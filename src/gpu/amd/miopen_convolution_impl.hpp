@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,11 +21,11 @@
 #include "common/c_types_map.hpp"
 #include "common/convolution_pd.hpp"
 #include "common/utils.hpp"
+#include "gpu/amd/engine.hpp"
 #include "gpu/amd/miopen_conv_filter_adjustment_base.hpp"
 #include "gpu/amd/miopen_convolution_pd.hpp"
-#include "gpu/amd/sycl_hip_engine.hpp"
+#include "gpu/amd/stream.hpp"
 #include "gpu/amd/sycl_hip_scoped_context.hpp"
-#include "gpu/amd/sycl_hip_stream.hpp"
 #include "gpu/amd/sycl_hip_utils.hpp"
 
 #include <vector>
@@ -62,7 +62,7 @@ protected:
     size_t workspace_size = 0;
     bool with_bias = false;
     int selected_sol = -1;
-    bool do_scaling = false;
+    bool do_scaling = false; // TODO: add proper scaling support.
     float output_scaling = 1.0f;
     bool runtime_scaling = false;
     bool use_temp_dst_ = false;
@@ -77,7 +77,8 @@ public:
             MIOPEN_EXECUTE_FUNC_V(miopenDestroyTensorDescriptor, descs[i]);
         }
     }
-    virtual status_t configure_alg_kind(engine_t *, convolution_pd_t *pd) = 0;
+    virtual status_t configure_alg_kind(impl::engine_t *, convolution_pd_t *pd)
+            = 0;
 
     virtual bool supported_filter_format(
             const memory_desc_t *md) const override {
@@ -93,7 +94,7 @@ public:
     bool using_transformed_filter() const { return filter_needs_transform; }
     bool with_scratchpad() const { return workspace_size > 0; }
 
-    virtual status_t init(engine_t *engine, convolution_pd_t *pd,
+    virtual status_t init(impl::engine_t *engine, convolution_pd_t *pd,
             bool use_scratch_dst = false) {
         CHECK(configure_parameters(pd));
         CHECK(create_miopen_descs(pd));
@@ -153,8 +154,8 @@ public:
         with_bias = pd->with_bias();
         alpha = 1.0f;
         beta = 0.0f;
-        do_scaling = !pd->attr()->output_scales_.has_default_values();
-        output_scaling = !pd->attr()->output_scales_.defined();
+        do_scaling = false;
+        output_scaling = false;
 
         dnnl_descs[x] = *pd->invariant_src_md();
         dnnl_descs[weights] = *pd->invariant_wei_md();
@@ -234,7 +235,8 @@ public:
 
         return status::success;
     }
-    virtual status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) {
+    virtual status_t init_scratchpad(
+            impl::engine_t *engine, convolution_pd_t *pd) {
         if (filter_needs_transform) {
             auto sz = memory_desc_wrapper(&dnnl_descs[weights]).size();
             auto data_size
@@ -340,7 +342,7 @@ public:
         int expected_dims[MIOPEN_DIM_MAX] = {};
         MIOPEN_EXECUTE_FUNC_V(miopenGetConvolutionNdForwardOutputDim, conv_desc,
                 descs[x], weights_desc, &ndims[y], &expected_dims[0]);
-        for (size_t i = 0; i < ndims[y]; i++) {
+        for (int i = 0; i < ndims[y]; i++) {
             if (dims[y][i] != expected_dims[i]) return status::unimplemented;
         }
         return status::success;
@@ -444,7 +446,7 @@ public:
     status_t configure_post_ops(convolution_pd_t *pd) {
         auto &p = pd->attr()->post_ops_;
         num_post_ops = p.len();
-        for (size_t i = 0; i < p.len(); i++) {
+        for (int i = 0; i < p.len(); i++) {
             post_ops[i] = p.entry_[i].kind;
             if (post_ops[i] == dnnl_eltwise) {
                 CHECK(create_and_set_eltwise_descriptor(pd));
@@ -464,7 +466,7 @@ public:
         return status::success;
     }
 
-    status_t init(engine_t *engine, convolution_pd_t *pd,
+    status_t init(impl::engine_t *engine, convolution_pd_t *pd,
             bool use_scratch_dst) override {
         use_temp_dst_ = use_scratch_dst;
         CHECK(configure_parameters(pd));
@@ -560,11 +562,12 @@ public:
             execute_reorder(handle, post_op_scratch, y, false);
         }
     }
-    status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_hip_engine_t *>(engine);
-        stream_t *service_stream;
+    status_t init_scratchpad(
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<amd::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
-        auto hip_stream = utils::downcast<sycl_hip_stream_t *>(service_stream);
+        auto hip_stream = utils::downcast<stream_t *>(service_stream);
         auto handle = hip_stream->get_miopen_handle();
 
         CHECK(MIOPEN_EXECUTE_FUNC_S(miopenConvolutionForwardGetSolutionCount,
@@ -577,7 +580,7 @@ public:
                 weights_desc, descs[io::x], conv_desc, descs[io::y],
                 maxSolutionCount, &actualCount, solutions.data()));
 
-        for (int i = 0; i < actualCount; i++) {
+        for (size_t i = 0; i < actualCount; i++) {
             if (solutions[i].workspace_size > 0) continue;
             selected_sol = i;
             break;
@@ -602,10 +605,10 @@ public:
     }
 
     status_t configure_alg_kind(
-            engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_hip_engine_t *>(engine);
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<amd::engine_t *>(engine);
         hip_sycl_scoped_context_handler_t sc(sycl_engine);
-        stream_t *service_stream;
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
         double activAlpha, activBeta, activGamma;
@@ -673,21 +676,22 @@ struct miopen_convolution_impl_bwd_data_t
     : public miopen_convolution_impl_base_t {
 protected:
     status_t configure_alg_kind(
-            engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_hip_engine_t *>(engine);
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<amd::engine_t *>(engine);
         hip_sycl_scoped_context_handler_t sc(sycl_engine);
-        stream_t *service_stream;
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
         return status::success;
     }
 
-    status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_hip_engine_t *>(engine);
-        stream_t *service_stream;
+    status_t init_scratchpad(
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<amd::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto hip_stream = utils::downcast<sycl_hip_stream_t *>(service_stream);
+        auto hip_stream = utils::downcast<stream_t *>(service_stream);
         auto handle = hip_stream->get_miopen_handle();
 
         CHECK(MIOPEN_EXECUTE_FUNC_S(
@@ -701,7 +705,7 @@ protected:
                 handle, descs[io::y], weights_desc, conv_desc, descs[io::x],
                 solutionCountm, &solutionCount, solutions.data()));
 
-        for (int i = 0; i < solutionCount; i++) {
+        for (size_t i = 0; i < solutionCount; i++) {
             if (selected_sol == -1) {
                 ws_size = solutions[i].workspace_size;
                 selected_sol = i;
@@ -809,21 +813,22 @@ public:
         return status::success;
     }
     virtual status_t configure_alg_kind(
-            engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_hip_engine_t *>(engine);
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<amd::engine_t *>(engine);
         hip_sycl_scoped_context_handler_t sc(sycl_engine);
-        stream_t *service_stream;
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
         return status::success;
     }
 
-    status_t init_scratchpad(engine_t *engine, convolution_pd_t *pd) override {
-        auto &sycl_engine = *utils::downcast<sycl_hip_engine_t *>(engine);
-        stream_t *service_stream;
+    status_t init_scratchpad(
+            impl::engine_t *engine, convolution_pd_t *pd) override {
+        auto &sycl_engine = *utils::downcast<amd::engine_t *>(engine);
+        impl::stream_t *service_stream;
         CHECK(sycl_engine.get_service_stream(service_stream));
 
-        auto hip_stream = utils::downcast<sycl_hip_stream_t *>(service_stream);
+        auto hip_stream = utils::downcast<stream_t *>(service_stream);
         auto handle = hip_stream->get_miopen_handle();
 
         CHECK(MIOPEN_EXECUTE_FUNC_S(
@@ -837,7 +842,7 @@ public:
                 handle, descs[io::y], descs[io::x], conv_desc, weights_desc,
                 solutionCountm, &solutionCount, solutions.data()));
 
-        for (int i = 0; i < solutionCount; i++) {
+        for (size_t i = 0; i < solutionCount; i++) {
             if (selected_sol == -1) {
                 ws_size = solutions[i].workspace_size;
                 selected_sol = i;

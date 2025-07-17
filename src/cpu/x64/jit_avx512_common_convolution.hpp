@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,9 +39,7 @@ template <impl::data_type_t src_type, impl::data_type_t wei_type = src_type,
         impl::data_type_t dst_type = src_type>
 struct jit_avx512_common_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit:", avx512_core, ""),
                 jit_avx512_common_convolution_fwd_t);
@@ -59,29 +57,30 @@ struct jit_avx512_common_convolution_fwd_t : public primitive_t {
                             primitive_attr_t::skip_mask_t::post_ops, dst_type),
                     VERBOSE_UNSUPPORTED_ATTR);
 
-            CHECK(jit_avx512_common_conv_fwd_kernel::init_conf(jcp_, *desc(),
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_avx512_common_conv_fwd_kernel_t::init_conf(jcp_, *desc(),
                     src_md_, weights_md_, dst_md_, bias_md_, attr_,
                     dnnl_get_max_threads()));
 
             auto scratchpad = scratchpad_registry().registrar();
-            jit_avx512_common_conv_fwd_kernel::init_scratchpad(
+            jit_avx512_common_conv_fwd_kernel_t::init_scratchpad(
                     scratchpad, jcp_);
 
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     jit_avx512_common_convolution_fwd_t(const pd_t *apd) : primitive_t(apd) {}
 
-    typedef typename prec_traits<src_type>::type src_data_t;
-    typedef typename prec_traits<wei_type>::type wei_data_t;
-    typedef typename prec_traits<dst_type>::type dst_data_t;
+    using src_data_t = typename prec_traits_t<src_type>::type;
+    using wei_data_t = typename prec_traits_t<wei_type>::type;
+    using dst_data_t = typename prec_traits_t<dst_type>::type;
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
-                new jit_avx512_common_conv_fwd_kernel(
+                new jit_avx512_common_conv_fwd_kernel_t(
                         pd()->jcp_, *pd()->attr(), *pd()->dst_md(0))));
         return kernel_->create_kernel();
     }
@@ -108,7 +107,7 @@ private:
     void execute_forward_3d(const exec_ctx_t &ctx) const;
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
-    std::unique_ptr<jit_avx512_common_conv_fwd_kernel> kernel_;
+    std::unique_ptr<jit_avx512_common_conv_fwd_kernel_t> kernel_;
 };
 
 template <impl::data_type_t diff_dst_type,
@@ -116,9 +115,7 @@ template <impl::data_type_t diff_dst_type,
         impl::data_type_t diff_src_type = diff_dst_type>
 struct jit_avx512_common_convolution_bwd_data_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_data_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_data_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_bwd_data_pd_t::cpu_convolution_bwd_data_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit:", avx512_core, ""),
                 jit_avx512_common_convolution_bwd_data_t);
@@ -136,32 +133,31 @@ struct jit_avx512_common_convolution_bwd_data_t : public primitive_t {
             VDISPATCH_CONV(
                     attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
 
-            status_t status
-                    = jit_avx512_common_conv_bwd_data_kernel_f32::init_conf(
-                            jcp_, *desc(), diff_src_md_, weights_md_,
-                            diff_dst_md_, dnnl_get_max_threads());
-            if (status != status::success) return status;
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_avx512_common_conv_bwd_data_kernel_f32_t::init_conf(jcp_,
+                    *desc(), diff_src_md_, weights_md_, diff_dst_md_,
+                    dnnl_get_max_threads()));
 
             auto scratchpad = scratchpad_registry().registrar();
-            jit_avx512_common_conv_bwd_data_kernel_f32::init_scratchpad(
+            jit_avx512_common_conv_bwd_data_kernel_f32_t::init_scratchpad(
                     scratchpad, jcp_);
 
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     jit_avx512_common_convolution_bwd_data_t(const pd_t *apd)
         : primitive_t(apd) {}
 
-    typedef typename prec_traits<diff_dst_type>::type diff_dst_data_t;
-    typedef typename prec_traits<wei_type>::type wei_data_t;
-    typedef typename prec_traits<diff_src_type>::type diff_src_data_t;
+    using diff_dst_data_t = typename prec_traits_t<diff_dst_type>::type;
+    using wei_data_t = typename prec_traits_t<wei_type>::type;
+    using diff_src_data_t = typename prec_traits_t<diff_src_type>::type;
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
-                new jit_avx512_common_conv_bwd_data_kernel_f32(pd()->jcp_)));
+                new jit_avx512_common_conv_bwd_data_kernel_f32_t(pd()->jcp_)));
         return kernel_->create_kernel();
     }
 
@@ -183,7 +179,7 @@ private:
     void execute_backward_data_3d(const exec_ctx_t &ctx) const;
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
-    std::unique_ptr<jit_avx512_common_conv_bwd_data_kernel_f32> kernel_;
+    std::unique_ptr<jit_avx512_common_conv_bwd_data_kernel_f32_t> kernel_;
 };
 
 template <impl::data_type_t src_type,
@@ -191,10 +187,8 @@ template <impl::data_type_t src_type,
         impl::data_type_t diff_weights_type = src_type>
 struct jit_avx512_common_convolution_bwd_weights_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_weights_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_weights_pd_t(adesc, attr, hint_fwd_pd)
-            , jcp_() {}
+        using cpu_convolution_bwd_weights_pd_t::
+                cpu_convolution_bwd_weights_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit:", avx512_core, ""),
                 jit_avx512_common_convolution_bwd_weights_t);
@@ -212,27 +206,25 @@ struct jit_avx512_common_convolution_bwd_weights_t : public primitive_t {
             VDISPATCH_CONV(
                     attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
 
-            status_t status
-                    = jit_avx512_common_conv_bwd_weights_kernel_f32::init_conf(
-                            jcp_, *desc(), src_md_, diff_weights_md_,
-                            diff_bias_md_, diff_dst_md_,
-                            dnnl_get_max_threads());
-            if (status != status::success) return status;
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_avx512_common_conv_bwd_weights_kernel_f32_t::init_conf(
+                    jcp_, *desc(), src_md_, diff_weights_md_, diff_bias_md_,
+                    diff_dst_md_, dnnl_get_max_threads()));
 
             init_balancers();
 
             auto scratchpad = scratchpad_registry().registrar();
-            jit_avx512_common_conv_bwd_weights_kernel_f32::init_scratchpad(
+            jit_avx512_common_conv_bwd_weights_kernel_f32_t::init_scratchpad(
                     scratchpad, jcp_);
 
             auto reducer_bia_scratchpad = memory_tracking::registrar_t(
                     scratchpad, memory_tracking::names::prefix_reducer_bia);
             reducer_bia_conf_.init_scratchpad(reducer_bia_scratchpad);
 
-            return status;
+            return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
         typename cpu_reducer_t<diff_weights_type>::conf_t reducer_bia_conf_;
 
     private:
@@ -249,9 +241,9 @@ struct jit_avx512_common_convolution_bwd_weights_t : public primitive_t {
     jit_avx512_common_convolution_bwd_weights_t(const pd_t *apd)
         : primitive_t(apd) {}
 
-    typedef typename prec_traits<src_type>::type src_data_t;
-    typedef typename prec_traits<diff_dst_type>::type diff_dst_data_t;
-    typedef typename prec_traits<diff_weights_type>::type diff_weights_data_t;
+    using src_data_t = typename prec_traits_t<src_type>::type;
+    using diff_dst_data_t = typename prec_traits_t<diff_dst_type>::type;
+    using diff_weights_data_t = typename prec_traits_t<diff_weights_type>::type;
 
     status_t init(engine_t *engine) override;
 
@@ -277,7 +269,7 @@ private:
 
     int nthr_, nthr_mb_, nthr_g_, nthr_oc_b_, nthr_ic_b_;
 
-    std::unique_ptr<jit_avx512_common_conv_bwd_weights_kernel_f32> kernel_;
+    std::unique_ptr<jit_avx512_common_conv_bwd_weights_kernel_f32_t> kernel_;
     std::unique_ptr<cpu_accumulator_1d_t<diff_weights_type>> acc_ker_;
     std::unique_ptr<cpu_reducer_t<diff_weights_type>> reducer_bias_;
 };

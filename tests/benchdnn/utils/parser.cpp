@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,13 +27,29 @@ namespace parser {
 
 bool last_parsed_is_problem = false;
 const size_t eol = std::string::npos;
-std::stringstream help_ss;
+dnnl::impl::stringstream_t help_ss;
 
 static const std::string benchdnn_url
-        = "https://github.com/oneapi-src/oneDNN/blob/master/tests/benchdnn";
+        = "https://github.com/uxlfoundation/oneDNN/blob/main/tests/benchdnn";
 static const std::string doc_url = benchdnn_url + "/doc/";
 
 namespace parser_utils {
+
+// Current definition works only through the build system. It can be generalized
+// through C++11 `__has_feature` macro, but not every sanitizer has a macro
+// to check against.
+//
+// The function disables `no_ref_memory` modifier for sanitizers testing because
+// many legit places in the library can't work with completely overflowed
+// values, like int32 zero-point values.
+bool has_clang_sanitizers() {
+#if defined(DNNL_ENABLED_CLANG_SANITIZER)
+    return true;
+#else
+    return false;
+#endif
+}
+
 std::string get_pattern(const std::string &option_name, bool with_args) {
     std::string s = std::string("--") + option_name;
     if (with_args) s += "=";
@@ -103,13 +119,6 @@ attr_t::post_ops_t parse_attr_post_ops_func(const std::string &s) {
                 = attr_t::post_ops_t::str2kind(get_substr(subs, subs_pos, ':'));
         if (kind == attr_t::post_ops_t::kind_t::KIND_TOTAL) SAFE_V(FAIL);
 
-#define CATCH_DANGLING_SYMBOL \
-    if (subs_pos >= subs.size()) { \
-        BENCHDNN_PRINT(0, "%s \'%s\'\n", \
-                "Error: dangling symbol at the end of input", subs.c_str()); \
-        SAFE_V(FAIL); \
-    }
-
         v.entry.emplace_back(kind);
         if (subs_pos == std::string::npos) {
             if (kind != attr_t::post_ops_t::kind_t::DW) continue;
@@ -119,19 +128,16 @@ attr_t::post_ops_t parse_attr_post_ops_func(const std::string &s) {
                     "and 'p' values.");
             SAFE_V(FAIL);
         }
-        CATCH_DANGLING_SYMBOL;
 
         auto &e = v.entry.back();
         if (e.is_sum_kind()) {
             e.sum.scale
                     = parser_utils::stof_safe(get_substr(subs, subs_pos, ':'));
             if (subs_pos == std::string::npos) continue;
-            CATCH_DANGLING_SYMBOL;
 
             auto zp_str = get_substr(subs, subs_pos, ':');
             e.sum.zero_point = parser_utils::stoll_safe(zp_str);
             if (subs_pos == std::string::npos) continue;
-            CATCH_DANGLING_SYMBOL;
 
             const auto dt_str = get_substr(subs, subs_pos, ':');
             e.sum.dt = str2dt(dt_str.c_str());
@@ -209,60 +215,153 @@ attr_t::post_ops_t parse_attr_post_ops_func(const std::string &s) {
             e.eltwise.alpha
                     = parser_utils::stof_safe(get_substr(subs, subs_pos, ':'));
             if (subs_pos == std::string::npos) continue;
-            CATCH_DANGLING_SYMBOL;
 
             e.eltwise.beta
                     = parser_utils::stof_safe(get_substr(subs, subs_pos, ':'));
             if (subs_pos == std::string::npos) continue;
         } else if (e.is_binary_kind()) {
-            const auto dt_str = get_substr(subs, subs_pos, ':');
-            e.binary.src1_dt = str2dt(dt_str.c_str());
-            if (e.binary.src1_dt == dnnl_data_type_undef) {
-                BENCHDNN_PRINT(0, "%s \'%s\' %s\n",
-                        "Error: binary post-op data type", dt_str.c_str(),
-                        "is not recognized.");
-                SAFE_V(FAIL);
-            }
-            if (subs_pos == std::string::npos) continue;
-            CATCH_DANGLING_SYMBOL;
 
-            const auto mask_input_str = get_substr(subs, subs_pos, ':');
-            // Check if `mask_input_str` consists of only digits.
-            const bool only_digits = std::all_of(
-                    mask_input_str.cbegin(), mask_input_str.cend(), [](int c) {
-                        assert(c < UINT8_MAX);
-                        return std::isdigit(c);
-                    });
+            char src_delim = ':';
+            bool has_src2_specs = false;
+            std::string src1_subs, src2_subs;
 
-            using mask_input_t
-                    = attr_t::post_ops_t::entry_t::binary_t::mask_input_t;
-            if (only_digits) {
-                // If digits only, then read it as integer value.
-                e.binary.mask = parser_utils::stoll_safe(mask_input_str);
-                e.binary.mask_input = mask_input_t::mask;
+            // placeholder data type for the ternary conditional input
+            e.binary.src2_dt = dnnl_s8;
+
+            // For binary algorithms with ternary inputs, specifications can
+            // be provided for both binary (src1) and ternary (src2) tensors in
+            // the form:
+            // --attr-post-ops=BINARY:DT[.S1_MASK_INPUT[.S1_TAG]][:S2_MASK_INPUT[.S2_TAG]].
+            // In that case, we check for the ':' delimiter that separates src1
+            // and src2 args, split the string for the two tensors and parse
+            // them individually.
+            // TODO: Currently, there is no broadcasting support for the src2
+            // tensor - specifying src2 mask inputs and tags therefore has no
+            // effect on the operation.
+
+            if (e.is_binary_kind_with_ternary_op()) {
+                src_delim = '.';
+                auto src2_pos = subs.find_first_of(':', subs_pos);
+                has_src2_specs = (src2_pos != std::string::npos);
+                src1_subs = get_substr(subs, subs_pos, ':');
+                if (has_src2_specs) src2_subs = get_substr(subs, subs_pos, ':');
             } else {
-                // Otherwise, re-direct to policy parsing.
-                e.binary.policy = attr_t::str2policy(mask_input_str);
-                if (e.binary.policy == attr_t::policy_t::POLICY_TOTAL) {
+                src1_subs = subs.substr(subs_pos);
+            }
+
+            auto parse_src_input_specs = [&](const std::string &s, char delim,
+                                                 const bool is_ternary) {
+                size_t src_subpos = 0;
+
+                // parse data type for the src tensor - provided only for
+                // the src1 tensor
+                if (!is_ternary) {
+                    const auto dt_str = get_substr(s, src_subpos, delim);
+                    e.binary.src1_dt = str2dt(dt_str.c_str());
+
+                    if (e.binary.src1_dt == dnnl_data_type_undef) {
+                        BENCHDNN_PRINT(0, "%s \'%s\' %s\n",
+                                "Error: binary post-op data type",
+                                dt_str.c_str(), "is not recognized.");
+                        SAFE_V(FAIL);
+                    }
+                }
+
+                if (src_subpos == std::string::npos) return;
+
+                // parse mask input - processed for both src1/src2 tensors.
+                const auto mask_input_str = get_substr(s, src_subpos, delim);
+                // Check if `mask_input_str` consists of only digits.
+                const bool only_digits = std::all_of(mask_input_str.cbegin(),
+                        mask_input_str.cend(), [](int c) {
+                            assert(c < UINT8_MAX);
+                            return std::isdigit(c);
+                        });
+
+                using mask_input_t
+                        = attr_t::post_ops_t::entry_t::binary_t::mask_input_t;
+                if (only_digits) {
+                    // If digits only, then read it as integer value.
+                    const auto src_mask
+                            = parser_utils::stoll_safe(mask_input_str);
+
+                    if (!is_ternary) {
+                        e.binary.mask = src_mask;
+                        e.binary.mask_input = mask_input_t::mask;
+                    } else {
+                        e.binary.src2_mask = src_mask;
+                        e.binary.src2_mask_input = mask_input_t::mask;
+                        if (e.binary.src2_mask > 0)
+                            BENCHDNN_PRINT(0, "%s \'%s\' %s\n",
+                                    "Error: binary post-op policy for the "
+                                    "src2 tensor",
+                                    mask_input_str.c_str(),
+                                    "is not recognized - broadcasting is not "
+                                    "supported for the ternary tensor.");
+                    }
+                } else {
+                    // Otherwise, re-direct to policy parsing.
+                    const auto src_policy = attr_t::str2policy(mask_input_str);
+
+                    if (!is_ternary) {
+                        e.binary.policy = src_policy;
+                        e.binary.mask_input = mask_input_t::policy;
+
+                        if (e.binary.policy == attr_t::policy_t::POLICY_TOTAL) {
+                            BENCHDNN_PRINT(0, "%s \'%s\' %s\n",
+                                    "Error: binary post-op policy",
+                                    mask_input_str.c_str(),
+                                    "is not "
+                                    "recognized. Input also is not consisted "
+                                    "of only integers to process it as mask "
+                                    "directly.");
+                            SAFE_V(FAIL);
+                        }
+                    } else {
+                        e.binary.src2_policy = src_policy;
+                        e.binary.src2_mask_input = mask_input_t::policy;
+
+                        if (e.binary.src2_policy != attr_t::policy_t::COMMON) {
+                            BENCHDNN_PRINT(0, "%s \'%s\' %s\n",
+                                    "Error: binary post-op policy for the "
+                                    "src2 tensor",
+                                    mask_input_str.c_str(),
+                                    "is not supported - broadcasting is "
+                                    "not supported for the src2 tensor.");
+                            SAFE_V(FAIL);
+                        }
+                    }
+                }
+
+                if (src_subpos == std::string::npos) return;
+
+                // parse tag input - processed for both src1/2 tensors.
+                const auto tag_str = get_substr(s, src_subpos, delim);
+                if (check_tag(tag_str) != OK) {
                     BENCHDNN_PRINT(0, "%s \'%s\' %s\n",
-                            "Error: binary post-op policy",
-                            mask_input_str.c_str(),
-                            "is not recognized. Input also is not consisted of "
-                            "only integers to process it as mask directly.");
+                            "Error: binary post-op tag", tag_str.c_str(),
+                            "is not recognized.");
                     SAFE_V(FAIL);
                 }
-                e.binary.mask_input = mask_input_t::policy;
-            }
-            if (subs_pos == std::string::npos) continue;
-            CATCH_DANGLING_SYMBOL;
+                e.binary.tag = tag_str;
 
-            const auto tag_str = get_substr(subs, subs_pos, ':');
-            e.binary.tag = tag_str;
-            if (check_tag(e.binary.tag) != OK) {
-                BENCHDNN_PRINT(0, "%s \'%s\' %s\n", "Error: binary post-op tag",
-                        tag_str.c_str(), "is not recognized.");
-                SAFE_V(FAIL);
+                if (src_subpos != std::string::npos) {
+                    const auto unknown_str = get_substr(s, src_subpos, delim);
+                    BENCHDNN_PRINT(0, "%s \'%s\' %s\n",
+                            "Warning: Additional unrecognized arguments",
+                            unknown_str.c_str(), "are specified.");
+                }
+            };
+
+            bool is_ternary_input = false;
+            for (const auto &s : {src1_subs, src2_subs}) {
+                parse_src_input_specs(s, src_delim, is_ternary_input);
+                if (!has_src2_specs)
+                    break;
+                else
+                    is_ternary_input = true;
             }
+
         } else if (e.is_prelu_kind()) {
             const auto policy_str = get_substr(subs, subs_pos, ':');
             e.prelu.policy = attr_t::str2policy(policy_str);
@@ -274,7 +373,6 @@ attr_t::post_ops_t parse_attr_post_ops_func(const std::string &s) {
             }
         }
         if (subs_pos == std::string::npos) continue;
-        CATCH_DANGLING_SYMBOL;
     }
 
     return v;
@@ -296,24 +394,190 @@ attr_t::fpmath_mode_t parse_attr_fpmath_mode_func(const std::string &s) {
     auto subs = get_substr(s, start_pos, ':');
     v.mode = str2fpmath_mode(subs.c_str());
     if (start_pos == std::string::npos) return v;
-    if (start_pos >= s.size()) {
-        BENCHDNN_PRINT(0, "%s \'%s\'\n",
-                "Error: dangling symbol at the end of input", s.c_str());
+
+    subs = get_substr(s, start_pos, '\0');
+    v.apply_to_int = str2bool(subs.c_str());
+
+    return v;
+}
+
+attr_t::rounding_mode_t parse_attr_rounding_mode_func(const std::string &s) {
+    attr_t::rounding_mode_t rm;
+
+    if (s.empty()) return rm;
+
+    size_t start_pos = 0;
+    while (start_pos != std::string::npos) {
+        auto subs = parser::get_substr(s, start_pos, '+');
+        size_t subs_pos = 0;
+
+        auto arg = str2arg(parser::get_substr(subs, subs_pos, ':'));
+        if (arg == DNNL_ARG_UNDEF) {
+            BENCHDNN_PRINT(0, "%s\n", "Error: undefined argument index");
+            SAFE_V(FAIL);
+        }
+        if (subs_pos != std::string::npos)
+            rm.set(arg,
+                    str2rounding_mode(parser::get_substr(subs, subs_pos, ':')));
+        if (subs_pos != std::string::npos)
+            rm.set_seed(stoll_safe(get_substr(subs, subs_pos, ':')));
+    }
+    return rm;
+}
+
+attr_t::dropout_t parse_attr_dropout_func(const std::string &s) {
+    attr_t::dropout_t v;
+    if (s.empty()) return v;
+
+    size_t start_pos = 0;
+    auto subs = get_substr(s, start_pos, ':');
+    v.p = stof_safe(subs);
+    if ((v.p < 0.f) || (v.p > 1.f)) {
+        BENCHDNN_PRINT(0, "Error: bad dropout probability value: %f\n", v.p);
+        SAFE_V(FAIL);
+    }
+    if (start_pos == std::string::npos) return v;
+
+    subs = get_substr(s, start_pos, ':');
+    v.seed = stoll_safe(subs);
+    if (start_pos == std::string::npos) return v;
+
+    v.tag = get_substr(s, start_pos, '\0');
+    if (check_tag(v.tag) != OK) {
+        BENCHDNN_PRINT(0, "%s \'%s\' %s\n", "Error: dropout mask tag",
+                v.tag.c_str(), "is not recognized.");
         SAFE_V(FAIL);
     }
 
-    if (start_pos != std::string::npos) {
-        subs = get_substr(s, start_pos, '\0');
-        v.apply_to_int = str2bool(subs.c_str());
+    return v;
+}
 
-        if (start_pos != std::string::npos) {
-            BENCHDNN_PRINT(0, "%s \'%s\'\n",
-                    "Error: dangling symbol at the end of input", s.c_str());
+bool parse_impl_filter(impl_filter_t &impl_filter,
+        const impl_filter_t &def_impl_filter, bool use_impl, const char *str,
+        const std::string &option_name, const std::string &help) {
+    const auto chars2chars = [](const char *str) { return str; };
+    const auto str2impl_filter = [&](const char *str) {
+        std::vector<std::string> v, def;
+        parse_vector_str(v, def, chars2chars, str);
+
+        // Remove all quotes from input string since they affect the search.
+        for_(auto &e : v)
+        for (auto c : {'"', '\''}) {
+            size_t start_pos = 0;
+            while (start_pos != eol) {
+                start_pos = e.find_first_of(c, start_pos);
+                if (start_pos != eol) e.erase(start_pos, 1);
+            }
+        }
+
+        return impl_filter_t(v, use_impl, /* respect_global_filter = */ true);
+    };
+    return parse_single_value_option(impl_filter, def_impl_filter,
+            str2impl_filter, str, option_name, help);
+}
+
+summary_t parse_summary_str(const std::string &s) {
+    // Allowed input: (no-)option+...
+    summary_t v;
+    if (s.empty()) return v;
+
+    size_t start_pos = 0;
+    while (start_pos != std::string::npos) {
+        auto subs = parser::get_substr(s, start_pos, '+');
+        size_t subs_pos = 0;
+
+        bool negate_option = false;
+        if (subs.find("no-", 0, 3) != std::string::npos) {
+            negate_option = true;
+            subs_pos += 3;
+        }
+
+        auto option = parser::get_substr(subs, subs_pos, '\0');
+        if (option == "failures") {
+            v.failed_cases = !negate_option;
+        } else {
+            BENCHDNN_PRINT(0,
+                    "Error: unsupported option-value combination "
+                    "\'--summary=%s\'\n",
+                    option.c_str());
             SAFE_V(FAIL);
         }
     }
 
     return v;
+}
+
+cold_cache_input_t str2cold_cache_input(const std::string &s) {
+    // Allowed input: MODE[+EXTENSION[+...]]
+    // Allowed extensions: TLB[:SIZE]
+    cold_cache_input_t c;
+
+    size_t start_pos = 0;
+    std::string mode_str = get_substr(s, start_pos, '+');
+    if (mode_str == "none") {
+        c.cold_cache_mode_ = cold_cache_mode_t::none;
+    } else if (mode_str == "wei") {
+        c.cold_cache_mode_ = cold_cache_mode_t::wei;
+    } else if (mode_str == "all") {
+        c.cold_cache_mode_ = cold_cache_mode_t::all;
+    } else if (mode_str == "custom") {
+        c.cold_cache_mode_ = cold_cache_mode_t::custom;
+    } else {
+        BENCHDNN_PRINT(0,
+                "Error: unknown cold-cache mode \'%s\'. Supported values are "
+                "\'wei\', \'all\', or \'custom\'.\n",
+                mode_str.c_str());
+        SAFE_V(FAIL);
+    }
+
+    if (c.cold_cache_mode_ == cold_cache_mode_t::none
+            && start_pos != std::string::npos) {
+        BENCHDNN_PRINT(0, "%s\n",
+                "Error: cold-cache extensions can't be enabled with cold-cache "
+                "disabled");
+        SAFE_V(FAIL);
+    }
+
+    while (start_pos != std::string::npos) {
+        std::string ext_str = get_substr(s, start_pos, '+');
+
+        size_t ext_pos = 0;
+        std::string ext_main_str = get_substr(ext_str, ext_pos, ':');
+        if (ext_main_str == "tlb") {
+            c.cold_tlb_ = true;
+            if (ext_pos != std::string::npos) {
+                std::string ext_aux_str = get_substr(ext_str, ext_pos, '\0');
+
+                const auto last_char = std::toupper(ext_aux_str.back());
+                if (last_char != 'G' && last_char != 'M') {
+                    BENCHDNN_PRINT(0,
+                            "Error: cold-TLB supports only \'M\' or \'G\' "
+                            "values for size modification. Given input: "
+                            "\'%c\'.\n",
+                            last_char);
+                    SAFE_V(FAIL);
+                }
+
+                std::string size_str = ext_aux_str;
+                // Remove size modifier to feed the rest for value verification.
+                size_str.pop_back();
+                const float size = stof_safe(size_str);
+                c.cold_tlb_size_ = static_cast<size_t>(
+                        size * 1024 * 1024 * (last_char == 'G' ? 1024 : 1));
+
+                // Save the input string once all values are verified.
+                c.cold_tlb_size_str_ = std::move(ext_aux_str);
+            }
+        } else {
+            BENCHDNN_PRINT(0,
+                    "Error: unknown cold-cache extension \'%s\'. Supported "
+                    "values are \'tlb\'\n.",
+                    ext_main_str.c_str());
+            SAFE_V(FAIL);
+        }
+    }
+
+    return c;
 }
 
 } // namespace parser_utils
@@ -391,14 +655,13 @@ bool parse_tag(std::vector<std::string> &tag,
     return true;
 }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 bool parse_encoding(std::vector<sparse_options_t> &sparse_options,
         const char *str, const std::string &option_name /* = "encoding"*/) {
     static const std::string help
             = "ENCODING[+SPARSITY]:ENCODING[+SPARSITY]:ENCODING[+SPARSITY]\n   "
               "Specifies sparse encodings and sparsity.\n    More details at "
-              "https://github.com/oneapi-src/oneDNN/blob/master/tests/benchdnn/"
-              "doc/knobs_encoding.md\n";
+              "https://github.com/uxlfoundation/oneDNN/blob/main/tests/"
+              "benchdnn/doc/knobs_encoding.md\n";
 
     std::vector<sparse_options_t> def {sparse_options_t()};
     auto parse_sparse_options_func = [](const std::string &s) {
@@ -410,7 +673,6 @@ bool parse_encoding(std::vector<sparse_options_t> &sparse_options,
     return parse_vector_option(sparse_options, def, parse_sparse_options_func,
             str, option_name, help);
 }
-#endif
 
 bool parse_multi_tag(std::vector<std::vector<std::string>> &tag,
         const std::vector<std::vector<std::string>> &def_tag, const char *str,
@@ -436,45 +698,57 @@ bool parse_mb(std::vector<int64_t> &mb, const std::vector<int64_t> &def_mb,
 }
 
 bool parse_attr_post_ops(std::vector<attr_t::post_ops_t> &po, const char *str,
-        const std::string &option_name /* = "attr-post-ops"*/) {
+        const std::string &option_name = "attr-post-ops") {
     static const std::string help
             = "POST-OPS\n    Specifies post-ops attribute. `POST-OPS` syntax "
               "is one of those:\n    * SUM[:SCALE[:ZERO_POINT[:DATA_TYPE]]]\n  "
               "  * ELTWISE[:ALPHA[:BETA[:SCALE]]]\n    * DW:KkSsPp[:DST_DT]\n  "
               "  * BINARY:DT[:MASK_INPUT[:TAG]]\n    More details at "
-              "https://github.com/oneapi-src/oneDNN/blob/master/tests/benchdnn/"
-              "doc/knobs_attr.md\n";
+              "https://github.com/uxlfoundation/oneDNN/blob/main/tests/"
+              "benchdnn/doc/knobs_attr.md\n";
     std::vector<attr_t::post_ops_t> def {attr_t::post_ops_t()};
     return parse_vector_option(po, def, parser_utils::parse_attr_post_ops_func,
             str, option_name, help);
 }
 
 bool parse_attr_scales(std::vector<attr_t::arg_scales_t> &scales,
-        const char *str, const std::string &option_name /* = "attr-scales"*/) {
+        const char *str, const std::string &option_name = "attr-scales") {
     static const std::string help
             = "ARG:POLICY[:SCALE][+...]\n    Specifies input scales "
               "attribute.\n    More details at "
-              "https://github.com/oneapi-src/oneDNN/blob/master/tests/benchdnn/"
-              "doc/knobs_attr.md\n";
+              "https://github.com/uxlfoundation/oneDNN/blob/main/tests/"
+              "benchdnn/doc/knobs_attr.md\n";
     return parse_subattr(scales, str, option_name, help);
 }
 
 bool parse_attr_zero_points(std::vector<attr_t::zero_points_t> &zp,
-        const char *str,
-        const std::string &option_name /* = "attr-zero-points"*/) {
+        const char *str, const std::string &option_name = "attr-zero-points") {
     static const std::string help
             = "ARG:POLICY[:ZEROPOINT][+...]\n    Specifies zero-points "
               "attribute.\n    More details at "
-              "https://github.com/oneapi-src/oneDNN/blob/master/tests/benchdnn/"
-              "doc/knobs_attr.md\n";
+              "https://github.com/uxlfoundation/oneDNN/blob/main/tests/"
+              "benchdnn/doc/knobs_attr.md\n";
     return parse_subattr(zp, str, option_name, help);
+}
+
+bool parse_attr_rounding_mode(std::vector<attr_t::rounding_mode_t> &rm,
+        const char *str,
+        const std::string &option_name = "attr-rounding-mode") {
+    static const std::string help
+            = "ARG:MODE[:SEED][+...]    (Default: `environment`)\n    "
+              "Specifies a "
+              "rounding mode MODE to be applied upon conversion of argument "
+              "ARG.\n    More details at "
+            + doc_url + "knobs_attr.md\n";
+    return parse_vector_option(rm, {},
+            parser_utils::parse_attr_rounding_mode_func, str, option_name,
+            help);
 }
 
 bool parse_attr_scratchpad_mode(
         std::vector<dnnl_scratchpad_mode_t> &scratchpad_mode,
         const std::vector<dnnl_scratchpad_mode_t> &def_scratchpad_mode,
-        const char *str,
-        const std::string &option_name /* = "attr-scratchpad"*/) {
+        const char *str, const std::string &option_name = "attr-scratchpad") {
     static const std::string help
             = "MODE    (Default: `library`)\n    Specifies scratchpad "
               "attribute. `MODE` values can be `library` or `user`.\n    More "
@@ -486,7 +760,7 @@ bool parse_attr_scratchpad_mode(
 
 bool parse_attr_fpmath_mode(std::vector<attr_t::fpmath_mode_t> &fpmath_mode,
         const std::vector<attr_t::fpmath_mode_t> &def_fpmath_mode,
-        const char *str, const std::string &option_name /* = "attr-fpmath"*/) {
+        const char *str, const std::string &option_name = "attr-fpmath") {
     static const std::string help
             = "MODE[:APPLY_TO_INT]    (Default: `strict[:false]`)\n    "
               "Specifies "
@@ -496,10 +770,20 @@ bool parse_attr_fpmath_mode(std::vector<attr_t::fpmath_mode_t> &fpmath_mode,
             parser_utils::parse_attr_fpmath_mode_func, str, option_name, help);
 }
 
+bool parse_attr_dropout(std::vector<attr_t::dropout_t> &dropout,
+        const std::vector<attr_t::dropout_t> &def_dropout, const char *str,
+        const std::string &option_name = "attr-dropout") {
+    static const std::string help
+            = "PROBABILITY[:SEED[:TAG]]\n    Specifies dropout attribute.\n    "
+              "More details at "
+            + doc_url + "knobs_attr.md\n";
+    return parse_vector_option(dropout, def_dropout,
+            parser_utils::parse_attr_dropout_func, str, option_name, help);
+}
+
 bool parse_attr_acc_mode(std::vector<dnnl_accumulation_mode_t> &acc_mode,
         const std::vector<dnnl_accumulation_mode_t> &def_acc_mode,
-        const char *str,
-        const std::string &option_name /* = "attr-acc-mode"*/) {
+        const char *str, const std::string &option_name = "attr-acc-mode") {
     static const std::string help
             = "MODE    (Default: `strict`)\n    Specifies accumulation mode "
               "attribute. `MODE` values can be `strict`, `relaxed`, `any`,"
@@ -512,13 +796,28 @@ bool parse_attr_deterministic(
         std::vector<attr_t::deterministic_t> &deterministic,
         const std::vector<attr_t::deterministic_t> &def_deterministic,
         const char *str,
-        const std::string &option_name /* = "attr-deterministic"*/) {
+        const std::string &option_name = "attr-deterministic") {
     static const std::string help
             = "MODE    (Default: `false`)\n    Specifies deterministic mode "
               "attribute. `MODE` values can be `true`, or `false`.\n";
     return parse_vector_option(deterministic, def_deterministic,
             parser_utils::parse_attr_deterministic_func, str, option_name,
             help);
+}
+
+bool parse_attributes(
+        base_settings_t &s, const base_settings_t &def, const char *str) {
+    const bool parsed_attrs = parse_attr_scales(s.scales, str)
+            || parse_attr_zero_points(s.zero_points, str)
+            || parse_attr_post_ops(s.post_ops, str)
+            || parse_attr_dropout(s.dropout, def.dropout, str)
+            || parse_attr_scratchpad_mode(
+                    s.scratchpad_mode, def.scratchpad_mode, str)
+            || parse_attr_fpmath_mode(s.fpmath_mode, def.fpmath_mode, str)
+            || parse_attr_acc_mode(s.acc_mode, def.acc_mode, str)
+            || parse_attr_deterministic(s.deterministic, def.deterministic, str)
+            || parse_attr_rounding_mode(s.rounding_mode, str);
+    return parsed_attrs;
 }
 
 bool parse_axis(std::vector<int> &axis, const std::vector<int> &def_axis,
@@ -541,6 +840,37 @@ bool parse_test_pattern_match(const char *&match, const char *str,
     const auto chars2chars = [](const char *str) { return str; };
     return parse_single_value_option(
             match, def_match, chars2chars, str, option_name, help);
+}
+
+bool parse_impl(impl_filter_t &impl_filter,
+        const impl_filter_t &def_impl_filter, const char *str,
+        const std::string &option_name) {
+    static const std::string help
+            = "STRINGS    (Default: not specified)\n    Instructs the driver "
+              "to fetch the next implementation from the list if fetched "
+              "implementation name doesn't match any from the `STRINGS` list "
+              "(a.k.a. include-list).\n    `STRINGS` is a comma-separated list "
+              "of string literal entries with no spaces.\n    When empty, the "
+              "option has no effect. The option is opposite to "
+              "`--skip-impl`.\n";
+
+    return parser_utils::parse_impl_filter(impl_filter, def_impl_filter,
+            /* use_impl = */ true, str, option_name, help);
+}
+
+bool parse_skip_impl(impl_filter_t &impl_filter,
+        const impl_filter_t &def_impl_filter, const char *str,
+        const std::string &option_name) {
+    static const std::string help
+            = "STRINGS    (Default: not specified)\n    Instructs the driver "
+              "to fetch the next implementation from the list if fetched "
+              "implementation name matches any from the `STRINGS` list (a.k.a. "
+              "exclude-list).\n    `STRINGS` is a comma-separated list of "
+              "string literal entries with no spaces.\n    When empty, the "
+              "option has no effect. The option is opposite to `--impl`.\n";
+
+    return parser_utils::parse_impl_filter(impl_filter, def_impl_filter,
+            /* use_impl = */ false, str, option_name, help);
 }
 
 bool parse_inplace(std::vector<bool> &inplace,
@@ -615,9 +945,9 @@ bool parse_perf_template(const char *&pt, const char *pt_def,
     const auto str2pt = [&pt_def, &pt_csv](const char *str_) {
         const std::string csv_pattern = "csv";
         const std::string def_pattern = "def";
-        if (csv_pattern.find(str_, 0, csv_pattern.size()) != eol)
+        if (parser_utils::option_matched(csv_pattern, str_))
             return pt_csv;
-        else if (def_pattern.find(str_, 0, def_pattern.size()) != eol)
+        else if (parser_utils::option_matched(def_pattern, str_))
             return pt_def;
         else
             return str_;
@@ -642,7 +972,7 @@ bool parse_batch(const bench_f bench, const char *str,
 
 bool parse_help(const char *str, const std::string &option_name /* = "help"*/) {
     std::string pattern = parser_utils::get_pattern(option_name, false);
-    if (pattern.find(str, 0, pattern.size()) == eol) return false;
+    if (!parser_utils::option_matched(pattern, str)) return false;
 
     BENCHDNN_PRINT(0, "%s\n", help_ss.str().c_str());
     exit(0);
@@ -651,7 +981,7 @@ bool parse_help(const char *str, const std::string &option_name /* = "help"*/) {
 bool parse_main_help(
         const char *str, const std::string &option_name /* = "help"*/) {
     std::string pattern = parser_utils::get_pattern(option_name, false);
-    if (pattern.find(str, 0, pattern.size()) == eol) return false;
+    if (!parser_utils::option_matched(pattern, str)) return false;
 
     static const std::string main_help
             = "Usage:\n    benchdnn --<driver> [global_options] "
@@ -751,38 +1081,37 @@ static bool parse_canonical(
             canonical, false, str2bool, str, option_name, help);
 }
 
+static bool parse_check_ref_impl(
+        const char *str, const std::string &option_name = "check-ref-impl") {
+    static const std::string help
+            = "BOOL    (Default: `false`)\n    Instructs the driver to compare "
+              "an implementation name against the \'ref\' string pattern.\n    "
+              "When set to `true`, the check would return an error if the "
+              "implementation name contains such pattern.\n";
+    return parse_single_value_option(
+            check_ref_impl, false, str2bool, str, option_name, help);
+}
+
 static bool parse_cold_cache(
         const char *str, const std::string &option_name = "cold-cache") {
     static const std::string help
-            = "MODE    (Default: `none`)\n    Instructs the driver to enable a "
-              "cold cache for performance mode.\n    When set to `none` (the "
-              "default), cold cache is disabled.\n    When set to `wei`, cold "
-              "cache is enabled for weights argument only. Targets forward "
-              "propagation kind.\n    When set to `all`, cold cache is enabled "
-              "for each execution argument.\n    When set to `custom`, cold "
-              "cache is enabled for custom arguments which should be specified "
-              "directly in the code. Refer to doc for more details.\n";
+            = "MODE[+EXTENSION]    (Default: `empty`)\n    Instructs the "
+              "driver to enable a cold-cache feature for the performance "
+              "mode.\n    When `MODE` set to `none` (the default), the "
+              "cold-cache mode is disabled.\n    When `MODE` set to `wei`, the "
+              "cold-cache is enabled for weights argument only. Targets "
+              "forward propagation kind.\n    When `MODE` set to `all`, the "
+              "cold-cache is enabled for every execution argument.\n    When "
+              "`MODE` set to `custom`, the cold-cache is enabled for custom "
+              "arguments which should be specified directly in the code. Refer "
+              "to doc for more details.\n    Supported `EXTENSION` values:\n   "
+              " * `tlb[:SIZE]`, where `SIZE` is a string-literal with "
+              "floating-point number followed by `M` (Megabytes) or `G` "
+              "(Gigabytes) characters, e.g., `tlb:500M`.\n";
 
-    const auto str2cold_cache_mode = [](const std::string &_str) {
-        cold_cache_mode_t cc_mode = default_cold_cache_mode;
-        if (_str == "none") {
-            cc_mode = cold_cache_mode_t::none;
-        } else if (_str == "wei") {
-            cc_mode = cold_cache_mode_t::wei;
-        } else if (_str == "all") {
-            cc_mode = cold_cache_mode_t::all;
-        } else if (_str == "custom") {
-            cc_mode = cold_cache_mode_t::custom;
-        } else {
-            BENCHDNN_PRINT(0, "%s \'%s\'\n%s", "Error: unknown cold cache mode",
-                    _str.c_str(), help.c_str());
-            SAFE_V(FAIL);
-        }
-        return cc_mode;
-    };
-
-    return parse_single_value_option(cold_cache_mode, cold_cache_mode_t::none,
-            str2cold_cache_mode, str, option_name, help);
+    return parse_single_value_option(cold_cache_input,
+            default_cold_cache_input(), parser_utils::str2cold_cache_input, str,
+            option_name, help);
 }
 
 static bool parse_cpu_isa_hints(
@@ -805,22 +1134,34 @@ static bool parse_engine(
               "use an engine with requested `KIND`.\n    `KIND` values can be "
               "`cpu` or `gpu`.\n    `INDEX` is an integer value specifying "
               "which engine to use if several were identified.\n";
-    if (!parse_single_value_option(engine_tgt_kind, dnnl_cpu, str2engine_kind,
-                str, option_name, help))
-        return false;
-    // Parse engine index if present
-    std::string s(str);
-    auto start_pos = s.find_first_of(':');
-    if (start_pos != eol) engine_index = std::stoi(s.substr(start_pos + 1));
 
-    auto n_devices = dnnl_engine_get_count(engine_tgt_kind);
-    if (engine_index >= n_devices) {
-        fprintf(stderr,
-                "ERROR: requested engine with index %ld is not registered in "
-                "the system. Number of devices registered is %ld.\n",
-                (long)engine_index, (long)n_devices);
-        exit(2);
+    // Note: this is a special case because index and engine kind are parsed
+    // into separate global objects instead of one under a common parsing
+    // function.
+    // TODO: fix this.
+    //
+    // Because of this fact, need to extract kind separated by `:`. `:` can be
+    // valid dangling for certain options in the command line (--strides=::).
+    // Thus, extract the kind allowing dangling. Verify, it's `--engine` option,
+    // and if yes, perform a safe check for dangling after.
+    size_t start_pos = 0;
+    std::string kind_str = get_substr(str, start_pos, ':', true);
+
+    if (!parse_single_value_option(engine_tgt_kind, dnnl_cpu, str2engine_kind,
+                kind_str.c_str(), option_name, help))
+        return false;
+
+    // This is to catch a dangling `:` at the end of `--engine`.
+    start_pos = 0;
+    kind_str = get_substr(str, start_pos, ':');
+
+    if (start_pos != std::string::npos) {
+        std::string index_str(str + start_pos);
+        // If the index is a valid number, let the library catch potential
+        // issues around unavailable devices, etc.
+        engine_index = parser_utils::stoll_safe(index_str);
     }
+
     return true;
 }
 
@@ -845,29 +1186,26 @@ static bool parse_fast_ref(
     return parsed;
 }
 
-// TODO: remove
-static bool parse_fast_ref_gpu(
-        const char *str, const std::string &option_name = "fast-ref-gpu") {
-    bool parsed = parse_single_value_option(fast_ref, default_fast_ref,
-            str2bool, str, option_name, std::string());
+static bool parse_global_impl(
+        const char *str, const std::string &option_name = "global-impl") {
+    static const std::string help
+            = "STRINGS    (Default: not specified)\n    Same as `--impl` but "
+              "overrides any values from `--impl` or `--skip-impl` options met "
+              "on the way.\n";
 
-    static bool msg_printed = false;
-    if (parsed && !msg_printed) {
-        BENCHDNN_PRINT(0, "%s\n",
-                "Warning: \'--fast-ref-gpu\' is deprecated. Use \'--fast-ref\' "
-                "instead.");
-        msg_printed = true;
-    }
-#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_NONE
-    if (parsed && fast_ref) {
-        fast_ref = false;
-        fprintf(stderr,
-                "%s driver: WARNING: option `fast_ref` is not supported "
-                "for GPU only configurations.\n",
-                driver_name.c_str());
-    }
-#endif
-    return parsed;
+    return parser_utils::parse_impl_filter(global_impl_filter, impl_filter_t(),
+            /* use_impl = */ true, str, option_name, help);
+}
+
+static bool parse_global_skip_impl(
+        const char *str, const std::string &option_name = "global-skip-impl") {
+    static const std::string help
+            = "STRINGS    (Default: not specified)\n    Same as `--skip-impl` "
+              "but overrides any values from `--impl` or `--skip-impl` options "
+              "met on the way.\n";
+
+    return parser_utils::parse_impl_filter(global_impl_filter, impl_filter_t(),
+            /* use_impl = */ false, str, option_name, help);
 }
 
 bool parse_ctx(std::vector<thr_ctx_t> &ctx,
@@ -1066,7 +1404,11 @@ static bool parse_mode(
                 case 'i':
                 case 'I': mode = bench_mode_t::init; break;
                 case 'r':
-                case 'R': mode = bench_mode_t::exec; break;
+                case 'R':
+                    mode = bench_mode_t::exec;
+                    if (!parser_utils::has_clang_sanitizers())
+                        bench_mode_modifier |= mode_modifier_t::no_ref_memory;
+                    break;
                 case 'c':
                 case 'C': mode = bench_mode_t::corr; break;
                 case 'p':
@@ -1075,8 +1417,8 @@ static bool parse_mode(
                 case 'F':
                     mode = bench_mode_t::perf_fast;
                     max_ms_per_prb = 10;
-                    bench_mode_modifier = mode_modifier_t::par_create
-                            | mode_modifier_t::no_host_memory;
+                    bench_mode_modifier |= mode_modifier_t::par_create
+                            | mode_modifier_t::no_ref_memory;
                     break;
                 case 'b':
                 case 'B': mode = bench_mode_t::bitwise; break;
@@ -1104,21 +1446,20 @@ static bool parse_mode_modifier(
               "          The flow will create as many primitives in parallel \n"
               "          as number of threads identified on the system \n"
               "          first, then execute them one by one.\n"
-              "    * `M` to disable usage of host memory.\n"
+              "    * `M` to disable usage of reference memory.\n"
               "          It removes any overheads for mapping, unmapping and \n"
               "          reorders used in filling functions (disabled).\n"
-              "          Applicable for performance mode and GPU engine only.\n"
               "    More details at "
             + doc_url + "benchdnn_general_info.md\n";
 
     const auto str2mode_modifier = [](const std::string &_str) {
-        mode_modifier_t modifier = default_bench_mode_modifier;
+        mode_modifier_t modifier = bench_mode_modifier;
         for (auto s : _str) {
             switch (s) {
                 case 'p':
                 case 'P': modifier |= mode_modifier_t::par_create; break;
                 case 'm':
-                case 'M': modifier |= mode_modifier_t::no_host_memory; break;
+                case 'M': modifier |= mode_modifier_t::no_ref_memory; break;
                 default:
                     BENCHDNN_PRINT(0, "%s\n%s",
                             "Error: modifier value is invalid.", help.c_str());
@@ -1132,30 +1473,6 @@ static bool parse_mode_modifier(
     return parse_single_value_option(bench_mode_modifier,
             default_bench_mode_modifier, str2mode_modifier, str, option_name,
             help);
-}
-
-static bool parse_skip_impl(
-        const char *str, const std::string &option_name = "skip-impl") {
-    static const std::string help
-            = "STRING    (Default: not specified)\n    Instructs the driver to "
-              "iterate over implementations when fetched implementation name "
-              "matching `STRING`.\n    `STRING` is a string literal with no "
-              "spaces.\n    When empty, option has no effect.\n";
-    const auto chars2chars = [](const char *str) { return str; };
-    bool parsed = parse_single_value_option(
-            skip_impl, std::string(), chars2chars, str, option_name, help);
-
-    // Remove all quotes from input string since they affect the search.
-    if (parsed) {
-        for (auto c : {'"', '\''}) {
-            size_t start_pos = 0;
-            while (start_pos != eol) {
-                start_pos = skip_impl.find_first_of(c, start_pos);
-                if (start_pos != eol) skip_impl.erase(start_pos, 1);
-            }
-        }
-    }
-    return parsed;
 }
 
 static bool parse_start(
@@ -1190,6 +1507,16 @@ static bool parse_stream_kind(
     return parsed;
 }
 
+static bool parse_summary(
+        const char *str, const std::string &option_name = "summary") {
+    static const std::string help
+            = "STRING    (Default: `failures`)\n    Instructs benchdnn to "
+              "print additional statistics and information based on the STRING "
+              "values.\n";
+    return parse_single_value_option(summary, summary_t(),
+            parser_utils::parse_summary_str, str, option_name, help);
+}
+
 static bool parse_verbose(
         const char *str, const std::string &option_name = "verbose") {
     static const std::string help
@@ -1202,11 +1529,38 @@ static bool parse_verbose(
     if (parsed) return parsed;
 
     const std::string pattern("-v"); // check short option first
-    if (pattern.find(str, 0, pattern.size()) != eol) {
+    if (parser_utils::option_matched(pattern, str)) {
         verbose = parser_utils::stoll_safe(str + pattern.size());
         return true;
     }
     return false;
+}
+
+static bool parse_execution_mode(
+        const char *str, const std::string &option_name = "execution-mode") {
+    static const std::string help
+            = "MODE    (Default: direct)\n"
+              "    Specifies a `MODE` of execution.\n"
+              "    `MODE` values are:\n"
+              "    * `direct` instruction the driver to execute the primitive "
+              "directly.\n"
+              "    * `graph` to execute the primitive using a graph backend.\n"
+              "          Currently limited to the experimental SYCL Graph on "
+              "DPC++ builds.\n";
+    bool parsed = parse_single_value_option(execution_mode,
+            execution_mode_t::direct, str2execution_mode, str, option_name,
+            help);
+
+#if !defined(DNNL_WITH_SYCL)
+    if (parsed) {
+        BENCHDNN_PRINT(0,
+                "Error: option `--%s` is supported with DPC++ "
+                "builds only, exiting...\n",
+                option_name.c_str());
+        SAFE_V(FAIL);
+    }
+#endif
+    return parsed;
 }
 
 bool parse_bench_settings(const char *str) {
@@ -1218,21 +1572,23 @@ bool parse_bench_settings(const char *str) {
         help_ss << "= Global options: =\n";
         help_ss << "===================\n";
         help_ss << "(More technical details available at "
-                   "https://github.com/oneapi-src/oneDNN/blob/master/tests/"
+                   "https://github.com/uxlfoundation/oneDNN/blob/main/tests/"
                    "benchdnn/doc/knobs_common.md)\n\n";
         start_msg = true;
     }
 
     bool parsed = parse_allow_enum_tags_only(str)
             || parse_attr_same_pd_check(str) || parse_canonical(str)
-            || parse_cold_cache(str) || parse_cpu_isa_hints(str)
-            || parse_engine(str) || parse_fast_ref(str)
-            || parse_fast_ref_gpu(str) || parse_fix_times_per_prb(str)
+            || parse_check_ref_impl(str) || parse_cold_cache(str)
+            || parse_cpu_isa_hints(str) || parse_engine(str)
+            || parse_fast_ref(str) || parse_fix_times_per_prb(str)
+            || parse_global_impl(str) || parse_global_skip_impl(str)
             || parse_max_ms_per_prb(str) || parse_num_streams(str)
             || parse_repeats_per_prb(str) || parse_mem_check(str)
             || parse_memory_kind(str) || parse_mode(str)
-            || parse_mode_modifier(str) || parse_skip_impl(str)
-            || parse_start(str) || parse_stream_kind(str) || parse_verbose(str);
+            || parse_mode_modifier(str) || parse_start(str)
+            || parse_stream_kind(str) || parse_summary(str)
+            || parse_verbose(str) || parse_execution_mode(str);
 
     // Last condition makes this help message to be triggered once driver_name
     // is already known.
@@ -1241,7 +1597,7 @@ bool parse_bench_settings(const char *str) {
         help_ss << "= Driver options: =\n";
         help_ss << "===================\n";
         help_ss << "(More technical details available at "
-                   "https://github.com/oneapi-src/oneDNN/blob/master/tests/"
+                   "https://github.com/uxlfoundation/oneDNN/blob/main/tests/"
                    "benchdnn/doc/driver_"
                 << driver_name << ".md)\n\n";
         end_msg = true;
@@ -1254,7 +1610,7 @@ void catch_unknown_options(const char *str) {
     last_parsed_is_problem = true; // if reached, means problem parsing
 
     std::string pattern = "--";
-    if (pattern.find(str, 0, pattern.size()) != eol) {
+    if (parser_utils::option_matched(pattern, str)) {
         BENCHDNN_PRINT(0, "%s %s \'%s\'\n",
                 "driver: ERROR: unknown option:", driver_name.c_str(), str);
         exit(2);
@@ -1262,7 +1618,7 @@ void catch_unknown_options(const char *str) {
 
     // Must stay after `--` check.
     pattern = "-";
-    if (pattern.find(str, 0, pattern.size()) != eol) {
+    if (parser_utils::option_matched(pattern, str)) {
         BENCHDNN_PRINT(0, "%s\n%s \'%s\'\n",
                 "ERROR: options should be passed with `--` prefix.",
                 "Given input:", str);
@@ -1278,10 +1634,16 @@ int parse_last_argument() {
     return OK;
 }
 
-std::string get_substr(const std::string &s, size_t &start_pos, char delim) {
+std::string get_substr(const std::string &s, size_t &start_pos, char delim,
+        bool allow_dangling) {
     auto end_pos = s.find_first_of(delim, start_pos);
     auto sub = s.substr(start_pos, end_pos - start_pos);
     start_pos = end_pos + (end_pos != eol);
+    if (!allow_dangling && start_pos == s.size()) {
+        BENCHDNN_PRINT(0, "%s \'%s\'\n",
+                "Error: dangling symbol at the end of input", s.c_str());
+        SAFE_V(FAIL);
+    }
     return sub;
 }
 

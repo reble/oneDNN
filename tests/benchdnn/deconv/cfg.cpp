@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,29 +30,8 @@ cfg_t::cfg_t(const prb_t *prb, const std::vector<data_kind_t> &kinds) {
                         kind, orig_data_type, data_type, get_cfg_map(kind)});
     }
 
-    adjust_ranges_for_safe_n_acc();
-
-    // Use wider dst to test proper u8 loads.
-    const bool is_int8_and_wide_dst
-            = dnnl_data_type_size(this->get_dt(WEI)) == 1
-            && dnnl_data_type_size(this->get_dt(DST)) >= 4;
-    if (is_int8_and_wide_dst) { this->set_range_max(SRC, 160); }
-
-    // For s8s8 weights have to be even to comply with adjust_scale of 0.5f.
-    // Divide the range by factor of two here, and multiply values by factor
-    // of two when do filling.
-    const bool is_s8s8
-            = this->get_dt(SRC) == dnnl_s8 && this->get_dt(WEI) == dnnl_s8;
-    if (is_s8s8) {
-        this->set_range_min(WEI, -2);
-        this->set_range_max(WEI, 2);
-    }
-
-    BENCHDNN_PRINT(6,
-            "[FILL_CFG] SRC_%s=[%d;%d]; WEI_%s=[%d;%d]; DST_%s=[%d;%d];\n",
-            dt2str(this->get_dt(SRC)), get_range_min(SRC), get_range_max(SRC),
-            dt2str(this->get_dt(WEI)), get_range_min(WEI), get_range_max(WEI),
-            dt2str(this->get_dt(DST)), get_range_min(DST), get_range_max(DST));
+    adjust_ranges();
+    print_fill_cfg_verbose();
 }
 
 // Adjust density based on accumulation chain.
@@ -63,10 +42,8 @@ float cfg_t::get_density(const cfg_t::density_args_t &density_args) const {
     const data_kind_t allowed_non_dense_kind
             = output_data_kind_ == DST ? SRC : DST;
 
-    if (has_bench_mode_bit(mode_bit_t::corr)
-            && density_args.data_kind == allowed_non_dense_kind) {
+    if (density_args.data_kind == allowed_non_dense_kind) {
         int64_t safe_n_acc = get_safe_n_acc();
-        assert(safe_n_acc > 0);
         safe_n_acc_str = std::to_string(safe_n_acc);
 
         // Bump density for some empiric value for int8 validation to hit
@@ -89,6 +66,8 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
             {{dnnl_f32}, {-32, 32}},
             {{dnnl_bf16}, {-4, 4}},
             {{dnnl_f16}, {-4, 4}},
+            {{dnnl_f8_e5m2}, {-4, 4}},
+            {{dnnl_f8_e4m3}, {-4, 4}},
             {{dnnl_s8}, {-4, 4}},
             {{dnnl_u8}, {0, 8}},
     };
@@ -98,6 +77,8 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
             {{dnnl_f32}, {-32, 32}},
             {{dnnl_bf16}, {-8, 8}},
             {{dnnl_f16}, {-2, 2}},
+            {{dnnl_f8_e5m2}, {-2, 2}},
+            {{dnnl_f8_e4m3}, {-2, 2}},
             {{dnnl_s8}, {-4, 4}},
     };
 
@@ -106,6 +87,8 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
             {{dnnl_f32}, {-8, 8}},
             {{dnnl_bf16}, {-8, 8}},
             {{dnnl_f16}, {-8, 8}},
+            {{dnnl_f8_e5m2}, {-8, 8}},
+            {{dnnl_f8_e4m3}, {-8, 8}},
             {{dnnl_s8}, {-8, 8}},
             {{dnnl_u8}, {0, 8}},
             {{dnnl_s32}, {-8, 8}},
@@ -116,6 +99,8 @@ cfg_t::cfg_entry_t::cfg_map_t cfg_t::get_cfg_map(data_kind_t kind) const {
             {{dnnl_f32}, {-8, 8}},
             {{dnnl_bf16}, {-4, 4}},
             {{dnnl_f16}, {-4, 4}},
+            {{dnnl_f8_e5m2}, {-4, 4}},
+            {{dnnl_f8_e4m3}, {-4, 4}},
             {{dnnl_s8}, {-4, 4}},
             {{dnnl_u8}, {0, 160}},
             {{dnnl_s32}, {-128, 128}},

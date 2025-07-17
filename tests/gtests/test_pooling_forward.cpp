@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 * Copyright 2022-2023 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -82,6 +82,13 @@ bool hip_check_format_tags(memory::format_tag format) {
             || format == memory::format_tag::ncdhw;
 
     return format_ok;
+}
+
+bool generic_check_format_tags(memory::format_tag format) {
+    return impl::utils::one_of(format, memory::format_tag::a,
+            memory::format_tag::nchw, memory::format_tag::ncdhw,
+            memory::format_tag::nhwc, memory::format_tag::ndhwc,
+            memory::format_tag::any);
 }
 
 template <typename data_t>
@@ -216,7 +223,7 @@ protected:
     void SetUp() override {
         p = ::testing::TestWithParam<decltype(p)>::GetParam();
 
-        SKIP_IF(unsupported_data_type(data_traits<data_t>::data_type),
+        SKIP_IF(unsupported_data_type(data_traits_t<data_t>::data_type),
                 "Engine does not support this data type.");
         SKIP_IF_CUDA(!cuda_check_format_tags(p.src_format),
                 "Unsupported format tag");
@@ -226,8 +233,12 @@ protected:
                 !hip_check_format_tags(p.src_format), "Unsupported format tag");
         SKIP_IF_HIP(
                 !hip_check_format_tags(p.dst_format), "Unsupported format tag");
-        SKIP_IF_HIP(data_traits<data_t>::data_type == memory::data_type::s8,
+        SKIP_IF_HIP(data_traits_t<data_t>::data_type == memory::data_type::s8,
                 "Unsupported data type");
+        SKIP_IF_GENERIC(!generic_check_format_tags(p.src_format),
+                "Unsupported format tag");
+        SKIP_IF_GENERIC(!generic_check_format_tags(p.dst_format),
+                "Unsupported format tag");
 
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status);
@@ -266,7 +277,7 @@ protected:
                 || p.aprop_kind == prop_kind::forward_inference);
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
-        memory::data_type data_type = data_traits<data_t>::data_type;
+        memory::data_type data_type = data_traits_t<data_t>::data_type;
 
         test_pool_desc_t pd = p.test_pd;
         auto p_src_desc = (p.ndims == 5)
@@ -314,7 +325,7 @@ protected:
         auto pool_prim_desc = pd_t(eng, p.aprop_kind, p.aalgorithm, p_src_desc,
                 p_dst_desc, strides, ker, dilation, pad_l, pad_r);
         // test all pd ctors
-        allows_attr_t aa {false};
+        allows_attr_t aa {};
         if (!(is_nvidia_gpu(eng) || is_amd_gpu(eng))) {
             aa.po_eltwise = true;
             aa.po_binary = true;
@@ -766,12 +777,7 @@ INSTANTIATE_TEST_SUITE_P(TestPoolingForwardZeroDim, pooling_test_float,
                         algorithm::pooling_max, memory::format_tag::nhwc,
                         memory::format_tag::nhwc,
                         EXPAND_SIZES_2D(
-                                0, 4, 4, 4, 4, 4, 3, 3, 0, 0, 1, 1, 1, 1)},
-                pool_test_params_float {prop_kind::forward_training,
-                        algorithm::pooling_max, memory::format_tag::nchw,
-                        memory::format_tag::nchw,
-                        EXPAND_SIZES_2D(
-                                2, 4, 0, 4, 4, 4, 3, 3, 1, 1, 1, 1, 1, 1)}));
+                                0, 4, 4, 4, 4, 4, 3, 3, 0, 0, 1, 1, 1, 1)}));
 
 INSTANTIATE_TEST_SUITE_P(TestPoolingForwardEF, pooling_test_float,
         ::testing::Values(

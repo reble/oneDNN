@@ -14,6 +14,11 @@ where *brgemm-knobs* are:
  - `--bia_dt={undef [default], f32, s32, s8, u8}` -- bias data type.
             To run BRGEMM kernel without bias, use `undef` data type.
             Refer to [data types](knobs_dt.md) for details.
+ - `--wtag={abx [default], ...}` -- physical wei memory layout.
+            Refer to [tags](knobs_tag.md) for details.
+ - `--strides=:WEI_STRIDES:` -- physical memory layout specification for
+            `weights` tensor through strides values.
+            Refer to [option documentation](knob_strides.md) for details.
  - `--ld=LDA:LDB:LDD` -- direct leading dimension specification for src,
             weights, and dst tensors. The value for either of the tensors can be
             skipped meaning a default value will be applied.
@@ -29,20 +34,13 @@ where *brgemm-knobs* are:
             The format is: KEY:VALUE[+KEY:VALUE[...]] following post-ops
             notation. STRING may have `,` to iterate over multiple attribute
             settings. Refer to internal brgemm headers for more details.
- - `--attr-scales=STRING` -- scale primitive attribute. No scale is
-            set by default. Refer to [attributes](knobs_attr.md) for details.
- - `--attr-zero-points=STRING` -- zero points primitive attribute. No zero
-            points are set by default. Refer to [attributes](knobs_attr.md)
-            for details.
- - `--attr-post-ops=STRING` -- post operation primitive attribute. No post
-            operations are set by default. Refer to [attributes](knobs_attr.md)
-            for details.
- - `--attr-fpmath=STRING` -- fpmath mode primitive attribute. `strict` math mode
-            is set by default. Refer to [attributes](knobs_attr.md) for details.
+ - `--batch-kind=STRING` -- specifies brgemm batch kind. Supported values are:
+            `addr` (the default), `offs`.
  - `--match=REGEX` -- skip problems not matching the regular expression in
             `REGEX`. By default no pattern is applied (run everything).
             Note: Windows may interpret only string arguments surrounded by
             double quotation marks.
+ - Any attributes options. Refer to [attributes](knobs_attr.md) for details.
 
 and *brgemm-desc* is a problem descriptor. The canonical form is:
 ```

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -38,7 +38,7 @@ public:
 template <typename prb_t>
 class prb_wrapper_t : public prb_wrapper_base_t {
 public:
-    prb_wrapper_t(const std::shared_ptr<prb_t> prb) { prb_ = prb; }
+    prb_wrapper_t(const std::shared_ptr<prb_t> &prb) : prb_(prb) {}
     // get raw pointer of prb object
     const prb_t *get() const { return prb_.get(); }
 
@@ -61,10 +61,14 @@ inline const prb_t *prb_wrapper_base_t::get() const {
 class ref_primitive_t {
 public:
     ref_primitive_t() = default;
-    ref_primitive_t(const deserialized_op &op);
+    ref_primitive_t(const deserialized_op_t &op);
 
-    int init_prb(::std::unordered_set<size_t> &bf16_rewrite, res_t *res);
-    int init_prim(const engine_t &eng, res_t *res);
+    int init_prb(res_t *res);
+    // By default, the reference primitives are created with f32 data type.
+    // However, there's a displacer that relies on the logic that would fill
+    // memories with int8 data. `force_override` flag restricts forcing f32
+    // data type primarily for this use case.
+    int init_prim(const engine_t &eng, res_t *res, bool force_override = false);
     void init_memory_args(const engine_t &eng);
     int init_ref_memory_args(const engine_t &eng, res_t *res);
     int execute_prim(res_t *res) const;
@@ -74,17 +78,28 @@ public:
     void replace_arg(const int arg, const dnn_mem_t &mem) {
         // Only compatible memory objects can be replaced.
         const auto &orig_mem = args_.find(arg);
-        if (orig_mem.size() != mem.size()) SAFE_V(FAIL);
+        if (orig_mem.size() != mem.size()) {
+            BENCHDNN_PRINT(0,
+                    "Error: can't replace mem_%s (%zu) with mem_%s (%zu) for "
+                    "%s op.\n",
+                    dt2str(orig_mem.dt()), orig_mem.size(), dt2str(mem.dt()),
+                    mem.size(), op_.kind_.c_str());
+            SAFE_V(FAIL);
+        }
 
         args_.replace(arg, &mem);
     }
     const dnn_mem_t &get_arg(const int arg) const { return args_.find(arg); }
     ::dnnl::graph::op::kind get_kind() const { return kind_; }
+    // Displaces scale values in a memory object with scale values from `op`.
+    int displace_scales() const;
+    dnnl_data_type_t get_lt_dt(size_t id) const;
+    const_dnnl_primitive_desc_t get_pd() const { return query_pd(prim_); }
 
 private:
     BENCHDNN_DISALLOW_COPY_AND_ASSIGN(ref_primitive_t);
 
-    deserialized_op op_;
+    deserialized_op_t op_;
     ::dnnl::graph::op::kind kind_;
     dnnl_driver_t driver_;
     bool is_special_backward_op_;

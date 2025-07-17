@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@
 #include "cpu/x64/jit_avx512_core_bf16_1x1_conv_kernel.hpp"
 #include "cpu/x64/jit_uni_1x1_conv_utils.hpp"
 
-#define GET_OFF(field) offsetof(jit_1x1_conv_call_s, field)
+#define GET_OFF(field) offsetof(jit_1x1_conv_args_t, field)
 
 namespace dnnl {
 namespace impl {
@@ -42,12 +42,10 @@ using namespace dnnl::impl::utils;
 
 using namespace Xbyak;
 
-jit_avx512_core_bf16_1x1_conv_kernel::jit_avx512_core_bf16_1x1_conv_kernel(
+jit_avx512_core_bf16_1x1_conv_kernel_t::jit_avx512_core_bf16_1x1_conv_kernel_t(
         const jit_1x1_conv_conf_t &ajcp, const primitive_attr_t &attr,
         const memory_desc_t &dst_md)
-    : jit_generator(jit_name(), nullptr, ker_code_size, true, avx512_core_bf16)
-    , jcp(ajcp)
-    , attr_(attr) {
+    : jit_generator_t(jit_name(), avx512_core_bf16), jcp(ajcp), attr_(attr) {
     if (jcp.with_eltwise || jcp.with_binary) {
         using namespace binary_injector;
         static constexpr bool preserve_gpr = true;
@@ -75,7 +73,7 @@ jit_avx512_core_bf16_1x1_conv_kernel::jit_avx512_core_bf16_1x1_conv_kernel(
                 bf16_emu_reserv_4, bf16_emu_reserv_5, bf16_emu_reserv_6);
 }
 
-void jit_avx512_core_bf16_1x1_conv_kernel::bcast_loop(int load_loop_blk) {
+void jit_avx512_core_bf16_1x1_conv_kernel_t::bcast_loop(int load_loop_blk) {
     mov(aux1_reg_bcast_data, reg_bcast_data);
     mov(aux_reg_bcast_data, reg_bcast_data);
 
@@ -148,7 +146,7 @@ static int vreg_accum_idx(
     return idx;
 }
 
-Address jit_avx512_core_bf16_1x1_conv_kernel::output_ptr(
+Address jit_avx512_core_bf16_1x1_conv_kernel_t::output_ptr(
         const int i_load, const int i_ur) {
     if (one_of(jcp.prop_kind, forward_training, forward_inference,
                 backward_data)) {
@@ -181,7 +179,7 @@ static void iterate(const int load_loop_blk, const int ur, const F &f) {
     iterate(load_loop_blk, ur, false, f);
 }
 
-void jit_avx512_core_bf16_1x1_conv_kernel::apply_postops(
+void jit_avx512_core_bf16_1x1_conv_kernel_t::apply_postops(
         const int load_loop_blk, const int ur) {
     if (jcp.with_eltwise || jcp.with_binary) {
         injector_utils::vmm_index_set_t vmm_idxs;
@@ -253,7 +251,7 @@ void jit_avx512_core_bf16_1x1_conv_kernel::apply_postops(
     }
 }
 
-void jit_avx512_core_bf16_1x1_conv_kernel::reduce_loop(
+void jit_avx512_core_bf16_1x1_conv_kernel_t::reduce_loop(
         int load_loop_blk, int ur, int substep, bool wraparound) {
     const bool load_layout_nxc = is_load_layout_nxc();
     const bool bcast_layout_nxc = is_bcast_layout_nxc();
@@ -880,7 +878,7 @@ void jit_avx512_core_bf16_1x1_conv_kernel::reduce_loop(
     store();
 }
 
-void jit_avx512_core_bf16_1x1_conv_kernel::compute_diff_bias(
+void jit_avx512_core_bf16_1x1_conv_kernel_t::compute_diff_bias(
         int load_loop_blk) {
     if (IMPLICATION(jcp.with_bias, jcp.prop_kind != backward_weights)) return;
     Label skip_diff_bias;
@@ -992,7 +990,7 @@ void jit_avx512_core_bf16_1x1_conv_kernel::compute_diff_bias(
     L(skip_diff_bias);
 }
 
-void jit_avx512_core_bf16_1x1_conv_kernel::generate() {
+void jit_avx512_core_bf16_1x1_conv_kernel_t::generate() {
     preamble();
 
     sub(rsp, stack_space_needed);
@@ -1025,10 +1023,15 @@ void jit_avx512_core_bf16_1x1_conv_kernel::generate() {
         mov(reg_trans_tmp.cvt32(), (1 << load_dim_tail) - 1);
         kmovw(k_load_dim_tail_mask, reg_trans_tmp.cvt32());
 
-        if (is_out_layout_nxc())
-            mov(reg_trans_tmp.cvt32(),
-                    (1 << (load_dim_tail + jcp.load_block)) - 1);
-        else {
+        if (is_out_layout_nxc()) {
+            // Computing the mask the other way around overflows int32_t for
+            // `load_dim_tail + jcp.load_block == 31`.
+            // Note: just "-1U" causes CL's warning:
+            // C4146: unary minus operator applied to unsigned type
+            auto zmm_32b_mask = static_cast<uint32_t>(-1)
+                    >> (32 - (load_dim_tail + jcp.load_block));
+            mov(reg_trans_tmp.cvt32(), zmm_32b_mask);
+        } else {
             const auto half_mask = (1 << load_dim_tail) - 1;
             mov(reg_trans_tmp.cvt32(), ((half_mask << 16) + half_mask));
         }
@@ -1174,7 +1177,8 @@ void jit_avx512_core_bf16_1x1_conv_kernel::generate() {
 
     postamble();
 
-    if (jcp.with_eltwise) postops_injector_->prepare_table();
+    if (jcp.with_eltwise)
+        postops_injector_->prepare_table(/* generate = */ true);
 
     if (jcp.prop_kind == backward_weights) {
         const uint16_t dst_prm_array[32] = {0, 16, 1, 17, 2, 18, 3, 19, 4, 20,
@@ -1188,14 +1192,19 @@ void jit_avx512_core_bf16_1x1_conv_kernel::generate() {
     }
 }
 
-status_t jit_avx512_core_bf16_1x1_conv_kernel::init_conf(
+status_t jit_avx512_core_bf16_1x1_conv_kernel_t::init_conf(
         jit_1x1_conv_conf_t &jcp, const convolution_desc_t &cd,
         const memory_desc_wrapper &src_d, const memory_desc_wrapper &weights_d,
         const memory_desc_wrapper &dst_d, primitive_attr_t &attr, int nthreads,
         bool reduce_src) {
     const bool with_groups = weights_d.ndims() == src_d.ndims() + 1;
-    const int simd_w = cpu_isa_traits<avx512_core>::vlen / sizeof(float);
+    const int simd_w = cpu_isa_traits_t<avx512_core>::vlen / sizeof(float);
     const int ndims = src_d.ndims();
+
+    // Big int (> INT_MAX) values are unsupported and jcp fields may overflow
+    // TODO: change data type of jcp fields to size_t
+    VDISPATCH_CONV_IC(!has_large_size(cd, src_d, weights_d, dst_d),
+            VERBOSE_BAD_PARAM, "Large size is not supported");
 
     jcp.nthr = nthreads;
     jcp.isa = mayiuse(avx512_core_bf16) ? avx512_core_bf16
@@ -1273,16 +1282,23 @@ status_t jit_avx512_core_bf16_1x1_conv_kernel::init_conf(
     static constexpr bool sum_at_pos_0_only = true;
     static constexpr bool sum_requires_scale_one = true;
     static constexpr bool sum_requires_zp_zero = true;
-    const bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(avx512_core,
+    bool post_ops_ok_ = post_ops_ok(post_ops_ok_args_t(avx512_core,
             {eltwise, binary, sum}, jcp.post_ops, &dst_d, sum_at_pos_0_only,
             sum_requires_scale_one, sum_requires_zp_zero));
+    // temporary workaround that skips avx512 implementation for ternary
+    // post-ops with scalar broadcasting to avoid register collisions.
+    post_ops_ok_ = post_ops_ok_
+            && IMPLICATION(jcp.with_binary,
+                    !binary_injector::
+                            any_binary_postop_rhs_with_ternary_scalar_bcast(
+                                    post_ops, dst_d));
     if (!post_ops_ok_) return status::unimplemented;
 
     using namespace format_tag;
     const auto dat_tag_nxc = pick(ndims - 3, nwc, nhwc, ndhwc);
     const auto dat_tag_nCx16c = pick(ndims - 3, nCw16c, nChw16c, nCdhw16c);
-    jcp.src_tag = src_d.matches_one_of_tag(dat_tag_nxc, dat_tag_nCx16c);
-    jcp.dst_tag = dst_d.matches_one_of_tag(dat_tag_nxc, dat_tag_nCx16c);
+    jcp.src_tag = src_d.mb_stride_relaxed_match(dat_tag_nxc, dat_tag_nCx16c);
+    jcp.dst_tag = dst_d.mb_stride_relaxed_match(dat_tag_nxc, dat_tag_nCx16c);
     bool is_data_layout_nxc
             = utils::everyone_is(dat_tag_nxc, jcp.src_tag, jcp.dst_tag);
     auto required_dat_tag = is_data_layout_nxc ? dat_tag_nxc : dat_tag_nCx16c;
@@ -1331,7 +1347,7 @@ status_t jit_avx512_core_bf16_1x1_conv_kernel::init_conf(
         jcp.dst_dt = src_d.data_type();
     } else if (jcp.prop_kind == backward_weights) {
         jcp.typesize_in = types::data_type_size(src_d.data_type());
-        jcp.typesize_out = sizeof(prec_traits<data_type::f32>::type);
+        jcp.typesize_out = sizeof(prec_traits_t<data_type::f32>::type);
         jcp.dst_dt = weights_d.data_type();
     }
 
@@ -1743,7 +1759,7 @@ status_t jit_avx512_core_bf16_1x1_conv_kernel::init_conf(
     return status::success;
 }
 
-status_t jit_avx512_core_bf16_1x1_conv_kernel::init_scratchpad(
+status_t jit_avx512_core_bf16_1x1_conv_kernel_t::init_scratchpad(
         memory_tracking::registrar_t &scratchpad,
         const jit_1x1_conv_conf_t &jcp) {
     using namespace dnnl::impl::memory_tracking::names;
@@ -1824,7 +1840,7 @@ status_t jit_avx512_core_bf16_1x1_conv_kernel::init_scratchpad(
     return status::success;
 }
 
-void jit_avx512_core_bf16_1x1_conv_kernel::balance(
+void jit_avx512_core_bf16_1x1_conv_kernel_t::balance(
         jit_1x1_conv_conf_t &jcp, int nthreads) {
     // initialize jcp reduction threading properties
     jcp.nthr = jcp.nthr_mb = jcp.nthr_g = jcp.nthr_oc_b = jcp.nthr_ic_b = 1;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,9 +25,9 @@
 using namespace sycl;
 
 namespace dnnl {
-class sycl_stream_test : public ::testing::TestWithParam<engine::kind> {
+class sycl_stream_test_t : public ::testing::TestWithParam<engine::kind> {
 protected:
-    virtual void SetUp() {
+    void SetUp() override {
         if (engine::get_count(engine::kind::cpu) > 0) {
             cpu_eng = engine(engine::kind::cpu, 0);
         }
@@ -76,7 +76,7 @@ protected:
     engine gpu_eng;
 };
 
-TEST_P(sycl_stream_test, Create) {
+TEST_P(sycl_stream_test_t, Create) {
     engine::kind kind = GetParam();
     SKIP_IF(!has(kind), "Device not found.");
 
@@ -97,7 +97,7 @@ TEST_P(sycl_stream_test, Create) {
     EXPECT_EQ(get_context(kind), queue_ctx);
 }
 
-TEST_P(sycl_stream_test, BasicInterop) {
+TEST_P(sycl_stream_test_t, BasicInterop) {
     engine::kind kind = GetParam();
     SKIP_IF(!has(kind), "Device not found.");
 
@@ -114,7 +114,7 @@ TEST_P(sycl_stream_test, BasicInterop) {
     EXPECT_EQ(interop_queue, sycl_interop::get_queue(s));
 }
 
-TEST_P(sycl_stream_test, InteropIncompatibleQueue) {
+TEST_P(sycl_stream_test_t, InteropIncompatibleQueue) {
     engine::kind kind = GetParam();
     SKIP_IF(!has(engine::kind::cpu) || !has(engine::kind::gpu),
             "CPU or GPU device not found.");
@@ -136,7 +136,7 @@ TEST_P(sycl_stream_test, InteropIncompatibleQueue) {
 extern "C" dnnl_status_t dnnl_reset_profiling(dnnl_stream_t stream);
 #endif
 
-TEST_P(sycl_stream_test, TestProfilingAPIDisabledAndEnabled) {
+TEST_P(sycl_stream_test_t, TestProfilingAPIDisabledAndEnabled) {
     engine::kind kind = GetParam();
     SKIP_IF(!has(kind), "Device not found.");
     SKIP_IF(kind == engine::kind::cpu, "Test is GPU specific.");
@@ -144,6 +144,12 @@ TEST_P(sycl_stream_test, TestProfilingAPIDisabledAndEnabled) {
     auto sycl_queue = sycl::queue(get_context(kind), get_device(kind),
             sycl::property_list {sycl::property::queue::in_order {},
                     sycl::property::queue::enable_profiling {}});
+
+#if defined(DNNL_EXPERIMENTAL_PROFILING) \
+        && (defined(DNNL_SYCL_CUDA) || defined(DNNL_SYCL_HIP))
+    EXPECT_ANY_THROW(sycl_interop::make_stream(get_engine(kind), sycl_queue));
+    return;
+#else
     stream strm = sycl_interop::make_stream(get_engine(kind), sycl_queue);
 
     memory::dims tz_dims = {2, 3, 4, 5};
@@ -173,6 +179,7 @@ TEST_P(sycl_stream_test, TestProfilingAPIDisabledAndEnabled) {
 #else
     EXPECT_EQ(st, dnnl_invalid_arguments);
 #endif
+#endif
 }
 
 // TODO: Enable the test below after sycl_stream_t is fixed to not reuse the
@@ -194,7 +201,7 @@ TEST_P(sycl_stream_test, Flags) {
 #endif
 
 namespace {
-struct PrintToStringParamName {
+struct print_to_string_param_name_t {
     template <class ParamType>
     std::string operator()(
             const ::testing::TestParamInfo<ParamType> &info) const {
@@ -208,8 +215,8 @@ struct PrintToStringParamName {
 };
 } // namespace
 
-INSTANTIATE_TEST_SUITE_P(AllEngineKinds, sycl_stream_test,
+INSTANTIATE_TEST_SUITE_P(AllEngineKinds, sycl_stream_test_t,
         ::testing::Values(engine::kind::cpu, engine::kind::gpu),
-        PrintToStringParamName());
+        print_to_string_param_name_t());
 
 } // namespace dnnl

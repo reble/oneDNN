@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -99,9 +99,11 @@ jit_avx512_core_amx_convolution_fwd_t::execute_forward_reduced_lowering(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float *oscales = scale_utils::precompute_scales(
-            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->OC(),
-            pd()->attr(), jit_scale_precompute_.get());
+            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->IC(),
+            pd()->OC(), false, wei_scale_mask > 0, pd()->attr(),
+            jit_scale_precompute_.get());
 
     auto inp_p_buffer = ctx.get_scratchpad_grantor().template get<char>(
             key_conv_amx_inp_buffer); // fix the template
@@ -136,7 +138,7 @@ jit_avx512_core_amx_convolution_fwd_t::execute_forward_reduced_lowering(
     const int zp_pbuff_size = jcp.zp_pbuff_size;
 
     // reorder weights from (g)Owhi16o to (g)OR16r16o4r, where r := whi
-    auto p = jit_conv_call_s();
+    auto p = jit_conv_args_t();
     p.src = weights;
     p.dst = wei_buffer;
     kernel_->copy_to_wbuffer()(&p);
@@ -165,7 +167,7 @@ jit_avx512_core_amx_convolution_fwd_t::execute_forward_reduced_lowering(
         const int oh_work = jcp.oh_pad;
         parallel_nd(
                 ngroups, oc_chunks, oh_work, [&](dim_t g, dim_t occ, dim_t oh) {
-                    auto p = jit_conv_call_s();
+                    auto p = jit_conv_args_t();
 
                     const int oh_ = oh >= zp_buff_b_pad_start
                             ? b_pad_start + oh - zp_buff_b_pad_start
@@ -215,7 +217,7 @@ jit_avx512_core_amx_convolution_fwd_t::execute_forward_reduced_lowering(
                 zp_flags[oc] = true;
         }
 
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         amx_tile_configure(tcfg);
 
         const int oh_work = jcp.oh_pad;
@@ -454,9 +456,11 @@ status_t jit_avx512_core_amx_convolution_fwd_t::execute_forward(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float *oscales = scale_utils::precompute_scales(
-            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->OC(),
-            pd()->attr(), jit_scale_precompute_.get());
+            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->IC(),
+            pd()->OC(), false, wei_scale_mask > 0, pd()->attr(),
+            jit_scale_precompute_.get());
 
     // TODO: use block offset instead of hand-calculated one
     //size_t wei_oc_shift = wht_blk_off(weights_d, 0, 1);
@@ -520,7 +524,7 @@ status_t jit_avx512_core_amx_convolution_fwd_t::execute_forward(
         const int oh_work = jcp.oh_pad;
         parallel_nd(ngroups, oc_chunks, od_work, oh_work,
                 [&](dim_t g, dim_t occ, dim_t od, dim_t oh) {
-                    auto p = jit_conv_call_s();
+                    auto p = jit_conv_args_t();
 
                     const int od_ = od >= zp_buff_back_pad_start
                             ? back_pad_start + od - zp_buff_back_pad_start
@@ -585,7 +589,7 @@ status_t jit_avx512_core_amx_convolution_fwd_t::execute_forward(
                 zp_flags[oc] = true;
         }
 
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         amx_tile_configure(tcfg);
 
         const int oh_work = jcp.oh_pad;
@@ -825,9 +829,11 @@ status_t jit_avx512_core_amx_convolution_bwd_data_t::execute_backward(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float *oscales = scale_utils::precompute_scales(
-            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->OC(),
-            pd()->attr(), jit_scale_precompute_.get());
+            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->IC(),
+            pd()->OC(), false, wei_scale_mask > 0, pd()->attr(),
+            jit_scale_precompute_.get());
 
     amx_utils::execute_backward_convolution_body(ctx, pd()->jcp_, kernel_,
             diff_dst, weights, nullptr /* no bias */, oscales, dst_scales,
@@ -860,8 +866,8 @@ status_t jit_avx512_core_amx_convolution_bwd_weights_t::init(engine_t *engine) {
     }
     if (j.transform_to_vnni) {
         CHECK(safe_ptr_assign(diff_wei_trans_kernel_,
-                new jit_diff_wei_trans_to_vnni_t(
-                        j.wei_dt, j.kd, j.kh, j.kw, j.ic_block, j.oc_block)));
+                new jit_diff_wei_trans_to_vnni_t(j.wei_dt, j.kd, j.kh, j.kw,
+                        j.ic_block, j.oc_block, j.nb_ic)));
         CHECK(diff_wei_trans_kernel_->create_kernel());
     }
     return status::success;
@@ -1100,7 +1106,7 @@ void jit_avx512_core_amx_convolution_bwd_weights_t::compute_diff_weights_2d(
     nd_iterator_init(start, img, jcp.mb, oh_s, jcp.oh);
 
     while (start < end) {
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         int work_rem = end - start;
         const int oh_e = oh_s + work_rem > jcp.oh ? jcp.oh : oh_s + work_rem;
         int ih_s = nstl::max(0, -jcp.t_pad + oh_s * jcp.stride_h);
@@ -1316,7 +1322,7 @@ void jit_avx512_core_amx_convolution_bwd_weights_t::compute_diff_weights_3d(
 
     nd_iterator_init(start, img, jcp.mb, od_s, jcp.od);
     while (start < end) {
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         int work_rem = end - start;
         const int od_e = od_s + work_rem > jcp.od ? jcp.od : od_s + work_rem;
         int id_s = nstl::max(0, -jcp.f_pad + od_s * jcp.stride_d);
@@ -1673,7 +1679,7 @@ void jit_avx512_core_amx_convolution_bwd_weights_t::compute_diff_weights(
     };
 
     for (int img = ti->img_start; img < ti->img_end; ++img) {
-        auto p = jit_conv_call_s();
+        auto p = jit_conv_args_t();
         if (jcp.global_transpose) {
             using simple_barrier::barrier;
             // TODO: try to call local transpositions just before jit kernel
@@ -1771,7 +1777,7 @@ void jit_avx512_core_amx_convolution_bwd_weights_t::store_in_vnni_format(
         const int g = ti->g_start + sub_g_start;
         const int oc_b = ti->oc_b_start + sub_oc_b_start;
         const int ic_b = ti->ic_b_start + 2 * sub_icb2_start;
-        jit_conv_call_s p = jit_conv_call_s();
+        jit_conv_args_t p = jit_conv_args_t();
 
         bfloat16_t *output = (bfloat16_t *)ti->diff_weights
                 + wei_offset_ext(g, oc_b, (ic_b / 2), 0);
@@ -1934,7 +1940,7 @@ void jit_avx512_core_amx_convolution_bwd_weights_t::prepare_scratchpad_data(
     const auto &jcp = pd()->jcp_;
 
     // XXX: See the comment about tr_iw and guarding elements in
-    // jit_avx512_core_bf16_conv_bwd_weights_kernel_f32::init_conf()
+    // jit_avx512_core_bf16_conv_bwd_weights_kernel_f32_t::init_conf()
     auto tr_src = scratchpad.template get<src_data_t>(key_conv_tr_src);
     // Zero out guard elements that cross a buffer boundary to prevent a
     // race condition due to buffer overflows from memory optimization where

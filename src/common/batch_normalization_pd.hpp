@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -97,7 +97,7 @@ struct batch_normalization_pd_t : public primitive_desc_t {
 
     float alpha() const {
         const auto &p = attr()->post_ops_;
-        const bool entry_size_ok = p.entry_.size() > 0;
+        const bool entry_size_ok = !p.entry_.empty();
         assert(entry_size_ok || fuse_norm_relu() || fuse_norm_add_relu());
         if (entry_size_ok) return p.entry_[0].eltwise.alpha;
         return 0.f;
@@ -126,16 +126,15 @@ protected:
 
     memory_desc_t ws_md_;
 
-    batch_normalization_pd_t(const batch_normalization_desc_t *adesc,
+    batch_normalization_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const batch_normalization_fwd_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<batch_normalization_desc_t>(adesc))
         , hint_fwd_pd_(hint_fwd_pd)
         , src_md_(desc_.src_desc)
         , stat_md_(desc_.stat_desc)
-        , scaleshift_md_(desc_.scaleshift_desc)
-        , ws_md_() {}
+        , scaleshift_md_(desc_.scaleshift_desc) {}
 
     virtual status_t init_default_ws(size_t bits_per_element) {
         const auto src_mdw = memory_desc_wrapper(src_md_);
@@ -149,14 +148,16 @@ protected:
     }
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct batch_normalization_fwd_pd_t : public batch_normalization_pd_t {
-    typedef batch_normalization_fwd_pd_t base_class;
-    typedef batch_normalization_fwd_pd_t hint_class;
+    using base_class = batch_normalization_fwd_pd_t;
+    using hint_class = batch_normalization_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg == DNNL_ARG_SRC) return arg_usage_t::input;
-        if (arg == DNNL_ARG_SRC_1 && fuse_norm_add_relu())
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_SRC_1)
+            return fuse_norm_add_relu() ? arg_usage_t::input
+                                        : arg_usage_t::unused;
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
 
         if (utils::one_of(arg, DNNL_ARG_MEAN, DNNL_ARG_VARIANCE)) {
@@ -165,11 +166,14 @@ struct batch_normalization_fwd_pd_t : public batch_normalization_pd_t {
             return arg_usage_t::unused;
         }
 
-        if (arg == DNNL_ARG_SCALE && use_scale()) return arg_usage_t::input;
-        if (arg == DNNL_ARG_SHIFT && use_shift()) return arg_usage_t::input;
+        if (arg == DNNL_ARG_SCALE)
+            return use_scale() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_SHIFT)
+            return use_shift() ? arg_usage_t::input : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_WORKSPACE && !types::is_zero_md(workspace_md()))
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return !types::is_zero_md(workspace_md()) ? arg_usage_t::output
+                                                      : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -230,7 +234,7 @@ struct batch_normalization_fwd_pd_t : public batch_normalization_pd_t {
 protected:
     memory_desc_t dst_md_;
 
-    batch_normalization_fwd_pd_t(const batch_normalization_desc_t *adesc,
+    batch_normalization_fwd_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const batch_normalization_fwd_pd_t *hint_fwd_pd)
         : batch_normalization_pd_t(adesc, attr, hint_fwd_pd)
@@ -247,30 +251,36 @@ protected:
                 weights_md()->data_type == data_type::f32);
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct batch_normalization_bwd_pd_t : public batch_normalization_pd_t {
-    typedef batch_normalization_bwd_pd_t base_class;
-    typedef batch_normalization_fwd_pd_t hint_class;
+    using base_class = batch_normalization_bwd_pd_t;
+    using hint_class = batch_normalization_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_MEAN, DNNL_ARG_VARIANCE,
                     DNNL_ARG_DIFF_DST))
             return arg_usage_t::input;
 
-        if (arg == DNNL_ARG_SCALE && use_scale()) return arg_usage_t::input;
-        if (arg == DNNL_ARG_SHIFT && use_shift()) return arg_usage_t::input;
+        if (arg == DNNL_ARG_SCALE)
+            return use_scale() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_SHIFT)
+            return use_shift() ? arg_usage_t::input : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_WORKSPACE && !types::is_zero_md(workspace_md()))
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return !types::is_zero_md(workspace_md()) ? arg_usage_t::input
+                                                      : arg_usage_t::unused;
 
         if (arg == DNNL_ARG_DIFF_SRC) return arg_usage_t::output;
-        if (arg == DNNL_ARG_DIFF_SRC_1 && fuse_norm_add_relu())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_DIFF_SRC_1)
+            return fuse_norm_add_relu() ? arg_usage_t::output
+                                        : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_DIFF_SCALE && use_scale())
-            return arg_usage_t::output;
-        if (arg == DNNL_ARG_DIFF_SHIFT && use_shift())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_DIFF_SCALE)
+            return use_scale() ? arg_usage_t::output : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_SHIFT)
+            return use_shift() ? arg_usage_t::output : arg_usage_t::unused;
         return primitive_desc_t::arg_usage(arg);
     }
 
@@ -341,7 +351,7 @@ protected:
     memory_desc_t diff_dst_md_;
     memory_desc_t diff_scaleshift_md_;
 
-    batch_normalization_bwd_pd_t(const batch_normalization_desc_t *adesc,
+    batch_normalization_bwd_pd_t(const op_desc_t *adesc,
             const primitive_attr_t *attr,
             const batch_normalization_fwd_pd_t *hint_fwd_pd)
         : batch_normalization_pd_t(adesc, attr, hint_fwd_pd)
@@ -366,6 +376,7 @@ protected:
                         diff_weights_md()->data_type));
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -81,10 +81,6 @@ struct softmax_pd_t : public primitive_desc_t {
                 dst_desc().dims + axis() + 1, ndims() - 1 - axis());
     }
 
-    dim_t outer_stride() const {
-        const memory_desc_wrapper dst_d(dst_desc());
-        return axis() > 0 ? dst_d.blocking_desc().strides[axis() - 1] : 1;
-    }
     dim_t axis_stride() const {
         const memory_desc_wrapper dst_d(dst_desc());
         return dst_d.blocking_desc().strides[axis()];
@@ -103,7 +99,10 @@ struct softmax_pd_t : public primitive_desc_t {
     }
 
     alg_kind_t alg_kind() const { return desc()->alg_kind; }
-    bool is_softmax() const { return alg_kind() == alg_kind::softmax_accurate; }
+    bool is_softmax() const {
+        return utils::one_of(alg_kind(), alg_kind::softmax_accurate,
+                alg_kind::softmax_accurate_inf_as_zero);
+    }
     bool is_logsoftmax() const { return alg_kind() == alg_kind::softmax_log; }
 
 protected:
@@ -112,10 +111,10 @@ protected:
 
     memory_desc_t dst_md_;
 
-    softmax_pd_t(const softmax_desc_t *adesc, const primitive_attr_t *attr,
+    softmax_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const softmax_fwd_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<softmax_desc_t>(adesc))
         , hint_fwd_pd_(hint_fwd_pd)
         , dst_md_(desc_.dst_desc) {}
 
@@ -123,17 +122,19 @@ private:
     const memory_desc_t &dst_desc() const { return dst_md_; }
 };
 
+// NOLINTBEGIN(google-default-arguments)
 struct softmax_fwd_pd_t : public softmax_pd_t {
-    typedef softmax_fwd_pd_t base_class;
-    typedef softmax_fwd_pd_t hint_class;
+    using base_class = softmax_fwd_pd_t;
+    using hint_class = softmax_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg == DNNL_ARG_SRC) return arg_usage_t::input;
 
         if (arg == DNNL_ARG_DST) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_WORKSPACE && (!types::is_zero_md(workspace_md())))
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return !types::is_zero_md(workspace_md()) ? arg_usage_t::output
+                                                      : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -166,7 +167,7 @@ struct softmax_fwd_pd_t : public softmax_pd_t {
 protected:
     memory_desc_t src_md_;
 
-    softmax_fwd_pd_t(const softmax_desc_t *adesc, const primitive_attr_t *attr,
+    softmax_fwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const softmax_fwd_pd_t *hint_fwd_pd)
         : softmax_pd_t(adesc, attr, hint_fwd_pd), src_md_(desc_.src_desc) {}
 
@@ -180,19 +181,28 @@ protected:
                 dst_md_, src_md_.format_desc.blocking);
     }
 
-    bool attr_scales_ok() const {
+    bool attr_scales_ok(const std::vector<int> &supported_args
+            = {DNNL_ARG_SRC, DNNL_ARG_DST}) const {
         const auto &scales = attr()->scales_;
-        bool ok = true;
-        for (const auto &e : scales.scales_) {
-            ok = ok && e.second.mask_ == 0;
+        bool ok = scales.has_default_values(supported_args);
+
+        for (const auto &arg : supported_args) {
+            if (scales.has_default_values(arg)) continue;
+
+            // TODO: disallow non-int8 scales?
+            // const data_type_t dt = arg_md(arg)->data_type;
+            // ok = ok && utils::one_of(dt, s8, u8);
+            ok = ok && scales.get_mask(arg) == 0;
         }
         return ok;
     }
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct softmax_bwd_pd_t : public softmax_pd_t {
-    typedef softmax_bwd_pd_t base_class;
-    typedef softmax_fwd_pd_t hint_class;
+    using base_class = softmax_bwd_pd_t;
+    using hint_class = softmax_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_DST, DNNL_ARG_DIFF_DST))
@@ -200,8 +210,9 @@ struct softmax_bwd_pd_t : public softmax_pd_t {
 
         if (arg == DNNL_ARG_DIFF_SRC) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_WORKSPACE && (!types::is_zero_md(workspace_md())))
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return !types::is_zero_md(workspace_md()) ? arg_usage_t::input
+                                                      : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -243,7 +254,7 @@ protected:
     memory_desc_t diff_src_md_;
     memory_desc_t diff_dst_md_;
 
-    softmax_bwd_pd_t(const softmax_desc_t *adesc, const primitive_attr_t *attr,
+    softmax_bwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const softmax_fwd_pd_t *hint_fwd_pd)
         : softmax_pd_t(adesc, attr, hint_fwd_pd)
         , diff_src_md_(desc_.diff_src_desc)
@@ -264,6 +275,7 @@ protected:
         return status::success;
     }
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

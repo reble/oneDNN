@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -71,11 +71,11 @@ struct jit_uni_i8i8_pooling_fwd_t : public primitive_t {
             VDISPATCH_POOLING(
                     memory_desc_matches_one_of_tag(*src_md(), nwc, nhwc, ndhwc)
                             != format_tag::undef,
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "src");
             VDISPATCH_POOLING(
                     memory_desc_matches_one_of_tag(*dst_md(), nwc, nhwc, ndhwc)
                             != format_tag::undef,
-                    VERBOSE_UNSUPPORTED_TAG);
+                    VERBOSE_UNSUPPORTED_TAG_S, "dst");
             VDISPATCH_POOLING(
                     attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_POSTOP);
@@ -92,7 +92,8 @@ struct jit_uni_i8i8_pooling_fwd_t : public primitive_t {
     };
 
     jit_uni_i8i8_pooling_fwd_t(const pd_t *apd);
-    ~jit_uni_i8i8_pooling_fwd_t();
+
+    ~jit_uni_i8i8_pooling_fwd_t() override;
 
     status_t init(engine_t *engine) override;
 

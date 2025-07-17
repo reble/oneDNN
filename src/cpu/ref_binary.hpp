@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -43,19 +43,28 @@ struct ref_binary_t : public primitive_t {
             using namespace data_type;
             using sm = primitive_attr_t::skip_mask_t;
 
+            const bool is_f64 = utils::one_of(f64, src_md(0)->data_type,
+                    src_md(1)->data_type, src_md(2)->data_type,
+                    dst_md()->data_type);
+            VDISPATCH_BINARY(!is_f64, VERBOSE_UNSUPPORTED_DT);
+
             VDISPATCH_BINARY(
                     platform::has_data_type_support(src_md(0)->data_type),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_BINARY(
                     platform::has_data_type_support(src_md(1)->data_type),
                     VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_BINARY(IMPLICATION(is_ternary_op(),
+                                     platform::has_data_type_support(
+                                             src_md(2)->data_type)),
+                    VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_BINARY(
                     platform::has_data_type_support(dst_md()->data_type),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_BINARY(set_default_params() == status::success,
                     VERBOSE_UNSUPPORTED_TAG);
-            VDISPATCH_BINARY(attr()->has_default_values(
-                                     sm::post_ops | sm::scales_runtime),
+            VDISPATCH_BINARY(
+                    attr()->has_default_values(sm::post_ops | sm::scales),
                     VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_BINARY(IMPLICATION(!attr()->scales_.has_default_values(),
                                      check_scales_mask()),

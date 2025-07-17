@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2021 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,10 +24,10 @@ namespace impl {
 namespace cpu {
 namespace x64 {
 
-class jit_avx512_core_amx_copy_kern : public jit_generator {
+class jit_avx512_core_amx_copy_kern_t : public jit_generator_t {
 public:
-    jit_avx512_core_amx_copy_kern(bool is_a, bool is_trans, int isize);
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_amx_copy_kern);
+    jit_avx512_core_amx_copy_kern_t(bool is_a, bool is_trans, int isize);
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_amx_copy_kern_t);
 
 protected:
     bool is_a_;
@@ -66,7 +66,7 @@ protected:
     void copy_n(int unroll_n, Xbyak::Label &epilogue);
     void copy_ns(int unroll_n, Xbyak::Label &epilogue);
 
-    void generate() override ATTRIBUTE_OPTIMIZE;
+    void generate() override;
 
 private:
     static const int offset_a_ = 0, offset_b_ = 0;

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -47,8 +47,9 @@ std::unique_ptr<prb_t> get_first_conv_prb(const prb_t *prb) {
     }
 
     return std::unique_ptr<prb_t>(new prb_t((desc_t)*prb, prb->dir, prb->dt,
-            prb->stag, prb->wtag, tag::any, prb->alg, attr, prb->ctx_init,
-            prb->ctx_exe, prb->mb));
+            prb->bia_dt(), prb->stag, prb->wtag, tag::any,
+            {vdims_t(STRIDES_SIZE)}, prb->alg, prb->mb, attr, prb->ctx_init,
+            prb->ctx_exe, prb->impl_filter));
 }
 
 void get_fused_conv_dst_dims(const int ndims,
@@ -131,9 +132,10 @@ std::unique_ptr<prb_t> get_fused_conv_prb(const prb_t *prb) {
     cd.ndims = prb->ndims;
     cd.init_pad_r();
 
-    return std::unique_ptr<prb_t>(new prb_t(cd, prb->dir, dw_dt, tag::any,
-            tag::any, prb->dtag, alg_t::DIRECT, fusion_attr, prb->ctx_init,
-            prb->ctx_exe, prb->mb));
+    return std::unique_ptr<prb_t>(new prb_t(cd, prb->dir, dw_dt,
+            prb->get_dt(BIA), tag::any, tag::any, prb->dtag,
+            {vdims_t(STRIDES_SIZE)}, alg_t::DIRECT, prb->mb, fusion_attr,
+            prb->ctx_init, prb->ctx_exe, prb->impl_filter));
 }
 
 int init_ref_memory_args(dnn_mem_map_t &mem_map0, dnn_mem_map_t &mem_map1,
@@ -152,7 +154,8 @@ int init_ref_memory_args(dnn_mem_map_t &mem_map0, dnn_mem_map_t &mem_map1,
         const int exec_arg = entry.first;
         auto &mem = entry.second; // `mem` is modified by filler (reorder).
 
-        dnn_mem_t ref_mem(mem.md_, dnnl_f32, tag::abx, ref_engine);
+        dnn_mem_t ref_mem(
+                mem.md_, dnnl_f32, tag::abx, ref_engine, /* prefill = */ false);
 
         switch (exec_arg) {
             case DNNL_ARG_SRC:
@@ -252,7 +255,8 @@ int init_ref_memory_args(dnn_mem_map_t &mem_map0, dnn_mem_map_t &mem_map1,
         int wei_scale_arg = DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS;
         int dw_wei_scale_arg = DNNL_ARG_ATTR_POST_OP_DW | wei_scale_arg;
         const auto &wei_scale_md = mem_map1.at(wei_scale_arg).md_;
-        mem_map[dw_wei_scale_arg] = dnn_mem_t(wei_scale_md, get_test_engine());
+        mem_map[dw_wei_scale_arg] = dnn_mem_t(
+                wei_scale_md, get_test_engine(), /* prefill = */ true);
         SAFE(fill_scales(prb1->attr, DNNL_ARG_WEIGHTS,
                      mem_map.at(dw_wei_scale_arg), mem_map1.at(wei_scale_arg)),
                 WARN);
@@ -262,7 +266,8 @@ int init_ref_memory_args(dnn_mem_map_t &mem_map0, dnn_mem_map_t &mem_map1,
         int dst_scale_arg = DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST;
         int dw_dst_scale_arg = DNNL_ARG_ATTR_POST_OP_DW | dst_scale_arg;
         const auto &dst_scale_md = mem_map1.at(dst_scale_arg).md_;
-        mem_map[dw_dst_scale_arg] = dnn_mem_t(dst_scale_md, get_test_engine());
+        mem_map[dw_dst_scale_arg] = dnn_mem_t(
+                dst_scale_md, get_test_engine(), /* prefill = */ true);
         SAFE(fill_scales(prb1->attr, DNNL_ARG_DST, mem_map.at(dw_dst_scale_arg),
                      mem_map1.at(dst_scale_arg)),
                 WARN);
@@ -304,8 +309,7 @@ int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
     return OK;
 }
 
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res) {
     SAFE(check_caches(v_prim[0], prb, res), WARN);
 

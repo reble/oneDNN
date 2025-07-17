@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -49,8 +49,7 @@ status_t cvt_primitive_args(const primitive_desc_t *pd, int nargs,
             case primitive_desc_t::arg_usage_t::input:
                 args[arg] = {mem, true};
                 n_inputs++;
-                extra_inputs += (arg == DNNL_ARG_ATTR_OUTPUT_SCALES)
-                        || (arg & DNNL_ARG_ATTR_ZERO_POINTS)
+                extra_inputs += (arg & DNNL_ARG_ATTR_ZERO_POINTS)
                         || (arg & DNNL_ARG_ATTR_SCALES)
                         // 1x1 + dw conv fusion
                         || (arg
@@ -62,12 +61,16 @@ status_t cvt_primitive_args(const primitive_desc_t *pd, int nargs,
                                         | DNNL_ARG_WEIGHTS))
                         || (arg
                                 == (DNNL_ARG_ATTR_POST_OP_DW
-                                        | DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST));
+                                        | DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST))
+                        || (arg == DNNL_ARG_ATTR_DROPOUT_PROBABILITY)
+                        || (arg == DNNL_ARG_ATTR_DROPOUT_SEED)
+                        || (arg == DNNL_ARG_ATTR_ROUNDING_SEED);
                 break;
             case primitive_desc_t::arg_usage_t::output:
                 args[arg] = {mem, false};
                 n_outputs++;
-                extra_outputs += (arg == DNNL_ARG_SCRATCHPAD);
+                extra_outputs += (arg == DNNL_ARG_SCRATCHPAD)
+                        || (arg == DNNL_ARG_ATTR_DROPOUT_MASK);
                 break;
             case primitive_desc_t::arg_usage_t::unused:
                 VINFO(primitive, exec, check, primitive,
@@ -139,10 +142,12 @@ void *exec_ctx_t::host_ptr(
 void *exec_ctx_t::host_ptr(const memory_storage_t *mem_storage) const {
     if (!mem_storage || mem_storage->is_null()) return nullptr;
 
-    void *handle = mem_storage->data_handle();
+    void *handle = mem_storage->root_storage()->data_handle();
     void *base_ptr = nullptr;
     if (memory_mapping_.count(handle) > 0) {
         base_ptr = memory_mapping_.at(handle);
+        base_ptr = reinterpret_cast<char *>(base_ptr)
+                + mem_storage->base_offset();
     } else {
         assert(mem_storage->is_host_accessible());
         base_ptr = handle;

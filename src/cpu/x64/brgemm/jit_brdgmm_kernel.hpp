@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef CPU_X64_JIT_BRDGMM_KERNEL_HPP
-#define CPU_X64_JIT_BRDGMM_KERNEL_HPP
+#ifndef CPU_X64_BRGEMM_JIT_BRDGMM_KERNEL_HPP
+#define CPU_X64_BRGEMM_JIT_BRDGMM_KERNEL_HPP
 
 #include "common/c_types_map.hpp"
 #include "common/nstl.hpp"
@@ -33,21 +33,21 @@ namespace impl {
 namespace cpu {
 namespace x64 {
 
-template <cpu_isa_t isa, typename Wmm>
-struct jit_brdgmm_kernel_base_t : public jit_generator {
-    jit_brdgmm_kernel_base_t(const brgemm_t &abrd);
+template <typename Wmm>
+struct jit_brdgmm_kernel_base_t : public jit_base_brgemm_kernel_t {
+    jit_brdgmm_kernel_base_t(const brgemm_desc_t &abrd);
 
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_brdgmm_kernel_base_t)
 
-    brgemm_t brg;
+    brgemm_desc_t brg;
 
-    static bool is_fast_vnni_int8(const brgemm_t &brg) {
+    static bool is_fast_vnni_int8(const brgemm_desc_t &brg) {
         return brg.is_dgmm && brg.is_int8 && brg.isa_impl == avx512_core_vnni
                 && brg.ldb_tail /*n_vlen_tail*/ == 0;
     }
 
     struct vmm_allocator_helper_t {
-        vmm_allocator_helper_t(const brgemm_t &brg)
+        vmm_allocator_helper_t(const brgemm_desc_t &brg)
             : aux_vmm_count_(0)
             , vmm_tmp_count_(0)
             , compute_vmm_base_idx_(-1)
@@ -88,15 +88,15 @@ struct jit_brdgmm_kernel_base_t : public jit_generator {
 
             // assign compute vmms
             idx_vmm_a_ = compute_vmm_base_idx_;
-            const int max_m = brg.bd_block2 + brg.brgattr.bs_group - 1;
+            const int max_m = brg.bd_block2 + brg.bs_group - 1;
             const int max_n = brg.ld_block2;
             idx_vmm_b_
                     = vmm_a_idx(brg, max_m - 1, max_n - 1) + !is_fma_embd(brg);
         }
-        int vnni_substep(const brgemm_t &brg) const {
+        int vnni_substep(const brgemm_desc_t &brg) const {
             return brg.isa_impl == avx2_vnni_2 && brg.is_xf16() ? 2 : 1;
         }
-        int vmm_a_idx(const brgemm_t &brg, int m, int n) const {
+        int vmm_a_idx(const brgemm_desc_t &brg, int m, int n) const {
             const auto idx_offset = grouped_bs(brg)
                     ? (m * brg.ld_block2 + n) * vnni_substep(brg)
                     : 0;
@@ -150,15 +150,17 @@ struct jit_brdgmm_kernel_base_t : public jit_generator {
         int idx_vmm_s8s8_comp_;
     };
 
-    static int get_aux_vmm_count(const brgemm_t &brg) {
+    static int get_aux_vmm_count(const brgemm_desc_t &brg) {
         auto vmm_alloc = vmm_allocator_helper_t(brg);
         return vmm_alloc.get_aux_vmm_count();
     }
 
-    static int get_compute_vmm_count(const brgemm_t &brg) {
+    static int get_compute_vmm_count(const brgemm_desc_t &brg) {
         auto vmm_alloc = vmm_allocator_helper_t(brg);
         return vmm_alloc.get_compute_vmm_count();
     }
+
+    const brgemm_desc_t &get_brg() const override { return brg; }
 
 private:
     // note: this kernel doesn't yet support TMM's. We differentiate Wmm and Vmm
@@ -166,11 +168,8 @@ private:
     using Vmm =
             typename utils::conditional<std::is_same<Wmm, Xbyak::Tmm>::value,
                     Xbyak::Zmm, Wmm>::type;
-    using Vmm_low_t = typename vreg_traits<Vmm>::Vmm_lower_t;
-    static constexpr cpu_isa_t po_isa_t = utils::map(isa, avx512_core, avx2,
-            avx2, avx2_vnni, avx2, avx2_vnni_2, avx2_vnni_2, avx512_core_fp16,
-            avx512_core_fp16);
-    using po_injector_t = injector::jit_uni_postops_injector_t<po_isa_t, Vmm>;
+    using Vmm_low_t = typename vreg_traits_t<Vmm>::Vmm_lower_t;
+    using po_injector_t = injector::jit_uni_postops_injector_base_t<Vmm>;
     std::unique_ptr<po_injector_t> postops_injector_;
     std::unique_ptr<bf16_emulation_t> bf16_emu_;
 
@@ -233,6 +232,7 @@ private:
     const int simd_w_;
     const int max_vmms_;
     const bool compute_dst_zp_, compute_src_zp_;
+    const bool is_src_zp_bcast_;
     const bool compute_compensation_; // code-path for either s8s8 or src_zp
     const bool has_vpad_; // vertical padding w.r.t. M dimension
     const bool has_bpad_; // batch pad is computed for the overlap between the
@@ -269,18 +269,23 @@ private:
     inline int n_block2_tail() { return brg.ldb2_tail; }
     int tail_length() { return n_block1_tail() % simd_w_; }
 
-    inline int bs_group() const { return brg.brgattr.bs_group; }
-    static bool grouped_bs(const brgemm_t &brg) {
-        return brg.brgattr.bs_group > 1;
+    inline int bs_group() const { return brg.bs_group; }
+    static bool grouped_bs(const brgemm_desc_t &brg) {
+        return brg.bs_group > 1;
     }
     inline bool grouped_bs() const { return grouped_bs(brg); }
-    static bool is_fma_embd(const brgemm_t &brg) {
+    static bool is_fma_embd(const brgemm_desc_t &brg) {
         return grouped_bs(brg)
                 ? false
                 : brg.is_f32 && is_superset(brg.isa_impl, avx512_core);
     }
     bool is_fma_embd() { return is_fma_embd(brg); }
     bool is_fast_vnni_int8() { return is_fast_vnni_int8(brg); }
+    bool is_slow_bf16_vnni() {
+        // On avx512_core_amx machines, the bf16 vnni is found to be slower.
+        // TODO: Check the above limitations on new cpus
+        return brg.is_bf16 && mayiuse(avx512_core_amx);
+    }
 
     bool req_vmm_reload() { return brg.is_bf16_emu; }
     bool assign_data_vmm_once() { return !req_vmm_reload(); }
@@ -339,7 +344,8 @@ private:
     void load_b(
             Vmm vmmb, int n_i, int v_i, bool has_n_tail, bool wei_zp = false);
     void comp_dot_product(compute_pad_kernel_t kernel_type, Vmm vmm_acc,
-            Vmm vmmb); // int8 compensation dot_product (zp and s8s8)
+            Vmm vmmb, int n,
+            bool is_tail_block); // int8 compensation dot_product (zp and s8s8)
     void pad_comp_kernel(compute_pad_kernel_t kernel_type, int m_blocks,
             int n_blocks, int padding, const Xbyak::Reg64 reg_pad,
             const std::function<int(int)> &get_mi, bool has_tail = false);
@@ -358,6 +364,7 @@ private:
     void apply_post_ops(int m_blocks, int n_blocks, bool has_n_tail);
     void maybe_transpose_interleaved_vnni_to_plain(
             int m_blocks, int n_blocks, bool has_n_tail);
+    void load_src_zp();
     void compute_int8_compensation(int m_blocks, int n_blocks, bool has_n_tail);
     void store_accumulators(int m_blocks, int n_blocks, bool has_n_tail);
     void store_accumulators_without_post_ops(

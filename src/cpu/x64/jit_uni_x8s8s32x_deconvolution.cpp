@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,7 +25,7 @@
 #include "cpu/x64/jit_uni_deconv_zp_pad_str_kernel.hpp"
 #include "cpu/x64/jit_uni_x8s8s32x_deconvolution.hpp"
 
-#define GET_OFF(field) offsetof(jit_deconv_call_s, field)
+#define GET_OFF(field) offsetof(jit_deconv_args_t, field)
 
 namespace dnnl {
 namespace impl {
@@ -44,7 +44,7 @@ using namespace nstl;
                          : (d).blk_off(__VA_ARGS__))
 
 template <cpu_isa_t isa>
-status_t jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(
+status_t jit_uni_x8s8s32x_deconv_fwd_kernel_t<isa>::init_conf(
         jit_conv_conf_t &jcp, const deconvolution_desc_t &cd,
         memory_desc_t &src_md, memory_desc_t &weights_md, memory_desc_t &dst_md,
         const bool with_bias, memory_desc_t &bias_md, primitive_attr_t &attr,
@@ -101,7 +101,7 @@ status_t jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(
             zero_points_valid(&attr), VERBOSE_UNSUPPORTED_ZP_CFG);
     jcp.src_zero_point = !attr.zero_points_.has_default_values(DNNL_ARG_SRC);
     jcp.dst_zero_point = !attr.zero_points_.has_default_values(DNNL_ARG_DST);
-    jcp.zp_src_is_common = attr.zero_points_.common(DNNL_ARG_SRC);
+    jcp.zp_src_is_common = attr.zero_points_.get_mask(DNNL_ARG_SRC) == 0;
 
     format_tag_t dat_tag = utils::pick(
             ndims - 3, format_tag::nwc, format_tag::nhwc, format_tag::ndhwc);
@@ -112,7 +112,8 @@ status_t jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(
     } else {
         jcp.src_tag = src_d.matches_one_of_tag(dat_tag);
     }
-    VDISPATCH_DECONVOLUTION_IC(jcp.src_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_DECONVOLUTION_IC(
+            jcp.src_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG_S, "src");
 
     if (dst_d.format_kind() == format_kind::any) {
         CHECK(memory_desc_init_by_tag(dst_md, dat_tag));
@@ -120,7 +121,8 @@ status_t jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(
     } else {
         jcp.dst_tag = dst_d.matches_one_of_tag(dat_tag);
     }
-    VDISPATCH_DECONVOLUTION_IC(jcp.dst_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_DECONVOLUTION_IC(
+            jcp.dst_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG_S, "dst");
 
     auto set_or_check_wei_format = [&]() {
         using namespace format_tag;
@@ -220,11 +222,11 @@ status_t jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(
         }
         VDISPATCH_DECONVOLUTION_IC(
                 !(jcp.ic % jcp.ic_block != 0 || jcp.oc % jcp.oc_block != 0),
-                VERBOSE_BLOCKING_FAIL);
+                VERBOSE_BLOCKING_FAIL, "bad blocking dimensions");
     }
 
     VDISPATCH_DECONVOLUTION_IC(
-            set_or_check_wei_format(), VERBOSE_UNSUPPORTED_TAG);
+            set_or_check_wei_format(), VERBOSE_UNSUPPORTED_TAG_S, "weights");
 
     jcp.dilate_d = is_3d ? cd.dilates[0] : 0;
     jcp.dilate_h = is_1d ? 0 : cd.dilates[ndims - 4];
@@ -249,8 +251,8 @@ status_t jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(
     const bool kernel_outside_src = false || ext_kw <= jcp.l_pad
             || ext_kw <= jcp.r_pad || ext_kh <= jcp.t_pad || ext_kh <= jcp.b_pad
             || ext_kd <= jcp.f_pad || ext_kd <= jcp.back_pad;
-    VDISPATCH_DECONVOLUTION_IC(!kernel_outside_src, VERBOSE_PADDING_ERROR,
-            "weight and src size mismatch");
+    VDISPATCH_DECONVOLUTION_IC(!kernel_outside_src,
+            VERBOSE_UNSUPPORTED_PAD_FEATURE, "weight and src size mismatch");
 
     CHECK(attr.set_default_formats(&dst_md));
     VDISPATCH_DECONVOLUTION_IC(
@@ -270,7 +272,7 @@ status_t jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(
 
     const auto &wei_scales = attr.scales_.get(DNNL_ARG_WEIGHTS);
     const auto &dst_scales = attr.scales_.get(DNNL_ARG_DST);
-    jcp.is_oc_scale = wei_scales.mask_ != 0;
+    jcp.is_oc_scale = wei_scales.get_mask() > 0;
     jcp.dst_scale = !dst_scales.has_default_values();
 
     jcp.post_ops = p;
@@ -350,7 +352,7 @@ status_t jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(
 }
 
 template <cpu_isa_t isa>
-jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::jit_uni_x8s8s32x_deconv_fwd_kernel(
+jit_uni_x8s8s32x_deconv_fwd_kernel_t<isa>::jit_uni_x8s8s32x_deconv_fwd_kernel_t(
         const jit_conv_conf_t &ajcp, const primitive_attr_t &attr,
         const memory_desc_wrapper &dst_d)
     : kernel_(nullptr) {
@@ -369,7 +371,7 @@ jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::jit_uni_x8s8s32x_deconv_fwd_kernel(
             break;
         case 4:
             kernel_ = utils::make_unique<
-                    _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Xbyak::Xmm>>(
+                    jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Xbyak::Xmm>>(
                     ajcp, attr, dst_d);
             return;
         default: assert(!"invalid channel blocking");
@@ -377,14 +379,15 @@ jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::jit_uni_x8s8s32x_deconv_fwd_kernel(
 }
 
 template <cpu_isa_t isa>
-jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::~jit_uni_x8s8s32x_deconv_fwd_kernel()
+jit_uni_x8s8s32x_deconv_fwd_kernel_t<
+        isa>::~jit_uni_x8s8s32x_deconv_fwd_kernel_t()
         = default;
 
 template <cpu_isa_t isa>
-void jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_scratchpad(
+void jit_uni_x8s8s32x_deconv_fwd_kernel_t<isa>::init_scratchpad(
         memory_tracking::registrar_t &scratchpad, const jit_conv_conf_t &jcp,
         const primitive_attr_t &attr) {
-    const int mask = attr.scales_.get(DNNL_ARG_WEIGHTS).mask_;
+    const int mask = attr.scales_.get_mask(DNNL_ARG_WEIGHTS);
     const dim_t scales_count
             = mask == 0 ? 1 : static_cast<dim_t>(jcp.oc) * jcp.ngroups;
     dim_t count = nstl::max<dim_t>(scales_count, 8);
@@ -399,8 +402,9 @@ void jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_scratchpad(
 }
 
 template <cpu_isa_t isa>
-bool jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::post_ops_ok(jit_conv_conf_t &jcp,
-        const memory_desc_wrapper &dst_d, const primitive_attr_t &attr) {
+bool jit_uni_x8s8s32x_deconv_fwd_kernel_t<isa>::post_ops_ok(
+        jit_conv_conf_t &jcp, const memory_desc_wrapper &dst_d,
+        const primitive_attr_t &attr) {
     using namespace injector;
 
     return injector::post_ops_ok(post_ops_ok_args_t(isa, {sum, eltwise, binary},
@@ -412,10 +416,11 @@ bool jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::post_ops_ok(jit_conv_conf_t &jcp,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-_jit_uni_x8s8s32x_deconv_fwd_kernel<isa,
-        Vmm>::_jit_uni_x8s8s32x_deconv_fwd_kernel(const jit_conv_conf_t &ajcp,
+jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa,
+        Vmm>::jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t(const jit_conv_conf_t
+                                                               &ajcp,
         const primitive_attr_t &attr, const memory_desc_wrapper &dst_d)
-    : jit_generator(jit_name(), nullptr, MAX_CODE_SIZE, true, isa)
+    : jit_generator_t(jit_name(), isa)
     , jcp_(ajcp)
     , postops_injector_(nullptr)
     , ker_max_regs_(jcp_.has_vnni ? 14 : 12) {
@@ -441,12 +446,12 @@ _jit_uni_x8s8s32x_deconv_fwd_kernel<isa,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-_jit_uni_x8s8s32x_deconv_fwd_kernel<isa,
-        Vmm>::~_jit_uni_x8s8s32x_deconv_fwd_kernel()
+jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa,
+        Vmm>::~jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t()
         = default;
 
 template <cpu_isa_t isa, typename Vmm>
-Vmm _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::vmm_out(
+Vmm jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::vmm_out(
         int i_ur, int i_oc) const {
     const int idx = i_ur * jcp_.nb_oc_blocking + i_oc;
     assert(idx < ker_max_regs_);
@@ -455,7 +460,7 @@ Vmm _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::vmm_out(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-Vmm _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::vmm_inp(
+Vmm jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::vmm_inp(
         int i_ic, int nb_x_blocking) const {
     const int idx = i_ic + nb_x_blocking * jcp_.ur_w;
     assert(idx < ker_max_regs_);
@@ -463,7 +468,7 @@ Vmm _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::vmm_inp(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-int _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::get_ow_start(
+int jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::get_ow_start(
         int ki, int l_overflow) const noexcept {
     int res = (jcp_.ow - 1 + jcp_.r_pad) % jcp_.stride_w
             + l_overflow * jcp_.stride_w
@@ -474,7 +479,7 @@ int _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::get_ow_start(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-int _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::get_ow_end(
+int jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::get_ow_end(
         int ur_w, int ki, int r_overflow) const noexcept {
     if (utils::one_of(ur_w, jcp_.ow, jcp_.ur_w_tail))
         ur_w += nstl::min(0, jcp_.r_pad); // remove negative padding
@@ -486,20 +491,20 @@ int _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::get_ow_end(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-int _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::get_blocking_size()
+int jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::get_blocking_size()
         const noexcept {
     return jcp_.is_depthwise ? jcp_.ch_block : jcp_.oc_block;
 }
 
 template <cpu_isa_t isa, typename Vmm>
-int _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::get_tail_size()
+int jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::get_tail_size()
         const noexcept {
     return jcp_.is_depthwise ? jcp_.ngroups % jcp_.ch_block
                              : jcp_.oc_without_padding % jcp_.oc_block;
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::compute(
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::compute(
         const Vmm vreg_acc, const Vmm vreg_wei, const Vmm vreg_src) {
 
     if (jcp_.has_vnni) {
@@ -516,7 +521,7 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::compute(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-std::function<Vmm()> _jit_uni_x8s8s32x_deconv_fwd_kernel<isa,
+std::function<Vmm()> jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa,
         Vmm>::prepare_round_robin_vmm_inp_generator(int ur_w) const noexcept {
 
     const int start_vmm_idx = vmm_inp(ur_w - 1, jcp_.nb_oc_blocking).getIdx();
@@ -533,8 +538,9 @@ std::function<Vmm()> _jit_uni_x8s8s32x_deconv_fwd_kernel<isa,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::apply_zp_src_pad_str_comp(
-        int ur_w, int l_overflow, int r_overflow, bool h_padded) {
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa,
+        Vmm>::apply_zp_src_pad_str_comp(int ur_w, int l_overflow,
+        int r_overflow, bool h_padded) {
     Xbyak::Label end_zp_pad, no_tail;
 
     // apply once per icb loop, zp src stride paddding compensation calculate as
@@ -563,9 +569,9 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::apply_zp_src_pad_str_comp(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::append_zp_src_pad_str_comp(
-        int ur_w, int l_overflow, int r_overflow, bool h_padded,
-        bool last_oc_block) {
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa,
+        Vmm>::append_zp_src_pad_str_comp(int ur_w, int l_overflow,
+        int r_overflow, bool h_padded, bool last_oc_block) {
 
     const auto &reg_zp_src_pad_comp = reg_scratch_;
     const auto get_next_comp_vmm = prepare_round_robin_vmm_inp_generator(ur_w);
@@ -656,7 +662,7 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::append_zp_src_pad_str_comp(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::compute_ker(int ur_w,
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::compute_ker(int ur_w,
         int l_overflow, int r_overflow, ker_block_t last_ic_block_flag,
         bool h_padded) {
 
@@ -778,7 +784,7 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::compute_ker(int ur_w,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::kh_loop(int ur_w,
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::kh_loop(int ur_w,
         int l_overflow, int r_overflow, ker_block_t last_ic_block_flag) {
 
     const bool signed_input_or_src_zp
@@ -976,7 +982,8 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::kh_loop(int ur_w,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::prepare_output(int ur_w) {
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::prepare_output(
+        int ur_w) {
     for (int ocb = 0; ocb < jcp_.nb_oc_blocking; ocb++) {
         for (int ur = 0; ur < ur_w; ur++) {
             const Vmm vmm = vmm_out(ur, ocb);
@@ -992,15 +999,16 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::prepare_output(int ur_w) {
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::cvt2ps(data_type_t type_in,
-        const Vmm vmm_in, const Reg64 reg, int offset, int load_size) {
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::cvt2ps(
+        data_type_t type_in, const Vmm vmm_in, const Reg64 reg, int offset,
+        int load_size) {
 
     load_data(type_in, vmm_in, reg, offset, load_size);
     if (type_in != data_type::f32) uni_vcvtdq2ps(vmm_in, vmm_in);
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::apply_postops(int ur_w,
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::apply_postops(int ur_w,
         bool last_oc_block, const float *p_sum_scale, const int32_t *p_sum_zp) {
     const auto sum_injector = [&]() {
         if (p_sum_scale) { // post_op: sum
@@ -1061,7 +1069,7 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::apply_postops(int ur_w,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::store_output(
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::store_output(
         int ur_w, bool last_oc_block) {
     mov(reg_bias_, ptr[param1_ + GET_OFF(bias)]);
     mov(reg_ptr_scales_, ptr[param1_ + GET_OFF(scales)]);
@@ -1220,7 +1228,7 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::store_output(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::icb_loop(
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::icb_loop(
         int ur_w, int l_overflow, int r_overflow, bool is_last_sp_block) {
 
     const int shift_src_icb = jcp_.typesize_in * jcp_.ic_block;
@@ -1300,7 +1308,7 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::icb_loop(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::generate() {
+void jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<isa, Vmm>::generate() {
     preamble();
 
     if (zp::should_calculate_deconv_zp_src_pad_str_comp(jcp_))
@@ -1375,7 +1383,8 @@ void _jit_uni_x8s8s32x_deconv_fwd_kernel<isa, Vmm>::generate() {
 
     postamble();
 
-    if (jcp_.with_eltwise) postops_injector_->prepare_table();
+    if (jcp_.with_eltwise)
+        postops_injector_->prepare_table(/* generate = */ true);
 }
 
 template <cpu_isa_t isa>
@@ -1411,17 +1420,20 @@ status_t jit_uni_x8s8s32x_deconvolution_fwd_t<isa>::pd_t::init(
     VDISPATCH_DECONVOLUTION(
             desc()->accum_data_type == s32, VERBOSE_UNSUPPORTED_DT);
     VDISPATCH_DECONVOLUTION(
-            attr()->has_default_values(skip_mask_t::scales_runtime
-                    | skip_mask_t::post_ops | skip_mask_t::zero_points_runtime),
+            attr()->has_default_values(skip_mask_t::scales
+                    | skip_mask_t::post_ops | skip_mask_t::zero_points),
             VERBOSE_UNSUPPORTED_ATTR);
     VDISPATCH_DECONVOLUTION(attr_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
+    VDISPATCH_DECONVOLUTION(impl::is_dense_format_kind({src_md(0),
+                                    weights_md(0), weights_md(1), dst_md(0)}),
+            VERBOSE_UNSUPPORTED_SPARSE_CFG);
 
-    CHECK(jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_conf(jcp_, *desc(),
+    CHECK(jit_uni_x8s8s32x_deconv_fwd_kernel_t<isa>::init_conf(jcp_, *desc(),
             src_md_, weights_md_, dst_md_, with_bias(), bias_md_, attr_,
             dnnl_get_max_threads()));
 
     auto scratchpad = scratchpad_registry().registrar();
-    jit_uni_x8s8s32x_deconv_fwd_kernel<isa>::init_scratchpad(
+    jit_uni_x8s8s32x_deconv_fwd_kernel_t<isa>::init_scratchpad(
             scratchpad, jcp_, *attr());
 
     return status::success;
@@ -1430,7 +1442,7 @@ status_t jit_uni_x8s8s32x_deconvolution_fwd_t<isa>::pd_t::init(
 template <cpu_isa_t isa>
 status_t jit_uni_x8s8s32x_deconvolution_fwd_t<isa>::init(engine_t *engine) {
     CHECK(safe_ptr_assign(kernel_,
-            new jit_uni_x8s8s32x_deconv_fwd_kernel<isa>(pd()->jcp_,
+            new jit_uni_x8s8s32x_deconv_fwd_kernel_t<isa>(pd()->jcp_,
                     *pd()->attr(), memory_desc_wrapper(pd()->dst_md()))));
 
     if (zp::should_calculate_deconv_zp_src_pad_str_comp(pd()->jcp_)) {
@@ -1448,15 +1460,18 @@ const float *jit_uni_x8s8s32x_deconvolution_fwd_t<isa>::adjust_oscales(
         const memory_tracking::grantor_t &scratchpad, const float *src_scales,
         const float *wei_scales) const {
     auto loc_scales = scratchpad.template get<float>(key_conv_adjusted_scales);
-    int wei_mask = pd()->attr()->scales_.get(DNNL_ARG_WEIGHTS).mask_;
+    const bool has_wei_scales
+            = !pd()->attr()->scales_.has_default_values(DNNL_ARG_WEIGHTS);
+    int wei_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     float factor = (pd()->jcp_.signed_input && (!pd()->jcp_.has_vnni))
             ? 1.f / pd()->jcp_.wei_adj_scale
             : 1.0f;
-    if (wei_mask == 0) {
-        utils::array_set(loc_scales, src_scales[0] * wei_scales[0] * factor, 8);
-    } else {
+    if (has_wei_scales && wei_mask > 0) {
         for (dim_t c = 0; c < pd()->OC(); c++)
             loc_scales[c] = src_scales[0] * wei_scales[c] * factor;
+    } else {
+        utils::array_set(loc_scales, src_scales[0] * wei_scales[0] * factor,
+                /* WHY: pd()->jcp_.simd_w = 0!!! */ 8);
     }
     return loc_scales;
 }
@@ -1531,7 +1546,7 @@ status_t jit_uni_x8s8s32x_deconvolution_fwd_t<isa>::execute_forward_1d(
         const int work_amount = jcp.mb * nb_groups * oc_chunks;
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_deconv_call_s();
+        auto p = jit_deconv_args_t();
 
         int n {0}, g {0}, occ {0};
         if (jcp.loop_order == loop_ngc)
@@ -1642,7 +1657,7 @@ status_t jit_uni_x8s8s32x_deconvolution_fwd_t<isa>::execute_forward_2d(
         const int work_amount = jcp.mb * nb_groups * oc_chunks * jcp.oh;
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_deconv_call_s();
+        auto p = jit_deconv_args_t();
 
         /*loop order = cgn*/
         int n {0}, g {0}, occ {0}, oh_s {0};
@@ -1817,7 +1832,7 @@ status_t jit_uni_x8s8s32x_deconvolution_fwd_t<isa>::execute_forward_3d(
         int work_amount = jcp.mb * nb_groups * oc_chunks * jcp.od * jcp.oh;
         balance211(work_amount, nthr, ithr, start, end);
 
-        auto p = jit_deconv_call_s();
+        auto p = jit_deconv_args_t();
 
         /*loop order = cgn*/
         int n {0}, g {0}, occ {0}, od_s {0}, oh_s {0};
@@ -1988,11 +2003,11 @@ status_t jit_uni_x8s8s32x_deconvolution_fwd_t<isa>::execute_forward_3d(
 using namespace data_type;
 template struct jit_uni_x8s8s32x_deconvolution_fwd_t<avx2>;
 template struct jit_uni_x8s8s32x_deconvolution_fwd_t<sse41>;
-template struct jit_uni_x8s8s32x_deconv_fwd_kernel<avx2>;
-template struct jit_uni_x8s8s32x_deconv_fwd_kernel<sse41>;
-template struct _jit_uni_x8s8s32x_deconv_fwd_kernel<avx2, Xbyak::Ymm>;
-template struct _jit_uni_x8s8s32x_deconv_fwd_kernel<avx2, Xbyak::Xmm>;
-template struct _jit_uni_x8s8s32x_deconv_fwd_kernel<sse41, Xbyak::Xmm>;
+template struct jit_uni_x8s8s32x_deconv_fwd_kernel_t<avx2>;
+template struct jit_uni_x8s8s32x_deconv_fwd_kernel_t<sse41>;
+template struct jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<avx2, Xbyak::Ymm>;
+template struct jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<avx2, Xbyak::Xmm>;
+template struct jit_uni_x8s8s32x_deconv_fwd_kernel_vmm_t<sse41, Xbyak::Xmm>;
 } // namespace x64
 } // namespace cpu
 } // namespace impl

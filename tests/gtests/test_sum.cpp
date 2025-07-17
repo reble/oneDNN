@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,6 +37,8 @@ protected:
 };
 
 TEST_F(iface_sum_test_t, SumTestDstDataTypeCompliance) {
+    SKIP_IF_HIP(true, "Sum operator is not supported by HIP");
+
     using dt = memory::data_type;
 
     const dt src_dt = dt::s8;
@@ -48,6 +50,7 @@ TEST_F(iface_sum_test_t, SumTestDstDataTypeCompliance) {
     for (dt dst_dt : {dt::undef, dt::s8, dt::s32, dt::f32}) {
         sum::primitive_desc sum_pd;
         SKIP_FOR_LOOP_CUDA(dst_dt == dt::s32, "Unsupported data_type");
+        SKIP_FOR_LOOP_GENERIC(dst_dt == dt::s32, "Unsupported data_type");
         if (dst_dt != dt::undef) {
             memory::desc dst_md(shape, dst_dt, dst_tag);
             sum_pd = sum::primitive_desc(
@@ -140,9 +143,21 @@ protected:
                 dnnl_cdeba, dnnl_decab, dnnl_defcab, dnnl_aBc4b, dnnl_aBcd4b,
                 dnnl_aBcde4b);
     }
+    bool generic_supported_format_tag(memory::format_tag tag) {
+        return impl::utils::one_of(tag, dnnl_a, dnnl_ab, dnnl_abc, dnnl_abcd,
+                dnnl_abcde, dnnl_abcdef, dnnl_abdec, dnnl_acb, dnnl_acbde,
+                dnnl_acbdef, dnnl_acdb, dnnl_acdeb, dnnl_ba, dnnl_bac,
+                dnnl_bacd, dnnl_bca, dnnl_bcda, dnnl_bcdea, dnnl_cba, dnnl_cdba,
+                dnnl_cdeba, dnnl_decab, dnnl_defcab, dnnl_format_tag_any);
+    }
+    bool generic_supported_dt(memory::data_type dt) {
+        return impl::utils::one_of(
+                dt, dnnl_f32, dnnl_bf16, dnnl_f16, dnnl_s8, dnnl_u8);
+    }
     void SetUp() override {
-        src_data_type = data_traits<src_data_t>::data_type;
-        dst_data_type = data_traits<dst_data_t>::data_type;
+        SKIP_IF_HIP(true, "Sum operator is not supported by HIP");
+        src_data_type = data_traits_t<src_data_t>::data_type;
+        dst_data_type = data_traits_t<dst_data_t>::data_type;
         sum_test_params p
                 = ::testing::TestWithParam<sum_test_params>::GetParam();
         SKIP_IF(get_test_engine_kind() == engine::kind::gpu
@@ -159,6 +174,18 @@ protected:
             SKIP_IF_CUDA(!cuda_supported_format_tag(p.srcs_format[i]),
                     "Unsupported format tag");
         }
+
+        SKIP_IF_GENERIC(
+                !generic_supported_dt(src_data_type), "Unsupported data type");
+        SKIP_IF_GENERIC(
+                !generic_supported_dt(dst_data_type), "Unsupported data type");
+        SKIP_IF_GENERIC(!generic_supported_format_tag(p.dst_format),
+                "Unsupported format tag");
+        for (size_t i = 0; i < p.srcs_format.size(); i++) {
+            SKIP_IF_GENERIC(!generic_supported_format_tag(p.srcs_format[i]),
+                    "Unsupported format tag");
+        }
+
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status);
     }
@@ -176,12 +203,11 @@ protected:
         auto strm = make_stream(eng);
 
         std::vector<memory::desc> srcs_md;
+        srcs_md.reserve(num_srcs);
         std::vector<memory> srcs;
 
-        for (size_t i = 0; i < num_srcs; i++) {
-            auto desc = memory::desc(p.dims, src_data_type, p.srcs_format[i]);
-            srcs_md.push_back(desc);
-        }
+        for (size_t i = 0; i < num_srcs; i++)
+            srcs_md.emplace_back(p.dims, src_data_type, p.srcs_format[i]);
 
         memory dst;
         sum::primitive_desc sum_pd;
@@ -197,7 +223,7 @@ protected:
         dst = test::make_memory(sum_pd.dst_desc(), eng);
 
         // test all pd ctors
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
         if (p.is_output_omitted)
             test_fwd_pd_constructors<pd_t>(sum_pd, aa, p.scale, srcs_md);
         else {
@@ -218,14 +244,17 @@ protected:
             // Keep few mantissa digits for fp types to avoid round-off errors
             // With proper scalars the computations give exact results
             if (!std::is_integral<src_data_t>::value) {
-                using uint_type = typename data_traits<src_data_t>::uint_type;
+                using uint_type = typename data_traits_t<src_data_t>::uint_type;
                 int mant_digits
                         = dnnl::impl::nstl::numeric_limits<src_data_t>::digits;
                 int want_mant_digits = 3;
+                int digits_shift = mant_digits - want_mant_digits;
+                uint_type max_val = (uint_type)-1;
+                // Move left to keep mask value in uint_type range, move left
+                // to flush all digits but `want_mant_digits`.
+                uint_type mask = (max_val >> digits_shift) << digits_shift;
                 auto src_ptr = map_memory<src_data_t>(src_memory);
                 for (size_t i = 0; i < sz; i++) {
-                    uint_type mask = (uint_type)-1
-                            << (mant_digits - want_mant_digits);
                     *((uint_type *)&src_ptr[i]) &= mask;
                 }
             }

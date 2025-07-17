@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 ################################################################################
-# Copyright 2018-2023 Intel Corporation
+# Copyright 2018-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -24,41 +24,19 @@ import datetime
 import xml.etree.ElementTree as ET
 
 
-def banner(year_from):
-    year_now = str(datetime.datetime.now().year)
-    banner_year = (
-        year_from if year_now == year_from else "%s-%s" % (year_from, year_now)
-    )
+def template(body, banner):
     return """\
-/*******************************************************************************
-* Copyright %s Intel Corporation
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-*     http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*******************************************************************************/
-
+%s
 // DO NOT EDIT, AUTO-GENERATED
 // Use this script to update the file: scripts/%s
 
 // clang-format off
 
-""" % (
-        banner_year,
+%s""" % (
+        banner,
         os.path.basename(__file__),
+        body,
     )
-
-
-def template(body, year_from):
-    return "%s%s" % (banner(year_from), body)
 
 
 def header(body):
@@ -99,6 +77,8 @@ def source(body):
 #include "oneapi/dnnl/dnnl_debug.h"
 #include "oneapi/dnnl/dnnl_types.h"
 
+#include "common/c_types_map.hpp"
+
 %s
 """
         % body
@@ -124,9 +104,7 @@ const char *dt2str(dnnl_data_type_t dt);
 const char *fmt_tag2str(dnnl_format_tag_t tag);
 
 /* encoding */
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 const char *sparse_encoding2str(dnnl_sparse_encoding_t encoding);
-#endif
 
 /* engine kind */
 const char *engine_kind2str(dnnl_engine_kind_t kind);
@@ -139,6 +117,9 @@ const char *fpmath_mode2str(dnnl_fpmath_mode_t mode);
 
 /* accumulation mode */
 const char *accumulation_mode2str(dnnl_accumulation_mode_t mode);
+
+/* rounding mode */
+const char *rounding_mode2str(dnnl_rounding_mode_t mode);
 
 #endif
 """
@@ -173,11 +154,9 @@ const char *fmt_tag2str(dnnl_format_tag_t tag) {
     return dnnl_fmt_tag2str(tag);
 }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 const char *sparse_encoding2str(dnnl_sparse_encoding_t encoding) {
     return dnnl_sparse_encoding2str(encoding);
 }
-#endif
 
 const char *engine_kind2str(dnnl_engine_kind_t kind) {
     return dnnl_engine_kind2str(kind);
@@ -193,6 +172,10 @@ const char *fpmath_mode2str(dnnl_fpmath_mode_t mode) {
 
 const char *accumulation_mode2str(dnnl_accumulation_mode_t mode) {
     return dnnl_accumulation_mode2str(mode);
+}
+
+const char *rounding_mode2str(dnnl_rounding_mode_t mode) {
+    return dnnl_rounding_mode2str(mode);
 }
 """
         % body.rstrip()
@@ -228,6 +211,7 @@ def sanitize_value(v):
         return "any"
     v = v.split("dnnl_fpmath_mode_")[-1]
     v = v.split("dnnl_accumulation_mode_")[-1]
+    v = v.split("dnnl_rounding_mode_")[-1]
     v = v.split("dnnl_scratchpad_mode_")[-1]
     v = v.split("dnnl_")[-1]
     return v
@@ -249,6 +233,16 @@ def func_to_str(enum, values):
     func += func_to_str_decl(enum) + " {\n"
     for v in values:
         func += '%sif (v == %s) return "%s";\n' % (indent, v, sanitize_value(v))
+    if enum == "dnnl_primitive_kind_t":
+        func += (
+            '%sif (v == dnnl::impl::primitive_kind::sdpa) return "sdpa";\n'
+            % indent
+        )
+    if enum == "dnnl_alg_kind_t":
+        func += (
+            '%sif (v == dnnl::impl::alg_kind::softmax_accurate_inf_as_zero) return "softmax_accurate_inf_as_zero";\n'
+            % indent
+        )
     func += '%sassert(!"unknown %s");\n' % (indent, abbrev)
     func += '%sreturn "unknown %s";\n}\n' % (indent, abbrev)
     return func
@@ -308,7 +302,7 @@ def str_to_func(enum, values, is_dnnl=True):
     return func
 
 
-def generate(ifile, banner_years):
+def generate(ifile, banners):
     h_body, s_body = "", ""
     h_benchdnn_body, s_benchdnn_body = "", ""
     root = ET.parse(ifile).getroot()
@@ -316,32 +310,22 @@ def generate(ifile, banner_years):
         enum = v_enum.attrib["name"]
         if maybe_skip(enum):
             continue
-        values = [v_value.attrib["name"] for v_value in v_enum.findall("EnumValue")]
-
-        if enum in ["dnnl_sparse_encoding_t"]:
-            h_body += "#ifdef DNNL_EXPERIMENTAL_SPARSE\n"
-            s_body += "#ifdef DNNL_EXPERIMENTAL_SPARSE\n"
+        values = [
+            v_value.attrib["name"] for v_value in v_enum.findall("EnumValue")
+        ]
 
         h_body += func_to_str_decl(enum, is_header=True) + ";\n"
         s_body += func_to_str(enum, values) + "\n"
 
-        if enum in ["dnnl_sparse_encoding_t"]:
-            h_body += "#endif\n"
-            s_body += "#endif\n"
-
-        if enum in ["dnnl_format_tag_t", "dnnl_data_type_t", "dnnl_sparse_encoding_t"]:
-            if enum in ["dnnl_sparse_encoding_t"]:
-                h_benchdnn_body += "#ifdef DNNL_EXPERIMENTAL_SPARSE\n"
-                s_benchdnn_body += "#ifdef DNNL_EXPERIMENTAL_SPARSE\n"
-
+        if enum in [
+            "dnnl_format_tag_t",
+            "dnnl_data_type_t",
+            "dnnl_sparse_encoding_t",
+        ]:
             h_benchdnn_body += (
                 str_to_func_decl(enum, is_header=True, is_dnnl=False) + ";\n"
             )
             s_benchdnn_body += str_to_func(enum, values, is_dnnl=False) + "\n"
-
-            if enum in ["dnnl_sparse_encoding_t"]:
-                h_benchdnn_body += "#endif\n"
-                s_benchdnn_body += "#endif\n"
 
     bodies = [
         header(h_body),
@@ -349,7 +333,7 @@ def generate(ifile, banner_years):
         header_benchdnn(h_benchdnn_body),
         source_benchdnn(s_benchdnn_body),
     ]
-    return [template(b, y) for b, y in zip(bodies, banner_years)]
+    return [template(b, y) for b, y in zip(bodies, banners)]
 
 
 def usage():
@@ -360,8 +344,7 @@ def usage():
 Generates oneDNN debug header and source files with enum to string mapping.
 Input types.xml file can be obtained with CastXML[1]:
 $ castxml --castxml-cc-gnu-c clang --castxml-output=1 \\
-        -DDNNL_EXPERIMENTAL_SPARSE -Iinclude -Ibuild/include \\
-        include/oneapi/dnnl/dnnl_types.h -o types.xml
+        -Iinclude -Ibuild/include include/oneapi/dnnl/dnnl_types.h -o types.xml
 
 [1] https://github.com/CastXML/CastXML"""
         % sys.argv[0]
@@ -384,12 +367,12 @@ file_paths = (
     "%s/../tests/benchdnn/dnnl_debug_autogenerated.cpp" % script_root,
 )
 
-banner_years = []
+banners = []
 for file_path in file_paths:
     with open(file_path, "r") as f:
-        m = re.search(r"Copyright (.*) Intel", f.read())
-        banner_years.append(m.group(1).split("-")[0])
+        m = re.match(r"^/\*+\n(\*.*\n)+\*+/\n", f.read())
+        banners.append("" if m == None else m.group(0))
 
-for file_path, file_body in zip(file_paths, generate(ifile, banner_years)):
+for file_path, file_body in zip(file_paths, generate(ifile, banners)):
     with open(file_path, "w") as f:
         f.write(file_body)

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 *******************************************************************************/
 
 #include "graph/backend/dnnl/internal_ops.hpp"
-#include "graph/backend/dnnl/kernels/batchnorm.hpp"
+#include "graph/backend/dnnl/kernels/batch_norm.hpp"
 #include "graph/backend/dnnl/patterns/fusions.hpp"
 #include "graph/backend/dnnl/patterns/pattern_matcher_pass.hpp"
 #include "graph/backend/dnnl/patterns/utils.hpp"
@@ -33,7 +33,7 @@ using FCreatePattern = graph::pass::FCreatePattern;
 
 DNNL_BACKEND_REGISTER_PATTERN_DEF_BEGIN(bn_fusion)
 
-DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_relu_fusion)
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, fp_bnorm_relu)
         .set_priority(8.8f)
         .set_kind(partition_kind_t::batch_norm_post_ops)
         .set_attr<FCreatePattern>("FCreatePattern",
@@ -49,10 +49,10 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_relu_fusion)
                             graph::op_kind::ReLU, {in_edge(0, bn, 0)});
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<batchnorm_fwd_t>();
+            return std::make_shared<batch_norm_fwd_t>();
         });
 
-DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, int8_bn_fusion)
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, s8f32s8_bnorm)
         .set_priority(9.f)
         .set_kind(partition_kind_t::batch_norm_post_ops)
         .set_attr<FCreatePattern>("FCreatePattern",
@@ -95,7 +95,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, int8_bn_fusion)
                             check_output_dtype<impl::data_type::s8>);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<batchnorm_fwd_t>();
+            return std::make_shared<batch_norm_fwd_t>();
         });
 
 #define BATCHNORM_OUTPUT_NUM_CHECK(n1, n2) \
@@ -104,7 +104,8 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, int8_bn_fusion)
                 || check_output_num<n2>(graph_op); \
     })
 
-DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_bwd_relu_bwd_fusion)
+#if BUILD_TRAINING
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, fp_bnorm_bwd_relu_bwd)
         .set_priority(8.8f)
         .set_kind(partition_kind_t::misc_post_ops)
         .set_attr<FCreatePattern>("FCreatePattern",
@@ -120,8 +121,9 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_bwd_relu_bwd_fusion)
                     bn_bwd->BATCHNORM_OUTPUT_NUM_CHECK(1, 3);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<batchnorm_bwd_t>();
+            return std::make_shared<batch_norm_bwd_t>();
         });
+#endif
 
 DNNL_BACKEND_REGISTER_PATTERN_DEF_END
 

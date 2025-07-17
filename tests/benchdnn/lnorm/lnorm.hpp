@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -41,16 +41,12 @@ const flags_t NONE = bnorm::NONE;
 const flags_t GLOB_STATS = bnorm::GLOB_STATS;
 const flags_t USE_SCALE = bnorm::USE_SCALE;
 const flags_t USE_SHIFT = bnorm::USE_SHIFT;
+const flags_t USE_RMS_NORM = bnorm::USE_RMS_NORM;
 const auto flags2str = bnorm::flags2str;
 flags_t str2flags(const char *str);
 
 struct settings_t : public base_settings_t {
-    settings_t() = default;
-
-    // ctor to save certain fields from resetting
-    settings_t(const char *perf_template) : settings_t() {
-        this->perf_template = perf_template;
-    }
+    using base_settings_t::base_settings_t;
 
     prb_dims_t prb_dims;
 
@@ -80,18 +76,18 @@ struct prb_t : public prb_dims_t {
     // A ctor with common interface across all drivers.
     prb_t(const settings_t &s)
         : prb_t(s.prb_dims, s.tag[0], s.stat_tag[0], s.ss_dt[0], s.dir[0],
-                s.dt[0], s.flags[0],
-                settings_t::get_attr(s.scales[0], s.zero_points[0],
-                        s.post_ops[0], s.scratchpad_mode[0], s.fpmath_mode[0]),
-                s.ctx_init[0], s.ctx_exe[0], s.inplace[0], s.check_alg) {
+                s.dt[0], s.flags[0], s.check_alg, s.inplace[0],
+                s.attributes.front(), s.ctx_init[0], s.ctx_exe[0],
+                s.impl_filter) {
         SAFE_V(s.has_single_setup() ? OK : FAIL);
     }
 
     prb_t(const prb_dims_t &prb_dims, const std::vector<std::string> &tag,
             const std::string &stat_tag, dnnl_data_type_t ss_dt, dir_t dir,
             const std::vector<dnnl_data_type_t> &dt, flags_t flags,
-            const attr_t &attr, const thr_ctx_t &ctx_init,
-            const thr_ctx_t &ctx_exe, bool inplace, check_alg_t check_alg)
+            check_alg_t check_alg, bool inplace, const attr_t &attr,
+            const thr_ctx_t &ctx_init, const thr_ctx_t &ctx_exe,
+            const impl_filter_t &impl_filter)
         : prb_dims_t(prb_dims)
         , check_alg(check_alg)
         , tag(tag)
@@ -103,19 +99,20 @@ struct prb_t : public prb_dims_t {
         , inplace(inplace)
         , attr(attr)
         , ctx_init(ctx_init)
-        , ctx_exe(ctx_exe) {
-        n = 1;
+        , ctx_exe(ctx_exe)
+        , impl_filter(impl_filter)
+        , n(1)
+        , c(dims[ndims - 1])
+        , eps(1.f / 16) {
         for (int d = 0; d < ndims - 1; d++)
             n *= dims[d];
-        c = dims[ndims - 1];
-        eps = 1.f / 16;
 
         // Broadcast data types if needed
         if (dt.size() == 1) {
             const auto val = dt[0]; // Need a copy here.
             this->dt.assign(2, val);
         }
-        if (tag.size() == 1) { this->tag.push_back(tag::any); }
+        if (tag.size() == 1) { this->tag.emplace_back(tag::any); }
         repro = set_repro_line(); // must be last in ctor to collect right info
     }
 
@@ -128,13 +125,15 @@ struct prb_t : public prb_dims_t {
     flags_t flags;
     bool inplace;
     attr_t attr;
-    const thr_ctx_t ctx_init, ctx_exe;
+    thr_ctx_t ctx_init, ctx_exe;
+    impl_filter_t impl_filter;
     int64_t n, c;
     float eps;
 
     bool use_stats() const { return flags & GLOB_STATS; }
     bool use_sc() const { return flags & USE_SCALE; }
     bool use_sh() const { return flags & USE_SHIFT; }
+    bool skip_mean() const { return flags & USE_RMS_NORM; }
 
     // Used to construct memory desc when dimensions are runtime since such mds
     // can't be used directly from query and memory objects can't be constructed.
@@ -258,13 +257,12 @@ int init_ref_memory_args(dnn_mem_map_t &ref_mem_map, dnn_mem_map_t &mem_map,
 
 void skip_unimplemented_prb(const prb_t *prb, res_t *res);
 void skip_invalid_prb(const prb_t *prb, res_t *res);
-void compute_ref(const prb_t *prb, const args_t &args,
+void compute_ref(const prb_t *prb, dir_t dir, const args_t &args,
         dnnl_primitive_t prim_ref = nullptr);
 
 int createit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
-int check_cacheit(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
+int checkit(std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);
 int doit(const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &v_prim,
         const prb_t *prb, res_t *res);

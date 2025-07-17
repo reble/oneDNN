@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@
 #include "c_types_map.hpp"
 #include "cache_blob.hpp"
 #include "cache_blob_id.hpp"
+#include "cache_hit_types.hpp"
 #include "memory_tracking.hpp"
 #include "nstl.hpp"
 #include "opdesc.hpp"
@@ -38,7 +39,12 @@ namespace impl {
 static int po_inputs(const post_ops_t &post_ops, const primitive_kind_t kind) {
     int n_inputs = 0;
     for (int idx = 0; idx < post_ops.len(); ++idx) {
-        if (post_ops.contain(kind, idx)) n_inputs++;
+        if (post_ops.contain(kind, idx)) {
+            n_inputs++;
+            if (kind == primitive_kind::binary)
+                n_inputs += static_cast<int>(
+                        post_ops.entry_[idx].is_binary_with_ternary_op());
+        }
     }
     return n_inputs;
 }
@@ -46,6 +52,7 @@ static int po_inputs(const post_ops_t &post_ops, const primitive_kind_t kind) {
 struct impl_list_item_t;
 struct primitive_t;
 // Primitive descriptor implementation
+// NOLINTBEGIN(google-default-arguments)
 struct primitive_desc_t : public c_compatible {
     primitive_desc_t(const primitive_attr_t *attr, primitive_kind_t kind)
         : attr_(*attr), kind_(kind), pd_iterator_offset_(0), skip_idx_(-1) {
@@ -79,7 +86,7 @@ struct primitive_desc_t : public c_compatible {
     //     doesn't require any special handling since `get_verbose` is `false`.
     std::string info_with_runtime_dims(engine_t *engine,
             const memory_desc_t *src_md, const memory_desc_t *wei_md,
-            const memory_desc_t *bia_md, const memory_desc_t *dst_md) {
+            const memory_desc_t *bia_md, const memory_desc_t *dst_md) const {
         std::string info_str = info(engine);
 
         // Matmul and reorder are the only primitives supporting runtime dims.
@@ -149,31 +156,41 @@ struct primitive_desc_t : public c_compatible {
     enum class arg_usage_t { unused, input, output };
     virtual arg_usage_t arg_usage(int arg) const {
         using types::is_zero_md;
-        if (arg == DNNL_ARG_ATTR_OUTPUT_SCALES
-                && !attr()->output_scales_.defined())
-            return arg_usage_t::input;
         if (arg & DNNL_ARG_ATTR_ZERO_POINTS) {
             int zp_arg = arg & ~DNNL_ARG_ATTR_ZERO_POINTS;
-            if (!attr()->zero_points_.defined(zp_arg))
-                return arg_usage_t::input;
+            return !attr()->zero_points_.has_default_values(zp_arg)
+                    ? arg_usage_t::input
+                    : arg_usage_t::unused;
         }
         if (arg & DNNL_ARG_ATTR_SCALES) {
             int scale_arg = arg & ~DNNL_ARG_ATTR_SCALES;
-            if (!attr()->scales_.get(scale_arg).defined())
-                return arg_usage_t::input;
+            return !attr()->scales_.has_default_values(scale_arg)
+                    ? arg_usage_t::input
+                    : arg_usage_t::unused;
         }
-        if ((arg == (DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC_0))
-                && !attr()->scales_.get(DNNL_ARG_SRC_0).defined())
-            return arg_usage_t::input;
-        if ((arg == (DNNL_ARG_ATTR_SCALES | DNNL_ARG_SRC_1))
-                && !attr()->scales_.get(DNNL_ARG_SRC_1).defined())
-            return arg_usage_t::input;
-        if (arg == DNNL_ARG_SCRATCHPAD && !is_zero_md(scratchpad_md()))
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_SCRATCHPAD)
+            return !is_zero_md(scratchpad_md()) ? arg_usage_t::output
+                                                : arg_usage_t::unused;
+        if (arg == DNNL_ARG_ATTR_DROPOUT_MASK)
+            return !attr()->dropout_.has_default_values() ? arg_usage_t::output
+                                                          : arg_usage_t::unused;
+        if (arg == DNNL_ARG_ATTR_DROPOUT_PROBABILITY)
+            return !attr()->dropout_.has_default_values() ? arg_usage_t::input
+                                                          : arg_usage_t::unused;
+        if (arg == DNNL_ARG_ATTR_DROPOUT_SEED)
+            return !attr()->dropout_.has_default_values() ? arg_usage_t::input
+                                                          : arg_usage_t::unused;
+        if (arg == DNNL_ARG_ATTR_ROUNDING_SEED)
+            return !attr()->rounding_mode_.has_default_values()
+                    ? arg_usage_t::input
+                    : arg_usage_t::unused;
+
         for (int idx = 0; idx < attr()->post_ops_.len(); ++idx) {
             using namespace primitive_kind;
             if (post_op_has_proper_input(
                         attr(), binary, idx, arg, DNNL_ARG_SRC_1)
+                    || post_op_has_proper_input(
+                            attr(), binary, idx, arg, DNNL_ARG_SRC_2)
                     || post_op_has_proper_input(
                             attr(), prelu, idx, arg, DNNL_ARG_WEIGHTS))
                 return arg_usage_t::input;
@@ -191,18 +208,30 @@ struct primitive_desc_t : public c_compatible {
                            post_ops_t::post_ops_limit)) {
             const auto &po = attr()->post_ops_;
             for (int idx = 0; idx < po.len(); ++idx) {
-                if (arg
-                        != (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
-                                | DNNL_ARG_SRC_1))
+                if (!utils::one_of(arg,
+                            (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
+                                    | DNNL_ARG_SRC_1),
+                            (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
+                                    | DNNL_ARG_SRC_2)))
                     continue;
 
-                return &po.entry_[idx].binary.src1_desc;
+                if (arg
+                        == (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
+                                | DNNL_ARG_SRC_1)) {
+                    return &po.entry_[idx].binary.src1_desc;
+                } else if (arg
+                        == (DNNL_ARG_ATTR_MULTIPLE_POST_OP(idx)
+                                | DNNL_ARG_SRC_2)) {
+                    return &po.entry_[idx].binary.src2_desc;
+                }
             }
         }
 
         switch (arg) {
             case DNNL_ARG_WORKSPACE: return workspace_md(0);
             case DNNL_ARG_SCRATCHPAD: return scratchpad_md(0);
+            case DNNL_ARG_ATTR_DROPOUT_MASK:
+                return &attr()->dropout_.dropout_desc_;
             default: return &glob_zero_md;
         }
     }
@@ -370,29 +399,58 @@ struct primitive_desc_t : public c_compatible {
         return {};
     }
 
+    // `force_create_from_blob` forces the implementation not to pick up the
+    // primitive from the cache even if it resides there.
+    // See `force_create_from_blob` comment for more details.
     virtual status_t create_primitive(
-            std::pair<std::shared_ptr<primitive_t>, bool> &primitive,
-            engine_t *engine, const cache_blob_t &cache_blob) const = 0;
+            std::pair<std::shared_ptr<primitive_t>, cache_state_t> &primitive,
+            engine_t *engine, const cache_blob_t &cache_blob,
+            bool force_create_from_blob) const = 0;
 
     // This is a proxy interface that is used for creating nested primitives.
-    // It ignores the bool value that indicates whether the requested primitive
+    // It ignores the cache_state_t value that indicates whether the requested primitive
     // was taken from cache.
     status_t create_primitive(std::shared_ptr<primitive_t> &primitive,
             engine_t *engine,
             const cache_blob_t &cache_blob = cache_blob_t()) const {
-        std::pair<std::shared_ptr<primitive_t>, bool> p;
+        std::pair<std::shared_ptr<primitive_t>, cache_state_t> p;
+        status_t status = create_primitive_nested(p, engine, cache_blob);
+        primitive = p.first;
+        return status;
+    }
+
+    // This is a proxy interface that is used for explicitly creating nested primitives,
+    // This version is used when cache_state_t is required for further analysis
+    status_t create_primitive_nested(
+            std::pair<std::shared_ptr<primitive_t>, cache_state_t> &primitive,
+            engine_t *engine,
+            const cache_blob_t &cache_blob = cache_blob_t()) const {
+        // A scenario with a top-level primitive containing two or more nested
+        // primitives is unique when it comes to a creation from a blob. If the
+        // top-level primitive wasn't fetched from the cache, all nested
+        // primitives must be forced to be created. Otherwise, there's a
+        // possible collision of nested primitives, one of them could be picked
+        // up from the cache and lead to the errornous deserialization process
+        // of further nested primitives which may not hit the primitive cache.
+        const bool force_create_from_blob = static_cast<bool>(cache_blob);
         if (get_verbose(verbose_t::debuginfo) >= 1) {
             double start_ms = get_msec();
-            CHECK(create_primitive(p, engine, cache_blob));
+            CHECK(create_primitive(
+                    primitive, engine, cache_blob, force_create_from_blob));
             double duration_ms = get_msec() - start_ms;
-            const char *str = p.second ? ":cache_hit" : ":cache_miss";
-            if (cache_blob) str = ":from_cache_blob";
+
+            // Since the primitive_hit has a higher fetching priority,
+            // it shouldn't be overrided by a persistent_hit.
+            if (cache_blob && primitive.second != cache_state_t::primitive_hit)
+                primitive.second = cache_state_t::persistent_hit;
+            const char *str = cache_state2str(primitive.second);
+
             VPROF(start_ms, primitive, create_nested, str, info(engine),
                     duration_ms);
         } else {
-            CHECK(create_primitive(p, engine, cache_blob));
+            CHECK(create_primitive(
+                    primitive, engine, cache_blob, force_create_from_blob));
         }
-        primitive = p.first;
         return status::success;
     }
 
@@ -414,7 +472,6 @@ protected:
 
     memory_tracking::registry_t scratchpad_registry_;
 
-protected:
     void init_pd_iterator_offset(int offset) { pd_iterator_offset_ = offset; }
     void init_skip_idx(int skip_idx) { skip_idx_ = skip_idx; }
 
@@ -436,11 +493,11 @@ protected:
         /** the only reason why this class is here is the inability of
          * utils::make_unique() to operate on protected parent classes
          * of the derivative pd_t's; compilers should optimize it out */
-        class pd_t_compat : public pd_t {
+        class pd_compat_t : public pd_t {
         public:
-            pd_t_compat(Args &&...args) : pd_t(std::forward<Args>(args)...) {}
+            pd_compat_t(Args &&...args) : pd_t(std::forward<Args>(args)...) {}
         };
-        return utils::make_unique<pd_t_compat>(std::forward<Args>(args)...);
+        return utils::make_unique<pd_compat_t>(std::forward<Args>(args)...);
     }
 
     template <typename pd_t>
@@ -448,13 +505,11 @@ protected:
             const primitive_attr_t *attr, engine_t *engine,
             const primitive_desc_t *hint_fwd) {
         using namespace dnnl::impl::status;
-        using pd_op_desc_t = typename pkind_traits<pd_t::base_pkind>::desc_type;
-        if (adesc->kind != pd_t::base_pkind) return invalid_arguments;
+        if (adesc->primitive_kind != pd_t::base_pkind) return invalid_arguments;
         assert(hint_fwd ? hint_fwd->kind() == pd_t::base_pkind : true);
         auto hint
                 = reinterpret_cast<const typename pd_t::hint_class *>(hint_fwd);
-        auto _pd
-                = make_unique_pd<pd_t>((const pd_op_desc_t *)adesc, attr, hint);
+        auto _pd = make_unique_pd<pd_t>(adesc, attr, hint);
         if (_pd == nullptr) return out_of_memory;
         if (!_pd->is_initialized()) return out_of_memory;
         CHECK(_pd->init(engine));
@@ -464,6 +519,7 @@ protected:
 
     friend struct dnnl::impl::impl_list_item_t;
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl
@@ -475,16 +531,19 @@ protected:
         return new_pd.release(); \
     } \
     status_t create_primitive( \
-            std::pair<std::shared_ptr<primitive_t>, bool> &primitive, \
-            engine_t *engine, const cache_blob_t &cache_blob) const override { \
+            std::pair<std::shared_ptr<impl::primitive_t>, cache_state_t> \
+                    &primitive, \
+            dnnl::impl::engine_t *engine, const cache_blob_t &cache_blob, \
+            bool force_create_from_blob) const override { \
         return primitive_t::create_primitive_common<impl_type, pd_t>( \
-                primitive, this, engine, use_global_scratchpad, cache_blob); \
+                primitive, this, engine, use_global_scratchpad, cache_blob, \
+                force_create_from_blob); \
     } \
     const char *name() const override { return impl_name; } \
     template <typename pd_t> \
     friend status_t primitive_desc_t::create(primitive_desc_t **pd, \
             const op_desc_t *adesc, const primitive_attr_t *attr, \
-            engine_t *engine, const primitive_desc_t *hint_fwd);
+            dnnl::impl::engine_t *engine, const primitive_desc_t *hint_fwd);
 
 #define DECLARE_COMMON_PD_T_USE_GLOBAL_SCRATCHPAD(impl_name, impl_type) \
     DECLARE_COMMON_PD_t(impl_name, impl_type, true)

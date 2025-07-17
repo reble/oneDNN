@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,10 +24,10 @@ namespace impl {
 namespace cpu {
 namespace x64 {
 
-class jit_sse41_gemv_n_f32_kern : public jit_generator {
+class jit_sse41_gemv_n_f32_kern_t : public jit_generator_t {
 public:
-    jit_sse41_gemv_n_f32_kern();
-    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_sse41_gemv_n_f32_kern);
+    jit_sse41_gemv_n_f32_kern_t();
+    DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_sse41_gemv_n_f32_kern_t);
 
 protected:
     bool has_avx512_;
@@ -61,7 +61,7 @@ protected:
             Xbyak::Label *&cur_outerloop_label,
             Xbyak::Label *&outerloop_end_label);
 
-    void generate() override ATTRIBUTE_OPTIMIZE;
+    void generate() override;
 
 private:
     static const int max_um_vecs_ = 16;

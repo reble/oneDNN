@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,6 +28,9 @@ void compute_ref_fwd(const prb_t *prb, const args_t &args) {
 
     float *dst_ptr = (float *)dst;
 
+    // Used for graph reference version only when runs SDPA fwd training.
+    const dnn_mem_t &stats = args.find(DNNL_ARG_DST_1);
+
     const auto alg = prb->alg;
     int64_t outer_size {0}, inner_size {0}, axis_size {0};
     get_sizes(prb, outer_size, inner_size, axis_size);
@@ -37,11 +40,11 @@ void compute_ref_fwd(const prb_t *prb, const args_t &args) {
     assert(IMPLICATION(has_src_scale, src_scale.nelems() == 1));
     assert(IMPLICATION(has_dst_scale, dst_scale.nelems() == 1));
 
-    const float src_scale_val = has_src_scale ? src_scale.get_elem(0) : 1.f;
-    const float dst_scale_val = has_dst_scale ? dst_scale.get_elem(0) : 1.f;
+    const float src_scale_val = has_src_scale ? src_scale.get_f32_elem(0) : 1.f;
+    const float dst_scale_val = has_dst_scale ? dst_scale.get_f32_elem(0) : 1.f;
     const float r_dst_scale_val = 1.0f / dst_scale_val;
 
-    auto v_po_masks = prb->attr.post_ops.get_po_masks();
+    auto v_po_masks = prb->attr.post_ops.get_po_masks(prb->ndims);
 
     benchdnn_parallel_nd(outer_size, inner_size, [&](int64_t ou, int64_t in) {
         float space_denom = 0.;
@@ -50,13 +53,13 @@ void compute_ref_fwd(const prb_t *prb, const args_t &args) {
 
         for (int64_t as = 0; as < axis_size; ++as) {
             int64_t idx = ou_in_offset + as * inner_size;
-            space_max = MAX2(space_max, src.get_elem(idx));
+            space_max = MAX2(space_max, src.get_f32_elem(idx));
         }
 
         for (int64_t as = 0; as < axis_size; ++as) {
             int64_t idx = ou_in_offset + as * inner_size;
-            float s = src.get_elem(idx);
-            if (alg == SOFTMAX) {
+            float s = src.get_f32_elem(idx);
+            if (alg == SOFTMAX || alg == SOFTMAX_INF_AS_ZERO) {
                 float D = dst_ptr[idx] = expf(s - space_max);
                 space_denom += D;
             } else if (alg == LOGSOFTMAX) {
@@ -65,7 +68,13 @@ void compute_ref_fwd(const prb_t *prb, const args_t &args) {
             }
         }
 
-        if (alg == SOFTMAX) {
+        if (alg == SOFTMAX || alg == SOFTMAX_INF_AS_ZERO) {
+            if (prb->has_stats) {
+                int64_t stats_idx = ou * inner_size + in;
+                float stats_value
+                        = space_denom ? space_max + logf(space_denom) : 0.f;
+                stats.set_f32_elem(stats_idx, stats_value);
+            }
             space_denom = space_denom ? (1.f / space_denom) : 1.f;
         } else if (alg == LOGSOFTMAX) {
             space_denom = logf(space_denom);
@@ -73,7 +82,7 @@ void compute_ref_fwd(const prb_t *prb, const args_t &args) {
 
         for (int64_t as = 0; as < axis_size; ++as) {
             int64_t idx = ou_in_offset + as * inner_size;
-            if (alg == SOFTMAX) {
+            if (alg == SOFTMAX || alg == SOFTMAX_INF_AS_ZERO) {
                 dst_ptr[idx] *= space_denom;
             } else if (alg == LOGSOFTMAX) {
                 dst_ptr[idx] -= space_denom;
@@ -104,9 +113,9 @@ void compute_ref_bwd(const prb_t *prb, const args_t &args) {
 
         for (int64_t as = 0; as < axis_size; ++as) {
             int64_t idx = ou_in_offset + as * inner_size;
-            float d = dst.get_elem(idx);
-            float dd = d_dst.get_elem(idx);
-            if (alg == SOFTMAX) {
+            float d = dst.get_f32_elem(idx);
+            float dd = d_dst.get_f32_elem(idx);
+            if (alg == SOFTMAX || alg == SOFTMAX_INF_AS_ZERO) {
                 part_deriv_sum += dd * d;
             } else if (alg == LOGSOFTMAX) {
                 part_deriv_sum += dd;
@@ -115,9 +124,9 @@ void compute_ref_bwd(const prb_t *prb, const args_t &args) {
 
         for (int64_t as = 0; as < axis_size; ++as) {
             int64_t idx = ou_in_offset + as * inner_size;
-            float d = dst.get_elem(idx);
-            float dd = d_dst.get_elem(idx);
-            if (alg == SOFTMAX) {
+            float d = dst.get_f32_elem(idx);
+            float dd = d_dst.get_f32_elem(idx);
+            if (alg == SOFTMAX || alg == SOFTMAX_INF_AS_ZERO) {
                 d_src_ptr[idx] = d * (dd - part_deriv_sum);
             } else if (alg == LOGSOFTMAX) {
                 d_src_ptr[idx] = dd - expf(d) * part_deriv_sum;
@@ -126,9 +135,9 @@ void compute_ref_bwd(const prb_t *prb, const args_t &args) {
     });
 }
 
-void compute_ref(
-        const prb_t *prb, const args_t &args, dnnl_primitive_t prim_ref) {
-    if (prb->dir & FLAG_FWD)
+void compute_ref(const prb_t *prb, dir_t dir, const args_t &args,
+        dnnl_primitive_t prim_ref) {
+    if (dir & FLAG_FWD)
         compute_ref_fwd(prb, args);
     else
         compute_ref_bwd(prb, args);

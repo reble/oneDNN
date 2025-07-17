@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2024 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -26,7 +26,184 @@
 
 namespace graph {
 
-void flex_rewrite::rewrite(deserialized_graph &dgraph) {
+void flex_rewrite_t::rewrite_linked_shape_and_attr(
+        deserialized_graph_t &dgraph) {
+    for (auto &aop : dgraph.ops_) {
+        if (aop.kind_ == "DynamicDequantize") {
+            auto &attr = aop.attrs_;
+            if (attr.find("qtype") == attr.end()
+                    || attr["qtype"].str_value_ != "per_group")
+                continue;
+            if (attr.find("group_shape") == attr.end()) {
+                BENCHDNN_PRINT(0,
+                        "Error: missed `group-shape` attribute for "
+                        "per-group quantization for op with id=\'%zu\'\n",
+                        aop.id_);
+                SAFE_V(FAIL);
+            }
+
+            bool input_shape_rewrite = std::any_of(aop.in_lts_.begin(),
+                    aop.in_lts_.end(), [&](const deserialized_lt_t &in_lt) {
+                        return in_shapes_.count(in_lt.id_)
+                                && in_shapes_[in_lt.id_] != "default";
+                    });
+            bool group_shape_rewrite = op_attrs_.count(aop.id_)
+                    && parse_attrs(op_attrs_.at(aop.id_)).count("group_shape");
+
+            auto &group_shape = attr["group_shape"].s64_vector_;
+            const auto &src_lt = aop.in_lts_[0];
+
+            if (!group_shape_rewrite && !input_shape_rewrite) continue;
+            if (input_shape_rewrite && group_shape_rewrite) {
+                // if both input shapes and group_shape are provided, check if
+                // the new shape are valid.
+                auto &scale_lt = aop.in_lts_[1];
+                if (src_lt.shape_.size() != scale_lt.shape_.size()) {
+                    BENCHDNN_PRINT(0,
+                            "Error: the ndims of scale tensor should align "
+                            "with the ndims of input tensor for op with "
+                            "id=\'%zu\'\n",
+                            aop.id_);
+                    SAFE_V(FAIL);
+                }
+
+                if (src_lt.shape_.size() != group_shape.size()) {
+                    BENCHDNN_PRINT(0,
+                            "Error: the ndims of `group-shape` attribute "
+                            "should align with the input ndims for op with "
+                            "id=\'%zu\'\n",
+                            aop.id_);
+                    SAFE_V(FAIL);
+                }
+
+                for (size_t idx = 0; idx < src_lt.shape_.size(); ++idx) {
+                    if (src_lt.shape_[idx]
+                            != scale_lt.shape_[idx] * group_shape[idx]) {
+                        BENCHDNN_PRINT(0,
+                                "Error: the input shape should equal with the "
+                                "product of corresponding dimension of scale "
+                                "shape and group shape, input shape: %lld, "
+                                "scale shape: %lld, group shape: %lld\n",
+                                (long long)src_lt.shape_[idx],
+                                (long long)scale_lt.shape_[idx],
+                                (long long)group_shape[idx]);
+                        SAFE_V(FAIL);
+                    }
+                }
+
+                if (aop.in_lts_.size() > 2) {
+                    auto &zp_lt = aop.in_lts_[2];
+                    if (scale_lt.shape_.size() != zp_lt.shape_.size()) {
+                        BENCHDNN_PRINT(0,
+                                "Error: the ndims of scale tensor should align "
+                                "with the ndims of zero-point tensor for op "
+                                "with id=\'%zu\'\n",
+                                aop.id_);
+                        SAFE_V(FAIL);
+                    }
+
+                    for (size_t idx = 0; idx < scale_lt.shape_.size(); ++idx) {
+                        if (scale_lt.shape_[idx] != zp_lt.shape_[idx]) {
+                            BENCHDNN_PRINT(0,
+                                    "Error: the shape of zero-point tensor "
+                                    "should be the same as the shape of scale "
+                                    "tensor for op with id=\'%zu\'\n",
+                                    aop.id_);
+                            SAFE_V(FAIL);
+                        }
+                    }
+                }
+                continue;
+            }
+
+            if (group_shape_rewrite && !input_shape_rewrite) {
+                // if user only rewrite group shape attribute, update the scale
+                // shape and zps shape (if available) accordingly.
+                dims_t new_group_quant_scale_zps_dims(
+                        src_lt.shape_.size(), DNNL_GRAPH_UNKNOWN_DIM);
+                if (src_lt.shape_.size() != group_shape.size()) {
+                    BENCHDNN_PRINT(0,
+                            "Error: the ndims of `group-shape` attribute "
+                            "should align with the input ndims for op with "
+                            "id=\'%zu\'\n",
+                            aop.id_);
+                    SAFE_V(FAIL);
+                }
+
+                for (size_t idx = 0; idx < src_lt.shape_.size(); ++idx) {
+                    if (src_lt.shape_[idx] % group_shape[idx] != 0) {
+                        BENCHDNN_PRINT(0,
+                                "Error: the dimension of `group-shape` "
+                                "attribute should be divisible by the "
+                                "corresponding dimensions of the input shape, "
+                                "group shape: %lld, input shape: %lld\n",
+                                (long long)group_shape[idx],
+                                (long long)src_lt.shape_[idx]);
+                        SAFE_V(FAIL);
+                    }
+                    new_group_quant_scale_zps_dims[idx]
+                            = src_lt.shape_[idx] / group_shape[idx];
+                }
+
+                auto &scale_lt = aop.in_lts_[1];
+                scale_lt.shape_ = new_group_quant_scale_zps_dims;
+                if (dgraph.lt_2_mtag_[scale_lt.id_] == "not_available") {
+                    BENCHDNN_PRINT(0, "%s\n",
+                            "Error: scale input does not support "
+                            "non-contiguous memory.");
+                    SAFE_V(FAIL);
+                }
+                scale_lt.stride_ = memory_tag2strides(
+                        scale_lt.shape_, dgraph.lt_2_mtag_[scale_lt.id_]);
+
+                if (aop.in_lts_.size() > 2) {
+                    auto &zp_lt = aop.in_lts_[2];
+                    zp_lt.shape_ = new_group_quant_scale_zps_dims;
+                    if (dgraph.lt_2_mtag_[zp_lt.id_] == "not_available") {
+                        BENCHDNN_PRINT(0, "%s\n",
+                                "Error: zero point input does not support "
+                                "non-contiguous memory.");
+                        SAFE_V(FAIL);
+                    }
+                    zp_lt.stride_ = memory_tag2strides(
+                            zp_lt.shape_, dgraph.lt_2_mtag_[zp_lt.id_]);
+                }
+            } else if (input_shape_rewrite && !group_shape_rewrite) {
+                // if user only rewrites input shapes, update the group-shape
+                // attribute accordingly.
+                auto &scale_lt = aop.in_lts_[1];
+                if (src_lt.shape_.size() != scale_lt.shape_.size()) {
+                    BENCHDNN_PRINT(0,
+                            "Error: the ndims of scale tensor should align "
+                            "with the ndims of input tensor for op with "
+                            "id=\'%zu\'\n",
+                            aop.id_);
+                    SAFE_V(FAIL);
+                }
+
+                std::vector<int64_t> new_group_shape(src_lt.shape_.size(), 1);
+                for (size_t idx = 0; idx < src_lt.shape_.size(); ++idx) {
+                    if (src_lt.shape_[idx] % scale_lt.shape_[idx] != 0) {
+                        BENCHDNN_PRINT(0,
+                                "Error: the dimension of scale  shape should "
+                                "be divisible by the corresponding dimensions "
+                                "of the input  shape, scale shape: %lld, input "
+                                "shape: %lld\n",
+                                (long long)scale_lt.shape_[idx],
+                                (long long)src_lt.shape_[idx]);
+                        SAFE_V(FAIL);
+                    }
+                    new_group_shape[idx]
+                            = src_lt.shape_[idx] / scale_lt.shape_[idx];
+                }
+
+                group_shape = new_group_shape;
+            }
+        }
+    }
+}
+
+void flex_rewrite_t::rewrite(deserialized_graph_t &dgraph) {
     bool change_stride = false;
     inports_shape_rewrite(dgraph, change_stride);
     if (!(op_attrs_.size() == 1 && op_attrs_.count(0)
@@ -35,9 +212,14 @@ void flex_rewrite::rewrite(deserialized_graph &dgraph) {
     }
     infer_output_shape(dgraph, change_stride);
     quantized_graph_rewrite(dgraph);
+    op_kind_rewrite(dgraph);
+    graph_attrs_rewrite(dgraph);
+    rewrite_linked_shape_and_attr(dgraph);
+    dt_rewrite(dgraph);
+    dt_map_rewrite(dgraph);
 }
 
-void flex_rewrite::split_ncx(const std::string &data_format, dims_t &in,
+void flex_rewrite_t::split_ncx(const std::string &data_format, dims_t &in,
         int64_t &n, int64_t &c, dims_t &x) const {
     x.clear();
     n = in[0];
@@ -54,7 +236,7 @@ void flex_rewrite::split_ncx(const std::string &data_format, dims_t &in,
     }
 }
 
-void flex_rewrite::merge_ncx(const std::string &data_format, dims_t &out,
+void flex_rewrite_t::merge_ncx(const std::string &data_format, dims_t &out,
         int64_t n, int64_t c, const dims_t &x) const {
     out.clear();
     out.push_back(n);
@@ -71,7 +253,7 @@ void flex_rewrite::merge_ncx(const std::string &data_format, dims_t &out,
     }
 }
 
-void flex_rewrite::split_oix(const std::string &data_format, dims_t &in,
+void flex_rewrite_t::split_oix(const std::string &data_format, dims_t &in,
         dims_t &oi, dims_t &x) const {
     x.clear();
     if (data_format == "OIX" || data_format == "IOX") {
@@ -96,8 +278,22 @@ void flex_rewrite::split_oix(const std::string &data_format, dims_t &in,
     }
 }
 
-void flex_rewrite::broadcast(
-        const dims_t &x, const dims_t &y, dims_t &z) const {
+template <typename T>
+std::string stdvec2string(const std::vector<T> &v) {
+    std::string s;
+    if (v.empty()) return s;
+
+    s.append("[");
+    const size_t sz = v.size() - 1;
+    for (size_t i = 0; i < sz; i++) {
+        s.append(std::to_string(v[i])).append(", ");
+    }
+    s.append(std::to_string(v[sz])).append("]");
+    return s;
+}
+
+void flex_rewrite_t::broadcast(const dims_t &x, const dims_t &y, dims_t &z,
+        const std::string &x_str, const std::string &y_str) const {
     const size_t x_rank = x.size();
     const size_t y_rank = y.size();
     const size_t max_rank = std::max(x_rank, y_rank);
@@ -110,18 +306,25 @@ void flex_rewrite::broadcast(
         if (i >= by) r = y[i - by];
         if (l != r) {
             if (l != 1 && r != 1) {
-                fprintf(stderr, "graph: failed to broadcast in infer shape!\n");
+                BENCHDNN_PRINT(0,
+                        "Error: batched dimensions \'%lld\' from \'%s\' and "
+                        "\'%lld\' from \'%s\' are not consistent. They should "
+                        "be equal to each other or one of them should be equal "
+                        "to 1.\n",
+                        (long long)l, x_str.c_str(), (long long)r,
+                        y_str.c_str());
                 SAFE_V(FAIL);
             }
             z[i] = (l == 1 ? r : l);
         } else {
+            // Batch sizes are equal, use it as a final value.
             z[i] = l;
         }
     }
 }
 
-void flex_rewrite::cal_pads(dims_t &pads_begin, dims_t &pads_end,
-        const deserialized_op &aop, const dims_t &spatial_dims,
+void flex_rewrite_t::cal_pads(dims_t &pads_begin, dims_t &pads_end,
+        const deserialized_op_t &aop, const dims_t &spatial_dims,
         const dims_t &strides, const dims_t &kernel, bool deconv) const {
     pads_begin.clear();
     pads_end.clear();
@@ -159,8 +362,8 @@ void flex_rewrite::cal_pads(dims_t &pads_begin, dims_t &pads_end,
     }
 }
 
-void flex_rewrite::infer_output_shape(
-        deserialized_graph &dgraph, bool change_stride) {
+void flex_rewrite_t::infer_output_shape(
+        deserialized_graph_t &dgraph, bool change_stride) {
     auto &gi = dgraph.graph_tensors_;
     for (auto &aop : dgraph.ops_) {
         auto kind = opstr2kind(aop.kind_);
@@ -213,6 +416,8 @@ void flex_rewrite::infer_output_shape(
             case dnnl::graph::op::kind::Exp:
             case dnnl::graph::op::kind::GELU:
             case dnnl::graph::op::kind::GELUBackward:
+            case dnnl::graph::op::kind::GenIndex:
+            case dnnl::graph::op::kind::GreaterEqual:
             case dnnl::graph::op::kind::HardSigmoid:
             case dnnl::graph::op::kind::HardSigmoidBackward:
             case dnnl::graph::op::kind::HardSwish:
@@ -234,7 +439,6 @@ void flex_rewrite::infer_output_shape(
             case dnnl::graph::op::kind::Round:
             case dnnl::graph::op::kind::Sigmoid:
             case dnnl::graph::op::kind::SigmoidBackward:
-            case dnnl::graph::op::kind::SoftMax:
             case dnnl::graph::op::kind::SoftMaxBackward:
             case dnnl::graph::op::kind::SoftPlus:
             case dnnl::graph::op::kind::SoftPlusBackward:
@@ -480,6 +684,43 @@ void flex_rewrite::infer_output_shape(
                 merge_ncx(data_format, gi[out0], n, c, x);
                 break;
             // infer_norm_output_shape
+            case dnnl::graph::op::kind::GroupNorm:
+                // infer shape for dst.
+                in0 = aop.in_lts_[0].id_;
+                out0 = aop.out_lts_[0].id_;
+                gi[out0] = gi[in0];
+                // attr `keep_stats` is optional, default is `true`
+                if (aop.attrs_.find("keep_stats") == aop.attrs_.end()
+                        || aop.attrs_["keep_stats"].bool_value_) {
+                    // `true` means it has 3 output: dst, mean and var.
+                    //  need to infer shape for mean and var
+                    if (aop.out_lts_.size() == 3) {
+                        int64_t groups = 0;
+                        if (aop.attrs_.find("groups") == aop.attrs_.end()) {
+                            fprintf(stderr,
+                                    "graph: groups is required for "
+                                    "GroupNorm!\n");
+                            SAFE_V(FAIL);
+                        } else {
+                            groups = aop.attrs_["groups"].s64_value_;
+                        }
+                        size_t out1 = aop.out_lts_[1].id_;
+                        size_t out2 = aop.out_lts_[2].id_;
+                        gi[out1].clear();
+                        gi[out2].clear();
+                        // mean/var shape is N,C
+                        std::vector<int64_t> mv_shape = {gi[in0][0], groups};
+                        gi[out1] = mv_shape;
+                        gi[out2] = mv_shape;
+                    } else {
+                        fprintf(stderr,
+                                "graph: GroupNorm output number "
+                                "mismatch!\n");
+                        SAFE_V(FAIL);
+                    }
+                }
+                break;
+            // infer_norm_output_shape
             case dnnl::graph::op::kind::LayerNorm:
                 in0 = aop.in_lts_[0].id_;
                 out0 = aop.out_lts_[0].id_;
@@ -554,15 +795,26 @@ void flex_rewrite::infer_output_shape(
                     x[x.size() - 1] = n;
                     gi[out0] = x;
                 } else {
-                    assert(x[x.size() - 1] == y[y.size() - 2]);
-                    size_t a = x[x.size() - 2], b = y[y.size() - 1];
-                    x.pop_back();
-                    x.pop_back();
-                    y.pop_back();
-                    y.pop_back();
-                    broadcast(x, y, gi[out0]);
-                    gi[out0].push_back(a);
-                    gi[out0].push_back(b);
+                    // Check that K is consistent in updated inputs.
+                    if (x[x.size() - 1] != y[y.size() - 2]) {
+                        BENCHDNN_PRINT(0,
+                                "Error: updated shapes are not consistent. "
+                                "Expected element \'%lld\' from \'%s\' to be "
+                                "equal to element \'%lld\' from \'%s\'.\n",
+                                (long long)(x[x.size() - 1]),
+                                stdvec2string(x).c_str(),
+                                (long long)(y[y.size() - 2]),
+                                stdvec2string(y).c_str());
+                        SAFE_V(FAIL);
+                    }
+                    size_t M = x[x.size() - 2];
+                    size_t N = y[y.size() - 1];
+                    dims_t x_batch(x.begin(), x.end() - 2);
+                    dims_t y_batch(y.begin(), y.end() - 2);
+                    broadcast(x_batch, y_batch, gi[out0], stdvec2string(x),
+                            stdvec2string(y));
+                    gi[out0].push_back(M);
+                    gi[out0].push_back(N);
                 }
                 break;
             // infer_prelu_bwd_output_shape
@@ -653,6 +905,26 @@ void flex_rewrite::infer_output_shape(
                     }
                 }
                 break;
+            // infer_softmax_output_shape
+            case dnnl::graph::op::kind::SoftMax:
+                in0 = aop.in_lts_[0].id_;
+                out0 = aop.out_lts_[0].id_;
+                gi[out0] = gi[in0];
+                if (aop.out_lts_.size() > 1) {
+                    // infer softmax stats shape
+                    size_t out1 = aop.out_lts_[1].id_;
+                    // the axis attribute is optional, default is 1
+                    int64_t axis = 1;
+                    if (aop.attrs_.find("axis") != aop.attrs_.end()) {
+                        axis = aop.attrs_["axis"].s64_value_;
+                    }
+                    axis = axis >= 0 ? axis : gi[out0].size() + axis;
+                    logical_tensor::dims out1_dims = gi[out0];
+                    out1_dims[axis] = 1;
+                    gi[out1] = out1_dims;
+                }
+
+                break;
             // infer_unsupported_output_shape
             case dnnl::graph::op::kind::Wildcard:
             // no output, do nothing
@@ -660,12 +932,28 @@ void flex_rewrite::infer_output_shape(
             case dnnl::graph::op::kind::LastSymbol: break;
         }
 
+        // update the shape and strides for input tensors.
+        const auto &input_ports = dgraph.get_input_ports();
         for (auto &lt : aop.in_lts_) {
-            lt.shape_ = gi[lt.id_];
-            lt.stride_
-                    = memory_tag2strides(gi[lt.id_], dgraph.lt_2_mtag_[lt.id_]);
+            if (std::find(input_ports.begin(), input_ports.end(), lt.id_)
+                    == input_ports.end()) {
+                // for graph input ports, no action is needed, as they have
+                // been handled during the input shape rewrite stage. And for
+                // other intermediate tensors, set the input shape and strides
+                // based on the inference of parents ops.
+                if (dgraph.lt_2_mtag_[lt.id_] == "not_available") {
+                    BENCHDNN_PRINT(0, "%s\n",
+                            "Error: intermediate tensors do not support "
+                            "non-contiguous format");
+                    SAFE_V(FAIL);
+                }
+                lt.shape_ = gi[lt.id_];
+                lt.stride_ = memory_tag2strides(
+                        lt.shape_, dgraph.lt_2_mtag_[lt.id_]);
+            }
         }
-        // update outputs for the current op
+
+        // update the shape and strides for output tensors.
         update_output_info(aop, dgraph, change_stride);
     }
 }
@@ -678,9 +966,10 @@ void flex_rewrite::infer_output_shape(
 /// @param msg Error message info when function returns `false` value.
 /// @return `true` if an inport info is valid and `false` otherwise. A message `msg`
 /// describes an error occurred.
-bool flex_rewrite::get_inport_shape_stride(const std::string &in_shape,
-        std::string &shape, std::string &stride, std::string &msg) {
-    assert(shape.empty() && stride.empty());
+bool flex_rewrite_t::get_inport_shape_stride(const std::string &in_shape,
+        std::string &shape, std::string &stride, std::string &mtag,
+        std::string &msg) {
+    assert(shape.empty() && stride.empty() && mtag.empty());
     if (in_shape == "0" || in_shape == "-") {
         shape = in_shape;
         return true;
@@ -701,50 +990,61 @@ bool flex_rewrite::get_inport_shape_stride(const std::string &in_shape,
     };
 
     size_t in_length = in_shape.size();
-    size_t star_pos = in_shape.find('*');
+    size_t delimiter_pos = in_shape.find('*');
     const static std::string err_msg
             = "A shape is expected in the form of `NUMxNUMxNUM...`. A tag must "
               "be composed of letters only.";
-    // shape and stride are provided
-    if (star_pos != std::string::npos) {
-        // invalid CML info, e.g. "1x2x3*", "*abc"
-        if (star_pos == 0 || star_pos == in_length - 1) {
-            msg = "A shape must be provided before the `*`, a tag - after the "
-                  "`*`. Alternatively, remove the `*` to apply the default "
-                  "shape or stride.";
+    if (delimiter_pos != std::string::npos) {
+        // strides rewrite is provided
+        if (delimiter_pos == in_length - 1) {
+            // invalid CML info, e.g. "1x2x3*"
+            msg = "A memory tag or strides should be provided after the '*'.";
             return false;
         }
-        shape = in_shape.substr(0, star_pos);
-        stride = in_shape.substr(star_pos + 1, in_length);
+        shape = in_shape.substr(0, delimiter_pos);
+        std::string mtag_or_stride
+                = in_shape.substr(delimiter_pos + 1, in_length);
 
-        if (all_letters(stride) && all_digit_cross(shape)) {
-            return true;
-        } else {
-            msg = err_msg;
+        // if new shape does not contain numbers and `x` only
+        if (delimiter_pos != 0 && !all_digit_cross(shape)) return false;
+
+        if (all_letters(mtag_or_stride))
+            // if only memory tag is provied, such as --in-shapes=0:*abdc.
+            mtag = mtag_or_stride;
+        else if (all_digit_cross(mtag_or_stride))
+            // if only strides are provied, such as --in-shapse=0:*1x16x4
+            stride = mtag_or_stride;
+        else
             return false;
-        }
-    } else if (all_letters(in_shape)) { // user only provide a new stride
-        stride = in_shape;
         return true;
-    } else if (all_digit_cross(in_shape)) { // user only provide a new shape
+    } else if (all_letters(in_shape)) {
+        // if a new memory tag is provided without a delimiter
+        msg = "A memory tag or strides should be provided after the '*'.";
+        return false;
+    } else if (all_digit_cross(in_shape)) {
+        // if only a new shape is provided, such as --in-shapes=0:1x8x4
         shape = in_shape;
         return true;
-    } else { // a valid input info is rather strict, return false if the input info is none of the above
+    } else {
+        // a valid input info is rather strict, return false if the input info
+        // is none of the above
         msg = err_msg;
         return false;
     }
+
+    return true;
 }
 
-void flex_rewrite::inports_shape_rewrite(
-        deserialized_graph &dgraph, bool &change_stride) {
+void flex_rewrite_t::inports_shape_rewrite(
+        deserialized_graph_t &dgraph, bool &change_stride) {
     // reminder mb rewrite status
     if (mb_ != 0 && dgraph.graph_inputs_with_mb_.empty()) {
         BENCHDNN_PRINT(0,
-                "Error: flex_rewrite: can't rewrite mb value with \'%ld\'.\n",
+                "Error: flex_rewrite_t: can't rewrite mb value with \'%ld\'.\n",
                 (long)mb_);
     }
 
-    const auto set_default_deserialized_lt = [](deserialized_lt &lt) {
+    const auto set_default_deserialized_lt_t = [](deserialized_lt_t &lt) {
         auto ndims = lt.shape_.size();
         logical_tensor::dims infer_dim(ndims, -1);
         lt.shape_ = infer_dim;
@@ -754,7 +1054,7 @@ void flex_rewrite::inports_shape_rewrite(
     // check stride provided from cml, return false, if one is not a valid tag
     // for example: when stride is "dcba", return true;
     // when stride size is 4, "zcba" & "aabc" are all invalid stride
-    const auto is_valid_stride = [](const std::string &stride) -> bool {
+    const auto is_valid_tag = [](const std::string &stride) -> bool {
         assert(!stride.empty());
         for (size_t i = 0; i < stride.size(); ++i) {
             if (stride.find(char('a' + i)) == std::string::npos) {
@@ -764,11 +1064,21 @@ void flex_rewrite::inports_shape_rewrite(
         return true;
     };
 
+    const auto &input_ports = dgraph.get_input_ports();
     for_(auto &aop : dgraph.ops_)
     for (auto &lt : aop.in_lts_) {
         // if 'lt' is not a inport, set default logical tensor info
-        if (dgraph.graph_tensors_.find(lt.id_) == dgraph.graph_tensors_.end()) {
-            set_default_deserialized_lt(lt);
+        if (std::find(input_ports.begin(), input_ports.end(), lt.id_)
+                == input_ports.end()) {
+            // At the same time check if in_shapes contain non-inport tensors.
+            if (in_shapes_.find(lt.id_) != in_shapes_.end()) {
+                BENCHDNN_PRINT(0,
+                        "Error: \'in-shapes\' option contains a tensor with "
+                        "id=\'%zu\' which is not an input for a given graph.\n",
+                        lt.id_);
+                SAFE_V(FAIL);
+            }
+            set_default_deserialized_lt_t(lt);
             continue;
         }
 
@@ -779,9 +1089,9 @@ void flex_rewrite::inports_shape_rewrite(
         if (in_shapes_.find(lt.id_) != in_shapes_.end()
                 && in_shapes_[lt.id_] != "default") {
 
-            std::string new_shape, new_stride, message;
-            bool result = get_inport_shape_stride(
-                    in_shapes_[lt.id_], new_shape, new_stride, message);
+            std::string new_shape, new_mtag, new_stride, message;
+            bool result = get_inport_shape_stride(in_shapes_[lt.id_], new_shape,
+                    new_stride, new_mtag, message);
             if (!result) {
                 BENCHDNN_PRINT(0,
                         "Error: `--in-shapes` is not valid. Reason: %s\n",
@@ -794,9 +1104,10 @@ void flex_rewrite::inports_shape_rewrite(
             // shape, stride: ["1x32x4", ""] including ["0", ""]
             // shape, stride: ["1x32x4", "abc"]
             // shape, stride: ["", "abc"]
+            // shape,  stride:   ["1x32x4", "256x128x1"]
+            // shape,  stride:   ["", "256x128x1"]
             // and checks has been done accordingliy
             size_t ndims = lt.shape_.size(); // the original rank from JSON
-            dims_t new_shape_dims;
             // shape "-" means this logical tensor is 0 rank with shape: []
             const bool zero_rank = new_shape == "-";
             // if the current logical tensor is rewritten to rank-0
@@ -808,65 +1119,72 @@ void flex_rewrite::inports_shape_rewrite(
                 continue;
             }
             if (!new_shape.empty()) {
-                new_shape_dims = string_to_shape(new_shape);
-                if (!new_stride.empty()) {
-                    if (new_shape_dims.size() != new_stride.size()) {
-                        BENCHDNN_PRINT(0,
-                                "Error: the shape size (`%zu`) must coinside "
-                                "with the stride size (`%zu`).\n",
-                                new_shape_dims.size(), new_stride.size());
-                        SAFE_V(FAIL);
-                    }
-                    if (!is_valid_stride(new_stride)) {
-                        BENCHDNN_PRINT(0,
-                                "Error: the tag provided is not valid: `%s`: "
-                                "unexpected letters encountered.\n",
-                                new_stride.c_str());
-                        SAFE_V(FAIL);
-                    }
-                }
+                auto new_shape_dims = string_to_shape(new_shape);
                 if (has_mb_rewrite) { new_shape_dims[0] = mb_; }
-            }
 
-            // if rank change and no stride provided
-            if (new_shape_dims.size() != ndims && new_stride.empty()) {
-                change_stride = true;
-                // use default stride
-                dgraph.lt_2_mtag_[lt.id_]
-                        = get_default_tag(new_shape_dims.size());
-            }
+                // if only rewrite the shape, use dense format
+                if (new_mtag.empty() && new_stride.empty()) {
+                    change_stride = true;
+                    // use default stride
+                    dgraph.lt_2_mtag_[lt.id_]
+                            = get_default_tag(new_shape_dims.size());
+                }
 
-            // update new value to dgraph
-            if (!new_shape.empty()) {
+                // update new value to dgraph
                 lt.shape_ = new_shape_dims;
+                ndims = new_shape_dims.size();
                 dgraph.graph_tensors_[lt.id_] = new_shape_dims;
             }
-            if (!new_stride.empty()) {
-                // original 4d, no new shape and stride.size() != 4,
-                // this is not valid stride
-                if (new_shape.empty() && new_stride.size() != ndims) {
+
+            if (!new_mtag.empty()) {
+                if (new_mtag.size() != ndims) {
                     BENCHDNN_PRINT(0,
-                            "Error: the tag provided is not valid: `%s`: the "
+                            "Error: the tag provided is not valid: `%s`, the "
                             "tag size must be `%d`.\n",
-                            new_stride.c_str(), static_cast<int>(ndims));
+                            new_mtag.c_str(), static_cast<int>(ndims));
                     SAFE_V(FAIL);
                 }
-                if (!is_valid_stride(new_stride)) {
+                if (!is_valid_tag(new_mtag)) {
                     BENCHDNN_PRINT(0,
                             "Error: the tag provided is not valid: `%s`: "
                             "unexpected letters encountered.\n",
-                            new_stride.c_str());
+                            new_mtag.c_str());
                     SAFE_V(FAIL);
                 }
-                if (dgraph.lt_2_mtag_[lt.id_] != new_stride) {
+                if (dgraph.lt_2_mtag_[lt.id_] != new_mtag) {
                     change_stride = true;
-                    dgraph.lt_2_mtag_[lt.id_] = new_stride;
+                    dgraph.lt_2_mtag_[lt.id_] = new_mtag;
                 }
+                lt.stride_ = memory_tag2strides(
+                        lt.shape_, dgraph.lt_2_mtag_[lt.id_]);
+
+            } else if (!new_stride.empty()) {
+                auto new_stride_dims = string_to_shape(new_stride);
+                if (new_stride_dims.size() != ndims) {
+                    BENCHDNN_PRINT(0,
+                            "Error: the strides provided is not valid: `%s`, "
+                            "the "
+                            "strides size must be `%d`.\n",
+                            new_stride.c_str(), static_cast<int>(ndims));
+                    SAFE_V(FAIL);
+                }
+
+                change_stride = true;
+                std::string tmp_mtag = strides2memory_tag(
+                        lt.shape_.size(), new_stride_dims, false);
+                if (!is_contiguous_memory(
+                            new_stride_dims, lt.shape_, tmp_mtag)) {
+                    dgraph.lt_2_mtag_[lt.id_] = "not_available";
+                }
+                lt.stride_ = new_stride_dims;
+            } else {
+                lt.stride_ = memory_tag2strides(
+                        lt.shape_, dgraph.lt_2_mtag_[lt.id_]);
             }
-            lt.stride_
-                    = memory_tag2strides(lt.shape_, dgraph.lt_2_mtag_[lt.id_]);
 
         } else if (has_mb_rewrite) {
+            // if no shape and strides rewriting is provided, respect the
+            // information from the JSON file.
             lt.shape_[0] = mb_;
             dgraph.graph_tensors_[lt.id_] = lt.shape_;
         }
@@ -874,12 +1192,13 @@ void flex_rewrite::inports_shape_rewrite(
 
     for_(auto &aop : dgraph.ops_)
     for (auto &lt : aop.out_lts_) {
-        set_default_deserialized_lt(lt);
+        set_default_deserialized_lt_t(lt);
     }
 }
 
-void flex_rewrite::op_attrs_rewrite(deserialized_graph &dgraph) {
+void flex_rewrite_t::op_attrs_rewrite(deserialized_graph_t &dgraph) {
     std::vector<size_t> op_ids_;
+    op_ids_.reserve(dgraph.ops_.size());
     for (const auto &aop : dgraph.ops_) {
         op_ids_.emplace_back(aop.id_);
     }
@@ -894,15 +1213,15 @@ void flex_rewrite::op_attrs_rewrite(deserialized_graph &dgraph) {
         auto &temp_op = dgraph.ops_[std::distance(op_ids_.begin(), iter)];
         const auto attrs = parse_attrs(temp_attrs.second);
         for (const auto &new_attr : attrs) {
-            auto attr_name = new_attr.first;
+            const auto &attr_name = new_attr.first;
             if (!temp_op.attrs_.count(attr_name)) {
                 BENCHDNN_PRINT(0,
                         "graph: rewrite: no attr name `%s` in op %zd.\n",
                         attr_name.c_str(), temp_attrs.first);
                 SAFE_V(FAIL);
             }
-            auto new_val = new_attr.second;
-            auto attr_type = temp_op.attrs_[attr_name].type_;
+            const auto &new_val = new_attr.second;
+            const auto &attr_type = temp_op.attrs_[attr_name].type_;
             if (attr_type == "string") {
                 temp_op.attrs_[attr_name].str_value_ = new_val;
             } else if (attr_type == "bool") {
@@ -923,7 +1242,7 @@ void flex_rewrite::op_attrs_rewrite(deserialized_graph &dgraph) {
     }
 }
 
-inline bool is_int8_quantization(const deserialized_op &aop) {
+inline bool is_int8_quantization(const deserialized_op_t &aop) {
     if (aop.kind_ == "Dequantize") {
         const auto dt = aop.in_lts_.front().get_data_type();
         return (dt == logical_tensor::data_type::u8
@@ -938,7 +1257,7 @@ inline bool is_int8_quantization(const deserialized_op &aop) {
     }
 }
 
-void flex_rewrite::quantized_graph_rewrite(deserialized_graph &dgraph) {
+void flex_rewrite_t::quantized_graph_rewrite(deserialized_graph_t &dgraph) {
     for (auto &aop : dgraph.ops_) {
         if (aop.kind_ != "Dequantize" && aop.kind_ != "Quantize") continue;
 
@@ -950,24 +1269,18 @@ void flex_rewrite::quantized_graph_rewrite(deserialized_graph &dgraph) {
             continue;
         if (is_int8 && attr.find("zps") == attr.end()) continue;
 
-        auto pre_scales = attr["scales"].f32_vector_;
+        const auto &pre_scales = attr["scales"].f32_vector_;
+        const auto pre_scales_size = pre_scales.size();
         int64_t axis = 1;
         auto ndims = aop.in_lts_.front().shape_.size();
         if (attr.find("axis") != attr.end()) {
             axis = (attr["axis"].s64_value_ + ndims) % ndims;
         }
         const int64_t scales_zp_dim = aop.in_lts_.front().shape_[axis];
-        std::vector<float> scales(scales_zp_dim, pre_scales[0]);
+        std::vector<float> scales(scales_zp_dim);
 
-        attr_t::arg_scales_t::entry_t e(policy_t::PER_OC);
-        const dnnl_dims_t scales_dims {scales_zp_dim};
-        const auto scales_md
-                = dnn_mem_t::init_md(1, scales_dims, dnnl_f32, tag::abx);
-        dnn_mem_t scales_fp(scales_md, ::get_test_engine());
-        dnn_mem_t dummy;
-        fill_scales(e, dummy, scales_fp);
-        for (int i = 0; i < scales_fp.nelems(); i++)
-            scales[i] = scales_fp.get_elem(i);
+        for (int64_t i = 0; i < scales_zp_dim; i++)
+            scales[i] = pre_scales[i % pre_scales_size];
         aop.attrs_["scales"].f32_vector_ = scales;
 
         if (is_int8) {
@@ -985,18 +1298,239 @@ void flex_rewrite::quantized_graph_rewrite(deserialized_graph &dgraph) {
     }
 }
 
+// Select: only rewrite src_1/src_2/dst as `cond` is always `bool`.
+void dt_rewrite_select(deserialized_op_t &select, const std::string &dt) {
+    select.in_lts_[1].data_type_ = dt;
+    select.in_lts_[2].data_type_ = dt;
+    select.out_lts_[0].data_type_ = dt;
+}
+
+// Normalization ops: only rewrite src/dst/diff_src/diff_dst as f16
+// normalization still requires f32 for gamma/beta/etc. This is good for most of
+// the cases. But there is a potential issue if gamma/beta/etc is connected to
+// another op which will rewrite the data type at other places.
+void dt_rewrite_norm(deserialized_op_t &norm, const std::string &dt) {
+    if (norm.kind_ == "BatchNormTrainingBackward"
+            || norm.kind_ == "LayerNormBackward") {
+        // rewrite for src/diff_dst/diff_src.
+        norm.in_lts_[0].data_type_ = dt;
+        norm.in_lts_[1].data_type_ = dt;
+        norm.out_lts_[0].data_type_ = dt;
+    } else {
+        // only rewrite for src/dst.
+        norm.in_lts_[0].data_type_ = dt;
+        norm.out_lts_[0].data_type_ = dt;
+    }
+}
+
+void flex_rewrite_t::dt_rewrite(deserialized_graph_t &dgraph) {
+    if (dt_ == dnnl_data_type_undef) return;
+
+    // We can only do data type rewriting for pure floating-point graph.
+    static const std::vector<dnnl_data_type_t> fp_dts {
+            dnnl_f32, dnnl_bf16, dnnl_f16};
+    if (!std::any_of(fp_dts.begin(), fp_dts.end(),
+                [this](const dnnl_data_type_t &dt) { return dt_ == dt; })) {
+        BENCHDNN_PRINT(0, "graph: rewrite: `%s` data type is not supported\n",
+                dt2str(dt_));
+        SAFE_V(FAIL);
+    }
+
+    static const std::vector<std::string> lowp_ops {
+            "TypeCast",
+            "Quantize",
+            "Dequantize",
+            "DynamicQuantize",
+            "DynamicDequantize",
+    };
+    // If the graph contains mix-precision ops, we cannot rewrite the data type
+    // trivially.
+    for (auto &aop : dgraph.ops_) {
+        if (std::any_of(lowp_ops.begin(), lowp_ops.end(),
+                    [&aop](const std::string &k) { return aop.kind_ == k; })) {
+            BENCHDNN_PRINT(0,
+                    "graph: rewrite: the graph contains operation `%s`\n",
+                    aop.kind_.c_str());
+            SAFE_V(FAIL);
+        }
+    }
+
+    // Normalization ops need additional handling. See the comments of function
+    // `dt_rewrite_norm`.
+    static const std::vector<std::string> norm_ops {
+            "BatchNormForwardTraining",
+            "BatchNormInference",
+            "BatchNormTrainingBackward",
+            "GroupNorm",
+            "LayerNorm",
+            "LayerNormBackward",
+    };
+
+    // rewrite
+    std::string str_dt(dt2str(dt_));
+    for (auto &aop : dgraph.ops_) {
+        if (aop.kind_ == "Select") {
+            dt_rewrite_select(aop, str_dt);
+        } else if (std::any_of(norm_ops.begin(), norm_ops.end(),
+                           [&aop](const std::string &k) {
+                               return aop.kind_ == k;
+                           })) {
+            dt_rewrite_norm(aop, str_dt);
+        } else if (aop.kind_ == "GenIndex") {
+            // GenIndex: only rewrite src dtype
+            aop.in_lts_[0].data_type_ = str_dt;
+        } else if (aop.kind_ == "GreaterEqual") {
+            // GreaterEqual: only rewrite src dtype when it's floating-point
+            if (std::any_of(fp_dts.begin(), fp_dts.end(),
+                        [&aop](const dnnl_data_type_t &fp_dt) {
+                            return aop.in_lts_[0].data_type_ == dt2str(fp_dt);
+                        })) {
+                aop.in_lts_[0].data_type_ = str_dt;
+                aop.in_lts_[1].data_type_ = str_dt;
+            }
+        } else if (aop.kind_ == "Add" || aop.kind_ == "Subtract") {
+            // Add/Sub: only rewrite dtype when it's floating-point
+            if (std::any_of(fp_dts.begin(), fp_dts.end(),
+                        [&aop](const dnnl_data_type_t &fp_dt) {
+                            return aop.in_lts_[0].data_type_ == dt2str(fp_dt);
+                        })) {
+                aop.in_lts_[0].data_type_ = str_dt;
+                aop.in_lts_[1].data_type_ = str_dt;
+                aop.out_lts_[0].data_type_ = str_dt;
+            }
+
+        } else {
+            for (auto &lt : aop.in_lts_) {
+                lt.data_type_ = str_dt;
+            }
+
+            for (auto &lt : aop.out_lts_) {
+                lt.data_type_ = str_dt;
+            }
+        }
+    }
+}
+
+void flex_rewrite_t::op_kind_rewrite(deserialized_graph_t &dgraph) {
+    if (op_kind_map_.size() == 1 && op_kind_map_.begin()->second == "default")
+        return;
+
+    for_(auto &aop : dgraph.ops_)
+    for (const auto &v : op_kind_map_) {
+        if (aop.id_ != v.first) continue;
+
+        if (aop.empty()) {
+            BENCHDNN_PRINT(0,
+                    "graph: rewrite: ID `%zd` is not found in the graph\n",
+                    v.first);
+            SAFE_V(FAIL);
+        }
+        auto op_driver = aop.opkind2driver();
+
+        auto target_kind = opstr2kind(v.second);
+        if (target_kind == dnnl::graph::op::kind::LastSymbol) {
+            BENCHDNN_PRINT(0,
+                    "graph: rewrite: invalid target op kind %s is "
+                    "provided\n",
+                    v.second.c_str());
+            SAFE_V(FAIL);
+        }
+
+        // rewrite the op kind
+        aop.kind_ = v.second;
+        // Only support op kind rewrite for binary and eltwise ops.
+        auto target_driver = aop.opkind2driver();
+        if (target_driver != dnnl_driver_t::binary
+                && target_driver != dnnl_driver_t::eltwise) {
+            BENCHDNN_PRINT(0,
+                    "graph: rewrite: target op kind %s for id `%zd` is not "
+                    "supported\n",
+                    v.second.c_str(), v.first);
+            SAFE_V(FAIL);
+        }
+
+        // check if the target driver aligns with original driver
+        if (op_driver != target_driver) {
+            BENCHDNN_PRINT(0,
+                    "graph: rewrite: target op kind `%s` does not "
+                    "match the op kind `%s` in the graph\n",
+                    v.second.c_str(), aop.kind_.c_str());
+            SAFE_V(FAIL);
+        }
+    }
+}
+
+void flex_rewrite_t::dt_map_rewrite(deserialized_graph_t &dgraph) {
+    // check the IDs and data types in dt_map.
+    for (const auto &v : dt_map_) {
+        if (v.second == dnnl_data_type_undef) return;
+
+        bool found_id = false;
+        for (auto &aop : dgraph.ops_) {
+            for (auto &lt : aop.in_lts_) {
+                if (lt.id_ == v.first) found_id = true;
+            }
+
+            for (auto &lt : aop.out_lts_) {
+                if (lt.id_ == v.first) found_id = true;
+            }
+        }
+
+        if (!found_id) {
+            BENCHDNN_PRINT(0,
+                    "graph: rewrite: ID `%zd` is not found in the graph\n",
+                    v.first);
+            SAFE_V(FAIL);
+        }
+    }
+
+    // rewrite
+    for (const auto &v : dt_map_) {
+        const std::string str_dt(dt2str(v.second));
+        for (auto &aop : dgraph.ops_) {
+            for (auto &lt : aop.in_lts_) {
+                if (lt.id_ == v.first) lt.data_type_ = str_dt;
+            }
+
+            for (auto &lt : aop.out_lts_) {
+                if (lt.id_ == v.first) lt.data_type_ = str_dt;
+            }
+        }
+    }
+}
+
+void flex_rewrite_t::graph_attrs_rewrite(deserialized_graph_t &dgraph) {
+
+    // if the fpmath mode is specified by users through cml, replace the fpmath
+    // mode from JSON file with the value from cml.
+    if (fpmath_mode_.override_json_value_) dgraph.set_fpmath_mode(fpmath_mode_);
+
+    for (auto &aop : dgraph.ops_) {
+        // save the graph-level config for ops
+        const auto &mode = dgraph.get_fpmath_mode();
+        aop.fpmath_mode_ = mode.first;
+        aop.fpmath_mode_apply_to_int_ = mode.second;
+    }
+}
+
 /// @brief Update the output shape & stride & members after infer output shape
 /// @param aop The current op of the graph
 /// @param dgraph A deserialized graph
 /// @param change_stride A boolean value indicating whether the graph input strides
 /// have been changed.
-void flex_rewrite::update_output_info(
-        deserialized_op &aop, deserialized_graph &dgraph, bool change_stride) {
+void flex_rewrite_t::update_output_info(deserialized_op_t &aop,
+        deserialized_graph_t &dgraph, bool change_stride) {
     auto kind = opstr2kind(aop.kind_);
     auto &gi = dgraph.graph_tensors_;
     // if a input stride is not changed, the output stride should not be changed as well
     if (!change_stride) {
         for (auto &lt : aop.out_lts_) {
+            if (dgraph.lt_2_mtag_[lt.id_] == "not_available") {
+                BENCHDNN_PRINT(0, "%s\n",
+                        "Error: output and intermediate tensors do not support "
+                        "non-contiguous format");
+                SAFE_V(FAIL);
+            }
             lt.shape_ = gi[lt.id_];
             lt.stride_
                     = memory_tag2strides(gi[lt.id_], dgraph.lt_2_mtag_[lt.id_]);
@@ -1005,7 +1539,8 @@ void flex_rewrite::update_output_info(
     }
     // step1: get dominate stride info
     // get the src stride, normally index 0 input tensor
-    std::string dominate_stride = dgraph.lt_2_mtag_[aop.in_lts_.front().id_];
+    const auto &dominate_tag = dgraph.lt_2_mtag_[aop.in_lts_.front().id_];
+    const bool is_mtag_available = (dominate_tag != "not_available");
     // step2: determine out stride info
     switch (kind) {
         // category 1: all output lts have the same dim size
@@ -1034,6 +1569,9 @@ void flex_rewrite::update_output_info(
         case dnnl::graph::op::kind::Exp:
         case dnnl::graph::op::kind::GELU:
         case dnnl::graph::op::kind::GELUBackward:
+        case dnnl::graph::op::kind::GenIndex:
+        case dnnl::graph::op::kind::GreaterEqual:
+        case dnnl::graph::op::kind::GroupNorm:
         case dnnl::graph::op::kind::HardSigmoid:
         case dnnl::graph::op::kind::HardSigmoidBackward:
         case dnnl::graph::op::kind::HardSwish:
@@ -1086,8 +1624,14 @@ void flex_rewrite::update_output_info(
                 // shape has been determined in 'gi' by infer_out_shape()
                 // so update shape in lt here
                 lt.shape_ = gi[lt.id_];
-                dgraph.lt_2_mtag_[lt.id_] = dominate_stride;
-                lt.stride_ = memory_tag2strides(gi[lt.id_], dominate_stride);
+                if (is_mtag_available) {
+                    dgraph.lt_2_mtag_[lt.id_] = dominate_tag;
+                } else {
+                    dgraph.lt_2_mtag_[lt.id_]
+                            = get_default_tag(lt.shape_.size());
+                }
+                lt.stride_ = memory_tag2strides(
+                        lt.shape_, dgraph.lt_2_mtag_[lt.id_]);
             }
             break;
         }
@@ -1098,9 +1642,14 @@ void flex_rewrite::update_output_info(
             for (auto &lt : aop.out_lts_) {
                 lt.shape_ = gi[lt.id_];
                 if (lt.shape_.size() != 1) {
-                    dgraph.lt_2_mtag_[lt.id_] = dominate_stride;
-                    lt.stride_
-                            = memory_tag2strides(gi[lt.id_], dominate_stride);
+                    if (is_mtag_available) {
+                        dgraph.lt_2_mtag_[lt.id_] = dominate_tag;
+                    } else {
+                        dgraph.lt_2_mtag_[lt.id_]
+                                = get_default_tag(lt.shape_.size());
+                    }
+                    lt.stride_ = memory_tag2strides(
+                            lt.shape_, dgraph.lt_2_mtag_[lt.id_]);
                 } else {
                     dgraph.lt_2_mtag_[lt.id_] = "a";
                     lt.stride_ = memory_tag2strides(gi[lt.id_], "a");

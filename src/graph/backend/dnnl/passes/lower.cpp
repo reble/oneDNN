@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2024 Intel Corporation
+ * Copyright 2022-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -42,6 +42,14 @@
 #include "graph/backend/dnnl/passes/transform.hpp"
 #include "graph/backend/dnnl/passes/utils.hpp"
 
+#define VCHECK_INVALID_ARGUMENT(cond, msg, ...) \
+    VCONDCHECK(graph, create, check, compile, (cond), \
+            status::invalid_arguments, msg, ##__VA_ARGS__);
+
+#define VCHECK_UNIMPLEMENTED(cond, msg, ...) \
+    VCONDCHECK(graph, create, check, compile, (cond), status::unimplemented, \
+            msg, ##__VA_ARGS__);
+
 namespace dnnl {
 namespace impl {
 namespace graph {
@@ -83,6 +91,12 @@ static status_t binary_handler(
     new_op->merge_attributes(op->get_attributes());
     rewriter.replace_op(op, new_op);
     insert_empty_scratchpad(new_op);
+    if (op->get_kind() == graph::op_kind::GreaterEqual) {
+        auto out_vals = op->get_output_values();
+        const auto &dst = out_vals[0];
+        // GreaterEqual output's datatype is boolean. we treated it as u8
+        dst->set_data_type(dnnl::impl::data_type::u8);
+    }
     return status::success;
 }
 
@@ -102,7 +116,7 @@ static status_t eltwise_fwd_handler(
         const std::shared_ptr<op_t> &op, subgraph_rewriter_t &rewriter) {
     auto new_op = std::make_shared<op_t>(op_kind::dnnl_eltwise);
     new_op->set_attr<int64_t>(op_attr::alg_kind,
-            static_cast<int64_t>(get_eltwise_alg_map().at(op->get_kind())));
+            static_cast<int64_t>(get_eltwise_alg(op, false)));
     merge_common_eltwise_attrs(op, new_op);
     rewriter.replace_op(op, new_op);
     insert_empty_scratchpad(new_op);
@@ -118,13 +132,13 @@ static status_t eltwise_bwd_handler(
             : false;
     new_op->set_attr(op_attr::use_dst, use_dst);
 
-    auto kind = op->get_kind();
-    auto bwd_algo = get_eltwise_bwd_alg(kind, use_dst);
-    auto fwd_algo = get_eltwise_bwd_alg(kind, false);
-    if (bwd_algo == algorithm::undef) {
-        DEBUG_PRINT_ERROR("Unsupported eltwise bwd op.");
+    auto bwd_algo = get_eltwise_alg(op, true);
+    auto fwd_algo = get_eltwise_alg(op, false);
+    if (bwd_algo == algorithm::undef || fwd_algo == algorithm::undef) {
+        assert(!"unsupported eltwise bwd op.");
         return status::unimplemented;
     }
+
     new_op->set_attr<int64_t>(
             op_attr::alg_kind, static_cast<int64_t>(bwd_algo));
     new_op->set_attr<int64_t>(
@@ -173,6 +187,15 @@ static status_t batchnorm_fwd_handler(
 
 static status_t reduction_handler(
         const std::shared_ptr<op_t> &op, subgraph_rewriter_t &rewriter) {
+
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+    auto src_lt = op->get_input_values()[0]->get_logical_tensor();
+    auto src_nelems = ltw(src_lt).nelems();
+    //For now, reduction element size > 65535 is unsupported on NV GPU.
+    if (src_nelems > 65535) { return status::unimplemented; }
+#endif
+
     auto new_op = std::make_shared<op_t>(op_kind::dnnl_reduction);
     new_op->set_attr<int64_t>(
             op_attr::alg_kind, static_cast<int64_t>(op->get_kind()));
@@ -367,17 +390,16 @@ static status_t static_quant_handler(
 
     auto in_vals = op->get_input_values();
     auto out_vals = op->get_output_values();
-    assertm(in_vals.size() == 1 && out_vals.size() == 1,
-            "static quantize/dequantize should only have one input and "
-            "output");
-
+    VCHECK_INVALID_ARGUMENT(in_vals.size() == 1 && out_vals.size() == 1,
+            "static quantize/dequantize should only have one input and output"
+            " but got %zu input and %zu output",
+            in_vals.size(), out_vals.size());
+    VCHECK_INVALID_ARGUMENT(std::all_of(scales.begin(), scales.end(),
+                                    [](float i) { return i != 0.f; }),
+            "scales can't be zero");
     // int8 = f32 / scales + zps
     op_ptr mul_scales_op = std::make_shared<op_t>(op_kind::dnnl_mul_scales);
     op_ptr add_zps_op = std::make_shared<op_t>(op_kind::dnnl_add_zps);
-
-    assertm(std::all_of(scales.begin(), scales.end(),
-                    [](float i) { return i != 0.f; }),
-            "scales can't be zero");
 
     std::vector<float> inv_scales
             = dnnl_impl::utils::fmap(scales, [](float s) { return 1.f / s; });
@@ -425,8 +447,10 @@ static status_t static_dequant_handler(
 
     auto in_vals = cur_op->get_input_values();
     auto out_vals = cur_op->get_output_values();
-    assertm(in_vals.size() == 1 && out_vals.size() == 1,
-            "static dequantize should only have one input and output");
+    VCHECK_INVALID_ARGUMENT(in_vals.size() == 1 && out_vals.size() == 1,
+            "static dequantize should only have one input and output but "
+            "got %zu input and %zu output",
+            in_vals.size(), out_vals.size());
 
     // f32 = scales * (int8 - zps)
     op_ptr sub_zps_op = std::make_shared<op_t>(op_kind::dnnl_sub_zps);
@@ -470,9 +494,11 @@ static status_t dynamic_quant_handler(
 
     auto &in_vals = cur_op->get_input_values();
     auto &out_vals = cur_op->get_output_values();
-    assertm((in_vals.size() == 3 || in_vals.size() == 2)
+    VCHECK_INVALID_ARGUMENT((in_vals.size() == 3 || in_vals.size() == 2)
                     && out_vals.size() == 1,
-            "dynamic quantize must have 2 or 3 inputs and 1 output");
+            "dynamic quantize must have 2 or 3 inputs and 1 output, but "
+            "got %zu input and %zu output",
+            in_vals.size(), out_vals.size());
 
     // DynamicQuantize has optional zps
     bool has_zps = in_vals.size() == 3;
@@ -529,16 +555,58 @@ static status_t dynamic_dequant_handler(
 
     auto &in_vals = cur_op->get_input_values();
     auto &out_vals = cur_op->get_output_values();
-    assertm((in_vals.size() == 3 || in_vals.size() == 2)
+    VCHECK_INVALID_ARGUMENT((in_vals.size() == 3 || in_vals.size() == 2)
                     && out_vals.size() == 1,
-            "dynamic dequantize must have 2 or 3 inputs and 1 output");
+            "dynamic dequantize must have 2 or 3 inputs and 1 output, but "
+            "got %zu input and %zu output",
+            in_vals.size(), out_vals.size());
 
     // DynamicDequantize has optional zps
     bool has_zps = in_vals.size() == 3;
+    bool is_group_quantization = (qtype == "per_group");
 
     value_ptr src = in_vals[0], scales = in_vals[1], dst = out_vals[0], zps;
     if (has_zps) zps = in_vals[2];
 
+    int64_t group_mask = 0;
+    if (is_group_quantization) {
+
+        const auto &group_shape
+                = cur_op->get_attr<std::vector<int64_t>>(op_attr::group_shape);
+        const auto src_lt = src->get_logical_tensor();
+        const auto scale_lt = scales->get_logical_tensor();
+
+        const auto ndims = ltw(src_lt).ndims();
+        VCHECK_INVALID_ARGUMENT(
+                (static_cast<size_t>(ndims) == group_shape.size()),
+                "group shape size should match the number of dimensions of "
+                "src");
+        const auto &src_dims = ltw(src_lt).vdims();
+        const auto &scale_dims = ltw(scale_lt).vdims();
+
+        for (int idx = 0; idx < ndims - 2; ++idx) {
+            VCHECK_INVALID_ARGUMENT((src_dims[idx] == scale_dims[idx]),
+                    "the scale shape should match the input shape on the "
+                    "dimensions where no quantization is applied");
+        }
+
+        for (int idx = 0; idx < ndims; ++idx) {
+            VCHECK_INVALID_ARGUMENT(
+                    (src_dims[idx] == scale_dims[idx] * group_shape[idx]),
+                    "unsupported scale shape and group shape on dimension %d, "
+                    "src dim: %d, scale shape: %d, group shape: %d",
+                    idx, static_cast<int>(src_dims[idx]),
+                    static_cast<int>(scale_dims[idx]),
+                    static_cast<int>(group_shape[idx]));
+
+            if (group_shape[idx] != 1) {
+                group_mask += 1ULL << idx;
+                //Currently group quantization only happens on one dimension
+            }
+        }
+    }
+
+    const int64_t scales_data_type = scales->get_logical_tensor().data_type;
     // f32 = scales * (int8 - zps)
     // connect scales to mul_scales op
     op_ptr mul_scales = std::make_shared<op_t>(op_kind::dnnl_mul_scales);
@@ -546,6 +614,14 @@ static status_t dynamic_dequant_handler(
     scales->remove_consumer(*cur_op, 1);
     mul_scales->set_attr<int64_t>(op_attr::axis, axis);
     mul_scales->set_attr<std::string>(op_attr::qtype, qtype);
+    if (is_group_quantization) {
+        const auto &group_shape
+                = cur_op->get_attr<std::vector<int64_t>>(op_attr::group_shape);
+        mul_scales->set_attr<std::vector<int64_t>>(
+                op_attr::group_shape, group_shape);
+        mul_scales->set_attr<int64_t>(op_attr::group_mask, group_mask);
+    }
+    mul_scales->set_attr<int64_t>(op_attr::data_type, scales_data_type);
     mul_scales->set_attr<bool>(op_attr::with_runtime_scales, true);
 
     // connect mul_scales op to subgraph
@@ -555,19 +631,256 @@ static status_t dynamic_dequant_handler(
     rewriter.to_insert(mul_scales);
 
     if (has_zps) {
+        value_ptr zps = in_vals[2];
+        const int64_t zps_data_type = zps->get_logical_tensor().data_type;
         op_ptr sub_zps = std::make_shared<op_t>(op_kind::dnnl_sub_zps);
         sub_zps->connect_input(1, zps);
         zps->remove_consumer(*cur_op, 2);
         sub_zps->set_attr<int64_t>(op_attr::axis, axis);
         sub_zps->set_attr<std::string>(op_attr::qtype, qtype);
+        sub_zps->set_attr<int64_t>(op_attr::data_type, zps_data_type);
+        if (is_group_quantization) {
+            value_ptr scales = in_vals[1];
+            const auto &scale_dims = ltw(scales->get_logical_tensor()).vdims();
+            const auto &zp_dims = ltw(zps->get_logical_tensor()).vdims();
+            for (size_t idx = 0; idx < scale_dims.size(); ++idx) {
+                VCHECK_INVALID_ARGUMENT((scale_dims[idx] == zp_dims[idx]),
+                        "scale and zero point tensors should have the same "
+                        "shape");
+            }
+            const auto &group_shape = cur_op->get_attr<std::vector<int64_t>>(
+                    op_attr::group_shape);
+            sub_zps->set_attr<std::vector<int64_t>>(
+                    op_attr::group_shape, group_shape);
+            sub_zps->set_attr<int64_t>(op_attr::group_mask, group_mask);
+        }
         sub_zps->set_attr<bool>(op_attr::with_runtime_zps, true);
-
         // connect sub_zps op to subgraph
         rewriter.insert_op_before(sub_zps, mul_scales, 0, 0);
     }
 
     rewriter.to_remove(cur_op);
 
+    return status::success;
+}
+
+static status_t select_handler(
+        const std::shared_ptr<op_t> &op, subgraph_rewriter_t &rewriter) {
+    auto in_vals = op->get_input_values();
+    auto out_vals = op->get_output_values();
+    VCHECK_INVALID_ARGUMENT(in_vals.size() == 3 && out_vals.size() == 1,
+            "select should have three input and one output but "
+            "got %zu input and %zu output",
+            in_vals.size(), out_vals.size());
+    const auto &cond = in_vals[0];
+    const auto &src0 = in_vals[1];
+    const auto &src1 = in_vals[2];
+    // For the binary select operation, the conditional input tensor can
+    // only be of `s8` data type.
+    cond->set_data_type(dnnl::impl::data_type::s8);
+
+    op_ptr new_op = std::make_shared<op_t>(op_kind::dnnl_binary);
+    new_op->set_attr<int64_t>(op_attr::alg_kind,
+            static_cast<int64_t>(get_binary_alg_map().at(op->get_kind())));
+    new_op->merge_attributes(op->get_attributes());
+
+    // reconnect
+    cond->remove_consumer(*op, 0);
+    src0->remove_consumer(*op, 1);
+    src1->remove_consumer(*op, 2);
+
+    // binary select primitive places the condition input tensor as the
+    // third input tensor.
+    src0->add_consumer(*new_op, 0);
+    src1->add_consumer(*new_op, 1);
+    cond->add_consumer(*new_op, 2);
+
+    new_op->add_input(src0);
+    new_op->add_input(src1);
+    new_op->add_input(cond);
+    new_op->add_output(out_vals[0]);
+
+    insert_empty_scratchpad(new_op);
+    rewriter.to_insert(new_op);
+    rewriter.to_remove(op);
+
+    return status::success;
+}
+
+static status_t softmax_handler(
+        const std::shared_ptr<op_t> &op, subgraph_rewriter_t &rewriter) {
+    const auto &src = op->get_input_value(0);
+    const auto &dst = op->get_output_value(0);
+    bool no_stats = op->num_outputs() == 1;
+
+    auto new_softmax_op = std::make_shared<op_t>(op_kind::dnnl_softmax);
+    new_softmax_op->merge_attributes(op->get_attributes());
+
+    src->remove_consumer(*op, 0);
+    src->add_consumer(*new_softmax_op, 0);
+    new_softmax_op->add_input(src);
+    if (no_stats) {
+        new_softmax_op->add_output(dst);
+        insert_empty_scratchpad(new_softmax_op);
+        rewriter.to_insert(new_softmax_op);
+        rewriter.to_remove(op);
+        return status::success;
+    }
+
+    auto f32_dst = dst;
+    if (f32_dst->get_logical_tensor().data_type == impl::data_type::f32) {
+        // if the dst is already f32, we can just use it as the output
+        new_softmax_op->add_output(dst);
+        dst->remove_consumer(*op, 0);
+        insert_empty_scratchpad(new_softmax_op);
+        rewriter.to_insert(new_softmax_op);
+        rewriter.to_remove(op);
+    } else {
+        logical_tensor_t softmax_op_out_lt
+                = empty_logical_tensor_with_default_id();
+        f32_dst = std::make_shared<value_t>(
+                *new_softmax_op, 0, softmax_op_out_lt, true);
+        f32_dst->set_data_type(impl::data_type::f32);
+        new_softmax_op->add_output(f32_dst);
+        insert_empty_scratchpad(new_softmax_op);
+
+        // create reorder op to convert the output to the original data type
+        auto reorder_op = std::make_shared<op_t>(op_kind::dnnl_reorder);
+        reorder_op->set_attr<bool>(op_attr::change_layout, false);
+        reorder_op->add_input(f32_dst);
+        f32_dst->add_consumer(*reorder_op, 0);
+        reorder_op->add_output(dst);
+        dst->remove_consumer(*op, 0);
+        insert_empty_scratchpad(reorder_op);
+        rewriter.to_insert(new_softmax_op);
+        rewriter.to_insert(reorder_op);
+        rewriter.to_remove(op);
+    }
+
+    // support stats computation: stats = reducemax(src) - log(reducemax(f32_dst))
+    const auto &stats = op->get_output_value(1);
+    // create reduce_src op
+    auto reduce_src_op = std::make_shared<op_t>(op_kind::dnnl_reduction);
+    reduce_src_op->set_attr<std::vector<int64_t>>(
+            op_attr::axes, {new_softmax_op->get_attr<int64_t>(op_attr::axis)});
+    reduce_src_op->set_attr<bool>(op_attr::keep_dims, true);
+    reduce_src_op->set_attr<int64_t>(op_attr::alg_kind,
+            static_cast<int64_t>(dnnl::algorithm::reduction_max));
+    reduce_src_op->add_input(src);
+    src->add_consumer(*reduce_src_op, 0);
+    // add output for reduce_src
+    logical_tensor_t reduce_src_op_out_lt
+            = empty_logical_tensor_with_default_id();
+    auto reduce_src_op_out_val = std::make_shared<value_t>(
+            *reduce_src_op, 0, reduce_src_op_out_lt, true);
+    reduce_src_op_out_val->set_data_type(impl::data_type::f32);
+    reduce_src_op->add_output(reduce_src_op_out_val);
+    insert_empty_scratchpad(reduce_src_op);
+
+    // create reduce_dst op
+    auto reduce_dst_op = std::make_shared<op_t>(op_kind::dnnl_reduction);
+    reduce_dst_op->set_attr<std::vector<int64_t>>(
+            op_attr::axes, {new_softmax_op->get_attr<int64_t>(op_attr::axis)});
+    reduce_dst_op->set_attr<bool>(op_attr::keep_dims, true);
+    reduce_dst_op->set_attr<int64_t>(op_attr::alg_kind,
+            static_cast<int64_t>(dnnl::algorithm::reduction_max));
+    reduce_dst_op->add_input(f32_dst);
+    f32_dst->add_consumer(*reduce_dst_op, 0);
+    // add output for reduce_dst
+    logical_tensor_t reduce_dst_op_out_lt
+            = empty_logical_tensor_with_default_id();
+    auto reduce_dst_op_out_val = std::make_shared<value_t>(
+            *reduce_dst_op, 0, reduce_dst_op_out_lt, true);
+    reduce_dst_op_out_val->set_data_type(impl::data_type::f32);
+    reduce_dst_op->add_output(reduce_dst_op_out_val);
+    insert_empty_scratchpad(reduce_dst_op);
+
+    // create log op
+    auto log_op = std::make_shared<op_t>(op_kind::dnnl_eltwise);
+    log_op->set_attr<int64_t>(op_attr::alg_kind,
+            static_cast<int64_t>(dnnl::algorithm::eltwise_log));
+    log_op->add_input(reduce_dst_op_out_val);
+    reduce_dst_op_out_val->add_consumer(*log_op, 0);
+    // add output for log_op
+    logical_tensor_t log_op_out_lt = empty_logical_tensor_with_default_id();
+    auto log_op_out_val
+            = std::make_shared<value_t>(*log_op, 0, log_op_out_lt, true);
+    log_op_out_val->set_data_type(impl::data_type::f32);
+    log_op->add_output(log_op_out_val);
+    insert_empty_scratchpad(log_op);
+
+    // create subtract op
+    auto sub_op = std::make_shared<op_t>(op_kind::dnnl_binary);
+    sub_op->set_attr<int64_t>(op_attr::alg_kind,
+            static_cast<int64_t>(dnnl::algorithm::binary_sub));
+    sub_op->add_input(reduce_src_op_out_val);
+    reduce_src_op_out_val->add_consumer(*sub_op, 0);
+    sub_op->add_input(log_op_out_val);
+    log_op_out_val->add_consumer(*sub_op, 1);
+    // add output for sub_op
+    logical_tensor_t sub_op_out_lt = empty_logical_tensor_with_default_id();
+    auto sub_op_out_val
+            = std::make_shared<value_t>(*sub_op, 0, sub_op_out_lt, true);
+    sub_op_out_val->set_data_type(impl::data_type::f32);
+    sub_op->add_output(sub_op_out_val);
+    insert_empty_scratchpad(sub_op);
+
+    // special handling for inf_as_zero:
+    // stats = reducesum(f32_dst) == 0? 0: stats
+    // create reduce_sum_dst op
+    auto reduce_sum_dst_op = std::make_shared<op_t>(op_kind::dnnl_reduction);
+    reduce_sum_dst_op->set_attr<std::vector<int64_t>>(
+            op_attr::axes, {new_softmax_op->get_attr<int64_t>(op_attr::axis)});
+    reduce_sum_dst_op->set_attr<bool>(op_attr::keep_dims, true);
+    reduce_sum_dst_op->set_attr<int64_t>(op_attr::alg_kind,
+            static_cast<int64_t>(dnnl::algorithm::reduction_sum));
+    reduce_sum_dst_op->add_input(f32_dst);
+    f32_dst->add_consumer(*reduce_sum_dst_op, 0);
+    // add output for reduce_sum_dst
+    logical_tensor_t reduce_sum_dst_op_out_lt
+            = empty_logical_tensor_with_default_id();
+    auto reduce_sum_dst_op_out_val = std::make_shared<value_t>(
+            *reduce_sum_dst_op, 0, reduce_sum_dst_op_out_lt, true);
+    reduce_sum_dst_op_out_val->set_data_type(dnnl::impl::data_type::s8);
+    reduce_sum_dst_op->add_output(reduce_sum_dst_op_out_val);
+    insert_empty_scratchpad(reduce_sum_dst_op);
+
+    // create select op
+    auto select_op = std::make_shared<op_t>(op_kind::dnnl_binary);
+    select_op->set_attr<int64_t>(op_attr::alg_kind,
+            static_cast<int64_t>(dnnl::algorithm::binary_select));
+    select_op->add_input(sub_op_out_val);
+    sub_op_out_val->add_consumer(*select_op, 0);
+    select_op->add_input(reduce_dst_op_out_val);
+    reduce_dst_op_out_val->add_consumer(*select_op, 1);
+    // condition
+    select_op->add_input(reduce_sum_dst_op_out_val);
+    reduce_sum_dst_op_out_val->add_consumer(*select_op, 2);
+    select_op->add_output(stats);
+    insert_empty_scratchpad(select_op);
+
+    rewriter.to_insert(reduce_src_op);
+    rewriter.to_insert(reduce_dst_op);
+    rewriter.to_insert(log_op);
+    rewriter.to_insert(sub_op);
+    rewriter.to_insert(reduce_sum_dst_op);
+    rewriter.to_insert(select_op);
+
+    return status::success;
+}
+
+static status_t gen_index_handler(
+        const std::shared_ptr<op_t> &op, subgraph_rewriter_t &rewriter) {
+    auto new_op = std::make_shared<op_t>(op_kind::dnnl_gen_index);
+    new_op->merge_attributes(op->get_attributes());
+    int64_t axis = new_op->get_attr<int64_t>(op_attr::axis);
+    const int64_t ndims = static_cast<int64_t>(
+            ltw(op->get_input_value(0)->get_logical_tensor()).ndims());
+    VCHECK_INVALID_ARGUMENT(axis >= -1 * ndims && axis < ndims,
+            "GenIndex axis should be in range [-ndims, ndims) but got %d",
+            static_cast<int>(axis));
+    if (axis < 0) { new_op->set_attr<int64_t>(op_attr::axis, axis + ndims); }
+    rewriter.replace_op(op, new_op);
     return status::success;
 }
 
@@ -597,7 +910,7 @@ static const std::unordered_map<graph::op_kind_t, handler_func> handler_table {
         ITEM(AvgPoolBackward, avgpool_bwd_handler),
         ITEM(MaxPoolBackward, maxpool_bwd_handler),
         // softmax
-        ITEM(SoftMax, common_handler<op_kind::kDnnl_softmax>),
+        ITEM(SoftMax, softmax_handler),
         ITEM(LogSoftmax, common_handler<op_kind::kDnnl_logsoftmax>),
         ITEM(SoftMaxBackward, common_handler<op_kind::kDnnl_softmax_bwd>),
         ITEM(LogSoftmaxBackward, common_handler<op_kind::kDnnl_logsoftmax_bwd>),
@@ -608,6 +921,7 @@ static const std::unordered_map<graph::op_kind_t, handler_func> handler_table {
         ITEM(Divide, binary_handler),
         ITEM(Minimum, binary_handler),
         ITEM(Maximum, binary_handler),
+        ITEM(GreaterEqual, binary_handler),
         // eltwise fwd
         ITEM(Abs, eltwise_fwd_handler),
         ITEM(Clamp, eltwise_fwd_handler),
@@ -663,6 +977,8 @@ static const std::unordered_map<graph::op_kind_t, handler_func> handler_table {
         // layernorm
         ITEM(LayerNorm, common_handler<op_kind::kDnnl_layernorm>),
         ITEM(LayerNormBackward, common_handler<op_kind::kDnnl_layernorm_bwd>),
+        // groupnorm
+        ITEM(GroupNorm, common_handler<op_kind::kDnnl_groupnorm>),
         // quantization
         ITEM(Quantize, static_quant_handler),
         ITEM(Dequantize, static_dequant_handler),
@@ -678,6 +994,8 @@ static const std::unordered_map<graph::op_kind_t, handler_func> handler_table {
         ITEM(Reciprocal, reciprocal_handler),
         ITEM(Concat, common_handler<op_kind::kDnnl_concat>),
         ITEM(SquaredDifference, squared_difference_handler),
+        ITEM(Select, select_handler),
+        ITEM(GenIndex, gen_index_handler),
         // utility
         ITEM(Wildcard, dummy_handler),
         ITEM(End, dummy_handler),
@@ -690,13 +1008,11 @@ status_t lower_down(std::shared_ptr<subgraph_t> &sg) {
 
     for (auto &cur_op : sg->get_ops()) {
         auto kind = cur_op->get_kind();
-        if (!handler_table.count(kind)) {
-            assertm(false,
-                    "All spec ops should be lowered to internal ops, except "
-                    "for some utility ops like End, Wildcard");
-            return status::invalid_graph_op;
-        }
-
+        VCHECK_INVALID_ARGUMENT(handler_table.count(kind),
+                "All spec ops should be lowered to internal ops, except "
+                "for some utility ops like End, Wildcard. Current op name is "
+                "%s",
+                cur_op->get_name().c_str());
         // lower this spec op to dnnl backend internal op
         const auto &handler = handler_table.at(kind);
         auto status = handler(cur_op, rewriter);

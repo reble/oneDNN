@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2021-2023 Intel Corporation
+# Copyright 2021-2024 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,11 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #===============================================================================
+set(gpu_rt_pattern "(SYCL|DPCPP|OCL)")
 set(sycl_rt_pattern "(SYCL|DPCPP)")
 
 function(register_graph_api_test_suite test_suite_name exe_name)
-    if(${test_suite_name} MATCHES "_usm")
-        if(DNNL_GPU_RUNTIME MATCHES ${sycl_rt_pattern})
+    if(${test_suite_name} MATCHES "_cpu")
+        if(NOT DNNL_CPU_RUNTIME STREQUAL "NONE")
+            add_test(${test_suite_name} ${exe_name} --engine=cpu)
+            maybe_configure_windows_test(${test_suite_name} TEST)
+        endif()
+    elseif(${test_suite_name} MATCHES "_gpu")
+        if(DNNL_GPU_RUNTIME MATCHES ${gpu_rt_pattern})
+            add_test(${test_suite_name} ${exe_name} --engine=gpu)
+            maybe_configure_windows_test(${test_suite_name} TEST)
+        endif()
+    else()
+        if(DNNL_GPU_RUNTIME MATCHES ${gpu_rt_pattern})
             add_test(${test_suite_name}_gpu ${exe_name} --engine=gpu)
             maybe_configure_windows_test(${test_suite_name}_gpu TEST)
         endif()
@@ -26,12 +37,7 @@ function(register_graph_api_test_suite test_suite_name exe_name)
             add_test(${test_suite_name}_cpu ${exe_name} --engine=cpu)
             maybe_configure_windows_test(${test_suite_name}_cpu TEST)
         endif()
-    else()
-        if(NOT DNNL_CPU_RUNTIME STREQUAL "NONE")
-            add_test(${test_suite_name} ${exe_name})
-            maybe_configure_windows_test(${test_suite_name} TEST)
-        endif()
-    endif()    
+    endif()
 endfunction()
 
 FILE(GLOB COMMON_API_TEST_DEPS
@@ -85,9 +91,13 @@ foreach(TEST_FILE ${API_TEST_ENGINE_DEPENDENT_SOURCES})
         ${DNNL_LIBRARY_NAME}
         ${EXTRA_SHARED_LIBS}
     )
-    register_graph_api_test_suite(${exe_name}_usm ${exe_name})
+    register_graph_api_test_suite(${exe_name} ${exe_name})
 endforeach()
 
 if(DNNL_CPU_RUNTIME MATCHES ${sycl_rt_pattern} OR DNNL_GPU_RUNTIME MATCHES ${sycl_rt_pattern})
     add_subdirectory(sycl)
+endif()
+
+if(DNNL_GPU_RUNTIME STREQUAL "OCL")
+    add_subdirectory(ocl)
 endif()

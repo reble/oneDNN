@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,6 +30,7 @@
 #include "common/engine.hpp"
 
 #include "graph/interface/c_types_map.hpp"
+#include "graph/interface/graph_attr.hpp"
 #include "graph/interface/logical_tensor.hpp"
 #include "graph/interface/op.hpp"
 
@@ -37,7 +38,11 @@
 #include "graph/utils/utils.hpp"
 
 #ifdef DNNL_WITH_SYCL
-#include "graph/utils/sycl_check.hpp"
+#include "oneapi/dnnl/dnnl_sycl.hpp"
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include <CL/cl.h>
 #endif
 
 namespace std {
@@ -62,19 +67,21 @@ class backend_t;
 
 class partition_impl_t : public std::enable_shared_from_this<partition_impl_t> {
 public:
-    explicit partition_impl_t(engine_kind_t engine_kind,
-            fpmath_mode_t fpmath_mode, partition_kind_t pkind)
+    explicit partition_impl_t(engine_kind_t engine_kind, fpmath_t fpmath_mode,
+            partition_kind_t pkind)
         : engine_kind_(engine_kind)
         , fpmath_mode_(fpmath_mode)
         , pkind_(pkind)
         , can_use_blocked_layout_(false) {}
 
-    explicit partition_impl_t(engine_kind_t engine_kind,
-            fpmath_mode_t fpmath_mode = fpmath_mode::strict)
+    explicit partition_impl_t(
+            engine_kind_t engine_kind, fpmath_t fpmath_mode = {})
         : engine_kind_(engine_kind)
         , fpmath_mode_(fpmath_mode)
         , pkind_(partition_kind_t::undef)
-        , can_use_blocked_layout_(false) {}
+        , can_use_blocked_layout_(false) {
+        fpmath_mode_.mode_ = graph::fpmath_mode::strict;
+    }
 
     virtual ~partition_impl_t() = default;
 
@@ -82,7 +89,7 @@ public:
     engine_kind_t get_engine_kind() const { return engine_kind_; }
 
     /// The getter for fpmath_mode_
-    fpmath_mode_t get_fpmath_mode() const { return fpmath_mode_; }
+    const fpmath_t &get_fpmath_mode() const { return fpmath_mode_; }
 
     /// The getter for partition kind
     partition_kind_t get_kind() const { return pkind_; }
@@ -189,7 +196,7 @@ protected:
     engine_kind_t engine_kind_;
 
     // floating-point math mode
-    fpmath_mode_t fpmath_mode_;
+    fpmath_t fpmath_mode_;
 
     // Partition kind
     partition_kind_t pkind_;
@@ -234,10 +241,10 @@ protected:
     std::vector<std::shared_ptr<op_t>> ops_;
 
     /// All the input logical tensors of a partition
-    std::vector<logical_tensor_t> inputs_ {};
+    std::vector<logical_tensor_t> inputs_;
 
     /// All the output logical tensors of a partition
-    std::vector<logical_tensor_t> outputs_ {};
+    std::vector<logical_tensor_t> outputs_;
 
     /// Partition_impl id
     size_t id_ = std::numeric_limits<size_t>::max();
@@ -276,6 +283,8 @@ public:
         , inplace_pairs_(inplace_pairs) {};
 
     virtual ~compiled_partition_impl_t() = default;
+
+    virtual std::string str() const { return "n/a"; }
 
     /// The getters for engine_, which is used in C API implementation
     const engine_t *get_engine() const { return engine_; }
@@ -352,6 +361,14 @@ public:
             = 0;
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    virtual status_t execute_ocl(const stream_t *astream,
+            const std::vector<tensor_t> &inputs,
+            const std::vector<tensor_t> &outputs,
+            const std::vector<cl_event> &ocl_deps, cl_event *ocl_event)
+            = 0;
+#endif
+
 protected:
     /// The engine which this compiled_partition_impl_t is specialized
     /// for. Should directly store the engine that is given when calling
@@ -361,12 +378,12 @@ protected:
     /// The inputs logical tensors which this compiled_partition_impl_t
     /// is specialized for.Should have exact shape/dtype/layout and be
     /// in same order with inputs_ in partition_impl_t
-    std::vector<logical_tensor_t> inputs_ {};
+    std::vector<logical_tensor_t> inputs_;
 
     /// The outputs logical tensors which this compiled_partition_impl_t
     /// is specialized for.Should have exact shape/dtype/layout and be
     /// in same order with outputs_ in partition_impl_t
-    std::vector<logical_tensor_t> outputs_ {};
+    std::vector<logical_tensor_t> outputs_;
 
     /// The inplace_pair_t is used to indicate which input
     /// and output tensor given in execute can share same

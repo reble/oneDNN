@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -35,9 +35,7 @@ namespace x64 {
 template <cpu_isa_t isa>
 struct jit_uni_x8s8s32x_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(
                 JIT_IMPL_NAME_HELPER("jit_uni_int8:",
@@ -65,46 +63,37 @@ struct jit_uni_x8s8s32x_convolution_fwd_t : public primitive_t {
                     VERBOSE_BAD_ALGORITHM);
             VDISPATCH_CONV(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
             VDISPATCH_CONV(
-                    attr()->has_default_values(smask_t::scales_runtime
-                                    | smask_t::zero_points_runtime
-                                    | smask_t::post_ops | smask_t::sum_dt,
+                    attr()->has_default_values(smask_t::scales
+                                    | smask_t::zero_points | smask_t::post_ops
+                                    | smask_t::sum_dt,
                             dst_md(0)->data_type),
                     VERBOSE_UNSUPPORTED_ATTR);
             VDISPATCH_CONV(attr()->post_ops_.check_sum_consistency(
                                    dst_md(0)->data_type, /* is_int8 */ true),
                     VERBOSE_UNSUPPORTED_POSTOP);
-            VDISPATCH_CONV(attr_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
-            VDISPATCH_CONV(zero_points_ok(), VERBOSE_UNSUPPORTED_ZP_CFG);
+            CHECK(attr_scales_ok());
+            CHECK(attr_zero_points_ok());
 
-            CHECK(jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jcp_, *desc(),
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_uni_x8s8s32x_fwd_kernel_t<isa>::init_conf(jcp_, *desc(),
                     src_md_, weights_md_, dst_md_, bias_md_, attr_,
                     dnnl_get_max_threads()));
 
             auto scratchpad = scratchpad_registry().registrar();
-            jit_uni_x8s8s32x_fwd_kernel<isa>::init_scratchpad(
+            jit_uni_x8s8s32x_fwd_kernel_t<isa>::init_scratchpad(
                     scratchpad, jcp_, *attr());
 
             return attr_.set_default_formats(dst_md(0));
         }
 
-        jit_conv_conf_t jcp_;
-
-    protected:
-        bool zero_points_ok() const {
-            // Only common zero points are supported -> mask should only be 0
-            int mask_src = 0, mask_dst = 0;
-            attr()->zero_points_.get(DNNL_ARG_SRC, &mask_src);
-            attr()->zero_points_.get(DNNL_ARG_DST, &mask_dst);
-            return attr()->zero_points_.has_default_values(DNNL_ARG_WEIGHTS)
-                    && mask_src == 0 && mask_dst == 0;
-        }
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     jit_uni_x8s8s32x_convolution_fwd_t(const pd_t *apd) : primitive_t(apd) {}
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
-                new jit_uni_x8s8s32x_fwd_kernel<isa>(
+                new jit_uni_x8s8s32x_fwd_kernel_t<isa>(
                         pd()->jcp_, *pd()->attr(), *pd()->dst_md())));
         return kernel_->create_kernel();
     }
@@ -135,7 +124,7 @@ private:
     const float *adjust_oscales(const memory_tracking::grantor_t &scratchpad,
             const float *src_scales, const float *wei_scales) const;
 
-    std::unique_ptr<jit_uni_x8s8s32x_fwd_kernel<isa>> kernel_;
+    std::unique_ptr<jit_uni_x8s8s32x_fwd_kernel_t<isa>> kernel_;
 };
 
 } // namespace x64

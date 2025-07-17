@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,9 +22,9 @@
 
 #include "common/c_types_map.hpp"
 #include "common/lrn_pd.hpp"
-#include "common/primitive.hpp"
+#include "gpu/gpu_primitive.hpp"
 #include "gpu/nvidia/cudnn_lrn_impl.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/engine.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -32,15 +32,15 @@ namespace impl {
 namespace gpu {
 namespace nvidia {
 
-struct cudnn_lrn_fwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct cudnn_lrn_fwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public lrn_fwd_pd_t {
         using lrn_fwd_pd_t::lrn_fwd_pd_t;
 
         DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_lrn_fwd_t);
 
-        status_t init(engine_t *) {
+        status_t init(impl::engine_t *) {
             using namespace data_type;
             using namespace format_tag;
 
@@ -83,15 +83,15 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 };
 
-struct cudnn_lrn_bwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct cudnn_lrn_bwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public lrn_bwd_pd_t {
         using lrn_bwd_pd_t::lrn_bwd_pd_t;
 
         DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_lrn_bwd_t);
 
-        status_t init(engine_t *) {
+        status_t init(impl::engine_t *) {
             using namespace data_type;
 
             bool ok = !is_fwd()

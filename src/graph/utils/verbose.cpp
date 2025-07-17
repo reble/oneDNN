@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -51,19 +51,10 @@ void print_verbose_header() {
             = backend_registry_t::get_singleton().get_registered_backends();
     for (size_t i = 0; i < backends.size() - 1; ++i) {
         backend_t *bkd = const_cast<backend_t *>(backends[i]);
-        printf("onednn_verbose,info,graph,backend,%zu:%s\n", i,
-                bkd->get_name().c_str());
+        verbose_printf(
+                "info,graph,backend,%zu:%s\n", i, bkd->get_name().c_str());
     }
 }
-
-#if defined(DISABLE_VERBOSE)
-void partition_info_t::init(
-        const engine_t *engine, const compiled_partition_t *partition) {
-    UNUSED(engine);
-    UNUSED(partition);
-}
-
-#else
 
 namespace {
 
@@ -189,7 +180,7 @@ std::string partition2fmt_str(const partition_t &partition) {
 
 std::string init_info_partition(const engine_t *engine,
         const compiled_partition_t *compiled_partition) {
-    std::stringstream ss;
+    stringstream_t ss;
 
     const auto &partition = compiled_partition->src_partition();
 
@@ -226,7 +217,11 @@ std::string init_info_partition(const engine_t *engine,
         }
     }
 
-    ss << ",fpm:" << fpmath_mode2str(partition.get_pimpl()->get_fpmath_mode());
+    const auto &fpm = partition.get_pimpl()->get_fpmath_mode();
+    ss << ",fpm:" << fpmath_mode2str(fpm.mode_);
+    if (fpm.apply_to_int_) ss << ":true";
+
+    ss << "," << compiled_partition->get_pimpl()->str();
 
     ss << "," << partition.get_assigned_backend()->get_name();
 
@@ -237,6 +232,7 @@ std::string init_info_partition(const engine_t *engine,
 
 void partition_info_t::init(const engine_t *engine,
         const compiled_partition_t *compiled_partition) {
+    // Handles VERBOSE_DISABLE since `is_initialized_` is set to `true`.
     if (is_initialized_) return;
 
     std::call_once(initialization_flag_, [&] {
@@ -244,8 +240,6 @@ void partition_info_t::init(const engine_t *engine,
         is_initialized_ = true;
     });
 }
-
-#endif
 
 } // namespace utils
 } // namespace graph

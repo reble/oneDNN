@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -36,6 +36,11 @@ struct shuffle_test_params_t {
     dnnl_status_t expected_status;
 };
 
+bool generic_check_format(memory::format_tag tag) {
+    return impl::utils::one_of(
+            tag, dnnl_abc, dnnl_abcd, dnnl_acbde, dnnl_acb, dnnl_acdb);
+}
+
 class shuffle_test_t : public ::testing::TestWithParam<shuffle_test_params_t> {
 private:
     shuffle_test_params_t p;
@@ -46,9 +51,12 @@ protected:
         p = ::testing::TestWithParam<shuffle_test_params_t>::GetParam();
 
         SKIP_IF_CUDA(true, "Shuffle primitive not supported by CUDA");
+        SKIP_IF_HIP(true, "Shuffle primitive not supported by HIP");
 
         SKIP_IF(unsupported_data_type(p.src_dt, p.dst_dt),
                 "Engine does not support this data type.");
+        SKIP_IF_GENERIC(!generic_check_format(p.src_tag), "Unsupported format");
+        SKIP_IF_GENERIC(!generic_check_format(p.dst_tag), "Unsupported format");
 
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status);
@@ -61,7 +69,7 @@ protected:
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
 
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
 
         auto src_md = memory::desc(p.dims, p.src_dt, p.src_tag);
         auto dst_md = memory::desc(p.dims, p.dst_dt, p.dst_tag);
@@ -117,7 +125,7 @@ protected:
         // shuffle specific types and values
         using pd_t = shuffle_backward::primitive_desc;
         using hint_pd_t = shuffle_forward::primitive_desc;
-        allows_attr_t aa {false}; // doesn't support anything
+        allows_attr_t aa {}; // doesn't support anything
 
         auto eng = get_test_engine();
         auto strm = make_stream(eng);

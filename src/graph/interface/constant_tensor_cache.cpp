@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2023-2024 Intel Corporation
+ * Copyright 2023-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,17 @@
 
 #include "common/engine.hpp"
 #include "common/utils.hpp"
+
+#if DNNL_CPU_RUNTIME != DNNL_RUNTIME_NONE
 #include "cpu/cpu_engine.hpp"
+#endif
+
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+#include "xpu/ocl/engine_factory.hpp"
+#endif
+
 #ifdef DNNL_WITH_SYCL
-#include "sycl/sycl_engine.hpp"
+#include "xpu/sycl/engine_factory.hpp"
 #endif
 
 #include "graph/interface/backend.hpp"
@@ -292,9 +300,16 @@ static std::unique_ptr<impl::engine_factory_t> get_engine_factory(
     }
 #endif
 
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+    if (kind == engine_kind::gpu && runtime_kind == runtime_kind::ocl) {
+        return std::unique_ptr<engine_factory_t>(
+                new xpu::ocl::engine_factory_t(kind));
+    }
+#endif
+
 #ifdef DNNL_WITH_SYCL
     if (runtime_kind == impl::runtime_kind::sycl)
-        return impl::sycl::get_engine_factory(kind);
+        return xpu::sycl::get_engine_factory(kind);
 #endif
     return nullptr;
 }
@@ -337,7 +352,7 @@ private:
             // The first field: engine kind
             impl::engine_kind_t env_eng_kind = impl::engine_kind::any_engine;
             if (!fields.empty() && !fields[0].empty()) {
-                std::string eng_kind = fields[0];
+                const std::string &eng_kind = fields[0];
                 assertm(eng_kind == "cpu" || eng_kind == "gpu",
                         "engine kind must be cpu or gpu");
                 env_eng_kind = eng_kind == "cpu" ? impl::engine_kind::cpu

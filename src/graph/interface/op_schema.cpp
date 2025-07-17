@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -86,8 +86,7 @@ std::set<size_t> op_schema_t::get_num_outputs() const {
 op_schema_t &op_schema_t::set_input(
         size_t in_offset, std::string &&in_name, std::string &&dtype_string) {
     verify_input_(in_offset);
-    inputs_.emplace_back(
-            op_parameter_t(std::move(in_name), std::move(dtype_string)));
+    inputs_.emplace_back(std::move(in_name), std::move(dtype_string));
     return *this;
 }
 
@@ -99,20 +98,31 @@ op_schema_t::get_inputs() const {
 op_schema_t &op_schema_t::set_output(
         size_t out_offset, std::string &&out_name, std::string &&dtype_string) {
     verify_output_(out_offset);
-    outputs_.emplace_back(
-            op_parameter_t(std::move(out_name), std::move(dtype_string)));
+    outputs_.emplace_back(std::move(out_name), std::move(dtype_string));
     return *this;
 }
 
-op_schema_t &op_schema_t::set_commutative_inputs() {
-    assertm(num_inputs_.size() == 1 && *(num_inputs_.begin()) == 2,
-            "commutative inputs can only be enabled for ops with two inputs");
-    commutative_inputs_enabled_ = true;
+op_schema_t &op_schema_t::set_commutative_inputs(
+        const std::set<size_t> &inputs) {
+    assertm(inputs.size() == 2, "the number of commutative inputs must be 2");
+    assertm(num_inputs_.size() == 1 && *(num_inputs_.begin()) > 1,
+            "The number of inputs is at least two");
+    assertm(std::all_of(inputs.begin(), inputs.end(),
+                    [&](size_t idx) { return idx < *(num_inputs_.begin()); }),
+            "each input value must be less than input numbers");
+    commutative_inputs_ = inputs;
     return *this;
 }
 
-bool op_schema_t::get_commutative_inputs() const {
-    return commutative_inputs_enabled_;
+bool op_schema_t::is_commutative_inputs(
+        const size_t input0, const size_t input1) const {
+
+    return is_commutative_op() && commutative_inputs_.count(input0)
+            && commutative_inputs_.count(input1);
+}
+
+bool op_schema_t::is_commutative_op() const {
+    return !commutative_inputs_.empty();
 }
 
 op_schema_t &op_schema_t::set_type_constraints(

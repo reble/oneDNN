@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2022 FUJITSU LIMITED
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,7 +30,14 @@ const impl_list_map_t &regular_s8_impl_list_map() {
         {{s8, data_type::undef, 0}, {
             CPU_REORDER_INSTANCE(rnn_weights_reorder_s8_t<s8>)
             CPU_REORDER_INSTANCE(rnn_brgemm_weights_reorder_s8_t<s8, s8>)
-            DNNL_X64_ONLY(CPU_REORDER_INSTANCE(x64::brgemm_matmul_matrix_B_reorder_t))
+            DNNL_X64_ONLY(CPU_REORDER_INSTANCE(x64::brgemm_matmul_copy_reorder_t))
+
+            DNNL_X64_ONLY(CPU_REORDER_INSTANCE(x64::jit_uni_reorder_direct_copy_t))
+            DNNL_X64_ONLY(CPU_REORDER_INSTANCE(x64::jit_blk_reorder_t))
+            DNNL_X64_ONLY(CPU_REORDER_INSTANCE(x64::jit_uni_reorder_t))
+
+            DNNL_AARCH64_ONLY(CPU_REORDER_INSTANCE(aarch64::jit_blk_reorder_t))
+            DNNL_AARCH64_ONLY(CPU_REORDER_INSTANCE(aarch64::jit_uni_reorder_t))
 
             REG_FAST_DIRECT_COPY(s8, f32)
             REG_FAST_DIRECT_COPY(s8, s32)
@@ -38,12 +45,6 @@ const impl_list_map_t &regular_s8_impl_list_map() {
             REG_FAST_DIRECT_COPY(s8, f16)
             REG_FAST_DIRECT_COPY(s8, s8)
             REG_FAST_DIRECT_COPY(s8, u8)
-
-            DNNL_X64_ONLY(CPU_REORDER_INSTANCE(x64::jit_blk_reorder_t))
-            DNNL_X64_ONLY(CPU_REORDER_INSTANCE(x64::jit_uni_reorder_t))
-
-            DNNL_AARCH64_ONLY(CPU_REORDER_INSTANCE(aarch64::jit_blk_reorder_t))
-            DNNL_AARCH64_ONLY(CPU_REORDER_INSTANCE(aarch64::jit_uni_reorder_t))
 
             DNNL_NON_X64_ONLY(REG_SR_BIDIR(s8, any, f32, nChw16c))
             DNNL_NON_X64_ONLY(REG_SR_BIDIR(s8, any, s32, nChw16c))
@@ -65,7 +66,7 @@ const impl_list_map_t &regular_s8_impl_list_map() {
             REG_SR(s8, any, s8, any, fmt_order::any, spec::reference)
             REG_SR(s8, any, u8, any, fmt_order::any, spec::reference)
 
-            REG_SPARSE_SR_X64(s8, any, s8, any)
+            DNNL_X64_ONLY(CPU_REORDER_INSTANCE(simple_sparse_reorder_t<s8, impl::format_tag_t, any, s8, impl::format_tag_t, any>))
 
             nullptr,
         }},

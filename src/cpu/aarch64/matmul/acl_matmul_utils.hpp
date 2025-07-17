@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2023 Arm Ltd. and affiliates
+* Copyright 2021-2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,53 +14,69 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef CPU_AARCH64_ACL_MATMUL_UTILS_HPP
-#define CPU_AARCH64_ACL_MATMUL_UTILS_HPP
+#ifndef CPU_AARCH64_MATMUL_ACL_MATMUL_UTILS_HPP
+#define CPU_AARCH64_MATMUL_ACL_MATMUL_UTILS_HPP
 
-#include "cpu/matmul/cpu_matmul_pd.hpp"
+#include "arm_compute/runtime/experimental/low_level/CpuGemmAssemblyDispatch.h"
+#include "arm_compute/runtime/experimental/operators/CpuActivation.h"
+#include "arm_compute/runtime/experimental/operators/CpuTranspose.h"
 
-#include "cpu/aarch64/acl_utils.hpp"
+#include "common/memory_tracking.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace cpu {
 namespace aarch64 {
 
+namespace {
+// Keys are anonymous. So deduce the type automagically.
+using matmul_key_t = decltype(memory_tracking::names::key_gemm_asm_tmp_buffer);
+
+// Map: [slot , key]
+const std::map<int, matmul_key_t> matmul_keys = {
+        {0, matmul_key_t::key_gemm_asm_tmp_buffer},
+        {1, matmul_key_t::key_gemm_pretransposed_rhs},
+        {2, matmul_key_t::key_gemm_pretranspose},
+};
+} // namespace
+
 struct acl_matmul_obj_t {
-    arm_compute::NEGEMM gemm;
-    arm_compute::NETranspose transA;
-    arm_compute::NETranspose transB;
-    arm_compute::Tensor src_tensor;
-    arm_compute::Tensor src_acc_tensor;
-    arm_compute::Tensor wei_acc_tensor;
-    arm_compute::Tensor wei_tensor;
-    arm_compute::Tensor dst_tensor;
+    arm_compute::experimental::op::ll::CpuGemmAssemblyDispatch asm_gemm;
+    arm_compute::experimental::op::CpuActivation act;
+    arm_compute::experimental::op::CpuTranspose transA;
+    arm_compute::experimental::op::CpuTranspose transB;
+    arm_compute::experimental::op::CpuTranspose transC;
+    arm_compute::experimental::MemoryRequirements aux_mem_req;
 };
 
 struct acl_matmul_conf_t {
     bool is_transA;
     bool is_transB;
+    bool do_transC;
+    bool do_act;
     // If this is true, the result of the matmul goes into a temporarily
     // allocated ACL tensor to be accumulated into the oneDNN dst during postops
-    bool use_dst_acc;
+    bool use_dst_acc_for_sum;
     arm_compute::TensorInfo src_tensor_info;
-    arm_compute::TensorInfo src_acc_info;
-    arm_compute::TensorInfo wei_acc_info;
     arm_compute::TensorInfo wei_tensor_info;
     arm_compute::TensorInfo dst_tensor_info;
+    arm_compute::TensorInfo src_acc_info;
+    arm_compute::TensorInfo wei_acc_info;
+    arm_compute::TensorInfo dst_acc_info;
     arm_compute::GEMMInfo gemm_info;
-    float alpha;
 };
 
 namespace acl_matmul_utils {
 
-status_t init_conf_matmul_fixed_format(acl_matmul_conf_t &amp,
-        memory_desc_t &src_md, memory_desc_t &wei_md, memory_desc_t &dst_md,
-        const matmul_desc_t &md, const primitive_attr_t &attr);
+template <bool IsFixedFormat>
+status_t init_conf_matmul(acl_matmul_conf_t &amp, memory_desc_t &src_md,
+        memory_desc_t &wei_md, memory_desc_t &dst_md, const matmul_desc_t &md,
+        const primitive_attr_t &attr);
 
-status_t init_conf_matmul_non_fixed_format(acl_matmul_conf_t &amp,
-        memory_desc_t &src_md, memory_desc_t &wei_md, memory_desc_t &dst_md,
-        const matmul_desc_t &md, const primitive_attr_t &attr);
+status_t init_scratchpad(memory_tracking::registrar_t &scratchpad,
+        const acl_matmul_conf_t &amp, const memory_desc_t &src_md,
+        const memory_desc_t &weights_md, const memory_desc_t &dst_md,
+        const arm_compute::experimental::MemoryRequirements &aux_mem_req);
 
 } // namespace acl_matmul_utils
 
@@ -69,4 +85,4 @@ status_t init_conf_matmul_non_fixed_format(acl_matmul_conf_t &amp,
 } // namespace impl
 } // namespace dnnl
 
-#endif // CPU_AARCH64_ACL_MATMUL_UTILS_HPP
+#endif // CPU_AARCH64_MATMUL_ACL_MATMUL_UTILS_HPP

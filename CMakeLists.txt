@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2016-2019 Intel Corporation
+# Copyright 2016-2024 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -14,54 +14,26 @@
 # limitations under the License.
 #===============================================================================
 
-cmake_minimum_required(VERSION 2.8.12)
+cmake_minimum_required(VERSION 3.13)
 
-if(POLICY CMP0022)
-    cmake_policy(SET CMP0022 NEW)
-endif()
+# CMake minimum required version enables all policies introduced in minimum
+# version and earlier versions. Policies introduced in future versions
+# are handled individually in the section below.
 
-# Foo::Bar always refers to an IMPORTED target
-if(POLICY CMP0028)
-    cmake_policy(SET CMP0028 NEW)
-endif()
-
-if(POLICY CMP0054)
-    cmake_policy(SET CMP0054 NEW)
-endif()
-
-# Enable RPATH on MacOS/OSX
-if(POLICY CMP0042)
-    cmake_policy(SET CMP0042 NEW)
-endif()
-
-# Do not export symbols from executables
-if(POLICY CMP0065)
-    cmake_policy(SET CMP0065 NEW)
-endif()
-
-# Pass linker flags to try_compile
-if(POLICY CMP0056)
-    cmake_policy(SET CMP0056 NEW)
-endif()
-
-# Always link with full path
-if(POLICY CMP0060)
-    cmake_policy(SET CMP0060 NEW)
-endif()
-
-# Pass compiler flags to try_compile
-if(POLICY CMP0066)
-    cmake_policy(SET CMP0066 NEW)
-endif()
-
-# Use <PackageName>_ROOT env. variable as a prefix
-if(POLICY CMP0074)
-    cmake_policy(SET CMP0074 NEW)
-endif()
-
-# Install rules order
+# CMake 3.14: Install rules from add_subdirectory() calls are interleaved
+# with those in caller.
 if(POLICY CMP0082)
     cmake_policy(SET CMP0082 NEW)
+endif()
+
+# CMake 3.27: The FindPythonInterp and FindPythonLibs modules are removed.
+if(POLICY CMP0148)
+    cmake_policy(SET CMP0148 NEW)
+endif()
+
+# CMake 3.27: The FindCUDA module is removed.
+if(POLICY CMP0146)
+    cmake_policy(SET CMP0146 OLD)
 endif()
 
 if("${CMAKE_BUILD_TYPE}" STREQUAL "")
@@ -69,17 +41,20 @@ if("${CMAKE_BUILD_TYPE}" STREQUAL "")
     set(CMAKE_BUILD_TYPE "Release" CACHE STRING
         "Choose the type of build, options are: None Debug Release RelWithDebInfo MinSizeRel RelWithAssert RelWithMDd...")
 endif()
+if (CMAKE_GENERATOR MATCHES "^Visual Studio")
+    message(STATUS
+"oneDNN build configuration is based on the CMAKE_BUILD_TYPE value, but
+ the CMake generator '${CMAKE_GENERATOR}' does not respect it and requires
+ using the --config option to choose the build type. Changing the build type
+ using the --config option requires rerunning CMake from scratch with a
+ matching CMAKE_BUILD_TYPE value.")
+endif()
 
 set(PROJECT_NAME "oneDNN")
 set(PROJECT_FULL_NAME "oneAPI Deep Neural Network Library (oneDNN)")
-set(PROJECT_VERSION "3.5.0")
+set(PROJECT_VERSION "3.10.0")
 
-if (CMAKE_VERSION VERSION_LESS 3.0)
-    project(${PROJECT_NAME} C CXX)
-else()
-    cmake_policy(SET CMP0048 NEW)
-    project(${PROJECT_NAME} VERSION "${PROJECT_VERSION}" LANGUAGES C CXX)
-endif()
+project(${PROJECT_NAME} VERSION "${PROJECT_VERSION}" LANGUAGES C CXX)
 
 if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "oneDNN supports 64 bit platforms only")
@@ -133,28 +108,18 @@ include("cmake/host_compiler.cmake")
 include("cmake/configuring_primitive_list.cmake")
 
 if(UNIX OR MINGW)
-    if(CMAKE_VERSION VERSION_LESS "3.1.0")
-        # No CMAKE_<lang>_STANDARD, so add directly to CMAKE_<lang>_FLAGS
-        # (prepended so the user can override)
-        set(CMAKE_C_FLAGS "-std=c99 ${CMAKE_C_FLAGS}")
-        # Let SYCL to choose the C++ standard it needs.
-        if(NOT DNNL_WITH_SYCL)
-            set(CMAKE_CXX_FLAGS "-std=c++11 ${CMAKE_CXX_FLAGS}")
-        endif()
-    else()
-        # CMAKE_<lang>_STANDARD support, so set it to our defaults, unless
-        # overridden by the user
-        if(NOT DEFINED CMAKE_C_STANDARD)
-            set(CMAKE_C_STANDARD 99)
-        endif()
-        if(NOT DEFINED CMAKE_CXX_STANDARD AND NOT DNNL_WITH_SYCL)
-            set(CMAKE_CXX_STANDARD 11)
-        endif()
-
-        # Disable -std=gnuXX and -std=gnu++XX
-        set(CMAKE_C_EXTENSIONS OFF)
-        set(CMAKE_CXX_EXTENSIONS OFF)
+    # CMAKE_<lang>_STANDARD support, so set it to our defaults, unless
+    # overridden by the user
+    if(NOT DEFINED CMAKE_C_STANDARD)
+        set(CMAKE_C_STANDARD 99)
     endif()
+    if(NOT DEFINED CMAKE_CXX_STANDARD AND NOT DNNL_WITH_SYCL)
+        set(CMAKE_CXX_STANDARD 11)
+    endif()
+
+    # Disable -std=gnuXX and -std=gnu++XX
+    set(CMAKE_C_EXTENSIONS OFF)
+    set(CMAKE_CXX_EXTENSIONS OFF)
 endif()
 
 # Handle cases when OpenMP runtime is requested but not found: override CPU
@@ -179,7 +144,7 @@ configure_file(
     "${PROJECT_BINARY_DIR}/README"
 )
 
-if(DNNL_INSTALL_MODE MATCHES "^(BUNDLE|BUNDLE_V2)$" AND NOT DEFINED CMAKE_INSTALL_LIBDIR)
+if(DNNL_INSTALL_MODE STREQUAL "BUNDLE" AND NOT DEFINED CMAKE_INSTALL_LIBDIR)
     # define CMAKE_INSTALL_LIBDIR as "lib" in the case of bundle
     set(CMAKE_INSTALL_LIBDIR "lib")
 endif()
@@ -192,10 +157,6 @@ add_subdirectory(examples)
 add_subdirectory(tests)
 
 if(DNNL_INSTALL_MODE STREQUAL "BUNDLE")
-    install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_PREFIX})
-    install(FILES THIRD-PARTY-PROGRAMS DESTINATION ${CMAKE_INSTALL_PREFIX})
-    install(FILES ${PROJECT_BINARY_DIR}/README DESTINATION ${CMAKE_INSTALL_PREFIX})
-elseif(DNNL_INSTALL_MODE STREQUAL "BUNDLE_V2")
     install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME})
     install(FILES THIRD-PARTY-PROGRAMS DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME})
     install(FILES ${PROJECT_BINARY_DIR}/README DESTINATION ${CMAKE_INSTALL_DATAROOTDIR}/doc/${LIB_PACKAGE_NAME})

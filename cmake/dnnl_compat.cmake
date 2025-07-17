@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2021-2023 Intel Corporation
+# Copyright 2021-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -34,13 +34,16 @@ endmacro()
 
 set(COMPAT_CACHE_BOOL_VARS
     "EXPERIMENTAL"
-    "EXPERIMENTAL_SPARSE"
+    "EXPERIMENTAL_UKERNEL"
+    "EXPERIMENTAL_LOGGING"
+    "EXPERIMENTAL_SYCL_KERNEL_COMPILER"
     "VERBOSE"
     "ENABLE_CONCURRENT_EXEC"
     "ENABLE_PRIMITIVE_CACHE"
     "USE_RT_OBJECTS_IN_PRIMITIVE_CACHE"
     "ENABLE_MAX_CPU_ISA"
     "ENABLE_CPU_ISA_HINTS"
+    "BUILD_DOC"
     "BUILD_EXAMPLES"
     "BUILD_TESTS"
     "BUILD_FOR_CI"
@@ -51,6 +54,7 @@ set(COMPAT_CACHE_BOOL_VARS
     "ENABLE_MEM_DEBUG"
     "ENABLE_STACK_CHECKER"
     "AARCH64_USE_ACL"
+    "DISABLE_GPU_REF_KERNELS"
     )
 
 set(COMPAT_CACHE_STRING_VARS

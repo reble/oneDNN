@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2024 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,12 +18,9 @@
 #include <set>
 #include <vector>
 
-#include "oneapi/dnnl/dnnl_graph.h"
-
 #include "cpu/platform.hpp"
-#ifdef DNNL_WITH_SYCL
-#include "dnnl_sycl.hpp"
-#endif
+
+#include "allocator.hpp"
 #include "utils.hpp"
 #include "utils/timer.hpp"
 
@@ -35,14 +32,14 @@ bdnn_state_t convert_state(const dnnl_status_t &s) {
             return bdnn_state_t {res_state_t::PASSED};
         case dnnl_status_t::dnnl_out_of_memory:
             return bdnn_state_t {
-                    res_state_t::SKIPPED, skip_reason_t::NOT_ENOUGH_RAM};
+                    res_state_t::SKIPPED, skip_reason::not_enough_ram};
         case dnnl_status_t::dnnl_invalid_arguments:
             return bdnn_state_t {res_state_t::INVALID_ARGUMENTS};
         case dnnl_status_t::dnnl_unimplemented:
             return bdnn_state_t {res_state_t::UNIMPLEMENTED};
         case dnnl_status_t::dnnl_last_impl_reached:
             return bdnn_state_t {
-                    res_state_t::SKIPPED, skip_reason_t::SKIP_IMPL_HIT};
+                    res_state_t::SKIPPED, skip_reason::skip_impl_hit};
         case dnnl_status_t::dnnl_runtime_error:
             return bdnn_state_t {res_state_t::FAILED};
         case dnnl_status_t::dnnl_not_required:
@@ -51,10 +48,10 @@ bdnn_state_t convert_state(const dnnl_status_t &s) {
         case dnnl_status_t::dnnl_invalid_graph_op:
         case dnnl_status_t::dnnl_invalid_shape:
             return bdnn_state_t {
-                    res_state_t::SKIPPED, skip_reason_t::INVALID_CASE};
+                    res_state_t::SKIPPED, skip_reason::invalid_case};
         case dnnl_status_t::dnnl_invalid_data_type:
-            return bdnn_state_t {res_state_t::SKIPPED,
-                    skip_reason_t::DATA_TYPE_NOT_SUPPORTED};
+            return bdnn_state_t {
+                    res_state_t::SKIPPED, skip_reason::data_type_not_supported};
         default: assert(!"dnnl state is not found!"); return bdnn_state_t {};
     }
 }
@@ -73,8 +70,11 @@ void compiled_partition_executor(dnnl::graph::compiled_partition &cp,
 #if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
         dnnl::graph::sycl_interop::execute(cp, stream, inputs,
                 const_cast<std::vector<dnnl::graph::tensor> &>(outputs));
+#elif DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+        dnnl::graph::ocl_interop::execute(cp, stream, inputs,
+                const_cast<std::vector<dnnl::graph::tensor> &>(outputs));
 #else
-        assert(!"GPU only support DPCPP runtime now");
+        assert(!"unsupported gpu runtime");
 #endif
     }
 }
@@ -145,7 +145,11 @@ inline int measure_perf_aggregate(timer::timer_t &t,
         if (use_profiling) {
             std::vector<uint64_t> nsecs;
             std::vector<uint64_t> cycles;
-            get_gpu_profiling_info(((dnnl::stream)stream).get(), nsecs, cycles);
+            // Cannot determine the number of expected profiling entries
+            // beforehand so pass -1.
+            SAFE(get_gpu_profiling_info(((dnnl::stream)stream).get(), nsecs,
+                         cycles, /*expected_num_entries=*/-1),
+                    CRIT);
             reset_gpu_profiling(((dnnl::stream)stream).get());
 
             // Profiling should have information to report, otherwise, stop.
@@ -238,6 +242,7 @@ int measure_perf(timer::timer_t &t,
         const std::vector<std::vector<dnnl::graph::tensor>> &outputs_v,
         res_t *res) {
     std::vector<perf_function_t> perf_func_v;
+    perf_func_v.reserve(cp_v.size());
     for (size_t i = 0; i < cp_v.size(); i++) {
         perf_func_v.emplace_back(std::bind(&compiled_partition_executor,
                 cp_v[i], std::placeholders::_1, std::placeholders::_2,
@@ -248,102 +253,6 @@ int measure_perf(timer::timer_t &t,
     if (res) res->state = EXECUTED;
 
     return status;
-}
-
-#ifdef DNNL_WITH_SYCL
-void *scratchpad_mm_mgr::sycl_alloc_mm(
-        size_t size, size_t alignment, const void *dev, const void *ctx) {
-    // fake malloc for 0 size
-    if (size == 0) return nullptr;
-
-    void *ptr {nullptr};
-    bool need_alloc_new_mm = true;
-    // find alloc mm with same size
-    const auto cnt = map_size_ptr_.count(size);
-    if (cnt > 0) {
-        const auto Iter = map_size_ptr_.equal_range(size);
-        for (auto it = Iter.first; it != Iter.second; ++it) {
-            // check if same size mm is free
-            if (free_ptr_.find(it->second.get()) != free_ptr_.end()) {
-                ptr = it->second.get();
-                free_ptr_.erase(ptr);
-                need_alloc_new_mm = false;
-            }
-        }
-    }
-
-    if (need_alloc_new_mm) {
-        auto sh_ptr = std::shared_ptr<void> {
-                malloc_shared(size, *static_cast<const sycl::device *>(dev),
-                        *static_cast<const sycl::context *>(ctx)),
-                sycl_deletor {*static_cast<const sycl::context *>(ctx)}};
-        ptr = sh_ptr.get();
-        // record the map of mm size and its ptr for reuse
-        map_size_ptr_.emplace(std::make_pair(size, sh_ptr));
-    }
-    return ptr;
-}
-
-void scratchpad_mm_mgr::sycl_free_mm(
-        void *ptr, const void *device, const void *context, void *event) {
-    free_ptr_.insert(ptr);
-}
-
-static scratchpad_mm_mgr s_mm_mgr;
-
-void *test_sycl_malloc_wrapper(
-        size_t n, size_t alignment, const void *dev, const void *ctx) {
-    return malloc_device(n, *static_cast<const sycl::device *>(dev),
-            *static_cast<const sycl::context *>(ctx));
-}
-
-void test_sycl_free_wrapper(
-        void *ptr, const void *dev, const void *context, void *event) {
-    (void)(dev);
-    if (event) {
-        static_cast<sycl::event *>(const_cast<void *>(event))->wait();
-    }
-    free(ptr, *static_cast<const sycl::context *>(context));
-}
-
-void *sycl_malloc_wrapper(
-        size_t size, size_t alignment, const void *dev, const void *ctx) {
-    void *ptr = has_bench_mode_bit(mode_bit_t::corr) || is_cpu()
-            ? test_sycl_malloc_wrapper(size, alignment, dev, ctx)
-            : s_mm_mgr.sycl_alloc_mm(size, alignment, dev, ctx);
-
-    return ptr;
-}
-
-// perf mode, mem will be finally released in s_mm_mgr ~shared_ptr when
-// test finished.
-void sycl_free_wrapper(
-        void *ptr, const void *device, const void *context, void *event) {
-    if (has_bench_mode_bit(mode_bit_t::corr) || is_cpu()) {
-        test_sycl_free_wrapper(ptr, device, context, event);
-    } else {
-        s_mm_mgr.sycl_free_mm(ptr, device, context, event);
-    }
-}
-
-sycl::queue &get_queue() {
-    static dnnl::engine test_eng {::get_test_engine()};
-    static sycl::device dev {dnnl::sycl_interop::get_device(test_eng)};
-    static sycl::context ctx {dnnl::sycl_interop::get_context(test_eng)};
-    static sycl::queue q {ctx, dev, sycl::property::queue::in_order {}};
-    return q;
-}
-#endif // DNNL_WITH_SYCL
-
-bool is_sycl_engine() {
-#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_SYCL
-    if (is_cpu()) return true;
-#endif
-
-#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
-    if (!is_cpu()) return true;
-#endif
-    return false;
 }
 
 dnnl::graph::op::kind opstr2kind(const std::string &kind) {
@@ -383,6 +292,9 @@ dnnl::graph::op::kind opstr2kind(const std::string &kind) {
             {"Exp", dnnl::graph::op::kind::Exp},
             {"GELU", dnnl::graph::op::kind::GELU},
             {"GELUBackward", dnnl::graph::op::kind::GELUBackward},
+            {"GenIndex", dnnl::graph::op::kind::GenIndex},
+            {"GreaterEqual", dnnl::graph::op::kind::GreaterEqual},
+            {"GroupNorm", dnnl::graph::op::kind::GroupNorm},
             {"HardSigmoid", dnnl::graph::op::kind::HardSigmoid},
             {"HardSigmoidBackward", dnnl::graph::op::kind::HardSigmoidBackward},
             {"HardSwish", dnnl::graph::op::kind::HardSwish},
@@ -466,6 +378,7 @@ dnnl::graph::op::attr attrstr2kind(const std::string &attr_name) {
             {"axis", dnnl::graph::op::attr::axis},
             {"begin_norm_axis", dnnl::graph::op::attr::begin_norm_axis},
             {"groups", dnnl::graph::op::attr::groups},
+            {"group_shape", dnnl::graph::op::attr::group_shape},
             // int64_t vector attributes. The value of these attributes can be a
             // vector of int64 numbers.
             {"axes", dnnl::graph::op::attr::axes},
@@ -515,193 +428,6 @@ dnnl::graph::op::attr attrstr2kind(const std::string &attr_name) {
         SAFE_V(FAIL);
     }
     return dnnl::graph::op::attr::undef;
-}
-
-class op_kind_hash_t {
-public:
-    std::size_t operator()(const dnnl::graph::op::kind &op_kind) const {
-        return std::hash<int>()(static_cast<int>(op_kind));
-    }
-};
-
-dnnl_driver_t opkind2driver(const dnnl::graph::op::kind &kind) {
-    const static std::unordered_map<dnnl::graph::op::kind, dnnl_driver_t,
-            op_kind_hash_t>
-            op_map = {
-                    {dnnl::graph::op::kind::Abs, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::AbsBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Add, dnnl_driver_t::binary},
-                    {dnnl::graph::op::kind::AvgPool, dnnl_driver_t::pool},
-                    {dnnl::graph::op::kind::AvgPoolBackward,
-                            dnnl_driver_t::pool},
-                    {dnnl::graph::op::kind::BatchNormForwardTraining,
-                            dnnl_driver_t::bnorm},
-                    {dnnl::graph::op::kind::BatchNormInference,
-                            dnnl_driver_t::bnorm},
-                    {dnnl::graph::op::kind::BatchNormTrainingBackward,
-                            dnnl_driver_t::bnorm},
-                    {dnnl::graph::op::kind::BiasAdd, dnnl_driver_t::binary},
-                    {dnnl::graph::op::kind::BiasAddBackward,
-                            dnnl_driver_t::binary},
-                    {dnnl::graph::op::kind::Clamp, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::ClampBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Concat, dnnl_driver_t::concat},
-                    {dnnl::graph::op::kind::Convolution, dnnl_driver_t::conv},
-                    {dnnl::graph::op::kind::ConvolutionBackwardData,
-                            dnnl_driver_t::conv},
-                    {dnnl::graph::op::kind::ConvolutionBackwardWeights,
-                            dnnl_driver_t::conv},
-                    {dnnl::graph::op::kind::ConvTranspose,
-                            dnnl_driver_t::deconv},
-                    {dnnl::graph::op::kind::ConvTransposeBackwardData,
-                            dnnl_driver_t::deconv},
-                    {dnnl::graph::op::kind::ConvTransposeBackwardWeights,
-                            dnnl_driver_t::deconv},
-                    {dnnl::graph::op::kind::Dequantize, dnnl_driver_t::reorder},
-                    {dnnl::graph::op::kind::Divide, dnnl_driver_t::binary},
-                    {dnnl::graph::op::kind::DynamicDequantize,
-                            dnnl_driver_t::reorder},
-                    {dnnl::graph::op::kind::DynamicQuantize,
-                            dnnl_driver_t::reorder},
-                    {dnnl::graph::op::kind::Elu, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::EluBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::End, dnnl_driver_t::others},
-                    //{dnnl::graph::op::kind::Erf, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Exp, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::GELU, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::GELUBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::HardSigmoid,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::HardSigmoidBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::HardSwish, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::HardSwishBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Interpolate,
-                            dnnl_driver_t::resampling},
-                    {dnnl::graph::op::kind::InterpolateBackward,
-                            dnnl_driver_t::resampling},
-                    {dnnl::graph::op::kind::LayerNorm, dnnl_driver_t::lnorm},
-                    {dnnl::graph::op::kind::LayerNormBackward,
-                            dnnl_driver_t::lnorm},
-                    {dnnl::graph::op::kind::LeakyReLU, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Log, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::LogSoftmax, dnnl_driver_t::softmax},
-                    {dnnl::graph::op::kind::LogSoftmaxBackward,
-                            dnnl_driver_t::softmax},
-                    {dnnl::graph::op::kind::MatMul, dnnl_driver_t::matmul},
-                    {dnnl::graph::op::kind::Maximum, dnnl_driver_t::binary},
-                    {dnnl::graph::op::kind::MaxPool, dnnl_driver_t::pool},
-                    {dnnl::graph::op::kind::MaxPoolBackward,
-                            dnnl_driver_t::pool},
-                    {dnnl::graph::op::kind::Minimum, dnnl_driver_t::binary},
-                    {dnnl::graph::op::kind::Mish, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::MishBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Multiply, dnnl_driver_t::binary},
-                    {dnnl::graph::op::kind::PReLU, dnnl_driver_t::prelu},
-                    {dnnl::graph::op::kind::PReLUBackward,
-                            dnnl_driver_t::prelu},
-                    {dnnl::graph::op::kind::Pow, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Quantize, dnnl_driver_t::reorder},
-                    {dnnl::graph::op::kind::Reciprocal, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::ReduceL1, dnnl_driver_t::reduction},
-                    {dnnl::graph::op::kind::ReduceL2, dnnl_driver_t::reduction},
-                    {dnnl::graph::op::kind::ReduceMax,
-                            dnnl_driver_t::reduction},
-                    {dnnl::graph::op::kind::ReduceMean,
-                            dnnl_driver_t::reduction},
-                    {dnnl::graph::op::kind::ReduceMin,
-                            dnnl_driver_t::reduction},
-                    {dnnl::graph::op::kind::ReduceProd,
-                            dnnl_driver_t::reduction},
-                    {dnnl::graph::op::kind::ReduceSum,
-                            dnnl_driver_t::reduction},
-                    {dnnl::graph::op::kind::ReLU, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::ReLUBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Reorder, dnnl_driver_t::reorder},
-                    {dnnl::graph::op::kind::Round, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Select, dnnl_driver_t::custom},
-                    {dnnl::graph::op::kind::Sigmoid, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::SigmoidBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::SoftMax, dnnl_driver_t::softmax},
-                    {dnnl::graph::op::kind::SoftMaxBackward,
-                            dnnl_driver_t::softmax},
-                    {dnnl::graph::op::kind::SoftPlus, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::SoftPlusBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Sqrt, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::SqrtBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::Square, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::SquaredDifference,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::StaticReshape,
-                            dnnl_driver_t::custom},
-                    {dnnl::graph::op::kind::StaticTranspose,
-                            dnnl_driver_t::custom},
-                    {dnnl::graph::op::kind::Subtract, dnnl_driver_t::binary},
-                    {dnnl::graph::op::kind::Tanh, dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::TanhBackward,
-                            dnnl_driver_t::eltwise},
-                    {dnnl::graph::op::kind::TypeCast, dnnl_driver_t::reorder},
-                    {dnnl::graph::op::kind::Wildcard, dnnl_driver_t::others},
-            };
-    const auto it = op_map.find(kind);
-    if (it != op_map.end()) {
-        return it->second;
-    } else {
-        fprintf(stderr, "graph: ERROR: Unsupported opkind: `%d`, exiting...\n",
-                static_cast<int>(kind));
-        SAFE_V(FAIL);
-    }
-    return dnnl_driver_t::others;
-}
-
-bool is_nxc_lt_arg(const std::string &kind, const int exec_arg) {
-    // Mapping from the op kind to a set that indicates which input arg needs
-    // reorder
-    static const std::unordered_map<std::string, std::unordered_set<int>>
-            input_arg_for_reorder = {
-                    {"AvgPool", {DNNL_ARG_SRC}},
-                    {"AvgPoolBackward", {DNNL_ARG_DIFF_DST}},
-                    {"BatchNormInference", {DNNL_ARG_SRC}},
-                    {"BatchNormForwardTraining", {DNNL_ARG_SRC}},
-                    {"BiasAddBackward", {DNNL_ARG_SRC}},
-                    {"Interpolate", {DNNL_ARG_SRC}},
-                    {"MaxPool", {DNNL_ARG_SRC}},
-                    {"Convolution", {DNNL_ARG_SRC}},
-                    {"ConvolutionBackwardData", {DNNL_ARG_DIFF_DST}},
-                    {"ConvTranspose", {DNNL_ARG_SRC}},
-                    {"ConvTransposeBackwardData", {DNNL_ARG_DIFF_DST}},
-                    {"BatchNormTrainingBackward",
-                            {DNNL_ARG_SRC, DNNL_ARG_DIFF_DST}},
-                    {"BiasAdd", {DNNL_ARG_SRC_0, DNNL_ARG_SRC_1}},
-                    {"InterpolateBackward", {DNNL_ARG_DIFF_DST}},
-                    {"MaxPoolBackward", {DNNL_ARG_SRC, DNNL_ARG_DIFF_DST}},
-                    {"ConvolutionBackwardWeights",
-                            {DNNL_ARG_SRC, DNNL_ARG_DIFF_DST}},
-                    {"ConvTransposeBackwardWeights",
-                            {DNNL_ARG_SRC, DNNL_ARG_DIFF_DST}},
-                    {"PReLU", {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS}},
-                    {"PReLUBackward",
-                            {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS,
-                                    DNNL_ARG_DIFF_DST}},
-            };
-
-    const auto iter = input_arg_for_reorder.find(kind);
-    if (iter != input_arg_for_reorder.end()) {
-        const auto &args_to_reorder = iter->second;
-        return args_to_reorder.find(exec_arg) != args_to_reorder.end();
-    } else {
-        return false;
-    }
 }
 
 // when length is 3, return "abc", when length is 5, return "abcde"
@@ -761,6 +487,32 @@ std::string strides2memory_tag(const size_t ndims,
     return memory_tag;
 }
 
+bool is_contiguous_memory(const dnnl::graph::logical_tensor::dims &strides,
+        const dnnl::graph::logical_tensor::dims &shape,
+        const std::string &tag) {
+
+    // for invalid strides, a tensor is always treated as a dense memory.
+    bool valid_stride = strides.size() == shape.size()
+            && std::all_of(strides.begin(), strides.end(),
+                    [](const int64_t &x) { return x > 0; });
+    if (!valid_stride) return true;
+
+    std::string template_tag = "abcdefghijk";
+    const size_t ndims = shape.size();
+    // use plain tag as default if the tensor shape rank changed
+    std::string real_tag
+            = ndims == tag.length() ? tag : template_tag.substr(0, ndims);
+
+    dnnl_dim_t s = 1;
+    for (size_t i = 0; i < ndims; ++i) {
+        int adim = real_tag[ndims - 1 - i] - static_cast<int>('a');
+        if (adim < 0 || adim >= static_cast<int>(strides.size())) return false;
+        if (strides[adim] != s) return false;
+        s *= (shape[adim] == 0 ? 1 : shape[adim]);
+    }
+    return true;
+}
+
 dnnl::graph::logical_tensor::dims memory_tag2strides(
         const dnnl::graph::logical_tensor::dims &shape,
         const std::string &tag) {
@@ -817,7 +569,7 @@ std::string verbose_partitions_n_ops(
 std::string lt_dims2str(const dnnl::graph::logical_tensor::dims &dims) {
     if (dims.empty()) return std::string();
 
-    std::stringstream ss;
+    dnnl::impl::stringstream_t ss;
     std::copy(
             dims.begin(), dims.end(), std::ostream_iterator<int64_t>(ss, "x"));
     auto res = ss.str();
@@ -837,29 +589,6 @@ void permute_md(dnn_mem_t &mem, std::vector<int64_t> permutation) {
     (void)st;
     assert(st == dnnl_success);
     mem.md_ = clone_md(permuted_md.get());
-}
-void reshape_md(dnn_mem_t &mem, const dnnl::memory::dims &reshaped_dims,
-        const dnnl::memory::dims &reshaped_strides) {
-
-    const auto data_type = static_cast<dnnl::memory::data_type>(mem.dt());
-    dnnl::memory::desc md(reshaped_dims, data_type, reshaped_strides);
-    // Dirty hack to replace md with another one.
-    // TODO: replace it with a better solution.
-    auto st = dnnl_memory_desc_destroy(mem.md_);
-    (void)st;
-    assert(st == dnnl_success);
-    mem.md_ = clone_md(md.get());
-}
-
-void reshape_md(dnn_mem_t &mem, const dnnl::memory::dims &reshaped_dims) {
-    dnnl::memory::desc md(clone_md(mem.md_));
-    dnnl::memory::desc reshaped_md = md.reshape(reshaped_dims);
-    // Dirty hack to replace md with another one.
-    // TODO: replace it with a better solution.
-    auto st = dnnl_memory_desc_destroy(mem.md_);
-    (void)st;
-    assert(st == dnnl_success);
-    mem.md_ = clone_md(reshaped_md.get());
 }
 
 int get_prim_arg_name_from_graph_op_output_offset(
@@ -961,6 +690,33 @@ int get_prim_arg_name_from_graph_op_output_offset(
                 return -1;
             }
         } break;
+        case dnnl::graph::op::kind::GroupNorm: {
+            if (output_offset == 0)
+                return DNNL_ARG_DST;
+            else if (output_offset == 1)
+                return DNNL_ARG_MEAN;
+            else if (output_offset == 2)
+                return DNNL_ARG_VARIANCE;
+            else {
+                BENCHDNN_PRINT(0, "Error: no matching ARG for offset %d",
+                        static_cast<int>(output_offset));
+                assert(false);
+                return -1;
+            }
+
+        } break;
+        case dnnl::graph::op::kind::SoftMax: {
+            if (output_offset == 0)
+                return DNNL_ARG_DST;
+            else if (output_offset == 1)
+                return DNNL_ARG_DST_1;
+            else {
+                BENCHDNN_PRINT(0, "Error: no matching ARG for offset %d",
+                        static_cast<int>(output_offset));
+                assert(false);
+                return -1;
+            }
+        } break;
         default: {
             return DNNL_ARG_DST;
         } break;
@@ -976,7 +732,8 @@ int get_prim_arg_name_from_graph_op_input_offset(
         case dnnl::graph::op::kind::Maximum:
         case dnnl::graph::op::kind::Minimum:
         case dnnl::graph::op::kind::Multiply:
-        case dnnl::graph::op::kind::Subtract: {
+        case dnnl::graph::op::kind::Subtract:
+        case dnnl::graph::op::kind::GreaterEqual: {
             if (input_offset == 0)
                 return DNNL_ARG_SRC_0;
             else if (input_offset == 1)
@@ -1294,11 +1051,25 @@ int get_prim_arg_name_from_graph_op_input_offset(
         } break;
         case dnnl::graph::op::kind::Select: {
             if (input_offset == 0)
-                return DNNL_ARG_WEIGHTS;
+                return DNNL_ARG_SRC_2;
             else if (input_offset == 1)
                 return DNNL_ARG_SRC_0;
             else if (input_offset == 2)
                 return DNNL_ARG_SRC_1;
+            else {
+                BENCHDNN_PRINT(0, "Error: no matching ARG for offset %zu",
+                        input_offset);
+                assert(false);
+                return -1;
+            }
+        } break;
+        case dnnl::graph::op::kind::GroupNorm: {
+            if (input_offset == 0)
+                return DNNL_ARG_SRC;
+            else if (input_offset == 1)
+                return DNNL_ARG_SCALE;
+            else if (input_offset == 2)
+                return DNNL_ARG_SHIFT;
             else {
                 BENCHDNN_PRINT(0, "Error: no matching ARG for offset %zu",
                         input_offset);
@@ -1338,27 +1109,49 @@ cpp_stream_t::cpp_stream_t(
     stream_ = dnnl::stream {eng, flags};
 }
 
-cpp_engine_t::cpp_engine_t() {
-    if (is_cpu()) {
-#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_SYCL
-        static dnnl::graph::allocator alloc {
-                dnnl::graph::sycl_interop::make_allocator(
-                        sycl_malloc_wrapper, sycl_free_wrapper)};
-#else
-        static dnnl::graph::allocator alloc {};
-#endif
+cpp_engine_t::cpp_engine_t(bool use_host) {
+
+    dnnl::graph::allocator &alloc = get_graph_allocator(use_host);
+
+    if (use_host || is_cpu()) {
         engine_ = make_engine_with_allocator(dnnl::engine::kind::cpu,
                 static_cast<size_t>(engine_index), alloc);
     } else {
 #if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
-        static dnnl::graph::allocator alloc {
-                dnnl::graph::sycl_interop::make_allocator(
-                        sycl_malloc_wrapper, sycl_free_wrapper)};
         engine_ = make_engine_with_allocator(dnnl::engine::kind::gpu,
                 static_cast<size_t>(engine_index), alloc);
+#elif DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+        // needs to prepare ocl_malloc_wrapper and ocl_free_wrapper and call
+        // make_engine_with_allocator instead.
+        engine_ = dnnl::engine(
+                dnnl::engine::kind::gpu, static_cast<size_t>(engine_index));
 #else
-        assert(!"GraphAPI GPU only support DPCPP runtime now");
+        assert(!"unsupported gpu runtime");
 #endif
     }
 }
+
+dnnl_data_type_t convert_dt(const dnnl::graph::logical_tensor::data_type dt) {
+    using graph_dt = dnnl::graph::logical_tensor::data_type;
+
+    switch (dt) {
+        case graph_dt::f16: return dnnl_f16;
+        case graph_dt::bf16: return dnnl_bf16;
+        case graph_dt::f32: return dnnl_f32;
+        case graph_dt::s32: return dnnl_s32;
+        case graph_dt::s8: return dnnl_s8;
+        case graph_dt::u8: return dnnl_u8;
+        // Use `u8` instead of `boolean` in the reference path.
+        // `dnn_graph_mem_t` will use the data type from the logical tensor and
+        // the `u8` data handle.
+        case graph_dt::boolean: return dnnl_u8;
+        case graph_dt::f8_e5m2: return dnnl_f8_e5m2;
+        case graph_dt::f8_e4m3: return dnnl_f8_e4m3;
+        case graph_dt::s4: return dnnl_s4;
+        case graph_dt::u4: return dnnl_u4;
+        case graph_dt::undef:
+        default: return dnnl_data_type_undef;
+    }
+}
+
 } // namespace graph

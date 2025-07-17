@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -82,8 +82,8 @@ TEST(test_quantize_execute, QuantizePerTensor) {
         cp.query_logical_tensor(dst_lt.id, &lt);
         ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-        test_tensor src_ts(src_lt, engine, src);
-        test_tensor dst_ts(dst_lt, engine, dst);
+        test_tensor_t src_ts(src_lt, engine, src);
+        test_tensor_t dst_ts(dst_lt, engine, dst);
 
         graph::stream_t *strm = get_stream();
         ASSERT_EQ(cp.execute(strm, {src_ts.get()}, {dst_ts.get()}),
@@ -144,8 +144,8 @@ TEST(test_quantize_execute, QuantizePerTensorAnyLayout) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, engine, src);
-    test_tensor dst_ts(lt, engine, dst);
+    test_tensor_t src_ts(src_lt, engine, src);
+    test_tensor_t dst_ts(lt, engine, dst);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get()}, {dst_ts.get()}),
@@ -202,8 +202,8 @@ TEST(test_quantize_execute, QuantizePerChannelSymmetric) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, engine, src);
-    test_tensor dst_ts(lt, engine, dst);
+    test_tensor_t src_ts(src_lt, engine, src);
+    test_tensor_t dst_ts(lt, engine, dst);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get()}, {dst_ts.get()}),
@@ -268,14 +268,14 @@ TEST(test_quantize_execute, TypecastQuantize) {
     ASSERT_EQ(p.compile(&cp, lt_ins, lt_outs, engine), graph::status::success);
 
     std::vector<uint8_t> dst_data(product(src_shape));
-    test_tensor src_ts(src_bf16, engine, src_data);
-    test_tensor dst_ts(dst_int8, engine, dst_data);
+    test_tensor_t src_ts(src_bf16, engine, src_data);
+    test_tensor_t dst_ts(dst_int8, engine, dst_data);
     ASSERT_EQ(cp.execute(strm, {src_ts.get()}, {dst_ts.get()}),
             graph::status::success);
     strm->wait();
 }
 
-TEST(test_quantize_execute, DynamicQuantizeS32ZpsPerTensor) {
+TEST(test_quantize_execute, DynamicQuantizeS32ZpsPerTensor_CPU) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -332,10 +332,10 @@ TEST(test_quantize_execute, DynamicQuantizeS32ZpsPerTensor) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor scales_ts(scales_lt, eng, scales);
-    test_tensor zps_ts(zps_lt, eng, zps);
-    test_tensor dst_ts(dst_lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t scales_ts(scales_lt, eng, scales);
+    test_tensor_t zps_ts(zps_lt, eng, zps);
+    test_tensor_t dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get(), scales_ts.get(), zps_ts.get()},
@@ -348,7 +348,7 @@ TEST(test_quantize_execute, DynamicQuantizeS32ZpsPerTensor) {
     }
 }
 
-TEST(test_quantize_execute, DynamicQuantizeS32ZpsPerChannel) {
+TEST(test_quantize_execute, DynamicQuantizeS32ZpsPerChannel_CPU) {
     // oneDNN reorder primitive didn't support per channel asymmetric quantize
     // regression?
     SKIP_IF(true,
@@ -411,10 +411,10 @@ TEST(test_quantize_execute, DynamicQuantizeS32ZpsPerChannel) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor scales_ts(scales_lt, eng, scales);
-    test_tensor zps_ts(zps_lt, eng, zps);
-    test_tensor dst_ts(dst_lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t scales_ts(scales_lt, eng, scales);
+    test_tensor_t zps_ts(zps_lt, eng, zps);
+    test_tensor_t dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get(), scales_ts.get(), zps_ts.get()},
@@ -427,7 +427,7 @@ TEST(test_quantize_execute, DynamicQuantizeS32ZpsPerChannel) {
     }
 }
 
-TEST(test_quantize_execute, DynamicQuantizeS8ZpsPerTensor) {
+TEST(test_quantize_execute, DynamicQuantizeS8ZpsPerTensor_CPU) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -484,10 +484,10 @@ TEST(test_quantize_execute, DynamicQuantizeS8ZpsPerTensor) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor scales_ts(scales_lt, eng, scales);
-    test_tensor zps_ts(zps_lt, eng, zps);
-    test_tensor dst_ts(dst_lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t scales_ts(scales_lt, eng, scales);
+    test_tensor_t zps_ts(zps_lt, eng, zps);
+    test_tensor_t dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get(), scales_ts.get(), zps_ts.get()},
@@ -500,7 +500,7 @@ TEST(test_quantize_execute, DynamicQuantizeS8ZpsPerTensor) {
     }
 }
 
-TEST(test_quantize_execute, DynamicQuantizeNoZpsPerTensor) {
+TEST(test_quantize_execute, DynamicQuantizeNoZpsPerTensor_CPU) {
     // default engine kind is cpu.
     graph::engine_t *eng = get_engine();
 
@@ -552,9 +552,9 @@ TEST(test_quantize_execute, DynamicQuantizeNoZpsPerTensor) {
     cp.query_logical_tensor(dst_lt.id, &lt);
     ASSERT_EQ(lt.layout_type, graph::layout_type::strided);
 
-    test_tensor src_ts(src_lt, eng, src);
-    test_tensor scales_ts(scales_lt, eng, scales);
-    test_tensor dst_ts(dst_lt, eng, dst);
+    test_tensor_t src_ts(src_lt, eng, src);
+    test_tensor_t scales_ts(scales_lt, eng, scales);
+    test_tensor_t dst_ts(dst_lt, eng, dst);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get(), scales_ts.get()}, {dst_ts.get()}),
@@ -619,8 +619,8 @@ TEST(test_quantize_execute, QuantizeZeroVolume) {
     ASSERT_EQ(lt.layout.strides[2], 1U);
     ASSERT_EQ(graph::logical_tensor_wrapper_t(lt).size(), 0U);
 
-    test_tensor src_ts(src_lt, engine, src);
-    test_tensor dst_ts(lt, engine, dst);
+    test_tensor_t src_ts(src_lt, engine, src);
+    test_tensor_t dst_ts(lt, engine, dst);
 
     graph::stream_t *strm = get_stream();
     ASSERT_EQ(cp.execute(strm, {src_ts.get()}, {dst_ts.get()}),

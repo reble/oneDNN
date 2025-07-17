@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -34,9 +34,7 @@ namespace x64 {
 
 struct jit_avx512_core_x8s8s32x_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit_int8:", jcp_.isa, ""),
                 jit_avx512_core_x8s8s32x_convolution_fwd_t);
@@ -65,9 +63,9 @@ struct jit_avx512_core_x8s8s32x_convolution_fwd_t : public primitive_t {
             VDISPATCH_CONV(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
 
             VDISPATCH_CONV(
-                    attr()->has_default_values(smask_t::scales_runtime
-                                    | smask_t::zero_points_runtime
-                                    | smask_t::post_ops | smask_t::sum_dt,
+                    attr()->has_default_values(smask_t::scales
+                                    | smask_t::zero_points | smask_t::post_ops
+                                    | smask_t::sum_dt,
                             dst_md(0)->data_type),
                     VERBOSE_UNSUPPORTED_ATTR);
 
@@ -75,31 +73,22 @@ struct jit_avx512_core_x8s8s32x_convolution_fwd_t : public primitive_t {
                                    dst_md(0)->data_type, /* is_int8 */ true),
                     VERBOSE_UNSUPPORTED_POSTOP);
 
-            VDISPATCH_CONV(attr_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
-            VDISPATCH_CONV(zero_points_ok(), VERBOSE_UNSUPPORTED_ZP_CFG);
+            CHECK(attr_scales_ok());
+            CHECK(attr_zero_points_ok());
 
-            CHECK(jit_avx512_core_x8s8s32x_fwd_kernel::init_conf(jcp_, *desc(),
-                    src_md_, weights_md_, dst_md_, bias_md_, attr_,
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_avx512_core_x8s8s32x_fwd_kernel_t::init_conf(jcp_,
+                    *desc(), src_md_, weights_md_, dst_md_, bias_md_, attr_,
                     dnnl_get_max_threads()));
 
             auto scratchpad = scratchpad_registry().registrar();
-            jit_avx512_core_x8s8s32x_fwd_kernel::init_scratchpad(
+            jit_avx512_core_x8s8s32x_fwd_kernel_t::init_scratchpad(
                     scratchpad, jcp_, *attr());
 
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
-
-    protected:
-        bool zero_points_ok() const {
-            // Only common zero points are supported -> mask should only be 0
-            int mask_src = 0, mask_dst = 0;
-            attr()->zero_points_.get(DNNL_ARG_SRC, &mask_src);
-            attr()->zero_points_.get(DNNL_ARG_DST, &mask_dst);
-            return attr()->zero_points_.has_default_values(DNNL_ARG_WEIGHTS)
-                    && mask_src == 0 && mask_dst == 0;
-        }
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     jit_avx512_core_x8s8s32x_convolution_fwd_t(const pd_t *apd)
@@ -107,7 +96,7 @@ struct jit_avx512_core_x8s8s32x_convolution_fwd_t : public primitive_t {
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
-                new jit_avx512_core_x8s8s32x_fwd_kernel(
+                new jit_avx512_core_x8s8s32x_fwd_kernel_t(
                         pd()->jcp_, *pd()->attr(), *pd()->dst_md(0))));
         return kernel_->create_kernel();
     }
@@ -135,7 +124,7 @@ private:
     const float *adjust_oscales(const memory_tracking::grantor_t &scratchpad,
             const float *src_scales, const float *wei_scales) const;
 
-    std::unique_ptr<jit_avx512_core_x8s8s32x_fwd_kernel> kernel_;
+    std::unique_ptr<jit_avx512_core_x8s8s32x_fwd_kernel_t> kernel_;
 };
 
 } // namespace x64

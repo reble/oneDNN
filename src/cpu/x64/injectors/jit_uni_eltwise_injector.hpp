@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef CPU_X64_JIT_UNI_ELTWISE_INJECTOR_HPP
-#define CPU_X64_JIT_UNI_ELTWISE_INJECTOR_HPP
+#ifndef CPU_X64_INJECTORS_JIT_UNI_ELTWISE_INJECTOR_HPP
+#define CPU_X64_INJECTORS_JIT_UNI_ELTWISE_INJECTOR_HPP
 
 #include <assert.h>
 #include <type_traits>
@@ -71,12 +71,12 @@ bool is_alg_supported(alg_kind_t alg);
 /*
  * Checks if eltwise injection for given args is supported.
  */
-bool is_supported(cpu_isa_t isa, alg_kind_t alg);
+bool is_supported(cpu_isa_t isa, alg_kind_t alg, data_type_t dt);
 
 } // namespace eltwise_injector
 
-template <cpu_isa_t isa, typename Wmm = typename cpu_isa_traits<isa>::Vmm>
-struct jit_uni_eltwise_injector_f32 {
+template <cpu_isa_t isa, typename Wmm = typename cpu_isa_traits_t<isa>::Vmm>
+struct jit_uni_eltwise_injector_t {
     using Vmm = Wmm;
 
     // Arguments description:
@@ -91,8 +91,9 @@ struct jit_uni_eltwise_injector_f32 {
     //   - algorithm derivative.
     // use_dst - defines whether source or destination point is passed to alg
     //   code. Depends on algorithm. See `_use_dst_for_bwd` algs definition.
-    jit_uni_eltwise_injector_f32(jit_generator *host, alg_kind_t alg,
-            float alpha, float beta, float scale, bool save_state = true,
+    jit_uni_eltwise_injector_t(jit_generator_t *host, alg_kind_t alg,
+            float alpha, float beta, float scale,
+            data_type_t dt = data_type::f32, bool save_state = true,
             Xbyak::Reg64 p_table = Xbyak::Reg64(Xbyak::Operand::RAX),
             Xbyak::Opmask k_mask = Xbyak::Opmask(1), bool is_fwd = true,
             bool use_dst = false, bool preserve_vmm = true,
@@ -101,6 +102,7 @@ struct jit_uni_eltwise_injector_f32 {
         , alpha_(alpha)
         , beta_(beta)
         , scale_(scale)
+        , dt_(dt)
         , h(host)
         , save_state_(save_state)
         , p_table_(p_table)
@@ -110,20 +112,20 @@ struct jit_uni_eltwise_injector_f32 {
         , preserve_vmm_(preserve_vmm)
         , preserve_p_table_(preserve_p_table)
         , n_vregs_to_preserve_(aux_vecs_count(alg_, is_fwd_, alpha_)) {
-        assert(eltwise_injector::is_supported(isa, alg_));
+        assert(eltwise_injector::is_supported(isa, alg_, dt_));
 
         register_table_entries();
     }
 
-    jit_uni_eltwise_injector_f32(jit_generator *host,
+    jit_uni_eltwise_injector_t(jit_generator_t *host,
             const post_ops_t::entry_t::eltwise_t &eltwise,
-            bool save_state = true,
+            data_type_t dt = data_type::f32, bool save_state = true,
             Xbyak::Reg64 p_table = Xbyak::Reg64(Xbyak::Operand::RAX),
             Xbyak::Opmask k_mask = Xbyak::Opmask(1), bool is_fwd = true,
             bool use_dst = false, bool preserve_vmm = true,
             bool preserve_p_table = true)
-        : jit_uni_eltwise_injector_f32(host, eltwise.alg, eltwise.alpha,
-                eltwise.beta, eltwise.scale, save_state, p_table, k_mask,
+        : jit_uni_eltwise_injector_t(host, eltwise.alg, eltwise.alpha,
+                eltwise.beta, eltwise.scale, dt, save_state, p_table, k_mask,
                 is_fwd, use_dst, preserve_vmm, preserve_p_table) {}
 
     void compute_vector_range(size_t start_compute_idx, size_t end_compute_idx,
@@ -148,8 +150,9 @@ private:
     const float alpha_;
     const float beta_;
     const float scale_;
+    const data_type_t dt_;
 
-    jit_generator *const h;
+    jit_generator_t *const h;
 
     const bool save_state_;
     const Xbyak::Reg64 p_table_;
@@ -162,24 +165,24 @@ private:
 
     Xbyak::Label l_table_;
 
-    // if only the injector was inherited from jit_generator...
+    // if only the injector was inherited from jit_generator_t...
     enum {
-        _cmp_eq_oq = jit_generator::_cmp_eq_oq,
-        _cmp_neq_uq = jit_generator::_cmp_neq_uq,
-        _cmp_lt_os = jit_generator::_cmp_lt_os,
-        _cmp_le_os = jit_generator::_cmp_le_os,
-        _cmp_ge_os = jit_generator::_cmp_nlt_us,
-        _cmp_gt_os = jit_generator::_cmp_nle_us,
-        _op_floor = jit_generator::_op_floor,
-        _op_mxcsr = jit_generator::_op_mxcsr
+        _cmp_eq_oq = jit_generator_t::_cmp_eq_oq,
+        _cmp_neq_uq = jit_generator_t::_cmp_neq_uq,
+        _cmp_lt_os = jit_generator_t::_cmp_lt_os,
+        _cmp_le_os = jit_generator_t::_cmp_le_os,
+        _cmp_ge_os = jit_generator_t::_cmp_nlt_us,
+        _cmp_gt_os = jit_generator_t::_cmp_nle_us,
+        _op_floor = jit_generator_t::_op_floor,
+        _op_mxcsr = jit_generator_t::_op_mxcsr
     };
 
     const bool is_avx512_ = is_superset(isa, avx512_core);
 
-    static constexpr size_t vlen_ = vreg_traits<Vmm>::vlen;
+    static constexpr size_t vlen_ = vreg_traits_t<Vmm>::vlen;
     static constexpr size_t preserved_vecs_max_ = 6;
     static constexpr size_t preserved_gprs_max_ = 5;
-    static constexpr size_t n_vregs_ = cpu_isa_traits<isa>::n_vregs;
+    static constexpr size_t n_vregs_ = cpu_isa_traits_t<isa>::n_vregs;
     static constexpr int n_mantissa_bits_ = 23;
 
     const size_t n_vregs_to_preserve_;

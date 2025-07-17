@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include <assert.h>
 #include "common/c_types_map.hpp"
 #include "common/memory_desc.hpp"
+#include "common/opdesc.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -49,20 +50,23 @@ const sum_ab_t sum_none = dnnl_sum_none;
 // A descriptor for a matrix multiplication (gemm) operation. To make the
 // interface consistent, the descriptor represent the GEMM operation in row
 // major.
-struct gemm_desc_t {
-    // The kind of primitive. Used for self identifying the primitive
-    // descriptor. Must be #dnnl_gemm.
-    dnnl_primitive_kind_t primitive_kind;
+struct gemm_desc_t : public op_desc_t {
+    gemm_desc_t() : op_desc_t(primitive_kind::gemm) {}
+
+    std::unique_ptr<op_desc_t> clone() const override {
+        return utils::make_unique<gemm_desc_t>(*this);
+    }
+
     memory_desc_t a_desc;
     memory_desc_t b_desc;
     memory_desc_t c_desc;
     memory_desc_t bias_desc;
     // Type for accumulating A*B.
-    dnnl_data_type_t acc_type;
+    dnnl_data_type_t acc_type {};
     // Sum across k dimension in either A or B tensor
     // and output to sum_ab tensor.
-    sum_ab_t sum_ab;
-    dnnl_data_type_t sum_ab_type;
+    sum_ab_t sum_ab {};
+    dnnl_data_type_t sum_ab_type {};
 
     // These accessors are to be used by the GEMM implementation. Because the
     // GEMM implementation currently assumes column major. These accessors
@@ -71,13 +75,16 @@ struct gemm_desc_t {
     inline bool is_batched() const { return c_desc.ndims >= 3; }
 
     // Simplified accessors that comply to GEMM API
-    transpose_t get_trans(const memory_desc_t &md) const {
-        return md.format_desc.blocking.strides[md.ndims - 1] != 1
+    static transpose_t get_trans(const memory_desc_t &md) {
+        if (!md.ndims) return transpose::notrans; // arbitrary
+        return md.dims[md.ndims - 1] != 1
+                        && md.format_desc.blocking.strides[md.ndims - 1] != 1
                 ? transpose::trans
                 : transpose::notrans;
     }
     transpose_t transa() const { return get_trans(b_desc); };
     transpose_t transb() const { return get_trans(a_desc); };
+    transpose_t transc() const { return get_trans(c_desc); };
     transpose_t trans_bias() const { return get_trans(bias_desc); }
 
     dnnl_dim_t batch() const {
@@ -114,9 +121,16 @@ struct gemm_desc_t {
     // This assumes that one of the dimensions has strides 1
     static dnnl_dim_t get_ld(const memory_desc_t &md) {
         auto strides = md.format_desc.blocking.strides;
-        assert(strides[md.ndims - 1] == 1 || strides[md.ndims - 2] == 1);
-        return strides[md.ndims - 1] != 1 ? strides[md.ndims - 1]
-                                          : strides[md.ndims - 2];
+        assert(md.dims[md.ndims - 1] == 1 || strides[md.ndims - 1] == 1
+                || md.dims[md.ndims - 2] == 1 || strides[md.ndims - 2] == 1);
+        switch (get_trans(md)) {
+            case transpose::trans:
+                return md.dims[md.ndims - 1] > 1 ? strides[md.ndims - 1]
+                                                 : md.dims[md.ndims - 2];
+            default:
+                return md.dims[md.ndims - 2] > 1 ? strides[md.ndims - 2]
+                                                 : md.dims[md.ndims - 1];
+        }
     }
     // Leading dimension of A.
     dnnl_dim_t lda() const { return get_ld(b_desc); }
@@ -137,20 +151,10 @@ struct gemm_desc_t {
     dnnl_data_type_t bias_type() const { return bias_desc.data_type; }
     // Type of bias.
     int bias_mask() const {
-        assert(bias_desc.ndims <= 3);
+        assert(bias_desc.ndims <= 6);
         int mask = 0;
-        // TODO: update the mask for batched dimension if we start
-        // supporting more batch dimensions
-        if (is_batched()) mask |= (bias_desc.dims[0] > 1) ? 1 << 0 : 0;
-
-        // because the bias mask is in row major, we have to convert
-        // to col major here by swapping two last dimensions
-        int m_idx = is_batched();
-        mask |= (bias_desc.dims[m_idx] > 1) ? 1 << (bias_desc.ndims - m_idx)
-                                            : 0;
-        mask |= (bias_desc.dims[m_idx + 1] > 1)
-                ? 1 << (bias_desc.ndims - (m_idx + 1))
-                : 0;
+        for (int i = 0; i < bias_desc.ndims; i++)
+            mask |= (bias_desc.dims[i] > 1) ? 1 << i : 0;
         return mask;
     }
 };

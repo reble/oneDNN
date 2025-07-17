@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,13 +37,14 @@
 namespace dnnl {
 namespace impl {
 
+// NOLINTBEGIN(google-default-arguments)
 struct concat_pd_t : public primitive_desc_t {
     const concat_desc_t *desc() const { return &desc_; }
     const op_desc_t *op_desc() const override {
         return reinterpret_cast<const op_desc_t *>(this->desc());
     }
 
-    ~concat_pd_t() = default;
+    ~concat_pd_t() override = default;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg >= DNNL_ARG_MULTIPLE_SRC
@@ -95,7 +96,6 @@ protected:
      * use this auxiliary array iff init() returned success */
     std::vector<memory_desc_t> src_image_mds_;
 
-protected:
     concat_desc_t desc_;
 
     concat_pd_t(const primitive_attr_t *attr, const memory_desc_t *dst_md,
@@ -112,14 +112,14 @@ protected:
         init_desc();
     }
 
-    concat_pd_t(const concat_pd_t &other) : primitive_desc_t(other) {
-        n_ = other.n_;
-        concat_dim_ = other.concat_dim_;
-        dst_md_ = other.dst_md_;
-        original_dst_ = other.original_dst_;
-        src_mds_ = other.src_mds_;
-        src_image_mds_ = other.src_image_mds_;
-
+    concat_pd_t(const concat_pd_t &other)
+        : primitive_desc_t(other)
+        , n_(other.n_)
+        , concat_dim_(other.concat_dim_)
+        , dst_md_(other.dst_md_)
+        , original_dst_(other.original_dst_)
+        , src_mds_(other.src_mds_)
+        , src_image_mds_(other.src_image_mds_) {
         init_desc();
     }
 
@@ -266,11 +266,13 @@ private:
             desc_.src_mds.push_back(&md);
     }
 };
+// NOLINTEND(google-default-arguments)
 
 #define DECLARE_CONCAT_PD_t(impl_name, ...) \
-    static status_t create(concat_pd_t **concat_pd, engine_t *engine, \
-            const primitive_attr_t *attr, const memory_desc_t *dst_md, int n, \
-            int concat_dim, const memory_desc_t *const *src_mds) { \
+    static status_t create(concat_pd_t **concat_pd, \
+            dnnl::impl::engine_t *engine, const primitive_attr_t *attr, \
+            const memory_desc_t *dst_md, int n, int concat_dim, \
+            const memory_desc_t *const *src_mds) { \
         using namespace status; \
         auto _pd = make_unique_pd<pd_t>(attr, dst_md, n, concat_dim, src_mds); \
         if (_pd == nullptr) return out_of_memory; \
@@ -279,10 +281,13 @@ private:
         return safe_ptr_assign(*concat_pd, _pd.release()); \
     } \
     status_t create_primitive( \
-            std::pair<std::shared_ptr<primitive_t>, bool> &primitive, \
-            engine_t *engine, const cache_blob_t &cache_blob) const override { \
+            std::pair<std::shared_ptr<impl::primitive_t>, cache_state_t> \
+                    &primitive, \
+            dnnl::impl::engine_t *engine, const cache_blob_t &cache_blob, \
+            bool force_create_from_blob) const override { \
         return primitive_t::create_primitive_common<__VA_ARGS__, pd_t>( \
-                primitive, this, engine, false, cache_blob); \
+                primitive, this, engine, false, cache_blob, \
+                force_create_from_blob); \
     } \
     pd_t *clone() const override { \
         auto new_pd = utils::make_unique<pd_t>(*this); \

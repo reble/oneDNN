@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,9 +22,9 @@
 
 #include "common/binary_pd.hpp"
 #include "common/c_types_map.hpp"
-#include "common/primitive.hpp"
+#include "gpu/gpu_primitive.hpp"
 #include "gpu/nvidia/cudnn_binary_impl.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/engine.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -32,22 +32,22 @@ namespace impl {
 namespace gpu {
 namespace nvidia {
 
-struct cudnn_binary_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct cudnn_binary_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public binary_pd_t {
         using binary_pd_t::binary_pd_t;
 
         DECLARE_COMMON_PD_T("cuda:cudnn:any", cudnn_binary_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
 
             bool ok = (set_default_params() == status::success)
                     && check_data_types(engine) && check_no_blocking()
                     && check_broadcast()
                     && attr()->has_default_values(
-                            primitive_attr_t::skip_mask_t::scales_runtime)
+                            primitive_attr_t::skip_mask_t::scales)
                     && IMPLICATION(!attr()->scales_.has_default_values(),
                             check_scales_mask());
 
@@ -66,12 +66,7 @@ struct cudnn_binary_t : public primitive_t {
                     || has_zero_dims(dst_md()->dims, dst_md()->ndims);
         }
 
-        bool check_scales_mask() const {
-            for (const auto &s : attr()->scales_.scales_) {
-                if (s.second.mask_ != 0) return false;
-            }
-            return true;
-        }
+        bool check_scales_mask() const { return attr_scales_ok(); }
 
         bool check_no_blocking() const {
             // Blocking is not supported by cudnnOpTensor, return false if any
@@ -93,15 +88,14 @@ struct cudnn_binary_t : public primitive_t {
             return true;
         }
 
-        bool check_data_types(engine_t *engine) const {
+        bool check_data_types(impl::engine_t *engine) const {
             using namespace data_type;
             bool inputs_same = src_md(0)->data_type == src_md(1)->data_type;
             dnnl_data_type_t input_type = src_md(0)->data_type;
             dnnl_data_type_t output_type = dst_md()->data_type;
 
             auto sycl_dev
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine)
-                              ->device();
+                    = utils::downcast<nvidia::engine_t *>(engine)->device();
 
             if (!IMPLICATION(utils::one_of(bf16, input_type, output_type),
                         has_bf16_support(sycl_dev)))
@@ -128,7 +122,7 @@ struct cudnn_binary_t : public primitive_t {
         std::shared_ptr<cudnn_binary_impl_base_t> binary_impl_;
     };
 
-    status_t init(engine_t *engine) override {
+    status_t init(impl::engine_t *engine) override {
         // Only single-element scale is supported
         host_scales_ = new float[2];
         if (!host_scales_) return status::out_of_memory;

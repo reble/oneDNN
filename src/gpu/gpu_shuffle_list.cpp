@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2022 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,8 +16,14 @@
 
 #include "gpu/gpu_impl_list.hpp"
 
-#include "gpu/ocl/ref_shuffle.hpp"
-#include "gpu/ocl/shuffle_by_reorder.hpp"
+#if DNNL_GPU_VENDOR == DNNL_VENDOR_INTEL
+#include "gpu/intel/ref_shuffle.hpp"
+#include "gpu/intel/shuffle_by_reorder.hpp"
+#endif
+
+#ifdef GENERIC_SYCL_KERNELS_ENABLED
+#include "gpu/generic/sycl/ref_shuffle.hpp"
+#endif
 
 namespace dnnl {
 namespace impl {
@@ -27,8 +33,9 @@ namespace {
 
 // clang-format off
 constexpr impl_list_item_t impl_list[] = REG_SHUFFLE_P({
-        INSTANCE(ocl::shuffle_by_reorder_t)
-        INSTANCE(ocl::ref_shuffle_t)
+        GPU_INSTANCE_INTEL(intel::shuffle_by_reorder_t)
+        GPU_INSTANCE_INTEL(intel::ref_shuffle_t)
+        GPU_INSTANCE_GENERIC_SYCL(generic::sycl::ref_shuffle_t)
         nullptr,
 });
 // clang-format on

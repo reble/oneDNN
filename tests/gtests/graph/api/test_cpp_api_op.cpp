@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -113,6 +113,9 @@ TEST(APIOp, CreateAllOps) {
             op::kind::HardSigmoidBackward,
             op::kind::Select,
             op::kind::Pow,
+            op::kind::GroupNorm,
+            op::kind::GenIndex,
+            op::kind::GreaterEqual,
     };
     // clang-format on
 

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Arm Ltd. and affiliates
+* Copyright 2023-2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -95,12 +95,12 @@ struct acl_reorder_fwd_t : public primitive_t {
 
             if (!ok) return status::unimplemented;
 
-            int mask = -1;
-            bool is_set = false;
-            CHECK(attr->scales_.get(DNNL_ARG_DST, &mask, &is_set));
-            const memory_desc_wrapper input_d(src_md);
-            if (input_d.has_runtime_dims_or_strides() && is_set && mask > 0)
-                return status::unimplemented;
+            if (!attr->scales_.has_default_values(DNNL_ARG_DST)) {
+                int mask = attr->scales_.get_mask(DNNL_ARG_DST);
+                const memory_desc_wrapper input_d(src_md);
+                if (input_d.has_runtime_dims_or_strides() && mask > 0)
+                    return status::unimplemented;
+            }
 
             // Create and check primitive descriptor
             auto _pd = make_unique_pd<pd_t>(attr, src_engine->kind(), src_md,
@@ -110,8 +110,8 @@ struct acl_reorder_fwd_t : public primitive_t {
                 return status::unimplemented;
             }
 
-            // In case we have two or four dimensions we can't have the first
-            // two dimensions as 1. This is valid for f32->f32 and f32->bf16.
+            // In case we have two or four dimensions, we can't have one of the
+            // two first dimensions as 1. This is valid for f32->f32 and f32->bf16.
             if (dst_md->dims[0] == 1 || dst_md->dims[1] == 1) {
                 return status::unimplemented;
             }
@@ -123,17 +123,18 @@ struct acl_reorder_fwd_t : public primitive_t {
 
             auto dst_tag = memory_desc_matches_one_of_tag(*dst_md,
                     format_tag::BA8b4a, format_tag::BA4b4a, format_tag::Ab4a,
-                    format_tag::Ab8a);
+                    format_tag::Ab8a, format_tag::Acdb8a, format_tag::Acdb4a);
             ACL_CHECK_SUPPORT(format_tag::undef == dst_tag,
-                    "Only Ab4a, Ab8a, BA8b4a and BA4b4a destination formats "
-                    "supported");
+                    "Only Ab4a/Ab8a, BA8b4a/BA4b4a and Acdb8a/Acdb4a "
+                    "destination formats supported");
 
             if (dst_tag == format_tag::BA4b4a || dst_tag == format_tag::Acdb4a
                     || dst_tag == format_tag::Ab4a) {
                 _pd->app_.dst_wf = arm_compute::WeightFormat::OHWIo4;
-            } else if (dst_tag == format_tag::BA8b4a
-                    || dst_tag == format_tag::Acdb8a
-                    || dst_tag == format_tag::Ab8a) {
+            } else if (mayiuse(sve_256)
+                    && (dst_tag == format_tag::BA8b4a
+                            || dst_tag == format_tag::Acdb8a
+                            || dst_tag == format_tag::Ab8a)) {
                 _pd->app_.dst_wf = arm_compute::WeightFormat::OHWIo8;
             } else {
                 return status::unimplemented;
@@ -146,13 +147,17 @@ struct acl_reorder_fwd_t : public primitive_t {
             switch (src_md->ndims) {
                 case 2: {
                     if (src_tag == format_tag::ab
-                            && dst_md->data_type == data_type::bf16) { // bf16
+                            && dst_md->data_type == data_type::bf16
+                            && utils::one_of(dst_tag, format_tag::BA8b4a,
+                                    format_tag::BA4b4a)) { // bf16
                         acl_tensor_shape_in = arm_compute::TensorShape(
                                 src_md->dims[0], src_md->dims[1]);
                         acl_tensor_shape_out = arm_compute::TensorShape(
                                 dst_md->padded_dims[0], dst_md->padded_dims[1]);
                     } else if (src_tag == format_tag::ba
-                            && dst_md->data_type == data_type::f32) { // f32
+                            && dst_md->data_type == data_type::f32
+                            && !utils::one_of(dst_tag, format_tag::BA8b4a,
+                                    format_tag::BA4b4a)) { // f32
                         acl_tensor_shape_in = arm_compute::TensorShape(
                                 src_md->dims[1], src_md->dims[0]);
                         acl_tensor_shape_out = arm_compute::TensorShape(

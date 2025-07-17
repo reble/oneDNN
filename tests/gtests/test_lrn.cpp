@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -61,6 +61,13 @@ bool hip_check_format_tag(tag first_tag, Rest... rest_tags) {
     return hip_check_format_tag(rest_tags...);
 }
 
+template <typename... Rest>
+bool generic_check_format_tag(tag first_tag, Rest... rest_tags) {
+    const bool ok = cuda_check_format_tag(first_tag);
+    if (!ok) return ok;
+    return cuda_check_format_tag(rest_tags...);
+}
+
 class lrn_test_t : public ::testing::TestWithParam<lrn_test_params_t> {
 private:
     lrn_test_params_t p;
@@ -82,6 +89,8 @@ protected:
         SKIP_IF_CUDA(!cuda_check_format_tag(p.src_tag, p.dst_tag),
                 "Unsupported format tag");
         SKIP_IF_HIP(!hip_check_format_tag(p.src_tag, p.dst_tag),
+                "Unsupported format tag");
+        SKIP_IF_GENERIC(!generic_check_format_tag(p.src_tag, p.dst_tag),
                 "Unsupported format tag");
 
         SKIP_IF_CUDA(p.src_dt != p.dst_dt && p.src_dt != dt::undef
@@ -113,7 +122,7 @@ protected:
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
 
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
 
         auto src_md = memory::desc(p.dims, p.src_dt, p.src_tag);
         auto dst_md = memory::desc(p.dims, p.dst_dt, p.dst_tag);
@@ -179,7 +188,7 @@ protected:
         // lrn specific types and values
         using pd_t = lrn_backward::primitive_desc;
         using hint_pd_t = lrn_forward::primitive_desc;
-        allows_attr_t aa {false}; // doesn't support anything
+        allows_attr_t aa {}; // doesn't support anything
 
         auto eng = get_test_engine();
         auto strm = make_stream(eng);

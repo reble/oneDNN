@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -34,6 +34,8 @@ const char *data_type2str(data_type_t v) {
     if (v == data_type::boolean) return "boolean";
     if (v == data_type::f8_e5m2) return "f8_e5m2";
     if (v == data_type::f8_e4m3) return "f8_e4m3";
+    if (v == data_type::s4) return "s4";
+    if (v == data_type::u4) return "u4";
     assert(!"unknown data_type");
     return "unknown data_type";
 }
@@ -69,6 +71,7 @@ const char *property_type2str(property_type_t v) {
     if (v == property_type::undef) return "undef";
     if (v == property_type::variable) return "variable";
     if (v == property_type::constant) return "constant";
+    if (v == property_type::host_scalar) return "host_scalar";
     assert(!"unknown property_type");
     return "unknown property_type";
 }

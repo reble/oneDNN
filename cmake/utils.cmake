@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2018-2023 Intel Corporation
+# Copyright 2018-2024 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,10 +22,6 @@ if(utils_cmake_included)
 endif()
 set(utils_cmake_included true)
 include("cmake/options.cmake")
-
-if ("${CMAKE_PROJECT_NAME}" STREQUAL "${PROJECT_NAME}")
-    set(DNNL_IS_MAIN_PROJECT TRUE)
-endif()
 
 # Common configuration for tests / test cases on Windows
 function(maybe_configure_windows_test name kind)
@@ -146,35 +142,16 @@ macro(append_to_windows_path_list path_list path)
     endif()
 endmacro()
 
-function(target_link_libraries_build target list)
-    # Foreach is required for compatibility with 2.8.11 ways
-    foreach(lib ${list})
-        target_link_libraries(${target} LINK_PUBLIC
-            "$<BUILD_INTERFACE:${lib}>")
-    endforeach(lib)
-endfunction()
-
+# Strip paths from libraries before populating INSTALL_INTERFACE
 function(target_link_libraries_install target list)
-    # Foreach is required for compatibility with 2.8.11 ways
     foreach(lib ${list})
         get_filename_component(base "${lib}" NAME)
-        target_link_libraries(${target} LINK_PUBLIC
-            "$<INSTALL_INTERFACE:${base}>")
+        target_link_libraries(${target} PUBLIC "$<INSTALL_INTERFACE:${base}>")
     endforeach(lib)
 endfunction()
 
 function(find_libm var)
-    # This is to account for the linker cache in OSX11.  might work
-    # with lower than 3.9.4, but was not able to test with anything
-    # between 2.8 and 3.9. See here for more details:
-    # https://gitlab.kitware.com/cmake/cmake/-/issues/20863
-    if (APPLE AND (${CMAKE_HOST_SYSTEM_VERSION} VERSION_GREATER "20.0.0")
-           AND (${CMAKE_VERSION} VERSION_LESS "3.9.4"))
-        message(INFO "Using OSX11 and above with CMAKE older than 3.18 can cause linking issues.")
-        set(OSX11_AND_OLDER_CMAKE TRUE)
-    endif()
-
-    if(UNIX AND (NOT (APPLE AND OSX11_AND_OLDER_CMAKE)))
+    if(UNIX)
         find_library(${var} m REQUIRED)
     endif()
 endfunction()

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -25,17 +25,7 @@
 
 namespace sum {
 
-using create_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t *,
-        res_t *)>;
-using check_cache_func_t = std::function<int(
-        std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &, const prb_t *,
-        res_t *)>;
-using do_func_t = std::function<int(
-        const std::vector<benchdnn_dnnl_wrapper_t<dnnl_primitive_t>> &,
-        const prb_t *, res_t *)>;
-using driver_task_executor_t = task_executor_t<prb_t, perf_report_t,
-        create_func_t, check_cache_func_t, do_func_t>;
+TASK_EXECUTOR_DECL_TYPES;
 
 void check_correctness(
         const settings_t &s, driver_task_executor_t &task_executor) {
@@ -44,21 +34,16 @@ void check_correctness(
     for_(const auto &i_stag : s.stag)
     for_(const auto &i_dtag : s.dtag)
     for_(const auto &i_input_scales : s.input_scales)
-    for_(const auto &i_scratchpad_mode : s.scratchpad_mode)
-    for_(const auto &i_acc_mode : s.acc_mode)
-    for_(const auto &i_deterministic : s.deterministic)
+    for_(const auto &i_attr : s.attributes)
     for_(const auto &i_ctx_init : s.ctx_init)
     for_(const auto &i_ctx_exe : s.ctx_exe)
     for (auto i_inplace : s.inplace) {
-        auto attr = settings_t::get_attr(
-                i_scratchpad_mode, i_acc_mode, i_deterministic);
-
         const prb_t prb(s.prb_dims, i_sdt, i_ddt, i_stag, i_dtag,
-                i_input_scales, i_inplace, attr, i_ctx_init, i_ctx_exe);
+                i_input_scales, i_inplace, i_attr, i_ctx_init, i_ctx_exe,
+                s.impl_filter);
         if (s.pattern && !match_regex(prb.str(), s.pattern)) return;
 
-        task_executor.submit(
-                prb, s.perf_template, createit, check_cacheit, doit);
+        task_executor.submit(prb, s.perf_template, createit, checkit, doit);
     }
 }
 
@@ -114,22 +99,14 @@ int bench(int argc, char **argv) {
                 || parse_multivector_option(s.input_scales, def.input_scales,
                         atof, argv[0], "scales", help_scales)
                 || parse_inplace(s.inplace, def.inplace, argv[0])
-                || parse_attr_scratchpad_mode(
-                        s.scratchpad_mode, def.scratchpad_mode, argv[0])
-                || parse_attr_deterministic(
-                        s.deterministic, def.deterministic, argv[0])
-                || parse_ctx_init(s.ctx_init, def.ctx_init, argv[0])
-                || parse_ctx_exe(s.ctx_exe, def.ctx_exe, argv[0])
-                || parse_test_pattern_match(s.pattern, argv[0])
-                || parse_perf_template(s.perf_template, s.perf_template_def,
-                        s.perf_template_csv(), argv[0])
-                || parse_reset(s, argv[0]) || parse_help(argv[0]);
+                || parse_driver_shared_settings(s, def, argv[0]);
         if (!parsed_options) {
             catch_unknown_options(argv[0]);
 
             parse_prb_dims(s.prb_dims, argv[0]);
 
             SAFE(verify_input(s), WARN);
+            s.finalize();
             check_correctness(s, task_executor);
         }
     }

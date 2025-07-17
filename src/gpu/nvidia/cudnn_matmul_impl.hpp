@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,9 @@
 
 #include "cudnn.h"
 
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/cudnn_matmul_base_impl.hpp"
+#include "gpu/nvidia/engine.hpp"
+#include "gpu/nvidia/sycl_cuda_scoped_context.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -28,103 +30,37 @@ namespace impl {
 namespace gpu {
 namespace nvidia {
 
-struct cudnn_matmul_impl_t {
+struct cublas_params : cublas_base_params {
 
-    bool with_eltwise(int position, const matmul_pd_t *pd) const {
-        return pd->attr()->post_ops_.contain(primitive_kind::eltwise, position);
-    }
+    status_t init(const memory_desc_t *src_md, const memory_desc_t *weights_md,
+            const memory_desc_t *dst_md, const memory_desc_t *bias_md,
+            const primitive_attr_t *attr, bool batched, bool with_bias) {
 
-    float eltwise_alpha(const matmul_pd_t *pd) const {
-        int eltwise_idx_ = pd->attr()->post_ops_.find(primitive_kind::eltwise);
-        return with_eltwise(0, pd) || with_eltwise(1, pd)
-                ? pd->attr()->post_ops_.entry_[eltwise_idx_].eltwise.alpha
-                : 1.0f;
-    }
+        CHECK(get_cublas_data_type(src_md->data_type, src_type_));
 
-    float eltwise_beta(const matmul_pd_t *pd) const {
-        int eltwise_idx_ = pd->attr()->post_ops_.find(primitive_kind::eltwise);
-        return with_eltwise(0, pd) || with_eltwise(1, pd)
-                ? pd->attr()->post_ops_.entry_[eltwise_idx_].eltwise.beta
-                : 0.0f;
-    }
+        CHECK(get_cublas_data_type(weights_md->data_type, weights_type_));
 
-    alg_kind_t eltwise_algo(const matmul_pd_t *pd) const {
-        int eltwise_idx_ = pd->attr()->post_ops_.find(primitive_kind::eltwise);
-        return with_eltwise(0, pd) || with_eltwise(1, pd)
-                ? pd->attr()->post_ops_.entry_[eltwise_idx_].eltwise.alg
-                : dnnl_alg_kind_undef;
-    }
+        isbatched_ = batched;
 
-    bool with_sum(const matmul_pd_t *pd) const {
-        return pd->attr()->post_ops_.contain(primitive_kind::sum, 0)
-                || pd->attr()->post_ops_.contain(primitive_kind::sum, 1);
-    }
+        memory_desc_wrapper src_d = memory_desc_wrapper(src_md);
+        memory_desc_wrapper weights_d = memory_desc_wrapper(weights_md);
+        memory_desc_wrapper dst_d = memory_desc_wrapper(dst_md);
 
-    // Returns scaling factor for post-ops=sum operation
-    float sum_scale(const matmul_pd_t *pd) const {
-        int sum_idx_ = pd->attr()->post_ops_.find(primitive_kind::sum);
-        return pd->attr()->post_ops_.entry_[sum_idx_].sum.scale;
-    }
-
-    // creates operation descriptor based on the elemen-wise operation specified
-    status_t create_and_set_op_descriptor(const matmul_pd_t *pd) {
-        CHECK(CUDNN_EXECUTE_FUNC_S(
-                cudnnCreateActivationDescriptor, &act_desc_));
-
-        cudnnActivationMode_t mode;
-
-        switch (eltwise_algo(pd)) {
-            case alg_kind::eltwise_relu:
-                mode = cudnnActivationMode_t::CUDNN_ACTIVATION_RELU;
-                break;
-            case alg_kind::eltwise_tanh:
-                mode = cudnnActivationMode_t::CUDNN_ACTIVATION_TANH;
-                break;
-            case alg_kind::eltwise_elu:
-                mode = cudnnActivationMode_t::CUDNN_ACTIVATION_ELU;
-                break;
-            case alg_kind::eltwise_logistic:
-                mode = cudnnActivationMode_t::CUDNN_ACTIVATION_SIGMOID;
-                break;
-            default: return status::unimplemented;
+        if (!(src_d.is_plain() && weights_d.is_plain() && dst_d.is_plain())) {
+            return status::unimplemented;
         }
 
-        // NaNs by default are propagated in oneDNN, although the forward
-        // convolution routine does not support this.
-        auto propagate_nan = cudnnNanPropagation_t::CUDNN_NOT_PROPAGATE_NAN;
-
-        // For ReLU, a ceiling of 0 means no limit.
-        double ceiling = eltwise_alpha(pd);
-
-        CHECK(CUDNN_EXECUTE_FUNC_S(cudnnSetActivationDescriptor, act_desc_,
-                mode, propagate_nan, ceiling));
-
-        return status::success;
-    }
-
-    status_t init(matmul_pd_t *pd) {
-        CHECK(get_cublas_data_type(pd->src_md()->data_type, src_type_));
-        CHECK(get_cublas_data_type(pd->weights_md()->data_type, weights_type_));
-
-        isbatched_ = pd->batched();
-
-        memory_desc_wrapper src_d = memory_desc_wrapper(pd->src_md());
-        memory_desc_wrapper weights_d = memory_desc_wrapper(pd->weights_md());
-        memory_desc_wrapper dst_d = memory_desc_wrapper(pd->dst_md());
-
-        with_dst_scale_
-                = !pd->attr()->scales_.get(DNNL_ARG_DST).has_default_values();
-        with_bias_ = pd->with_bias();
-        if ((with_bias_)
-                && (pd->weights_md(1)->data_type != pd->dst_md()->data_type)) {
+        with_dst_scale_ = !attr->scales_.has_default_values(DNNL_ARG_DST);
+        with_separate_bias_ = with_bias;
+        if ((with_separate_bias_)
+                && (bias_md->data_type != dst_md->data_type)) {
             // When datatype of bias is different from the dst,
             // we need to reorder the output.
             bias_dt_mismatch_ = true;
             reorder_required_ = true;
-            CHECK(get_cublas_data_type(
-                    pd->weights_md(1)->data_type, dst_type_));
+            CHECK(get_cublas_data_type(bias_md->data_type, dst_type_));
         } else {
-            CHECK(get_cublas_data_type(pd->dst_md()->data_type, dst_type_));
+            CHECK(get_cublas_data_type(dst_md->data_type, dst_type_));
         }
 
         // cuBLAS only supports s8s8f32 configuration.
@@ -134,13 +70,13 @@ struct cudnn_matmul_impl_t {
             dst_type_ = cudaDataType_t::CUDA_R_32F;
         }
 
-        if (with_eltwise(0, pd) || with_eltwise(1, pd)) {
-            with_eltwise_ = true;
-            CHECK(create_and_set_op_descriptor(pd));
+        if (with_eltwise(0, attr) || with_eltwise(1, attr)) {
+            with_separate_eltwise_ = true;
+            CHECK(create_and_set_op_descriptor(attr, act_desc_));
         }
 
         // Set parameter when post-op sum is specified
-        if (with_sum(pd)) { post_op_sum_ = sum_scale(pd); }
+        if (with_sum(attr)) { post_op_sum_ = sum_scale(attr); }
 
         has_runtime_params_ = src_d.has_runtime_dims_or_strides()
                 || dst_d.has_runtime_dims_or_strides()
@@ -148,47 +84,30 @@ struct cudnn_matmul_impl_t {
 
         if (!has_runtime_params_) {
             // Initialise all gemm parameters if there are no runtime parameters
-            init_parameters(src_d, weights_d, dst_d,
-                    memory_desc_wrapper(pd->weights_md(1)));
+            set_params(src_d, weights_d, dst_d, memory_desc_wrapper(bias_md));
         }
 
         return status::success;
     }
 
-    bool isbatched() { return isbatched_; }
-    bool with_bias() { return with_bias_; }
-    bool has_runtime_params() { return has_runtime_params_; }
-
-    void convert_dims_matmul(
-            const dnnl_dim_t *dims, int *new_dims, int n_dims) {
-        // Moving the dimensions because cudnnAddTensor doesn't work when
-        // bia_mask=1
-        if (n_dims == 3) { return convert_dims(dims, new_dims, n_dims); }
-        new_dims[0] = 1;
-        for (size_t i = 0; i < n_dims; i++) {
-            new_dims[i + 1] = static_cast<int>(dims[i]);
-        }
-        for (size_t i = n_dims; i < 4; i++) {
-            new_dims[i + 1] = 1;
-        }
+    status_t init_from_params(const std::shared_ptr<cublas_params> &other) {
+        if (!other) { return status::invalid_arguments; }
+        src_type_ = other->src_type_;
+        weights_type_ = other->weights_type_;
+        isbatched_ = other->isbatched_;
+        with_dst_scale_ = other->with_dst_scale_;
+        with_separate_bias_ = other->with_separate_bias_;
+        bias_dt_mismatch_ = other->bias_dt_mismatch_;
+        reorder_required_ = other->reorder_required_;
+        dst_type_ = other->dst_type_;
+        with_separate_eltwise_ = other->with_separate_eltwise_;
+        has_runtime_params_ = other->has_runtime_params_;
+        return status::success;
     }
 
-    int get_ld(const memory_desc_wrapper desc, cublasOperation_t trans) {
-        const int ndims = desc.ndims();
-        const auto *strides = &desc.blocking_desc().strides[ndims - 2];
-        const int ld = strides[trans == cublasOperation_t::CUBLAS_OP_N ? 0 : 1];
-        return ld;
-    }
-
-    int get_batch_stride(const memory_desc_wrapper desc) {
-        auto dims = desc.dims();
-        auto strides = desc.blocking_desc().strides;
-        return dims[0] == 1 ? 0 : strides[0];
-    }
-
-    status_t init_gemm_parameters(const memory_desc_wrapper src_d,
-            const memory_desc_wrapper weights_d,
-            const memory_desc_wrapper dst_d) {
+    status_t set_gemm_params(const memory_desc_wrapper &src_d,
+            const memory_desc_wrapper &weights_d,
+            const memory_desc_wrapper &dst_d) {
 
         if (isbatched_) batch_count_ = dst_d.dims()[0];
         const dim_t M = dst_d.dims()[isbatched_ + 1];
@@ -238,14 +157,15 @@ struct cudnn_matmul_impl_t {
         return status::success;
     }
 
-    status_t init_parameters(const memory_desc_wrapper src_d,
-            const memory_desc_wrapper weights_d,
-            const memory_desc_wrapper dst_d, const memory_desc_wrapper bias_d) {
+    status_t set_params(const memory_desc_wrapper &src_d,
+            const memory_desc_wrapper &weights_d,
+            const memory_desc_wrapper &dst_d,
+            const memory_desc_wrapper &bias_d) {
         // Matmul supports runtime paramters for dimensions and scales.
         // We need to initialize them in the execute function.
-        CHECK(init_gemm_parameters(src_d, weights_d, dst_d));
+        CHECK(set_gemm_params(src_d, weights_d, dst_d));
 
-        if (with_bias_ || reorder_required_ || with_eltwise_
+        if (with_separate_bias_ || reorder_required_ || with_separate_eltwise_
                 || with_dst_scale_) {
             // Initialise cuDNN descriptors
             cudnnDataType_t data_types[NUM_IO];
@@ -268,7 +188,7 @@ struct cudnn_matmul_impl_t {
                         strides[dst]));
             }
 
-            if (with_bias_) {
+            if (with_separate_bias_) {
                 // Create bias and destination tensor descriptors
                 convert_dims_matmul(bias_d.dims(), dims[bias], bias_d.ndims());
                 convert_dims_matmul(bias_d.blocking_desc().strides,
@@ -282,18 +202,180 @@ struct cudnn_matmul_impl_t {
                 }
             }
         }
+
+        const auto dst_nelems = dst_d.nelems(true);
+        reorder_scratch_size_ = dst_nelems * sizeof(float);
+
         return status::success;
     }
 
+    size_t scratchpad_size(const memory_desc_t *dst_md) const {
+        const auto dst_nelems = memory_desc_wrapper(dst_md).nelems(true);
+        return dst_nelems * sizeof(float);
+    }
+
+    void init_scratchpad(const memory_desc_t *dst_md,
+            memory_tracking::registrar_t scratchpad) {
+        auto reorder_scratch_size = scratchpad_size(dst_md);
+        if (reorder_scratch_size > 0) {
+            scratchpad.book(memory_tracking::names::key_matmul_dst_in_acc_dt,
+                    reorder_scratch_size, 1);
+        }
+    }
+
+    void convert_dims_matmul(
+            const dnnl_dim_t *dims, int *new_dims, int n_dims) {
+        // Moving the dimensions because cudnnAddTensor doesn't work when
+        // bia_mask=1
+        if (n_dims == 3) { return convert_dims(dims, new_dims, n_dims); }
+        new_dims[0] = 1;
+        for (int i = 0; i < n_dims; i++) {
+            new_dims[i + 1] = static_cast<int>(dims[i]);
+        }
+        for (int i = n_dims; i < 4; i++) {
+            new_dims[i + 1] = 1;
+        }
+    }
+
+    int get_ld(const memory_desc_wrapper desc, cublasOperation_t trans) {
+        const int ndims = desc.ndims();
+        const auto *strides = &desc.blocking_desc().strides[ndims - 2];
+        const int ld = strides[trans == cublasOperation_t::CUBLAS_OP_N ? 0 : 1];
+        return ld;
+    }
+
+    // creates operation descriptor based on the elemen-wise operation specified
+    status_t create_and_set_op_descriptor(const primitive_attr_t *attr,
+            cudnnActivationDescriptor_t &act_desc) {
+        CHECK(CUDNN_EXECUTE_FUNC_S(cudnnCreateActivationDescriptor, &act_desc));
+
+        cudnnActivationMode_t mode;
+
+        switch (eltwise_algo(attr)) {
+            case alg_kind::eltwise_relu:
+                mode = cudnnActivationMode_t::CUDNN_ACTIVATION_RELU;
+                break;
+            case alg_kind::eltwise_tanh:
+                mode = cudnnActivationMode_t::CUDNN_ACTIVATION_TANH;
+                break;
+            case alg_kind::eltwise_elu:
+                mode = cudnnActivationMode_t::CUDNN_ACTIVATION_ELU;
+                break;
+            case alg_kind::eltwise_logistic:
+                mode = cudnnActivationMode_t::CUDNN_ACTIVATION_SIGMOID;
+                break;
+            default: return status::unimplemented;
+        }
+
+        // NaNs by default are propagated in oneDNN, although the forward
+        // convolution routine does not support this.
+        auto propagate_nan = cudnnNanPropagation_t::CUDNN_NOT_PROPAGATE_NAN;
+
+        // For ReLU, a ceiling of 0 means no limit.
+        double ceiling = eltwise_alpha(attr);
+
+        CHECK(CUDNN_EXECUTE_FUNC_S(cudnnSetActivationDescriptor, act_desc, mode,
+                propagate_nan, ceiling));
+
+        return status::success;
+    }
+
+    float eltwise_alpha(const primitive_attr_t *attr) {
+        int eltwise_idx_ = attr->post_ops_.find(primitive_kind::eltwise);
+        return with_eltwise(0, attr) || with_eltwise(1, attr)
+                ? attr->post_ops_.entry_[eltwise_idx_].eltwise.alpha
+                : 1.0f;
+    }
+
+    status_t handle_post_ops(cudnnHandle_t cudnn_handle, void *dst, void *bias,
+            void *reorder_scratch, float host_dst_scale) {
+        if (with_separate_bias_) {
+            // When bias is specified call cudnnAddTensor()
+            float bias_beta = 1;
+            auto scale = (with_separate_eltwise_ ? 1 : 1.0f / host_dst_scale);
+            CUDNN_EXECUTE_FUNC(cudnnAddTensor, cudnn_handle, &scale,
+                    tensor_descs_[io::bias], bias, &bias_beta, temp_mem_desc_,
+                    reorder_scratch);
+        }
+        if (with_separate_eltwise_) {
+            // Perform elementwise operation if specified
+            float alpha = 1.0f / host_dst_scale;
+            float beta = 0;
+            CUDNN_EXECUTE_FUNC(cudnnActivationForward, cudnn_handle, act_desc_,
+                    &alpha, temp_mem_desc_, reorder_scratch, &beta,
+                    temp_mem_desc_, reorder_scratch);
+        }
+        if (reorder_required_) {
+            // Reorder from scratchpad to destination if required
+            float reorder_alpha = 1;
+            CUDNN_EXECUTE_FUNC(cudnnTransformTensor, cudnn_handle,
+                    &reorder_alpha, temp_mem_desc_, reorder_scratch,
+                    &post_op_sum_, tensor_descs_[io::dst], dst);
+        }
+
+        return status::success;
+    }
+
+    void cleanup() const {
+        if (act_desc_) {
+            CUDNN_EXECUTE_FUNC_V(cudnnDestroyActivationDescriptor, act_desc_);
+        }
+        if ((reorder_required_ && !bias_dt_mismatch_)
+                || ((with_separate_bias_ && bias_dt_mismatch_)
+                        && temp_mem_desc_)) {
+            CUDNN_EXECUTE_FUNC_V(cudnnDestroyTensorDescriptor, temp_mem_desc_);
+        }
+        for (size_t i = 0; i < NUM_IO; i++) {
+            if (tensor_descs_[i]) {
+                CUDNN_EXECUTE_FUNC_V(
+                        cudnnDestroyTensorDescriptor, tensor_descs_[i]);
+            }
+        }
+    }
+
+    int lda_, ldb_, ldc_;
+
+    int64_t stride_a_, stride_b_, stride_c_;
+
+    enum io { bias = 0, dst, NUM_IO };
+    cudnnTensorDescriptor_t tensor_descs_[NUM_IO] = {},
+                            temp_mem_desc_ = nullptr;
+    cudnnActivationDescriptor_t act_desc_ = nullptr;
+
+    cublasOperation_t transA_;
+    cublasOperation_t transB_;
+    cublasOperation_t transC_;
+    cublasGemmAlgo_t gemm_algo_
+            = cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+};
+
+struct cudnn_matmul_impl_t {
+
+    void set_non_runtime_params(
+            const std::shared_ptr<cublas_params> &matmul_params) {
+        matmul_params_ = matmul_params;
+    }
+
     void execute(cublasHandle_t cublas_handle, cudnnHandle_t cudnn_handle,
-            void *a, void *b, void *c, void *bias, void *scratch,
+            const std::shared_ptr<cublas_params> &matmul_params, void *a,
+            void *b, void *c, void *bias, void *reorder_scratch,
             void *src_scale, void *wei_scale, void *dst_scale) {
+
+        cudaStream_t cuda_stream;
+        CUBLAS_EXECUTE_FUNC(cublasGetStream, cublas_handle, &cuda_stream);
+
+        // use cached params unless using runtime dimensions
+        std::shared_ptr<cublas_params> params
+                = matmul_params->has_runtime_params_ ? matmul_params
+                                                     : matmul_params_;
+
         float gemm_beta = 0;
-        if (!bias_dt_mismatch_ && !reorder_required_) {
+        if (!params->bias_dt_mismatch_ && !params->reorder_required_) {
             // Case where no reorder is required, scratchpad points to dst (c)
-            scratch = c;
-            temp_mem_desc_ = tensor_descs_[io::dst];
-            gemm_beta = post_op_sum_;
+            reorder_scratch = c;
+            params->temp_mem_desc_
+                    = params->tensor_descs_[cublas_params::io::dst];
+            gemm_beta = params->post_op_sum_;
         }
         auto flip_op = [](cublasOperation_t op) {
             return (op == cublasOperation_t::CUBLAS_OP_T)
@@ -305,139 +387,87 @@ struct cudnn_matmul_impl_t {
         float host_dst_scale = 1.0f;
         if (src_scale) {
             float host_src_scale = 1.0f;
-            CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_src_scale,
-                    (CUdeviceptr)src_scale, sizeof(float));
+            CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_src_scale,
+                    (CUdeviceptr)src_scale, sizeof(float), cuda_stream);
             scale *= host_src_scale;
         }
         if (wei_scale) {
             float host_wei_scale = 1.0f;
-            CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_wei_scale,
-                    (CUdeviceptr)wei_scale, sizeof(float));
+            CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_wei_scale,
+                    (CUdeviceptr)wei_scale, sizeof(float), cuda_stream);
             scale *= host_wei_scale;
         }
         if (dst_scale) {
-            CUDA_EXECUTE_FUNC(cuMemcpy, (CUdeviceptr)&host_dst_scale,
-                    (CUdeviceptr)dst_scale, sizeof(float));
+            CUDA_EXECUTE_FUNC(cuMemcpyAsync, (CUdeviceptr)&host_dst_scale,
+                    (CUdeviceptr)dst_scale, sizeof(float), cuda_stream);
             // For eltwise post-ops, apply the dst scale afterward
-            if (!with_eltwise_) scale /= host_dst_scale;
+            if (!params->with_separate_eltwise_) scale /= host_dst_scale;
         }
 
-        if (isbatched_) {
+        auto M = params->M_;
+        auto N = params->N_;
+        auto K = params->K_;
+
+        auto lda = params->lda_;
+        auto ldb = params->ldb_;
+        auto ldc = params->ldc_;
+
+        auto src_type = params->src_type_;
+        auto weights_type = params->weights_type_;
+        auto dst_type = params->dst_type_;
+
+        auto stride_a = params->stride_a_;
+        auto stride_b = params->stride_b_;
+        auto stride_c = params->stride_c_;
+
+        auto batch_count = params->batch_count_;
+        auto acc_type = params->acc_type_;
+        auto gemm_algo = params->gemm_algo_;
+
+        auto transA = params->transA_;
+        auto transB = params->transB_;
+        auto transC = params->transC_;
+
+        if (params->isbatched_) {
             // Calls cublasGemmStridedBatchedEx()
-            if (transC_ == cublasOperation_t::CUBLAS_OP_T) {
+            if (transC == cublasOperation_t::CUBLAS_OP_T) {
                 CUBLAS_EXECUTE_FUNC(cublasGemmStridedBatchedEx, cublas_handle,
-                        flip_op(transB_), flip_op(transA_), N_, M_, K_, &scale,
-                        b, src_type_, ldb_, stride_b_, a, weights_type_, lda_,
-                        stride_a_, &gemm_beta, scratch, dst_type_, ldc_,
-                        stride_c_, batch_count_, acc_type_, gemm_algo_);
+                        flip_op(transB), flip_op(transA), N, M, K, &scale, b,
+                        src_type, ldb, stride_b, a, weights_type, lda, stride_a,
+                        &gemm_beta, reorder_scratch, dst_type, ldc, stride_c,
+                        batch_count, acc_type, gemm_algo);
 
             } else {
                 CUBLAS_EXECUTE_FUNC(cublasGemmStridedBatchedEx, cublas_handle,
-                        transA_, transB_, M_, N_, K_, &scale, a, weights_type_,
-                        lda_, stride_a_, b, src_type_, ldb_, stride_b_,
-                        &gemm_beta, scratch, dst_type_, ldc_, stride_c_,
-                        batch_count_, acc_type_, gemm_algo_);
+                        transA, transB, M, N, K, &scale, a, weights_type, lda,
+                        stride_a, b, src_type, ldb, stride_b, &gemm_beta,
+                        reorder_scratch, dst_type, ldc, stride_c, batch_count,
+                        acc_type, gemm_algo);
             }
         } else {
             // Calls cublasGemmEx()
-            if (transC_ == cublasOperation_t::CUBLAS_OP_T) {
+            if (transC == cublasOperation_t::CUBLAS_OP_T) {
                 CUBLAS_EXECUTE_FUNC(cublasGemmEx, cublas_handle,
-                        flip_op(transB_), flip_op(transA_), N_, M_, K_, &scale,
-                        b, src_type_, ldb_, a, weights_type_, lda_, &gemm_beta,
-                        scratch, dst_type_, ldc_, acc_type_, gemm_algo_);
+                        flip_op(transB), flip_op(transA), N, M, K, &scale, b,
+                        src_type, ldb, a, weights_type, lda, &gemm_beta,
+                        reorder_scratch, dst_type, ldc, acc_type, gemm_algo);
             } else {
-                CUBLAS_EXECUTE_FUNC(cublasGemmEx, cublas_handle, transA_,
-                        transB_, M_, N_, K_, &scale, a, weights_type_, lda_, b,
-                        src_type_, ldb_, &gemm_beta, scratch, dst_type_, ldc_,
-                        acc_type_, gemm_algo_);
+                CUBLAS_EXECUTE_FUNC(cublasGemmEx, cublas_handle, transA, transB,
+                        M, N, K, &scale, a, weights_type, lda, b, src_type, ldb,
+                        &gemm_beta, reorder_scratch, dst_type, ldc, acc_type,
+                        gemm_algo);
             }
         }
-        if (with_bias_) {
-            // When bias is specified call cudnnAddTensor()
-            float bias_beta = 1;
-            scale = (with_eltwise_ ? 1 : 1.0f / host_dst_scale);
-            CUDNN_EXECUTE_FUNC(cudnnAddTensor, cudnn_handle, &scale,
-                    tensor_descs_[io::bias], bias, &bias_beta, temp_mem_desc_,
-                    scratch);
-        }
-        if (with_eltwise_) {
-            // Perform elementwise operation if specified
-            float alpha = 1.0f / host_dst_scale;
-            float beta = 0;
-            CUDNN_EXECUTE_FUNC(cudnnActivationForward, cudnn_handle, act_desc_,
-                    &alpha, temp_mem_desc_, scratch, &beta, temp_mem_desc_,
-                    scratch);
-        }
-        if (reorder_required_) {
-            // Reorder from scratchpad to destination if required
-            float reorder_alpha = 1;
-            CUDNN_EXECUTE_FUNC(cudnnTransformTensor, cudnn_handle,
-                    &reorder_alpha, temp_mem_desc_, scratch, &post_op_sum_,
-                    tensor_descs_[io::dst], c);
-        }
+        params->handle_post_ops(
+                cudnn_handle, c, bias, reorder_scratch, host_dst_scale);
     }
 
-    ~cudnn_matmul_impl_t() { cleanup(); }
-
-    void cleanup() {
-        if (act_desc_) {
-            CUDNN_EXECUTE_FUNC_V(cudnnDestroyActivationDescriptor, act_desc_);
-            act_desc_ = nullptr;
-        }
-        if ((reorder_required_ && !bias_dt_mismatch_)
-                || ((with_bias_ && bias_dt_mismatch_) && temp_mem_desc_)) {
-            CUDNN_EXECUTE_FUNC_V(cudnnDestroyTensorDescriptor, temp_mem_desc_);
-            temp_mem_desc_ = nullptr;
-        }
-        for (size_t i = 0; i < NUM_IO; i++) {
-            if (tensor_descs_[i]) {
-                CUDNN_EXECUTE_FUNC_V(
-                        cudnnDestroyTensorDescriptor, tensor_descs_[i]);
-                tensor_descs_[i] = nullptr;
-            }
-        }
+    ~cudnn_matmul_impl_t() {
+        if (matmul_params_) { matmul_params_->cleanup(); }
     }
 
 private:
-    status_t get_cublas_data_type(
-            dnnl_data_type_t data_type, cudaDataType_t &blas_dt) {
-        switch (data_type) {
-            case dnnl_data_type_t::dnnl_f32:
-                blas_dt = CUDA_R_32F;
-                return status::success;
-            case dnnl_data_type_t::dnnl_f16:
-                blas_dt = CUDA_R_16F;
-                return status::success;
-            case dnnl_data_type_t::dnnl_bf16:
-                blas_dt = CUDA_R_16BF;
-                return status::success;
-            case dnnl_data_type_t::dnnl_s8:
-                blas_dt = CUDA_R_8I;
-                return status::success;
-            default: return status::unimplemented;
-        }
-        return status::unimplemented;
-    }
-    cublasOperation_t transA_;
-    cublasOperation_t transB_;
-    cublasOperation_t transC_;
-    int M_, N_, K_;
-    int lda_, ldb_, ldc_;
-    long long int stride_a_, stride_b_, stride_c_;
-    bool isbatched_ = false, with_bias_ = false, bias_dt_mismatch_ = false,
-         with_dst_scale_ = false;
-    bool reorder_required_ = false, with_eltwise_ = false;
-    bool has_runtime_params_ = false;
-    cudaDataType_t src_type_, weights_type_, dst_type_;
-    cudaDataType_t acc_type_ = cudaDataType_t::CUDA_R_32F;
-    cublasGemmAlgo_t gemm_algo_
-            = cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP;
-    int batch_count_;
-    enum io { bias = 0, dst, NUM_IO };
-    cudnnTensorDescriptor_t tensor_descs_[NUM_IO] = {},
-                            temp_mem_desc_ = nullptr;
-    cudnnActivationDescriptor_t act_desc_ = nullptr;
-    float post_op_sum_;
+    std::shared_ptr<cublas_params> matmul_params_;
 };
 
 } // namespace nvidia

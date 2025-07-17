@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,13 +22,13 @@
 
 #include "common/batch_normalization_pd.hpp"
 #include "common/c_types_map.hpp"
-#include "common/primitive.hpp"
 #include "common/type_helpers.hpp"
+#include "gpu/amd/engine.hpp"
 #include "gpu/amd/miopen_batch_normalization_executor.hpp"
 #include "gpu/amd/miopen_batch_normalization_impl.hpp"
-#include "gpu/amd/sycl_hip_engine.hpp"
-#include "gpu/amd/sycl_hip_stream.hpp"
+#include "gpu/amd/stream.hpp"
 #include "gpu/amd/sycl_hip_utils.hpp"
+#include "gpu/gpu_primitive.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -38,7 +38,7 @@ namespace amd {
 struct miopen_batch_normalization_common_t {
     template <typename pd_t>
     static status_t execute(
-            const exec_ctx_t &ctx, engine_t *engine, const pd_t *pd) {
+            const exec_ctx_t &ctx, impl::engine_t *engine, const pd_t *pd) {
         if (memory_desc_wrapper(pd->src_md()).has_zero_dim()) {
             return status::success;
         }
@@ -62,14 +62,14 @@ struct miopen_batch_normalization_common_t {
     }
 };
 
-struct miopen_batch_normalization_fwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_batch_normalization_fwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
     struct pd_t : public batch_normalization_fwd_pd_t {
         using batch_normalization_fwd_pd_t::batch_normalization_fwd_pd_t;
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_batch_normalization_fwd_t);
 
-        status_t init(engine_t *) {
+        status_t init(impl::engine_t *) {
             using namespace data_type;
             using namespace types;
 
@@ -135,18 +135,15 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 };
 
-struct miopen_batch_normalization_bwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_batch_normalization_bwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
 
     struct pd_t : public batch_normalization_bwd_pd_t {
-        pd_t(const batch_normalization_desc_t *adesc,
-                const primitive_attr_t *attr,
-                const batch_normalization_fwd_pd_t *hint_fwd_pd)
-            : batch_normalization_bwd_pd_t(adesc, attr, hint_fwd_pd) {}
+        using batch_normalization_bwd_pd_t::batch_normalization_bwd_pd_t;
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_batch_normalization_bwd_t);
 
-        status_t init(engine_t *) {
+        status_t init(impl::engine_t *) {
             using namespace data_type;
             using namespace types;
 

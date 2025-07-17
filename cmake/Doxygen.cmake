@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2016-2023 Intel Corporation
+# Copyright 2016-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,10 +21,6 @@ if(Doxygen_cmake_included)
     return()
 endif()
 set(Doxygen_cmake_included true)
-
-if(NOT DNNL_IS_MAIN_PROJECT)
-    return()
-endif()
 
 find_package(Doxygen)
 if(DOXYGEN_FOUND)
@@ -53,7 +49,7 @@ if(DOXYGEN_FOUND)
         COMMENT "Generating API documentation in .xml format with Doxygen" VERBATIM)
     add_custom_target(doc_doxygen DEPENDS ${DOXYGEN_STAMP_FILE})
 
-    if(NOT DNNL_INSTALL_MODE MATCHES "BUNDLE|BUNDLE_V2")
+    if(NOT DNNL_INSTALL_MODE STREQUAL "BUNDLE")
         install(
             DIRECTORY ${DOXYGEN_OUTPUT_DIR}
             DESTINATION share/doc/${LIB_PACKAGE_NAME} OPTIONAL)

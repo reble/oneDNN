@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,8 +14,12 @@
 * limitations under the License.
 *******************************************************************************/
 
+/// @file
+/// Graph C++ API
+
 #ifndef ONEAPI_DNNL_DNNL_GRAPH_HPP
 #define ONEAPI_DNNL_DNNL_GRAPH_HPP
+// NOLINTBEGIN(readability-identifier-naming)
 
 #include "oneapi/dnnl/dnnl_common.hpp"
 #include "oneapi/dnnl/dnnl_graph.h"
@@ -29,10 +33,13 @@
 /// @addtogroup dnnl_api
 /// @{
 
+namespace dnnl {
+
 /// @addtogroup dnnl_graph_api Graph API
+/// oneDNN Graph API
 /// @{
 
-namespace dnnl {
+/// oneDNN Graph namespace
 namespace graph {
 
 /// @cond DO_NOT_DOCUMENT_THIS
@@ -118,7 +125,6 @@ using req = typename std::enable_if<B, bool>::type;
 
 /// @addtogroup dnnl_graph_api_status Status
 /// Definitions of status values returned by the library functions.
-///
 /// @{
 
 /// Status values returned by the library functions.
@@ -147,7 +153,7 @@ enum class status {
     invalid_data_type = dnnl_invalid_data_type,
 };
 
-/// @} dnnl_api_status
+/// @} dnnl_graph_api_status
 
 /// @addtogroup dnnl_graph_api_allocator Allocator
 ///
@@ -265,6 +271,10 @@ public:
         /// floating-point](https://www.opencompute.org/documents/ocp-8-bit-floating-point-specification-ofp8-revision-1-0-2023-06-20-pdf)
         /// with a 4-bit exponent and a 3-bit mantissa.
         f8_e4m3 = dnnl_f8_e4m3,
+        /// 4-bit signed integer.
+        s4 = dnnl_s4,
+        /// 4-bit unsigned integer.
+        u4 = dnnl_u4,
     };
 
     /// Layout type
@@ -296,6 +306,9 @@ public:
         /// the library. For example, constant weight tensors in inference
         /// scenarios.
         constant = dnnl_graph_tensor_property_constant,
+        /// Host scalar means the tensor will be a 0-D scalar tensor on host.
+        /// It should be used with a CPU engine when creating the tensor.
+        host_scalar = dnnl_graph_tensor_property_host_scalar,
     };
 
     /// default constructor
@@ -355,7 +368,7 @@ public:
             layout_type ltype, property_type ptype = property_type::undef) {
         dnnl_graph_logical_tensor_t val;
         // if dimension size equals to 0, it's a scalar
-        if (adims.size() == 0)
+        if (adims.empty())
             error::wrap_c_api(dnnl_graph_logical_tensor_init(&val, tid,
                                       convert_to_c(dtype), 0,
                                       convert_to_c(ltype), convert_to_c(ptype)),
@@ -410,7 +423,7 @@ public:
             property_type ptype = property_type::undef) {
         dnnl_graph_logical_tensor_t val;
 
-        if (adims.size() == 0) {
+        if (adims.empty()) {
             error::wrap_c_api(dnnl_graph_logical_tensor_init(&val, tid,
                                       convert_to_c(dtype), 0,
                                       convert_to_c(layout_type::opaque),
@@ -562,6 +575,8 @@ private:
 /// A tensor object
 class tensor : public tensor_handle {
 public:
+    using tensor_handle::handle;
+
     /// Default constructor. Constructs an empty object.
     tensor() = default;
 
@@ -594,6 +609,22 @@ public:
     tensor(const logical_tensor &lt, const engine &aengine)
         : tensor(lt, aengine, DNNL_MEMORY_ALLOCATE) {}
 
+    /// Creates a tensor object for host-side scalar value. The data type contained
+    /// in the logical tensor parameter will be used to interpret the scalar
+    /// pointer. The property type in the logical tensor must be `host_scalar`.
+    ///
+    /// @param lt The logical tensor describing the host scalar
+    /// @param scalar The pointer to scalar value
+    /// @returns Created tensor object
+    static tensor make_scalar_tensor(const logical_tensor &lt, void *scalar) {
+        dnnl_graph_tensor_t t = nullptr;
+        error::wrap_c_api(
+                dnnl_graph_tensor_create_scalar(&t, &(lt.data), scalar),
+                "could not create a scalar tensor object");
+
+        return tensor(t);
+    }
+
     /// Returns the underlying memory buffer.
     ///
     /// On the CPU engine, or when using USM, this is a pointer to the
@@ -621,6 +652,16 @@ public:
         error::wrap_c_api(dnnl_graph_tensor_get_engine(get(), &c_engine),
                 "could not get an engine from a tensor object");
         return engine(c_engine, true);
+    }
+
+    /// Returns the logical tensor of a tensor object.
+    ///
+    /// @returns A logical_tensor object.
+    logical_tensor get_logical_tensor() const {
+        dnnl_graph_logical_tensor_t lt;
+        error::wrap_c_api(dnnl_graph_tensor_get_logical_tensor(get(), &lt),
+                "could not get logical tensor from a tensor object");
+        return logical_tensor(lt);
     }
 };
 
@@ -762,6 +803,7 @@ public:
         Exp = dnnl_graph_op_exp,
         GELU = dnnl_graph_op_gelu,
         GELUBackward = dnnl_graph_op_gelu_backward,
+        GroupNorm = dnnl_graph_op_group_norm,
         HardSigmoid = dnnl_graph_op_hard_sigmoid,
         HardSigmoidBackward = dnnl_graph_op_hard_sigmoid_backward,
         HardSwish = dnnl_graph_op_hard_swish,
@@ -816,6 +858,8 @@ public:
         TanhBackward = dnnl_graph_op_tanh_backward,
         TypeCast = dnnl_graph_op_type_cast,
         Wildcard = dnnl_graph_op_wildcard,
+        GenIndex = dnnl_graph_op_gen_index,
+        GreaterEqual = dnnl_graph_op_greater_equal,
         // Sentinel
         LastSymbol = dnnl_graph_op_last_symbol,
     };
@@ -892,6 +936,12 @@ public:
         weights_shape = dnnl_graph_op_attr_weights_shape,
         /// Specifies a zps attribute to an op.
         zps = dnnl_graph_op_attr_zps,
+        /// Specifies the group shape of an op. The size of the vector should
+        /// match that of the input. For the dimensions where the grouped
+        /// quantization occurs, the values should correspond to the group
+        /// size, which indicates the number of elements that will share the
+        /// same scaling factor.
+        group_shape = dnnl_graph_op_attr_group_shape,
 
         // bool attributes. The value of these attributes can be any single bool
         // value.
@@ -930,9 +980,10 @@ public:
         = dnnl_graph_op_attr_coordinate_transformation_mode,
         /// Specifies a data_format of an op. The value can be "NCX" or "NXC".
         data_format = dnnl_graph_op_attr_data_format,
-        /// Specifies a mode attribute of an op. The value can be "nearest",
-        /// "linear", "bilinear", or "trilinear". The attribute is defined for
-        /// Interpolate operations.
+        /// Specifies a mode attribute of an op.
+        /// Interpolate: "nearest", "linear", "bilinear", or "trilinear".
+        /// SoftMax: "none", "inf_as_zero".
+        /// GELU/GELUBackward: "gelu_erf", "gelu_tanh".
         mode = dnnl_graph_op_attr_mode,
         /// Specifies a qtype attribute to an op. The value can be "per_channel"
         /// or "per_tensor". The attribute is defined for quantization
@@ -944,6 +995,9 @@ public:
         /// Specifies a weights_format of an op. The value can be "OIX", "XIO",
         /// "IOX", or "XOI". Different operations may support different values.
         weights_format = dnnl_graph_op_attr_weights_format,
+
+        /// Specifies the end of all above exteral attributes for check.
+        end = dnnl_graph_op_attr_end,
     };
 
     /// Constructs an op object with an unique ID, an operation kind, and a name
@@ -1022,12 +1076,12 @@ public:
 
     /// Sets the attribute according to the name and type (int64_t).
     ///
-    /// @tparam Type Attribute's type.
+    /// @tparam Type_i Attribute's type.
     /// @param name Attribute's name.
     /// @param value The attribute's value.
     /// @returns The Op self.
-    template <typename Type, req<std::is_same<Type, int64_t>::value> = true>
-    op &set_attr(attr name, const Type &value) {
+    template <typename Type_i, req<std::is_same<Type_i, int64_t>::value> = true>
+    op &set_attr(attr name, const Type_i &value) {
         dnnl_graph_op_attr_t attr = convert_to_c(name);
         error::wrap_c_api(dnnl_graph_op_set_attr_s64(get(), attr, &value, 1),
                 "could not set attribute to the op");
@@ -1036,12 +1090,12 @@ public:
 
     /// Sets the attribute according to the name and type (float).
     ///
-    /// @tparam Type Attribute's type.
+    /// @tparam Type_f Attribute's type.
     /// @param name Attribute's name.
     /// @param value The attribute's value.
     /// @returns The Op self.
-    template <typename Type, req<std::is_same<Type, float>::value> = true>
-    op &set_attr(attr name, const Type &value) {
+    template <typename Type_f, req<std::is_same<Type_f, float>::value> = true>
+    op &set_attr(attr name, const Type_f &value) {
         dnnl_graph_op_attr_t attr = convert_to_c(name);
         error::wrap_c_api(dnnl_graph_op_set_attr_f32(get(), attr, &value, 1),
                 "could not set attribute to the op");
@@ -1050,12 +1104,12 @@ public:
 
     /// Sets the attribute according to the name and type (bool).
     ///
-    /// @tparam Type Attribute's type.
+    /// @tparam Type_b Attribute's type.
     /// @param name Attribute's name.
     /// @param value The attribute's value.
     /// @returns The Op self.
-    template <typename Type, req<std::is_same<Type, bool>::value> = true>
-    op &set_attr(attr name, const Type &value) {
+    template <typename Type_b, req<std::is_same<Type_b, bool>::value> = true>
+    op &set_attr(attr name, const Type_b &value) {
         dnnl_graph_op_attr_t attr = convert_to_c(name);
         const uint8_t val = value;
         error::wrap_c_api(dnnl_graph_op_set_attr_bool(get(), attr, &val, 1),
@@ -1065,12 +1119,13 @@ public:
 
     /// Sets the attribute according to the name and type (string).
     ///
-    /// @tparam Type Attribute's type.
+    /// @tparam Type_s Attribute's type.
     /// @param name Attribute's name.
     /// @param value The attribute's value.
     /// @returns The Op self.
-    template <typename Type, req<std::is_same<Type, std::string>::value> = true>
-    op &set_attr(attr name, const Type &value) {
+    template <typename Type_s,
+            req<std::is_same<Type_s, std::string>::value> = true>
+    op &set_attr(attr name, const Type_s &value) {
         dnnl_graph_op_attr_t attr = convert_to_c(name);
         error::wrap_c_api(dnnl_graph_op_set_attr_str(
                                   get(), attr, value.c_str(), value.size()),
@@ -1081,13 +1136,13 @@ public:
     /// Sets the attribute according to the name and type
     /// (std::vector<int64_t>).
     ///
-    /// @tparam Type Attribute's type.
+    /// @tparam Type_is Attribute's type.
     /// @param name Attribute's name.
     /// @param value The attribute's value.
     /// @returns The Op self.
-    template <typename Type,
-            req<std::is_same<Type, std::vector<int64_t>>::value> = true>
-    op &set_attr(attr name, const Type &value) {
+    template <typename Type_is,
+            req<std::is_same<Type_is, std::vector<int64_t>>::value> = true>
+    op &set_attr(attr name, const Type_is &value) {
         dnnl_graph_op_attr_t attr = convert_to_c(name);
         error::wrap_c_api(dnnl_graph_op_set_attr_s64(
                                   get(), attr, value.data(), value.size()),
@@ -1097,13 +1152,13 @@ public:
 
     /// Sets the attribute according to the name and type (std::vector<float>).
     ///
-    /// @tparam Type Attribute's type.
+    /// @tparam Type_fs Attribute's type.
     /// @param name Attribute's name.
     /// @param value The attribute's value.
     /// @returns The Op self.
-    template <typename Type,
-            req<std::is_same<Type, std::vector<float>>::value> = true>
-    op &set_attr(attr name, const Type &value) {
+    template <typename Type_fs,
+            req<std::is_same<Type_fs, std::vector<float>>::value> = true>
+    op &set_attr(attr name, const Type_fs &value) {
         dnnl_graph_op_attr_t attr = convert_to_c(name);
         error::wrap_c_api(dnnl_graph_op_set_attr_f32(
                                   get(), attr, value.data(), value.size()),
@@ -1353,6 +1408,10 @@ public:
     /// mode. All partitions returned from the graph will inherit the engine
     /// kind and floating-point math mode.
     ///
+    /// Setting the floating-point math mode enables automatic down-conversion
+    /// of inputs for the given graph, promoting speedup by using
+    /// lower-precision data types when available.
+    ///
     /// @param engine_kind Engine kind.
     /// @param mode Floating-point math mode.
     graph(engine::kind engine_kind, fpmath_mode mode) {
@@ -1362,6 +1421,37 @@ public:
                         &g, convert_to_c(engine_kind), convert_to_c(mode)),
                 "could not create graph with engine kind and math mode");
         reset(g);
+    }
+
+    /// Set the floating point math mode for a graph. Users can enforce the
+    /// graph to comply with the mode by specifying a boolean flag with the
+    /// setter function.
+    ///
+    /// @param mode The floating-point math mode.
+    /// @param apply_to_int The flag that controls whether to use
+    /// floating-point arithmetic for integral operations.
+    void set_fpmath_mode(fpmath_mode mode, bool apply_to_int = false) {
+        error::wrap_c_api(dnnl_graph_graph_set_fpmath_mode(
+                                  get(), convert_to_c(mode), apply_to_int),
+                "could not set fpmath mode graph attribute");
+    }
+
+    /// Get the floating point math mode and the boolean flag that specifies
+    /// whether the graph will be enforced to comply the mode.
+    ///
+    /// @param mode The floating-point math mode.
+    /// @param apply_to_int The flag that controls whether to use
+    /// floating-point arithmetic for integral operations.
+    void get_fpmath_mode(fpmath_mode &mode, bool &apply_to_int) const {
+        dnnl_fpmath_mode_t c_mode;
+        int c_apply_to_int;
+
+        error::wrap_c_api(dnnl_graph_graph_get_fpmath_mode(
+                                  get(), &c_mode, &c_apply_to_int),
+                "could not get fpmath mode graph attribute");
+
+        mode = fpmath_mode(c_mode);
+        apply_to_int = static_cast<bool>(c_apply_to_int);
     }
 
     /// Adds an op into the graph to construct a computational DAG. The API will
@@ -1540,9 +1630,12 @@ inline size_t get_constant_tensor_cache_capacity(engine::kind kind) {
     return size;
 }
 
-/// @} dnnl_graph_constant_tensor_cache
+/// @} dnnl_graph_api_constant_tensor_cache
 
 } // namespace graph
+
+/// @} dnnl_graph_api
+
 } // namespace dnnl
 
 /// @cond DO_NOT_DOCUMENT_THIS
@@ -1559,8 +1652,7 @@ namespace dnnl = ::dnnl;
 
 /// @endcond
 
-/// @} dnnl_graph_api
-
 /// @} dnnl_api
 
-#endif
+// NOLINTEND(readability-identifier-naming)
+#endif /* ONEAPI_DNNL_DNNL_GRAPH_HPP */

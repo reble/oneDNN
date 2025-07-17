@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -59,6 +59,11 @@ bool hip_check_format_tag(tag first_tag, Rest... rest_tags) {
     return hip_check_format_tag(rest_tags...);
 }
 
+bool generic_check_format_tag(tag atag) {
+    return impl::utils::one_of(atag, tag::ncw, tag::nchw, tag::ncdhw, tag::nwc,
+            tag::nhwc, tag::ndhwc, tag::any);
+}
+
 class batch_normalization_test_t
     : public ::testing::TestWithParam<batch_normalization_test_params_t> {
 private:
@@ -79,6 +84,11 @@ protected:
 
         SKIP_IF_HIP(!hip_check_format_tag(p.src_tag, p.dst_tag),
                 "Unsupported format tag");
+
+        SKIP_IF_GENERIC(
+                !generic_check_format_tag(p.src_tag), "Unsupported format tag");
+        SKIP_IF_GENERIC(
+                !generic_check_format_tag(p.dst_tag), "Unsupported format tag");
 
         SKIP_IF_CUDA(p.src_dt != p.dst_dt && p.src_dt != dt::undef
                         && p.dst_dt != dt::undef,
@@ -104,7 +114,7 @@ protected:
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
 
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
         aa.po_eltwise = true;
 
         auto src_md = memory::desc(p.dims, p.src_dt, p.src_tag);
@@ -217,7 +227,7 @@ protected:
         // batch_normalization specific types and values
         using pd_t = batch_normalization_backward::primitive_desc;
         using hint_pd_t = batch_normalization_forward::primitive_desc;
-        allows_attr_t aa {false}; // doesn't support anything
+        allows_attr_t aa {}; // doesn't support anything
 
         auto eng = get_test_engine();
         auto strm = make_stream(eng);

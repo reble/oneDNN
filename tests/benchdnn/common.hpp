@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,6 +27,7 @@
 
 #include <cinttypes>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -34,6 +35,7 @@
 #include "src/common/z_magic.hpp"
 
 #include "utils/bench_mode.hpp"
+#include "utils/res.hpp"
 #include "utils/timer.hpp"
 
 #define ABS(a) ((a) > 0 ? (a) : (-(a)))
@@ -66,12 +68,12 @@ enum { CRIT = 1, WARN = 2 };
     do { \
         int status__ = (f); \
         if (status__ != OK) { \
-            if (s == CRIT || s == WARN) { \
+            if ((s) == CRIT || (s) == WARN) { \
                 BENCHDNN_PRINT(0, \
                         "Error: Function '%s' at (%s:%d) returned '%d'\n", \
                         __FUNCTION__, __FILE__, __LINE__, status__); \
                 fflush(0); \
-                if (s == CRIT) exit(1); \
+                if ((s) == CRIT) exit(1); \
             } \
             return status__; \
         } \
@@ -93,6 +95,7 @@ extern int verbose;
 extern bool canonical;
 extern bool mem_check;
 extern bool attr_same_pd_check;
+extern bool check_ref_impl;
 extern std::string skip_impl; /* empty or "" means skip nothing */
 extern std::string driver_name;
 
@@ -105,9 +108,14 @@ extern std::string driver_name;
         } \
     } while (0)
 
+//NOLINTBEGIN(bugprone-macro-parentheses)
+// dnnl_common.hpp:119:5: error: expected ';' at end of declaration list [clang-diagnostic-error]
+//  119 |     BENCHDNN_DISALLOW_COPY_AND_ASSIGN(stream_t);
+//      |     ^
 #define BENCHDNN_DISALLOW_COPY_AND_ASSIGN(T) \
     T(const T &) = delete; \
     T &operator=(const T &) = delete;
+//NOLINTEND(bugprone-macro-parentheses)
 
 /* perf */
 extern double max_ms_per_prb; // max time spend per prb in ms
@@ -134,64 +142,23 @@ struct stat_t {
     int invalid_arguments;
     int listed;
     std::unordered_map<std::string, double[timer::timer_t::mode_t::n_modes]> ms;
+    // Key is the number of the test, value is the repro string.
+    std::map<int, std::string> failed_cases;
 };
 extern stat_t benchdnn_stat;
 
-/* result structure */
-enum res_state_t {
-    UNTESTED = 0,
-    PASSED,
-    SKIPPED,
-    MISTRUSTED,
-    UNIMPLEMENTED,
-    INVALID_ARGUMENTS,
-    FAILED,
-    LISTED,
-    INITIALIZED,
-    EXECUTED,
-};
 const char *state2str(res_state_t state);
 
-enum skip_reason_t {
-    SKIP_UNKNOWN = 0,
-    CASE_NOT_SUPPORTED,
-    DATA_TYPE_NOT_SUPPORTED,
-    INVALID_CASE,
-    NOT_ENOUGH_RAM,
-    SKIP_IMPL_HIT,
-    SKIP_START,
-};
-const char *skip_reason2str(skip_reason_t skip_reason);
+namespace skip_reason {
+extern std::string case_not_supported;
+extern std::string data_type_not_supported;
+extern std::string invalid_case;
+extern std::string not_enough_ram;
+extern std::string skip_impl_hit;
+extern std::string skip_start;
+} // namespace skip_reason
 
-enum dir_t {
-    DIR_UNDEF = 0,
-    FLAG_DAT = 1,
-    FLAG_WEI = 2,
-    FLAG_BIA = 4,
-    FLAG_FWD = 32,
-    FLAG_BWD = 64,
-    FLAG_INF = 128,
-    FWD_D = FLAG_FWD + FLAG_DAT,
-    FWD_I = FLAG_FWD + FLAG_DAT + FLAG_INF,
-    FWD_B = FLAG_FWD + FLAG_DAT + FLAG_BIA,
-    BWD_D = FLAG_BWD + FLAG_DAT,
-    BWD_DW = FLAG_BWD + FLAG_DAT + FLAG_WEI,
-    BWD_W = FLAG_BWD + FLAG_WEI,
-    BWD_WB = FLAG_BWD + FLAG_WEI + FLAG_BIA,
-};
 dir_t str2dir(const char *str);
-
-struct res_t {
-    res_state_t state;
-    size_t errors, total;
-    timer::timer_map_t timer_map;
-    std::string impl_name;
-    std::string prim_ref_repro;
-    skip_reason_t reason;
-    size_t ibytes, obytes;
-    dir_t mem_check_dir = DIR_UNDEF;
-};
-
 void parse_result(res_t &res, const char *pstr);
 
 /* misc */
@@ -199,16 +166,15 @@ void init_fp_mode();
 
 void *zmalloc(size_t size, size_t align);
 void zfree(void *ptr);
+void set_zmalloc_max_expected_size(size_t size);
 
 bool str2bool(const char *str);
 const char *bool2str(bool value);
 
-/* TODO: why two functions??? */
 bool match_regex(const char *str, const char *pattern);
-bool maybe_skip(const std::string &impl_str);
 bool skip_start(res_t *res, int idx = benchdnn_stat.tests);
 
-typedef int (*bench_f)(int argc, char **argv);
+using bench_f = int (*)(int, char **);
 std::string locate_file(const std::string &fname);
 int batch(const char *fname, bench_f bench);
 
@@ -216,7 +182,9 @@ int batch(const char *fname, bench_f bench);
 int flip_coin(ptrdiff_t seed, float probability);
 
 int64_t div_up(const int64_t a, const int64_t b);
+size_t div_up(const size_t a, const size_t b);
 int64_t rnd_up(const int64_t a, const int64_t b);
+size_t rnd_up(const size_t a, const size_t b);
 int64_t next_pow2(int64_t a);
 int mxcsr_cvt(float f);
 
@@ -241,4 +209,16 @@ void print_dhw(bool &print_d, bool &print_h, bool &print_w, int ndims,
         const std::vector<int64_t> &d, const std::vector<int64_t> &h,
         const std::vector<int64_t> &w);
 
+int benchdnn_getenv_int(const char *name, int default_value);
+std::string benchdnn_getenv_string(const char *name);
+
+// Responsible for printing service information.
+struct summary_t {
+    // Prints up to 10 failed cases reproducers at the end of the run.
+    bool failed_cases = true;
+};
+
+extern summary_t summary;
+
+std::string smart_bytes(double bytes);
 #endif

@@ -1,5 +1,6 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
+* Copyright 2024 FUJITSU LIMITED
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -24,6 +25,35 @@
 
 namespace dnnl {
 namespace impl {
+
+inline format_tag_t get_abx_tag(int ndims) {
+    switch (ndims) {
+        case 1: return format_tag::a;
+        case 2: return format_tag::ab;
+        case 3: return format_tag::abc;
+        case 4: return format_tag::abcd;
+        case 5: return format_tag::abcde;
+        case 6: return format_tag::abcdef;
+        case 7: return format_tag::abcdefg;
+        case 8: return format_tag::abcdefgh;
+        case 9: return format_tag::abcdefghi;
+        case 10: return format_tag::abcdefghij;
+        case 11: return format_tag::abcdefghijk;
+        case 12: return format_tag::abcdefghijkl;
+
+        default: assert(!"unexpected ndims"); return format_tag::undef;
+    }
+}
+
+inline format_tag_t get_axb_tag(int ndims) {
+    switch (ndims) {
+        case 2: return format_tag::ab;
+        case 3: return format_tag::acb;
+        case 4: return format_tag::acdb;
+        case 5: return format_tag::acdeb;
+        default: assert(!"unexpected ndims"); return format_tag::undef;
+    }
+}
 
 enum class block_dim_t {
     _,
@@ -66,6 +96,10 @@ enum class inner_blk_t {
     _64b,
     _64c,
 
+    _2a8b,
+    _2b8c,
+    _2a24b,
+    _2b24c,
     _4a4b,
     _4b4a,
     _4b4c,
@@ -73,6 +107,8 @@ enum class inner_blk_t {
     _8a2b,
     _8a4b,
     _8a8b,
+    _8a16b,
+    _8a24b,
     _8b2a,
     _8b4a,
     _8b8a,
@@ -80,6 +116,8 @@ enum class inner_blk_t {
     _8b4c,
     _8b16a,
     _8b24a,
+    _8b16c,
+    _8b24c,
     _8b32a,
     _8b8c,
     _8c2b,
@@ -104,6 +142,7 @@ enum class inner_blk_t {
     _16b4c,
     _16c2b,
     _16c4b,
+    _16e4c,
     _24a2b,
     _24a4b,
     _24b2a,
@@ -112,6 +151,7 @@ enum class inner_blk_t {
     _24b4c,
     _24c2b,
     _24c4b,
+    _16d4c,
     _32d4c,
     _32e2c,
     _32e4c,
@@ -222,16 +262,20 @@ constexpr int AB_or_BC_blk_off(int x0, int x1) {
                     ib::_16b48c, ib::_16b64c, ib::_16b32c2b, ib::_16b48c2b,
                     ib::_16b64c2b, ib::_16b16c4b, ib::_16b32c4b, ib::_16b48c4b,
                     ib::_16b64c4b, ib::_24a2b, ib::_24a4b, ib::_24b2a,
-                    ib::_24b4a, ib::_24b2c, ib::_24b4c, ib::_24c2b, ib::_24c4b),
+                    ib::_24b4a, ib::_24b2c, ib::_24b4c, ib::_24c2b, ib::_24c4b,
+                    ib::_2a8b, ib::_2b8c, ib::_2a24b, ib::_2b24c, ib::_8a16b,
+                    ib::_8b16c, ib::_8a24b, ib::_8b24c),
             "unexpected inner_blk format");
 
     // clang-format off
     return false ? 0
+        : (utils::one_of(f, ib::_2a8b, ib::_2b8c)) ? 8 * x0 + x1
+        : (utils::one_of(f, ib::_2a24b, ib::_2b24c, ib::_8a24b, ib::_8b24c)) ? 24 * x0 + x1
         : (f == ib::_4a4b || f == ib::_4b4c) ? 4 * x0 + x1
         : (f == ib::_4b4a || f == ib::_4c4b) ? 4 * x1 + x0
         : (f == ib::_8a8b || f == ib::_8b8c) ? 8 * x0 + x1
         : (f == ib::_8b8a || f == ib::_8c8b) ? 8 * x1 + x0
-        : (f == ib::_16a16b || f == ib::_16b16c) ? 16 * x0 + x1
+        : (utils::one_of(f, ib::_16a16b, ib::_16b16c, ib::_8a16b, ib::_8b16c)) ? 16 * x0 + x1
         : (f == ib::_16b64a) ? 64 * x1 + x0
         : (f == ib::_16b48a) ? 48 * x1 + x0
         : (f == ib::_8b32a || f == ib::_16b32a) ? 32 * x1 + x0
@@ -281,12 +325,12 @@ constexpr int AB_or_BC_blk_off(int x0, int x1) {
 }
 
 template <inner_blk_t b>
-struct inner_blk_traits {
+struct inner_blk_traits_t {
     using ib = inner_blk_t;
 };
 
 template <format_tag_t>
-struct tag_traits {
+struct tag_traits_t {
     // block_dim_t block_dims;
     // inner_blk_t inner_blks;
     // int ndims;
@@ -294,7 +338,7 @@ struct tag_traits {
 
 #define DECL_TRAITS(_tag, _blk_fmt, _inner_blk, _ndims) \
     template <> \
-    struct tag_traits<format_tag::_tag> { \
+    struct tag_traits_t<format_tag::_tag> { \
         static constexpr block_dim_t block_dims = block_dim_t::_blk_fmt; \
         static constexpr inner_blk_t inner_blks = inner_blk_t::_inner_blk; \
         static constexpr int ndims = _ndims; \
@@ -334,10 +378,13 @@ DECL_TRAITS(bac, _, _, 3);
 DECL_TRAITS(bacd, _, _, 4);
 DECL_TRAITS(bacde, _, _, 5);
 DECL_TRAITS(bca, _, _, 3);
+DECL_TRAITS(bcad, _, _, 4);
 DECL_TRAITS(bcda, _, _, 4);
 DECL_TRAITS(bcdea, _, _, 5);
 DECL_TRAITS(cba, _, _, 3);
+DECL_TRAITS(cabd, _, _, 4);
 DECL_TRAITS(cdba, _, _, 4);
+DECL_TRAITS(dabc, _, _, 4);
 DECL_TRAITS(dcab, _, _, 4);
 DECL_TRAITS(cdeba, _, _, 5);
 DECL_TRAITS(decab, _, _, 5);
@@ -752,7 +799,9 @@ DECL_TRAITS(AcB16a4b, _AB, _16a4b, 3);
 DECL_TRAITS(Acb8a, _A, _8a, 3);
 DECL_TRAITS(AcB8a2b, _AB, _8a2b, 3);
 DECL_TRAITS(AcB8a4b, _AB, _8a4b, 3);
+DECL_TRAITS(aCBd8b8c, _BC, _8b8c, 4);
 DECL_TRAITS(aCBd16b16c, _BC, _16b16c, 4);
+DECL_TRAITS(aCBde8b8c, _BC, _8b8c, 5);
 DECL_TRAITS(aCBde16b16c, _BC, _16b16c, 5);
 DECL_TRAITS(Acdb16a, _A, _16a, 4);
 DECL_TRAITS(AcdB16a2b, _AB, _16a2b, 4);
@@ -768,8 +817,11 @@ DECL_TRAITS(AcdeB8a2b, _AB, _8a2b, 5);
 DECL_TRAITS(AcdeB8a4b, _AB, _8a4b, 5);
 DECL_TRAITS(Acedb16a, _A, _16a, 5);
 DECL_TRAITS(Adcb16a, _A, _16a, 4);
+DECL_TRAITS(BAc8a8b, _AB, _8a8b, 3);
 DECL_TRAITS(BAc16a16b, _AB, _16a16b, 3);
+DECL_TRAITS(BAcd8a8b, _AB, _8a8b, 4);
 DECL_TRAITS(BAcd16a16b, _AB, _16a16b, 4);
+DECL_TRAITS(BAcde8a8b, _AB, _8a8b, 5);
 DECL_TRAITS(BAcde16a16b, _AB, _16a16b, 5);
 DECL_TRAITS(ABcd32a32b, _AB, _32a32b, 4);
 DECL_TRAITS(BAcde16b16a, _AB, _16b16a, 5);
@@ -779,6 +831,7 @@ DECL_TRAITS(aBCde4b8c8b4c, _BC, _4b8c8b4c, 5);
 DECL_TRAITS(aBCde2b8c8b2c, _BC, _2b8c8b2c, 5);
 DECL_TRAITS(aBdec32b, _B, _32b, 5);
 DECL_TRAITS(aCBdef16c16b, _BC, _16c16b, 6);
+DECL_TRAITS(aCBdef8b8c, _BC, _8b8c, 6);
 DECL_TRAITS(aCBdef16b16c, _BC, _16b16c, 6);
 DECL_TRAITS(Abcdef16a, _A, _16a, 6);
 DECL_TRAITS(aCBd16c16b, _BC, _16c16b, 4);
@@ -800,6 +853,7 @@ DECL_TRAITS(aBCde4c8b2c, _BC, _4c8b2c, 5);
 DECL_TRAITS(aBCdef4c8b2c, _BC, _4c8b2c, 6);
 DECL_TRAITS(abDc16d, _D, _16d, 4);
 DECL_TRAITS(abDc32d, _D, _32d, 4);
+DECL_TRAITS(abDC16d4c, _CD, _16d4c, 4);
 DECL_TRAITS(abDC32d4c, _CD, _32d4c, 4);
 DECL_TRAITS(abCd32c, _C, _32c, 4);
 DECL_TRAITS(abCde32c, _C, _32c, 5);
@@ -809,6 +863,7 @@ DECL_TRAITS(abCde4c, _C, _4c, 5);
 DECL_TRAITS(abCdef4c, _C, _4c, 6);
 DECL_TRAITS(abdEc16e, _E, _16e, 5);
 DECL_TRAITS(abdEc32e, _E, _32e, 5);
+DECL_TRAITS(abdEC16e4c, _CE, _16e4c, 5);
 DECL_TRAITS(abdEC32e2c, _CE, _32e2c, 5);
 DECL_TRAITS(abdEC32e4c, _CE, _32e4c, 5);
 DECL_TRAITS(abdEC64e2c, _CE, _64e2c, 5);
@@ -927,6 +982,16 @@ DECL_TRAITS(ABcd8b24a2b, _AB, _8b24a2b, 4);
 DECL_TRAITS(AcdB8b24a2b, _AB, _8b24a2b, 4);
 DECL_TRAITS(ABcde8b24a2b, _AB, _8b24a2b, 5);
 DECL_TRAITS(AcdeB8b24a2b, _AB, _8b24a2b, 5);
+DECL_TRAITS(BA2a24b, _AB, _2a24b, 2);
+DECL_TRAITS(aCB2b24c, _BC, _2b24c, 2);
+DECL_TRAITS(BA2a8b, _AB, _2a8b, 2);
+DECL_TRAITS(aCB2b8c, _BC, _2b8c, 2);
+DECL_TRAITS(BA8a24b, _AB, _8a24b, 2);
+DECL_TRAITS(aCB8b24c, _BC, _8b24c, 2);
+DECL_TRAITS(BA8a16b, _AB, _8a16b, 2);
+DECL_TRAITS(aCB8b16c, _BC, _8b16c, 2);
+DECL_TRAITS(BA8a8b, _AB, _8a8b, 2);
+DECL_TRAITS(aCB8b8c, _BC, _8b8c, 2);
 } // namespace impl
 } // namespace dnnl
 

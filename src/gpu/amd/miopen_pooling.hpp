@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,12 +20,12 @@
 
 #include "common/c_types_map.hpp"
 #include "common/pooling_pd.hpp"
-#include "common/primitive.hpp"
 #include "common/type_helpers.hpp"
+#include "gpu/amd/engine.hpp"
 #include "gpu/amd/miopen_pooling_impl.hpp"
-#include "gpu/amd/sycl_hip_engine.hpp"
-#include "gpu/amd/sycl_hip_stream.hpp"
+#include "gpu/amd/stream.hpp"
 #include "gpu/amd/sycl_hip_utils.hpp"
+#include "gpu/gpu_primitive.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -51,14 +51,14 @@ struct miopen_pooling_common_t {
     }
 };
 
-struct miopen_pooling_fwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_pooling_fwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
     struct pd_t : public pooling_fwd_pd_t, public miopen_pooling_common_t {
         using pooling_fwd_pd_t::pooling_fwd_pd_t;
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_pooling_fwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
             using namespace prop_kind;
             using namespace alg_kind;
@@ -116,14 +116,14 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 };
 
-struct miopen_pooling_bwd_t : public primitive_t {
-    using primitive_t::primitive_t;
+struct miopen_pooling_bwd_t : public gpu::primitive_t {
+    using gpu::primitive_t::primitive_t;
     struct pd_t : public pooling_bwd_pd_t, public miopen_pooling_common_t {
         using pooling_bwd_pd_t::pooling_bwd_pd_t;
 
         DECLARE_COMMON_PD_T("hip:miopen:any", miopen_pooling_bwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace prop_kind;
             using namespace alg_kind;
             using namespace format_tag;

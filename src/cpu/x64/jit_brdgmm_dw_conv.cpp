@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2021-2024 Intel Corporation
+* Copyright 2021-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -89,17 +89,17 @@ bool post_ops_ok(jit_brdgmm_conv_conf_t &jcp, const primitive_attr_t &attr,
                     broadcasting_strategy_t::no_broadcast}));
 }
 
-cpu_isa_t get_supported_isa(
-        bool is_f32, bool is_int8, bool is_bf16, bool is_f16) {
+cpu_isa_t get_supported_isa(bool is_f32, bool is_int8, bool is_bf16,
+        bool is_f16, bool is_f32_bf16, bool is_f32_f16) {
     std::vector<cpu_isa_t> isa_list;
-    if (is_f32) {
+    if (one_of(true, is_f32, is_f32_bf16, is_f32_f16)) {
         isa_list = {avx512_core, avx2};
     } else if (is_int8) {
-        isa_list = {avx512_core_vnni, avx2_vnni_2, avx2_vnni};
+        isa_list = {avx10_2_512, avx512_core_vnni, avx2_vnni_2, avx2_vnni};
     } else if (is_bf16) {
         isa_list = {avx512_core_bf16, avx2_vnni_2};
     } else if (is_f16) {
-        isa_list = {avx512_core_fp16, avx2_vnni_2};
+        isa_list = {avx10_2_512, avx512_core_fp16, avx2_vnni_2};
     }
 
     for (auto isa : isa_list) {
@@ -125,31 +125,37 @@ status_t brdgmm_dw_convolution_fwd_t::pd_t::init(engine_t *engine) {
             && one_of(dst_type, bf16, f32);
     const bool is_f16 = everyone_is(f16, src_type, wei_type)
             && one_of(dst_type, f16, f32);
-    const cpu_isa_t isa = get_supported_isa(is_f32, is_int8, is_bf16, is_f16);
+    const bool is_f32_bf16
+            = everyone_is(f32, src_type, dst_type) && wei_type == bf16;
+    const bool is_f32_f16
+            = everyone_is(f32, src_type, dst_type) && wei_type == f16;
+    const cpu_isa_t isa = get_supported_isa(
+            is_f32, is_int8, is_bf16, is_f16, is_f32_bf16, is_f32_f16);
 
-    auto skip_mask = skip_mask_t::post_ops;
-    if (is_int8)
-        skip_mask |= (skip_mask_t::scales_runtime
-                | skip_mask_t::zero_points_runtime);
+    auto skip_mask = skip_mask_t::post_ops | skip_mask_t::sum_dt;
+    if (is_int8) skip_mask |= (skip_mask_t::scales | skip_mask_t::zero_points);
 
     VDISPATCH_CONV(is_fwd(), VERBOSE_BAD_PROPKIND);
-    VDISPATCH_CONV(one_of(true, is_f32, is_int8, is_bf16, is_f16),
+    VDISPATCH_CONV(one_of(true, is_f32, is_int8, is_bf16, is_f16, is_f32_f16,
+                           is_f32_bf16),
             VERBOSE_UNSUPPORTED_DT);
     VDISPATCH_CONV(
             IMPLICATION(is_int8,
                     one_of(bia_type, data_type::undef, f32, s32, s8, u8)),
             VERBOSE_UNSUPPORTED_BIAS_CFG);
-    VDISPATCH_CONV(
-            IMPLICATION(!is_int8,
-                    one_of(bia_type, data_type::undef, src_type, dst_type)),
+    VDISPATCH_CONV(IMPLICATION(!is_int8,
+                           one_of(bia_type, data_type::undef, data_type::f32,
+                                   src_type, dst_type)),
             VERBOSE_UNSUPPORTED_BIAS_CFG);
     VDISPATCH_CONV(set_default_alg_kind(alg_kind::convolution_direct),
             VERBOSE_BAD_ALGORITHM);
     VDISPATCH_CONV(!has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
     VDISPATCH_CONV(
             (isa != isa_undef) && mayiuse(isa), "undefined or unsupported isa");
-    VDISPATCH_CONV(
-            attr()->has_default_values(skip_mask), VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_CONV(attr()->has_default_values(skip_mask, dst_type),
+            VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_CONV(attr()->post_ops_.check_sum_consistency(dst_type, is_int8),
+            VERBOSE_UNSUPPORTED_POSTOP);
 
     auto &jcp = jcp_;
 
@@ -158,19 +164,28 @@ status_t brdgmm_dw_convolution_fwd_t::pd_t::init(engine_t *engine) {
     const memory_desc_wrapper dst_d(&dst_md_);
     const memory_desc_wrapper bias_d(&bias_md_);
 
+    VDISPATCH_CONV(
+            impl::is_dense_format_kind({src_md(), weights_md(), dst_md()}),
+            VERBOSE_UNSUPPORTED_SPARSE_CFG);
+
+    // Big int (> INT_MAX) values are unsupported and jcp fields may overflow
+    // TODO: change data type of jcp fields to size_t
+    VDISPATCH_CONV_IC(!has_large_size(cd, src_d, weights_d, dst_d),
+            VERBOSE_BAD_PARAM, "Large size is not supported");
+
     const int ndims = src_d.ndims();
     const bool is_3d = ndims == 5;
     // Currently this kernel only supports 2D and 3D convolutions.
-    VDISPATCH_CONV(utils::one_of(ndims, 4, 5),
-            "skipping implementation as it only supports 2d/3d convolutions");
+    VDISPATCH_CONV(utils::one_of(ndims, 4, 5), VERBOSE_UNSUPPORTED_FEATURE,
+            "does not support 2d/3d convolutions");
     const bool with_groups = weights_d.ndims() == src_d.ndims() + 1;
-    VDISPATCH_CONV(with_groups,
-            "skipping non-grouped convolution in depthwise convolution "
+    VDISPATCH_CONV(with_groups, VERBOSE_UNSUPPORTED_FEATURE,
+            "non-grouped convolution in depthwise convolution "
             "implementation");
     // dilations are not supported
     VDISPATCH_CONV(!(cd.dilates[0] != 0 || cd.dilates[1] != 0
                            || (is_3d && cd.dilates[2] != 0)),
-            "skipping implementation as it does not support dilations");
+            VERBOSE_UNSUPPORTED_FEATURE, "dilations are not supported");
 
     jcp = zero<decltype(jcp)>();
     jcp.ngroups = weights_d.dims()[0];
@@ -240,29 +255,20 @@ status_t brdgmm_dw_convolution_fwd_t::pd_t::init(engine_t *engine) {
     const auto &wei_scales = attr_.scales_.get(DNNL_ARG_WEIGHTS);
     jcp.with_scale = !src_scales.has_default_values()
             || !wei_scales.has_default_values();
-    jcp.is_oc_scale = wei_scales.mask_ != 0;
+    jcp.is_oc_scale = wei_scales.get_mask() > 0;
 
-    const bool scales_ok
-            = attr_scales_ok({DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST});
-    VDISPATCH_CONV(scales_ok, VERBOSE_UNSUPPORTED_SCALES_CFG);
+    CHECK(attr_scales_ok());
+    CHECK(attr_zero_points_ok({{DNNL_ARG_SRC, {0, 2}}, {DNNL_ARG_DST, {0}}}));
 
-    const auto zp_attr = attr()->zero_points_;
-    jcp.src_zero_point = !zp_attr.has_default_values(DNNL_ARG_SRC);
-    jcp.dst_zero_point = !zp_attr.has_default_values(DNNL_ARG_DST);
+    const auto &zp = attr()->zero_points_;
+    jcp.src_zero_point = !zp.has_default_values(DNNL_ARG_SRC);
+    jcp.dst_zero_point = !zp.has_default_values(DNNL_ARG_DST);
 
-    // Only common zero points for the whole output tensor is supported now
-    const bool has_zero_points = jcp.src_zero_point || jcp.dst_zero_point;
-    const bool params_ok
-            = IMPLICATION(has_zero_points, utils::one_of(jcp.src_dt, u8, s8))
-            && IMPLICATION(jcp.src_zero_point,
-                    attr()->zero_points_.common(DNNL_ARG_SRC))
-            && IMPLICATION(jcp.dst_zero_point,
-                    attr()->zero_points_.common(DNNL_ARG_DST));
-    VDISPATCH_CONV(params_ok, VERBOSE_UNSUPPORTED_ZP_CFG);
-
-    VDISPATCH_CONV(!(jcp.src_zero_point
-                           && cd.weights_desc.format_kind != format_kind::any),
-            VERBOSE_UNSUPPORTED_ZP_CFG);
+    // Source zero_point requires compensation, thus, must initialize weights
+    // descriptor and can't take predefined one.
+    const bool src_zp_format_ok = IMPLICATION(jcp.src_zero_point,
+            cd.weights_desc.format_kind == format_kind::any);
+    VDISPATCH_CONV(src_zp_format_ok, VERBOSE_UNSUPPORTED_ZP_CFG);
 
     // strd is only feasible for 1D (i.e., height dim is one)
     // and if there are no tails (for calculating matrix_B strides).
@@ -412,7 +418,7 @@ status_t brdgmm_dw_convolution_fwd_t::pd_t::init_brdgmm_conf() {
         brg_attr.max_top_bpad = nstl::max(0, nstl::max(jcp.t_pad, jcp.f_pad));
         brg_attr.max_bottom_bpad
                 = nstl::max(0, nstl::max(jcp.b_pad, jcp.back_pad));
-        brg_attr.bs_group
+        brg_attr.hint_bs_group
                 = is_superset(jcp.isa, avx512_core) && jcp.stride_w == 1
                 ? jcp.kw
                 : 1;
@@ -428,6 +434,7 @@ status_t brdgmm_dw_convolution_fwd_t::pd_t::init_brdgmm_conf() {
                 LDA, LDC, M, N, &strides));
         CHECK(brgemm_desc_set_attr(&bcp, brg_attr));
         CHECK(brgemm_desc_set_postops(&bcp, attr(), dst_md(), LDD, jcp.bia_dt));
+        CHECK(brgemm_desc_finalize(&bcp));
         ++idx;
         return status::success;
     };
@@ -553,12 +560,12 @@ status_t brdgmm_dw_convolution_fwd_t::init(engine_t *engine) {
     // JIT to precompute scales
     const bool is_jit_supported = mayiuse(avx512_core);
     const auto attr = pd()->attr();
-    if (is_jit_supported && req_copy_scales(attr)) {
-        const auto &attr_scales = attr->scales_;
-        int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
-        if (wei_scale_mask != 0) {
+    const auto &attr_scales = attr->scales_;
+    if (is_jit_supported && pd()->OC() > 1 && req_copy_scales(attr_scales)) {
+        int wei_scale_mask = attr_scales.get_mask(DNNL_ARG_WEIGHTS);
+        if (wei_scale_mask > 0) {
             CHECK(safe_ptr_assign(jit_scale_precompute_,
-                    new jit_avx512_core_scale_precompute_t()));
+                    new jit_avx512_core_scale_precompute_t(attr)));
             CHECK(jit_scale_precompute_->create_kernel());
         }
     }
@@ -583,12 +590,14 @@ status_t brdgmm_dw_convolution_fwd_t::execute(const exec_ctx_t &ctx) const {
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
-    DEFINE_ZERO_POINT_VALUE(src_zero_point, DNNL_ARG_SRC);
+    DEFINE_ZERO_POINTS_BUFFER(src_zero_point, DNNL_ARG_SRC);
     DEFINE_ZERO_POINTS_BUFFER(dst_zero_point, DNNL_ARG_DST);
 
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
     const float *oscales = scale_utils::precompute_scales(
-            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->OC(),
-            pd()->attr(), jit_scale_precompute_.get());
+            ctx.get_scratchpad_grantor(), src_scales, wei_scales, pd()->IC(),
+            pd()->OC(), false, wei_scale_mask > 0, pd()->attr(),
+            jit_scale_precompute_.get());
 
     const memory_desc_wrapper weights_d(pd()->weights_md(0));
     const size_t wei_size = weights_d.size();
@@ -750,8 +759,12 @@ status_t brdgmm_dw_convolution_fwd_t::execute(const exec_ctx_t &ctx) const {
                 post_ops_data.scales = &oscales[jcp.is_oc_scale * ch];
                 post_ops_data.oc_logical_off = ch;
                 post_ops_data.dst_scales = dst_scales;
-                post_ops_data.zp_a_val
-                        = jcp.src_zero_point ? src_zero_point : 1;
+                const bool is_bcast_zp
+                        = pd()->attr()->zero_points_.get_mask(DNNL_ARG_SRC)
+                        == 0;
+                post_ops_data.a_zp_values = jcp.src_zero_point
+                        ? src_zero_point + ch * !is_bcast_zp
+                        : nullptr;
                 post_ops_data.c_zp_values
                         = jcp.dst_zero_point ? dst_zero_point : nullptr;
                 post_ops_data.a_zp_compensations

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2022 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,6 +27,8 @@
 #include "common/stream.hpp"
 #include "common/utils.hpp"
 
+#include "cpu/primitive_attr_postops.hpp"
+
 #include "cpu/cpu_layer_normalization_pd.hpp"
 
 namespace dnnl {
@@ -52,8 +54,10 @@ struct simple_layer_normalization_fwd_t : public primitive_t {
             using namespace memory_tracking::names;
             auto scratchpad = scratchpad_registry().registrar();
             if (use_tmp_stats()) {
-                scratchpad.template book<float>(
-                        key_lnorm_tmp_mean, across_axis());
+                if (!skip_mean()) {
+                    scratchpad.template book<float>(
+                            key_lnorm_tmp_mean, across_axis());
+                }
                 scratchpad.template book<float>(
                         key_lnorm_tmp_var, across_axis());
             }
@@ -61,11 +65,20 @@ struct simple_layer_normalization_fwd_t : public primitive_t {
                 scratchpad.book(key_nested, reorder_pd_->scratchpad_registry());
             }
         }
+        bool post_ops_ok() const {
+            return ref_post_ops_t::primitive_kind_ok(attr()->post_ops_);
+        }
     };
 
     status_t init(engine_t *engine) override {
         if (pd()->reorder_pd_)
             pd()->reorder_pd_->create_primitive(reorder_, engine);
+
+        ref_post_ops
+                = utils::make_unique<ref_post_ops_t>(pd()->attr()->post_ops_);
+        if (!ref_post_ops) return status::out_of_memory;
+        CHECK(ref_post_ops->init(pd()->dst_md()));
+
         return status::success;
     }
 
@@ -92,26 +105,43 @@ struct simple_layer_normalization_fwd_t : public primitive_t {
         using namespace memory_tracking::names;
         engine_t *engine = ctx.stream()->engine();
         auto scratchpad = ctx.get_scratchpad_grantor();
-        auto mean_mem = scratchpad.get_memory_storage(key_lnorm_tmp_mean);
+
+        bool skip_mean = pd()->skip_mean();
+
+        std::unique_ptr<memory_t, memory_deleter_t> mean;
+        if (!skip_mean) {
+            auto mean_mem = scratchpad.get_memory_storage(key_lnorm_tmp_mean);
+            CHECK(safe_ptr_assign(mean,
+                    new memory_t(engine, &(pd()->reordered_stat_md_),
+                            std::move(mean_mem))));
+        }
+
         auto variance_mem = scratchpad.get_memory_storage(key_lnorm_tmp_var);
-        memory_t mean(engine, &(pd()->reordered_stat_md_), std::move(mean_mem));
-        memory_t variance(
-                engine, &(pd()->reordered_stat_md_), std::move(variance_mem));
+        std::unique_ptr<memory_t, memory_deleter_t> variance;
+        CHECK(safe_ptr_assign(variance,
+                new memory_t(engine, &(pd()->reordered_stat_md_),
+                        std::move(variance_mem))));
 
         // reorder input stats
         if (pd()->stats_are_src() && reorder_) {
-            reorder_stat(
-                    ctx, engine, ctx.args().at(DNNL_ARG_MEAN), {&mean, false});
+            if (!skip_mean) {
+                reorder_stat(ctx, engine, ctx.args().at(DNNL_ARG_MEAN),
+                        {mean.get(), false});
+            }
             reorder_stat(ctx, engine, ctx.args().at(DNNL_ARG_VARIANCE),
-                    {&variance, false});
+                    {variance.get(), false});
         }
+
         status_t status = execute_forward(ctx);
         if (status != status::success) return status;
+
         // reorder output stats
         if (!pd()->stats_are_src() && reorder_) {
-            reorder_stat(
-                    ctx, engine, {&mean, true}, ctx.args().at(DNNL_ARG_MEAN));
-            reorder_stat(ctx, engine, {&variance, true},
+            if (!skip_mean) {
+                reorder_stat(ctx, engine, {mean.get(), true},
+                        ctx.args().at(DNNL_ARG_MEAN));
+            }
+            reorder_stat(ctx, engine, {variance.get(), true},
                     ctx.args().at(DNNL_ARG_VARIANCE));
         }
 
@@ -123,6 +153,7 @@ private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
     std::shared_ptr<primitive_t> reorder_;
+    std::unique_ptr<ref_post_ops_t> ref_post_ops;
 };
 
 struct simple_layer_normalization_bwd_t : public primitive_t {
@@ -145,8 +176,10 @@ struct simple_layer_normalization_bwd_t : public primitive_t {
             using namespace memory_tracking::names;
             auto scratchpad = scratchpad_registry().registrar();
             if (use_tmp_stats()) {
-                scratchpad.template book<float>(
-                        key_lnorm_tmp_mean, across_axis());
+                if (!skip_mean()) {
+                    scratchpad.template book<float>(
+                            key_lnorm_tmp_mean, across_axis());
+                }
                 scratchpad.template book<float>(
                         key_lnorm_tmp_var, across_axis());
             }
@@ -193,17 +226,28 @@ struct simple_layer_normalization_bwd_t : public primitive_t {
         if (reorder_) {
             engine_t *engine = ctx.stream()->engine();
             auto scratchpad = ctx.get_scratchpad_grantor();
-            auto mean_mem = scratchpad.get_memory_storage(key_lnorm_tmp_mean);
+
+            if (!pd()->skip_mean()) {
+                auto mean_mem
+                        = scratchpad.get_memory_storage(key_lnorm_tmp_mean);
+
+                std::unique_ptr<memory_t, memory_deleter_t> mean;
+                CHECK(safe_ptr_assign(mean,
+                        new memory_t(engine, &(pd()->reordered_stat_md_),
+                                std::move(mean_mem))));
+                reorder_stat(ctx, engine, ctx.args().at(DNNL_ARG_MEAN),
+                        {mean.get(), false});
+            }
+
             auto variance_mem
                     = scratchpad.get_memory_storage(key_lnorm_tmp_var);
-            memory_t mean(
-                    engine, &(pd()->reordered_stat_md_), std::move(mean_mem));
-            memory_t variance(engine, &(pd()->reordered_stat_md_),
-                    std::move(variance_mem));
-            reorder_stat(
-                    ctx, engine, ctx.args().at(DNNL_ARG_MEAN), {&mean, false});
+            std::unique_ptr<memory_t, memory_deleter_t> variance;
+            CHECK(safe_ptr_assign(variance,
+                    new memory_t(engine, &(pd()->reordered_stat_md_),
+                            std::move(variance_mem))));
+
             reorder_stat(ctx, engine, ctx.args().at(DNNL_ARG_VARIANCE),
-                    {&variance, false});
+                    {variance.get(), false});
         }
 
         return execute_backward(ctx);

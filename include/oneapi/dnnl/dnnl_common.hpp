@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2024 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,6 +19,7 @@
 
 #ifndef ONEAPI_DNNL_DNNL_COMMON_HPP
 #define ONEAPI_DNNL_DNNL_COMMON_HPP
+// NOLINTBEGIN(readability-identifier-naming)
 
 /// @cond DO_NOT_DOCUMENT_THIS
 #include <algorithm>
@@ -127,7 +128,7 @@ template <typename T, typename traits = handle_traits<T>>
 struct handle {
 private:
     static dnnl_status_t dummy_destructor(T) { return dnnl_success; }
-    std::shared_ptr<typename std::remove_pointer<T>::type> data_ {0};
+    std::shared_ptr<typename std::remove_pointer<T>::type> data_ {nullptr};
 
 protected:
     bool operator==(const T other) const { return other == data_.get(); }
@@ -370,6 +371,7 @@ struct stream : public handle<dnnl_stream_t> {
     }
 };
 
+//NOLINTBEGIN(bugprone-macro-parentheses)
 #define DNNL_DEFINE_BITMASK_OPS(enum_name) \
     inline enum_name operator|(enum_name lhs, enum_name rhs) { \
         return static_cast<enum_name>( \
@@ -407,6 +409,7 @@ struct stream : public handle<dnnl_stream_t> {
     inline enum_name operator~(enum_name rhs) { \
         return static_cast<enum_name>(~static_cast<unsigned>(rhs)); \
     }
+//NOLINTEND(bugprone-macro-parentheses)
 
 DNNL_DEFINE_BITMASK_OPS(stream::flags)
 
@@ -476,4 +479,5 @@ inline dnnl_accumulation_mode_t convert_to_c(accumulation_mode mode) {
 
 /// @} dnnl_api
 
-#endif
+// NOLINTEND(readability-identifier-naming)
+#endif /* ONEAPI_DNNL_DNNL_COMMON_HPP */

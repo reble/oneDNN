@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,8 +25,8 @@
 #include "common/primitive.hpp"
 #include "gpu/nvidia/cudnn_gemm_inner_product_impl.hpp"
 #include "gpu/nvidia/cudnn_inner_product.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
-#include "gpu/nvidia/sycl_cuda_stream.hpp"
+#include "gpu/nvidia/engine.hpp"
+#include "gpu/nvidia/stream.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -160,20 +160,20 @@ status_t template_set_default_params(memory_desc_t &src_md,
 
 struct cudnn_gemm_inner_product_fwd_t : public cudnn_inner_product_fwd_t {
     using cudnn_inner_product_fwd_t::cudnn_inner_product_fwd_t;
-    using parrent_pd_t = cudnn_inner_product_fwd_t::pd_t;
+    using parent_pd_t = cudnn_inner_product_fwd_t::pd_t;
 
-    struct pd_t : public parrent_pd_t {
-        using parrent_pd_t::parrent_pd_t;
+    struct pd_t : public parent_pd_t {
+        using parent_pd_t::parent_pd_t;
 
         DECLARE_COMMON_PD_T("cuda:cudnn:gemm", cudnn_gemm_inner_product_fwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
             using namespace prop_kind;
             using namespace data_type;
 
             using sm_t = primitive_attr_t::skip_mask_t;
-            const auto attr_skip_mask = sm_t::scales_runtime | sm_t::post_ops;
+            const auto attr_skip_mask = sm_t::scales | sm_t::post_ops;
 
             bool with_eltwise
                     = attr()->post_ops_.find(primitive_kind::eltwise) != -1;
@@ -210,8 +210,7 @@ struct cudnn_gemm_inner_product_fwd_t : public cudnn_inner_product_fwd_t {
             dnnl_data_type_t dst_type = dst_md()->data_type;
             dnnl_data_type_t acc_type = desc()->accum_data_type;
 
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+            auto *sycl_engine = utils::downcast<nvidia::engine_t *>(engine);
 
             ok = ok && memory_format_ok(src_md())
                     && memory_format_ok(weights_md(0))
@@ -223,10 +222,14 @@ struct cudnn_gemm_inner_product_fwd_t : public cudnn_inner_product_fwd_t {
                     && (gemm_compatible || need_reorder);
             if (!ok) return status::unimplemented;
 
+            const bool is_relaxed_acc_mode
+                    = attr()->acc_mode_ == dnnl_accumulation_mode_relaxed;
+            const bool use_f32_sum = with_sum && !is_relaxed_acc_mode;
+
             inner_product_impl_.reset(
                     new cudnn_gemm_inner_product_fwd_impl_t());
             return inner_product_impl_->init(engine, this, with_eltwise,
-                    with_eltwise, with_sum, need_reorder);
+                    with_eltwise, with_sum, need_reorder, use_f32_sum);
         }
 
         status_t set_default_params() {
@@ -251,7 +254,7 @@ struct cudnn_gemm_inner_product_bwd_data_t
         DECLARE_COMMON_PD_T(
                 "cuda:cudnn:gemm", cudnn_gemm_inner_product_bwd_data_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace prop_kind;
             using namespace data_type;
             assert(engine->kind() == engine_kind::gpu);
@@ -265,8 +268,7 @@ struct cudnn_gemm_inner_product_bwd_data_t
                     ? false
                     : reorder_check(diff_src_md(), weights_md(), diff_dst_md());
 
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+            auto *sycl_engine = utils::downcast<nvidia::engine_t *>(engine);
 
             auto diff_src_dt = diff_src_md()->data_type;
             auto weights_dt = weights_md(0)->data_type;
@@ -291,7 +293,7 @@ struct cudnn_gemm_inner_product_bwd_data_t
                     new cudnn_gemm_inner_product_bwd_data_impl_t());
 
             return inner_product_impl_->init(
-                    engine, this, false, false, false, need_reorder);
+                    engine, this, false, false, false, need_reorder, false);
         }
 
         status_t set_default_params() {
@@ -316,7 +318,7 @@ struct cudnn_gemm_inner_product_bwd_weights_t
         DECLARE_COMMON_PD_T(
                 "cuda:cudnn:gemm", cudnn_gemm_inner_product_bwd_weights_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace prop_kind;
             using namespace data_type;
             assert(engine->kind() == engine_kind::gpu);
@@ -330,8 +332,7 @@ struct cudnn_gemm_inner_product_bwd_weights_t
                     ? false
                     : reorder_check(src_md(), diff_weights_md(), diff_dst_md());
 
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+            auto *sycl_engine = utils::downcast<nvidia::engine_t *>(engine);
 
             ok = ok && expect_data_types(f32, f32, f32, f32, f32)
                     && attr()->has_default_values()
@@ -348,7 +349,7 @@ struct cudnn_gemm_inner_product_bwd_weights_t
             inner_product_impl_.reset(
                     new cudnn_gemm_inner_product_bwd_weights_impl_t());
             return inner_product_impl_->init(
-                    engine, this, false, false, false, need_reorder);
+                    engine, this, false, false, false, need_reorder, false);
         }
 
         status_t set_default_params() {

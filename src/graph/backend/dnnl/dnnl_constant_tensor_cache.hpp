@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2023 Intel Corporation
+ * Copyright 2023-2024 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -46,11 +46,19 @@ struct dnnl_constant_buffer_t : public graph::constant_buffer_t {
             void *data, impl::engine_t *eng, graph::allocator_t *alc) {
         dnnl::engine engine;
         engine.reset(eng, true); // not own
-#ifdef DNNL_WITH_SYCL
-        dnnl_allocator_t::free(data, engine, alc, {});
+        if (eng->kind() == engine_kind::cpu) {
+#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_SYCL
+            dnnl_allocator_t::free(data, engine, alc, ::sycl::event());
 #else
-        dnnl_allocator_t::free(data, engine, alc);
+            dnnl_allocator_t::free(data, engine, alc);
 #endif
+        } else if (eng->kind() == engine_kind::gpu) {
+#if DNNL_GPU_RUNTIME == DNNL_RUNTIME_SYCL
+            dnnl_allocator_t::free(data, engine, alc, ::sycl::event());
+#elif DNNL_GPU_RUNTIME == DNNL_RUNTIME_OCL
+            dnnl_allocator_t::free(data, engine, alc, cl_event());
+#endif
+        }
     }
 };
 
@@ -62,7 +70,7 @@ inline graph::constant_tensor_cache_t::value_t dnnl_constant_cache_get_or_add(
     assertm(cache,
             "no available constant cache for specified engine kind and index");
     return cache->get_or_add(
-            dnnl_backend::get_singleton().get_id(), key, size, value);
+            dnnl_backend_t::get_singleton().get_id(), key, size, value);
 }
 
 inline void dnnl_constant_cache_remove_if_exist(
@@ -71,7 +79,7 @@ inline void dnnl_constant_cache_remove_if_exist(
             eng.get()->kind(), eng.get()->index());
     assertm(cache,
             "no available constant cache for specified engine kind and index");
-    cache->remove_if_exist(dnnl_backend::get_singleton().get_id(), key);
+    cache->remove_if_exist(dnnl_backend_t::get_singleton().get_id(), key);
 }
 
 inline bool is_constant_cache_enabled(const dnnl::engine &eng) {

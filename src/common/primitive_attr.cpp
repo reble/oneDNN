@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include "oneapi/dnnl/dnnl.h"
 
 #include "c_types_map.hpp"
+#include "math_utils.hpp"
 #include "primitive_attr.hpp"
 #include "type_helpers.hpp"
 #include "utils.hpp"
@@ -34,12 +35,7 @@ const primitive_attr_t &default_attr() {
     return default_attr_instance;
 }
 
-const runtime_scales_t &default_runtime_scale() {
-    static const runtime_scales_t default_runtime_scale_instance;
-    return default_runtime_scale_instance;
-}
-
-void scales_t::set_single_scale(float scale) {
+void rnn_create_time_scales_t::set_single_scale(float scale) {
     count_ = 1;
     mask_ = 0;
     scales_ = scales_buf_;
@@ -50,7 +46,8 @@ void scales_t::set_single_scale(float scale) {
     }
 }
 
-status_t scales_t::set(dim_t count, int mask, const float *scales) {
+status_t rnn_create_time_scales_t::set(
+        dim_t count, int mask, const float *scales) {
     cleanup();
 
     count_ = count;
@@ -72,40 +69,17 @@ status_t scales_t::set(dim_t count, int mask, const float *scales) {
     return status::success;
 }
 
-status_t zero_points_t::get(int arg, int *mask, data_type_t *dt) const {
-    if (mask) *mask = get_mask(arg);
-    if (dt) *dt = get_data_type(arg);
-    return status::success;
-}
-
-int zero_points_t::get(int arg) const {
-    return get_mask(arg);
-}
-
-status_t zero_points_t::set(int arg, int mask, int ndims, const dims_t groups,
-        data_type_t data_type) {
-    const bool supported_arg
-            = utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_WEIGHTS, DNNL_ARG_DST);
-    if (!supported_arg) return status::unimplemented;
-
-    switch (arg) {
-        case DNNL_ARG_SRC:
-            is_set_src = true;
-            mask_src = mask;
-            break;
-        case DNNL_ARG_WEIGHTS:
-            is_set_wei = true;
-            mask_wei = mask;
-            data_type_wei = data_type;
-            group_ndims_wei = ndims;
-            utils::array_copy(group_dims_wei, groups, group_ndims_wei);
-            break;
-        case DNNL_ARG_DST:
-            is_set_dst = true;
-            mask_dst = mask;
-            break;
+status_t dropout_t::set_default_formats(const memory_desc_t *dst_md) {
+    auto is_any_or_undef = [](format_kind_t kind) {
+        return one_of(kind, dnnl_format_kind_any, dnnl_format_kind_undef);
+    };
+    const bool dst_ok = dst_md && !is_any_or_undef(dst_md->format_kind);
+    if (dst_ok && is_any_or_undef(dropout_desc_.format_kind)) {
+        const memory_desc_wrapper dst_mdw(dst_md);
+        CHECK(memory_desc_init_by_blocking_desc(
+                dropout_desc_, dst_mdw.blocking_desc()));
     }
-    return status::success;
+    return (dst_ok) ? status::success : status::invalid_arguments;
 }
 
 } // namespace impl
@@ -114,32 +88,22 @@ status_t zero_points_t::set(int arg, int mask, int ndims, const dims_t groups,
 bool primitive_attr_t::has_default_values(dnnl_primitive_attr::skip_mask_t mask,
         dnnl::impl::data_type_t dst_dt) const {
     using smask_t = skip_mask_t;
-    // prepare mask for runtime-parameters check
-    smask_t defined_mask = smask_t::none;
-    if ((mask & smask_t::oscale_runtime) == smask_t::oscale_runtime)
-        defined_mask |= smask_t::oscale;
-    if ((mask & smask_t::scales_runtime) == smask_t::scales_runtime)
-        defined_mask |= smask_t::scales;
-    if ((mask & smask_t::zero_points_runtime) == smask_t::zero_points_runtime)
-        defined_mask |= smask_t::zero_points;
     bool ok = true;
 
 #define CHECK_ARG(x) ok = ok && (x)
 #define CHECK_MASK(mask_name, mask_field) \
     CHECK_ARG(IMPLICATION( \
             (bool)(~mask & (mask_name)), (mask_field).has_default_values()))
-    CHECK_MASK(smask_t::oscale_runtime, output_scales_);
     CHECK_MASK(smask_t::scales, scales_);
-    CHECK_ARG(IMPLICATION((bool)(~mask & smask_t::scales_runtime_groups),
+    CHECK_ARG(IMPLICATION((bool)(~mask & smask_t::scales_groups),
             scales_.has_default_groups()));
-    CHECK_ARG(IMPLICATION((bool)(~mask & smask_t::scales_runtime_data_type),
+    CHECK_ARG(IMPLICATION((bool)(~mask & smask_t::scales_data_type),
             scales_.has_default_data_type()));
     CHECK_MASK(smask_t::zero_points, zero_points_);
-    CHECK_ARG(IMPLICATION((bool)(~mask & smask_t::zero_points_runtime_groups),
+    CHECK_ARG(IMPLICATION((bool)(~mask & smask_t::zero_points_groups),
             zero_points_.has_default_groups()));
-    CHECK_ARG(
-            IMPLICATION((bool)(~mask & smask_t::zero_points_runtime_data_type),
-                    zero_points_.has_default_data_type()));
+    CHECK_ARG(IMPLICATION((bool)(~mask & smask_t::zero_points_data_type),
+            zero_points_.has_default_data_type()));
     CHECK_MASK(smask_t::post_ops, post_ops_);
     CHECK_MASK(smask_t::rnn_data_qparams, rnn_data_qparams_);
     CHECK_MASK(smask_t::rnn_weights_qparams, rnn_weights_qparams_);
@@ -154,7 +118,11 @@ bool primitive_attr_t::has_default_values(dnnl_primitive_attr::skip_mask_t mask,
             utils::one_of(acc_mode_, dnnl::impl::accumulation_mode::strict,
                     dnnl::impl::accumulation_mode::relaxed,
                     dnnl::impl::accumulation_mode::any)));
-    CHECK_ARG(this->defined(defined_mask));
+    CHECK_ARG(IMPLICATION(
+            (bool)(~mask & smask_t::dropout), dropout_.has_default_values()));
+    CHECK_ARG(IMPLICATION((bool)(~mask & smask_t::rounding_mode),
+            rounding_mode_.has_default_values()));
+    CHECK_ARG(this->defined(smask_t::none));
     bool fpmath_mode_ok = IMPLICATION(
             (bool)(~mask & smask_t::fpmath_mode) && fpmath_.apply_to_int_,
             fpmath_.mode_ == fpmath_mode::strict);
@@ -170,10 +138,6 @@ bool primitive_attr_t::defined(dnnl_primitive_attr::skip_mask_t mask) const {
 #define CHECK_ARG(x) ok = ok && (x)
 #define CHECK_MASK(mask_name, mask_field) \
     CHECK_ARG(IMPLICATION((bool)(~mask & (mask_name)), (mask_field).defined()))
-    CHECK_MASK(smask_t::oscale, output_scales_);
-    CHECK_MASK(smask_t::scales, scales_);
-    CHECK_MASK(smask_t::zero_points, zero_points_);
-    CHECK_MASK(smask_t::post_ops, post_ops_);
     CHECK_MASK(smask_t::rnn_data_qparams, rnn_data_qparams_);
     CHECK_MASK(smask_t::rnn_weights_qparams, rnn_weights_qparams_);
     CHECK_MASK(smask_t::rnn_weights_projection_qparams,
@@ -185,6 +149,8 @@ bool primitive_attr_t::defined(dnnl_primitive_attr::skip_mask_t mask) const {
 
 status_t post_ops_t::append_sum(
         float scale, int32_t zero_point, data_type_t dt) {
+    if (is_runtime_value(scale)) return invalid_arguments;
+
     entry_.emplace_back();
     auto &e = entry_.back();
     e.kind = primitive_kind::sum;
@@ -198,6 +164,9 @@ status_t post_ops_t::append_eltwise(
         float scale, alg_kind_t alg, float alpha, float beta) {
     if (!math::is_eltwise_ok(data_type::f32, alg, alpha, beta))
         return invalid_arguments;
+    if (is_runtime_value(scale)) return invalid_arguments;
+    if (is_runtime_value(alpha)) return invalid_arguments;
+    if (is_runtime_value(beta)) return invalid_arguments;
 
     entry_.emplace_back();
     auto &e = entry_.back();
@@ -237,51 +206,77 @@ status_t post_ops_t::append_dw(data_type_t wei_dt, data_type_t bias_dt,
     return success;
 }
 
-status_t post_ops_t::validate_binary(
-        alg_kind_t alg, const memory_desc_t *user_src1_desc) const {
+status_t post_ops_t::validate_binary(alg_kind_t alg,
+        const memory_desc_t *user_src1_desc,
+        const memory_desc_t *user_src2_desc) const {
 
     if (len() == post_ops_limit) return out_of_memory;
     using namespace alg_kind;
     bool alg_ok = one_of(alg, binary_add, binary_mul, binary_max, binary_min,
             binary_div, binary_sub, binary_ge, binary_gt, binary_le, binary_lt,
-            binary_eq, binary_ne);
-    if (!alg_ok) return invalid_arguments;
-    if (!memory_desc_sanity_check(*user_src1_desc)) return invalid_arguments;
+            binary_eq, binary_ne, binary_select);
+    bool is_ternary_op = (alg == binary_select);
+
+    VCHECK_ATTR(alg_ok, VERBOSE_BAD_ALGORITHM);
+    VCHECK_ATTR(memory_desc_sanity_check(*user_src1_desc),
+            VERBOSE_MEM_DESC_CHECK_FAIL);
 
     // Additional check to restrict run-time dimension usage until supported.
     for (int d = 0; d < user_src1_desc->ndims; ++d) {
-        if (user_src1_desc->dims[d] == DNNL_RUNTIME_DIM_VAL)
-            return invalid_arguments;
+        VCHECK_ATTR(user_src1_desc->dims[d] != DNNL_RUNTIME_DIM_VAL,
+                VERBOSE_RUNTIMEDIM_UNSUPPORTED);
+    }
+
+    // Additional checks if the algorithm involves ternary inputs
+    if (is_ternary_op) {
+        VCHECK_ATTR(memory_desc_sanity_check(*user_src2_desc),
+                VERBOSE_MEM_DESC_CHECK_FAIL);
+        for (int d = 0; d < user_src2_desc->ndims; ++d) {
+            VCHECK_ATTR(user_src2_desc->dims[d] != DNNL_RUNTIME_DIM_VAL,
+                    VERBOSE_RUNTIMEDIM_UNSUPPORTED);
+        }
     }
 
     return success;
 }
 
-status_t post_ops_t::append_binary(
-        alg_kind_t alg, const memory_desc_t *user_src1_desc) {
-    auto status = validate_binary(alg, user_src1_desc);
-    if (status != success) return status;
+status_t post_ops_t::append_binary(alg_kind_t alg,
+        const memory_desc_t *user_src1_desc,
+        const memory_desc_t *user_src2_desc) {
+    CHECK(validate_binary(alg, user_src1_desc, user_src2_desc));
 
     entry_.emplace_back();
     auto &e = entry_.back();
     e.kind = primitive_kind::binary;
     e.binary.alg = alg;
+
     e.binary.user_src1_desc = *user_src1_desc;
     e.binary.src1_desc = *user_src1_desc;
+
+    if (alg == alg_kind::binary_select) {
+        e.binary.user_src2_desc = *user_src2_desc;
+        e.binary.src2_desc = *user_src2_desc;
+    }
     return success;
 }
 
-status_t post_ops_t::prepend_binary(
-        alg_kind_t alg, const memory_desc_t *user_src1_desc) {
-    auto status = validate_binary(alg, user_src1_desc);
-    if (status != success) return status;
+status_t post_ops_t::prepend_binary(alg_kind_t alg,
+        const memory_desc_t *user_src1_desc,
+        const memory_desc_t *user_src2_desc) {
+    CHECK(validate_binary(alg, user_src1_desc, user_src2_desc));
 
     entry_.emplace(entry_.begin());
     auto &e = entry_[0];
     e.kind = primitive_kind::binary;
     e.binary.alg = alg;
+
     e.binary.user_src1_desc = *user_src1_desc;
     e.binary.src1_desc = *user_src1_desc;
+
+    if (alg == alg_kind::binary_select) {
+        e.binary.user_src2_desc = *user_src2_desc;
+        e.binary.src2_desc = *user_src2_desc;
+    }
     return success;
 }
 
@@ -295,44 +290,38 @@ status_t post_ops_t::append_prelu(int mask) {
     return success;
 }
 
-bool post_ops_t::defined() const {
-    for (int idx = 0; idx < len(); ++idx) {
-        auto kind = entry_[idx].kind;
-        if (kind == primitive_kind::sum) {
-            if (is_runtime_value(entry_[idx].sum.scale)) return false;
-        } else if (kind == primitive_kind::eltwise) {
-            const auto &e = entry_[idx].eltwise;
-            if (is_runtime_value(e.scale) || is_runtime_value(e.alpha)
-                    || is_runtime_value(e.beta))
-                return false;
-        } else if (utils::one_of(kind, primitive_kind::binary,
-                           primitive_kind::prelu,
-                           primitive_kind::convolution)) {
-            // binary is always defined
-        } else {
-            assert(!"unreachable");
-        }
-    }
-    return true;
-}
-
 status_t post_ops_t::set_default_formats(const memory_desc_t *dst_md) {
     for (int idx = 0; idx < len(); ++idx) {
         if (!contain(primitive_kind::binary, idx)) continue;
 
         auto &src1_md = entry_[idx].binary.src1_desc;
         const memory_desc_wrapper src1_mdw(src1_md);
-        if (!src1_mdw.format_any()) continue;
 
         const memory_desc_wrapper dst_mdw(dst_md);
-        assert(!dst_mdw.format_any());
 
         // 1D tensors should be plain abx.
-        if (src1_mdw.count_non_unit_dims(1))
-            CHECK(memory_desc_init_by_strides(src1_md, nullptr));
-        else
-            CHECK(memory_desc_init_by_blocking_desc(
-                    src1_md, dst_mdw.blocking_desc()));
+        if (src1_mdw.format_any()) {
+            assert(!dst_mdw.format_any());
+
+            if (src1_mdw.count_non_unit_dims(1))
+                CHECK(memory_desc_init_by_strides(src1_md, nullptr));
+            else
+                CHECK(memory_desc_init_by_blocking_desc(
+                        src1_md, dst_mdw.blocking_desc()));
+        }
+
+        auto &src2_md = entry_[idx].binary.src2_desc;
+        const memory_desc_wrapper src2_mdw(src2_md);
+
+        if (entry_[idx].is_binary_with_ternary_op() && src2_mdw.format_any()) {
+            assert(!dst_mdw.format_any());
+
+            if (src1_mdw.count_non_unit_dims(1))
+                CHECK(memory_desc_init_by_strides(src2_md, nullptr));
+            else
+                CHECK(memory_desc_init_by_blocking_desc(
+                        src2_md, dst_mdw.blocking_desc()));
+        }
     }
 
     return status::success;
@@ -380,6 +369,47 @@ bool post_ops_t::check_sum_consistency(const data_type_t dst_dt,
             && check_sum_consistent_quantization(dst_dt, is_int8);
 }
 
+status_t post_ops_t::entry_t::validate_binary(
+        engine_kind_t engine_kind, const memory_desc_t *dst_md) const {
+    if (!is_binary()) return status::success;
+
+    VCHECK_ATTR(dst_md->ndims == binary.user_src1_desc.ndims,
+            VERBOSE_INCONSISTENT_NDIMS_WITH_VALS, "dst", "bin_po src1",
+            dst_md->ndims, binary.user_src1_desc.ndims);
+
+    VCHECK_ATTR(IMPLICATION(engine_kind == dnnl_cpu,
+                        binary.user_src1_desc.data_type != data_type::f64),
+            VERBOSE_INVALID_DATATYPE, "bin_po src1");
+
+    if (is_binary_with_ternary_op()) {
+        VCHECK_ATTR(dst_md->ndims == binary.user_src2_desc.ndims,
+                VERBOSE_INCONSISTENT_NDIMS_WITH_VALS, "dst", "bin_po src2",
+                dst_md->ndims, binary.user_src2_desc.ndims);
+
+        VCHECK_ATTR(IMPLICATION(engine_kind == dnnl_cpu,
+                            binary.user_src2_desc.data_type != data_type::f64),
+                VERBOSE_INVALID_DATATYPE, "bin_po src2");
+    }
+
+    return status::success;
+}
+
+status_t post_ops_t::validate_binary(
+        engine_kind_t engine_kind, const memory_desc_t *dst_md) const {
+    for (const auto &e : entry_) {
+        CHECK(e.validate_binary(engine_kind, dst_md));
+    }
+
+    return status::success;
+}
+
+status_t primitive_attr_t::set_dropout(const memory_desc_t *user_dropout_desc) {
+    if (any_null(user_dropout_desc)) return invalid_arguments;
+    dropout_.user_dropout_desc_ = *user_dropout_desc;
+    dropout_.dropout_desc_ = *user_dropout_desc;
+    return success;
+}
+
 status_t primitive_attr_t::set_fpmath_mode(
         fpmath_mode_t fpmath_mode, bool apply_to_int) {
     auto st = check_fpmath_mode(fpmath_mode);
@@ -418,7 +448,9 @@ status_t primitive_attr_t::set_post_ops(const post_ops_t &post_ops) {
 }
 
 status_t primitive_attr_t::set_default_formats(const memory_desc_t *dst_md) {
-    return post_ops_.set_default_formats(dst_md);
+    CHECK(post_ops_.set_default_formats(dst_md));
+    CHECK(dropout_.set_default_formats(dst_md));
+    return status::success;
 }
 
 status_t primitive_attr_t::set_gpu_attr(const primitive_attr_item_t &gpu_attr) {
@@ -448,6 +480,20 @@ status_t dnnl_primitive_attr_destroy(primitive_attr_t *attr) {
     delete attr;
 
     return success;
+}
+
+status_t dnnl_primitive_attr_get_dropout(
+        const primitive_attr_t *attr, const memory_desc_t **user_dropout_desc) {
+    if (any_null(attr)) return invalid_arguments;
+    if (user_dropout_desc)
+        *user_dropout_desc = &attr->dropout_.user_dropout_desc_;
+    return success;
+}
+
+status_t dnnl_primitive_attr_set_dropout(
+        primitive_attr_t *attr, const memory_desc_t *user_dropout_desc) {
+    if (any_null(attr)) return invalid_arguments;
+    return attr->set_dropout(user_dropout_desc);
 }
 
 status_t dnnl_primitive_attr_get_fpmath_mode(
@@ -521,44 +567,66 @@ status_t dnnl_primitive_attr_set_scratchpad_mode(
 
 status_t dnnl_primitive_attr_set_scales_mask(
         primitive_attr_t *attr, int arg, int mask) {
-    bool ok = attr && mask >= 0 && arg >= 0;
-    if (!ok) return invalid_arguments;
+    VCHECK_ATTR(attr, VERBOSE_NULL_ARG);
+    VCHECK_ATTR(mask >= 0, VERBOSE_BAD_PARAM, "mask");
+    VCHECK_ATTR(arg >= 0, VERBOSE_BAD_PARAM, "arg");
     return attr->scales_.set(arg, mask);
 }
 
 status_t dnnl_primitive_attr_set_scales(primitive_attr_t *attr, int arg,
         int mask, int ndims, const dims_t group_dims, data_type_t data_type) {
     using namespace data_type;
-    bool ok = attr && mask >= 0 && arg >= 0 && ndims >= 0
-            && utils::one_of(data_type, f32, bf16, f16)
-            && IMPLICATION(
-                    arg != DNNL_ARG_WEIGHTS, data_type == f32 && ndims == 0)
-            && IMPLICATION(ndims, validate_dims(ndims, group_dims));
-    if (!ok) return invalid_arguments;
-    return attr->scales_.set(arg, mask, ndims, group_dims, data_type);
+    VCHECK_ATTR(attr, VERBOSE_NULL_ARG);
+    VCHECK_ATTR(mask >= 0, VERBOSE_BAD_PARAM, "mask");
+    VCHECK_ATTR(arg >= 0, VERBOSE_BAD_PARAM, "arg");
+    VCHECK_ATTR(ndims >= 0, VERBOSE_BAD_PARAM, "ndims");
+    VCHECK_ATTR(
+            utils::one_of(data_type, f32, bf16, f16, e8m0, f8_e5m2, f8_e4m3),
+            VERBOSE_INVALID_DATATYPE, "scales");
+    VCHECK_ATTR(IMPLICATION(ndims, validate_dims(ndims, group_dims)),
+            VERBOSE_BAD_PARAM, "group_dims");
+    return attr->scales_.set(arg, mask, data_type, ndims, group_dims);
 }
 
 status_t dnnl_primitive_attr_set_zero_points_mask(
         primitive_attr_t *attr, int arg, int mask) {
-    bool ok = attr && mask >= 0;
-    if (!ok) return invalid_arguments;
-
+    VCHECK_ATTR(attr, VERBOSE_NULL_ARG);
+    VCHECK_ATTR(mask >= 0, VERBOSE_BAD_PARAM, "mask");
     return attr->zero_points_.set(arg, mask);
 }
 
-dnnl_status_t DNNL_API dnnl_primitive_attr_set_zero_points(
-        dnnl_primitive_attr_t attr, int arg, int mask, int ndims,
-        const dnnl_dims_t group_dims, dnnl_data_type_t data_type) {
+status_t dnnl_primitive_attr_set_zero_points(dnnl_primitive_attr_t attr,
+        int arg, int mask, int ndims, const dnnl_dims_t group_dims,
+        dnnl_data_type_t data_type) {
     using namespace data_type;
-    bool ok = attr && arg >= 0 && mask >= 0 && ndims >= 0
-            && utils::one_of(data_type, s32, s8, u8, s4, u4)
-            && IMPLICATION(
-                    arg != DNNL_ARG_WEIGHTS, data_type == s32 && ndims == 0)
-            && IMPLICATION(utils::one_of(data_type, s4, u4), mask > 0)
-            && IMPLICATION(ndims, validate_dims(ndims, group_dims));
-    if (!ok) return invalid_arguments;
+    VCHECK_ATTR(attr, VERBOSE_NULL_ARG);
+    VCHECK_ATTR(mask >= 0, VERBOSE_BAD_PARAM, "mask");
+    VCHECK_ATTR(arg >= 0, VERBOSE_BAD_PARAM, "arg");
+    VCHECK_ATTR(ndims >= 0, VERBOSE_BAD_PARAM, "ndims");
+    VCHECK_ATTR(utils::one_of(data_type, s32, s8, u8, s4, u4),
+            VERBOSE_INVALID_DATATYPE, "zero points");
+    VCHECK_ATTR(IMPLICATION(utils::one_of(data_type, s4, u4), mask > 0),
+            VERBOSE_BAD_PARAM, "mask with int4 data type");
+    VCHECK_ATTR(IMPLICATION(!utils::one_of(arg, DNNL_ARG_SRC, DNNL_ARG_WEIGHTS),
+                        data_type == s32 && ndims == 0),
+            VERBOSE_INVALID_DATATYPE, "zero points");
+    VCHECK_ATTR(IMPLICATION(ndims, validate_dims(ndims, group_dims)),
+            VERBOSE_BAD_PARAM, "group_dims");
 
-    return attr->zero_points_.set(arg, mask, ndims, group_dims, data_type);
+    return attr->zero_points_.set(arg, mask, data_type, ndims, group_dims);
+}
+
+status_t dnnl_primitive_attr_get_rounding(
+        primitive_attr_t *attr, int arg, dnnl_rounding_mode_t *mode) {
+    if (any_null(attr, mode)) return invalid_arguments;
+    *mode = attr->rounding_mode_.get(arg);
+    return success;
+}
+
+status_t dnnl_primitive_attr_set_rounding(
+        primitive_attr_t *attr, int arg, dnnl_rounding_mode_t mode) {
+    if (attr == nullptr) return invalid_arguments;
+    return attr->rounding_mode_.set(arg, mode);
 }
 
 status_t dnnl_primitive_attr_get_post_ops(
@@ -620,19 +688,20 @@ status_t dnnl_post_ops_append_sum(
 }
 
 namespace {
-bool simple_get_params_check(
+status_t simple_get_params_check(
         const post_ops_t *post_ops, int index, primitive_kind_t kind) {
-    bool ok = true && post_ops != nullptr && 0 <= index
-            && index < post_ops->len() && post_ops->entry_[index].kind == kind;
-    return ok;
+    VCHECK_ATTR(post_ops, VERBOSE_NULL_ARG);
+    VCHECK_ATTR(index >= 0, VERBOSE_BAD_PARAM, "index");
+    VCHECK_ATTR(index < post_ops->len(), VERBOSE_BAD_PARAM, "index");
+    VCHECK_ATTR(
+            post_ops->entry_[index].kind == kind, VERBOSE_BAD_PARAM, "kind");
+    return status::success;
 }
 } // namespace
 
 status_t dnnl_post_ops_get_params_sum(const post_ops_t *post_ops, int index,
         float *scale, int32_t *zero_point, data_type_t *dt) {
-    bool ok = true
-            && simple_get_params_check(post_ops, index, primitive_kind::sum);
-    if (!ok) return invalid_arguments;
+    CHECK(simple_get_params_check(post_ops, index, primitive_kind::sum));
 
     if (scale) *scale = post_ops->entry_[index].sum.scale;
     if (zero_point) *zero_point = post_ops->entry_[index].sum.zero_point;
@@ -650,15 +719,12 @@ status_t dnnl_post_ops_append_eltwise(
 
 status_t dnnl_post_ops_get_params_eltwise(const post_ops_t *post_ops, int index,
         alg_kind_t *alg, float *alpha, float *beta) {
-    bool ok = true
-            && simple_get_params_check(post_ops, index, primitive_kind::eltwise)
-            && !any_null(alpha, beta);
-    if (!ok) return invalid_arguments;
+    CHECK(simple_get_params_check(post_ops, index, primitive_kind::eltwise));
 
     const auto &e = post_ops->entry_[index].eltwise;
-    *alg = e.alg;
-    *alpha = e.alpha;
-    *beta = e.beta;
+    if (alg) *alg = e.alg;
+    if (alpha) *alpha = e.alpha;
+    if (beta) *beta = e.beta;
 
     return success;
 }
@@ -675,9 +741,8 @@ status_t dnnl_post_ops_append_dw(post_ops_t *post_ops, data_type_t wei_dt,
 status_t dnnl_post_ops_get_params_dw(const post_ops_t *post_ops, int index,
         data_type_t *wei_dt, data_type_t *bias_dt, data_type_t *dst_dt,
         dim_t *kernel, dim_t *stride, dim_t *padding) {
-
-    if (!simple_get_params_check(post_ops, index, primitive_kind::convolution))
-        return invalid_arguments;
+    CHECK(simple_get_params_check(
+            post_ops, index, primitive_kind::convolution));
 
     const auto &d = post_ops->entry_[index].depthwise_conv;
     if (wei_dt) *wei_dt = d.wei_dt;
@@ -697,14 +762,34 @@ status_t dnnl_post_ops_append_binary(post_ops_t *post_ops, alg_kind_t alg_kind,
     return post_ops->append_binary(alg_kind, user_src1_desc);
 }
 
+status_t dnnl_post_ops_append_binary_v2(post_ops_t *post_ops,
+        alg_kind_t alg_kind, const memory_desc_t *user_src1_desc,
+        const memory_desc_t *user_src2_desc) {
+    if (post_ops == nullptr) return invalid_arguments;
+
+    return post_ops->append_binary(alg_kind, user_src1_desc, user_src2_desc);
+}
+
 status_t dnnl_post_ops_get_params_binary(const post_ops_t *post_ops, int index,
         alg_kind_t *alg_kind, const memory_desc_t **user_src1_desc) {
-    if (!simple_get_params_check(post_ops, index, primitive_kind::binary))
-        return invalid_arguments;
+    CHECK(simple_get_params_check(post_ops, index, primitive_kind::binary));
 
     const auto &b = post_ops->entry_[index].binary;
     if (alg_kind) *alg_kind = b.alg;
     if (user_src1_desc) *user_src1_desc = &b.user_src1_desc;
+
+    return success;
+}
+
+status_t dnnl_post_ops_get_params_binary_v2(const post_ops_t *post_ops,
+        int index, alg_kind_t *alg_kind, const memory_desc_t **user_src1_desc,
+        const memory_desc_t **user_src2_desc) {
+    CHECK(simple_get_params_check(post_ops, index, primitive_kind::binary));
+
+    const auto &b = post_ops->entry_[index].binary;
+    if (alg_kind) *alg_kind = b.alg;
+    if (user_src1_desc) *user_src1_desc = &b.user_src1_desc;
+    if (user_src2_desc) *user_src2_desc = &b.user_src2_desc;
 
     return success;
 }

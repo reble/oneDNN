@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2024 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 * Copyright 2020-2021 FUJITSU LIMITED
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -205,8 +205,8 @@ TEST_F(attr_test_t, TestZeroPointsWithGroups) {
 TEST_F(attr_test_t, TestZeroPointsDataTypes) {
     dnnl::primitive_attr attr;
 
-    const std::vector<int> supported_args = {DNNL_ARG_WEIGHTS};
-    const std::vector<int> unsupported_args = {DNNL_ARG_SRC};
+    const std::vector<int> supported_args = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS};
+    const std::vector<int> unsupported_args = {DNNL_ARG_DST};
 
     const std::vector<data_type> supported_dts = {data_type::s32, data_type::s8,
             data_type::u8, data_type::s4, data_type::u4};
@@ -225,10 +225,10 @@ TEST_F(attr_test_t, TestZeroPointsDataTypes) {
     for (auto arg : unsupported_args) {
         for (auto dt : supported_dts) {
             if (dt == data_type::s32) {
-                // s32 is a default zero point data type supported by all eligible arguments
+                // s32 is a default zero point data type supported by all
+                // eligible arguments.
                 attr.set_zero_points(arg, 0, {}, dt);
             } else {
-                // Only weights support non-default zero point data type
                 EXPECT_ANY_THROW(attr.set_zero_points(arg, 0, {}, dt));
             }
         }
@@ -274,22 +274,24 @@ HANDLE_EXCEPTIONS_FOR_TEST_F(attr_test_t, TestScales) {
 HANDLE_EXCEPTIONS_FOR_TEST_F(attr_test_t, TestScalesWithGroups) {
     dnnl::primitive_attr attr;
 
-    const std::vector<int> supported_args = {DNNL_ARG_WEIGHTS};
-    const std::vector<int> unsupported_args = {DNNL_ARG_BIAS, DNNL_ARG_SRC,
-            DNNL_ARG_MEAN, DNNL_ARG_WORKSPACE, DNNL_ARG_SCRATCHPAD};
+    const std::vector<int> supported_args = {DNNL_ARG_SRC, DNNL_ARG_WEIGHTS};
+    const std::vector<int> unsupported_args = {DNNL_ARG_BIAS, DNNL_ARG_MEAN,
+            DNNL_ARG_WORKSPACE, DNNL_ARG_SCRATCHPAD};
 
     for (auto arg : supported_args) {
         // single non-default scales for supported arg
         attr.set_scales(arg, 0, {});
-        // multiple scales with groups
+        // multiple scales with a single group dim
         attr.set_scales(arg, 1 << 0, {4});
+        // multiple scales with multiple group dims
+        attr.set_scales(arg, 1 << 0, {4, 1});
         // scales with groups and a data type
-        attr.set_scales(arg, 1 << 0, {4}, data_type::f32);
+        attr.set_scales(arg, 1 << 0, {4, 1}, data_type::f32);
     }
 
     for (auto arg : unsupported_args) {
         // multiple scales with groups for unsupported args
-        EXPECT_ANY_THROW(attr.set_scales(arg, 1 << 0, {4}));
+        EXPECT_ANY_THROW(attr.set_scales(arg, 1 << 0, {4, 1}));
         // multiple scales with non-default data type for unsupported args
         EXPECT_ANY_THROW(attr.set_scales(arg, 1 << 0, {}, data_type::bf16));
     }
@@ -791,7 +793,7 @@ HANDLE_EXCEPTIONS_FOR_TEST_F(attr_test_t, TestGetCppObjects) {
     // of using a dangling pointer from destroyed object via
     // `pd.get_primitive_attr().get_post_ops()` construction as attributes will
     // be destroyed once post-ops are saved on stack.
-    // See https://github.com/oneapi-src/oneDNN/issues/1337 for details.
+    // See https://github.com/uxlfoundation/oneDNN/issues/1337 for details.
     dnnl::primitive_attr attr;
     dnnl::post_ops ops;
     memory::desc po_src1_md({1, 1, 1, 1}, data_type::f32, tag::abcd);

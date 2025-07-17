@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@
 #include "cpu/x64/injectors/jit_uni_eltwise_injector.hpp"
 #include "cpu/x64/jit_uni_x8s8s32x_conv_kernel.hpp"
 
-#define GET_OFF(field) offsetof(jit_conv_call_s, field)
+#define GET_OFF(field) offsetof(jit_conv_args_t, field)
 
 namespace dnnl {
 namespace impl {
@@ -54,12 +54,10 @@ void pick_loop_order(jit_conv_conf_t &jcp) {
 } // namespace
 
 template <cpu_isa_t isa, typename Vmm>
-_jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::_jit_uni_x8s8s32x_fwd_kernel(
+jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::jit_uni_x8s8s32x_fwd_kernel_vmm_t(
         const jit_conv_conf_t &ajcp, const primitive_attr_t &attr,
         const memory_desc_t &dst_md)
-    : jit_generator(jit_name(), nullptr, MAX_CODE_SIZE, true, isa)
-    , jcp(ajcp)
-    , attr_(attr) {
+    : jit_generator_t(jit_name(), isa), jcp(ajcp), attr_(attr) {
     if (jcp.with_eltwise || jcp.with_binary || jcp.with_sum) {
         using namespace binary_injector;
         static constexpr bool preserve_gpr = true;
@@ -87,7 +85,7 @@ _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::_jit_uni_x8s8s32x_fwd_kernel(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::prepare_output(int ur_w) {
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::prepare_output(int ur_w) {
     int nb_oc_block
             = jcp.is_depthwise ? jcp.nb_ch_blocking : jcp.nb_oc_blocking;
     for (int k = 0; k < nb_oc_block; ++k)
@@ -107,7 +105,7 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::prepare_output(int ur_w) {
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::cvt2ps(data_type_t type_in,
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::cvt2ps(data_type_t type_in,
         const Vmm &vmm_in, const Reg64 &reg, int offset, int load_size) {
 
     load_data(type_in, vmm_in, reg, offset, load_size);
@@ -135,9 +133,9 @@ void iterate(const int nb_oc_block, const int ur_w, const F &f) {
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::apply_sum(const int nb_oc_block,
-        const int ur_w, const bool last_oc_block_flag, const int oc_block,
-        const float *p_sum_scale, const int32_t *p_sum_zp) {
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::apply_sum(
+        const int nb_oc_block, const int ur_w, const bool last_oc_block_flag,
+        const int oc_block, const float *p_sum_scale, const int32_t *p_sum_zp) {
     if (jcp.with_sum) {
         assert(!utils::any_null(p_sum_scale, p_sum_zp)
                 && "p_sum_scale or p_sum_zp = nullptr");
@@ -179,7 +177,7 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::apply_sum(const int nb_oc_block,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::apply_postops(
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::apply_postops(
         const int nb_oc_block, const int ur_w, const bool last_oc_block_flag,
         const int oc_block, const float *p_sum_scale, const int32_t *p_sum_zp) {
     if (jcp.with_eltwise || jcp.with_binary || jcp.with_sum) {
@@ -223,7 +221,7 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::apply_postops(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::store_output(
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::store_output(
         int ur_w, bool last_oc_block_flag) {
     int nb_oc_block
             = jcp.is_depthwise ? jcp.nb_ch_blocking : jcp.nb_oc_blocking;
@@ -375,8 +373,8 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::store_output(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::compute_ker_dw(int ur_w, int pad_l,
-        int pad_r, ic_block_t last_ic_block_flag, bool h_padded) {
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::compute_ker_dw(int ur_w,
+        int pad_l, int pad_r, ic_block_t last_ic_block_flag, bool h_padded) {
 
     if (!(utils::one_of(isa, avx2) && std::is_same<Vmm, Xbyak::Ymm>::value)
             && !(utils::one_of(isa, sse41)
@@ -516,8 +514,8 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::compute_ker_dw(int ur_w, int pad_l,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::compute_ker(int ur_w, int pad_l,
-        int pad_r, ic_block_t last_ic_block_flag, bool h_padded) {
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::compute_ker(int ur_w,
+        int pad_l, int pad_r, ic_block_t last_ic_block_flag, bool h_padded) {
     if (jcp.is_depthwise)
         return compute_ker_dw(ur_w, pad_l, pad_r, last_ic_block_flag, h_padded);
 
@@ -661,7 +659,7 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::compute_ker(int ur_w, int pad_l,
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::kh_loop(
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::kh_loop(
         int ur_w, int pad_l, int pad_r, ic_block_t last_ic_block_flag) {
 
     Label kd_label, kh_label, skip_kd_loop, skip_kh_loop;
@@ -818,7 +816,7 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::kh_loop(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::icb_loop(
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::icb_loop(
         int ur_w, int pad_l, int pad_r, bool is_last_sp_block) {
     prepare_output(ur_w);
 
@@ -890,7 +888,7 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::icb_loop(
 }
 
 template <cpu_isa_t isa, typename Vmm>
-void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::generate() {
+void jit_uni_x8s8s32x_fwd_kernel_vmm_t<isa, Vmm>::generate() {
     Label permute_index_table;
     int in_ic_shift = jcp.is_fused_conv ? jcp.dw_conv_buffer_oc
                                         : jcp.ic_without_padding * jcp.ngroups;
@@ -1233,11 +1231,12 @@ void _jit_uni_x8s8s32x_fwd_kernel<isa, Vmm>::generate() {
 
     postamble();
 
-    if (jcp.with_eltwise) postops_injector_->prepare_table();
+    if (jcp.with_eltwise)
+        postops_injector_->prepare_table(/* generate = */ true);
 }
 
 template <cpu_isa_t isa>
-status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
+status_t jit_uni_x8s8s32x_fwd_kernel_t<isa>::init_conf(jit_conv_conf_t &jcp,
         const convolution_desc_t &cd, memory_desc_t &src_md,
         memory_desc_t &weights_md, memory_desc_t &dst_md,
         memory_desc_t &bias_md, primitive_attr_t &attr, int nthreads) {
@@ -1247,6 +1246,11 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
     const memory_desc_wrapper weights_d(&weights_md);
     const memory_desc_wrapper dst_d(&dst_md);
     const memory_desc_wrapper bias_d(&bias_md);
+
+    // Big int (> INT_MAX) values are unsupported and jcp fields may overflow
+    // TODO: change data type of jcp fields to size_t
+    VDISPATCH_CONV_IC(!has_large_size(cd, src_d, weights_d, dst_d),
+            VERBOSE_BAD_PARAM, "Large size is not supported");
 
     const bool with_groups = weights_d.ndims() == src_d.ndims() + 1;
     const int ndims = src_d.ndims();
@@ -1316,21 +1320,22 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
     const auto &wei_scales = attr.scales_.get(DNNL_ARG_WEIGHTS);
     const auto &dst_scales = attr.scales_.get(DNNL_ARG_DST);
 
-    jcp.is_oc_scale = wei_scales.mask_ != 0;
+    jcp.is_oc_scale = wei_scales.get_mask() > 0;
     jcp.dst_scale = !dst_scales.has_default_values();
 
     const auto zp = attr.zero_points_;
     jcp.dst_zero_point = !zp.has_default_values(DNNL_ARG_DST);
     jcp.src_zero_point = !zp.has_default_values(DNNL_ARG_SRC);
     jcp.zp_src_is_common
-            = zp.common(DNNL_ARG_SRC); // otherwise, it's per-channel
+            = zp.get_mask(DNNL_ARG_SRC) == 0; // otherwise, it's per-channel
     assert(IMPLICATION(jcp.src_zero_point, jcp.zp_src_is_common));
 
     VDISPATCH_CONV_IC(
             !((jcp.dst_zero_point || jcp.src_zero_point) && jcp.is_fused_conv),
+            VERBOSE_UNSUPPORTED_FEATURE,
             "fused depthwise convolution does not support zero-point");
 
-    VDISPATCH_CONV_IC(!(is_3d && jcp.is_depthwise),
+    VDISPATCH_CONV_IC(!(is_3d && jcp.is_depthwise), VERBOSE_UNSUPPORTED_FEATURE,
             "unsupported depthwise implementation for 3D convolution");
 
     if (jcp.is_depthwise) {
@@ -1357,7 +1362,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
         }
         VDISPATCH_CONV_IC(
                 !(jcp.ic % jcp.ic_block != 0 || jcp.oc % jcp.oc_block != 0),
-                VERBOSE_BLOCKING_FAIL);
+                VERBOSE_BLOCKING_FAIL, "bad blocking parameters");
     }
 
     jcp.is_resrc_depthwise = true && jcp.is_depthwise && jcp.stride_w < jcp.kw
@@ -1430,7 +1435,8 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
         return weights_md == want_wei_md;
     };
 
-    VDISPATCH_CONV_IC(set_or_check_wei_format(), VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_CONV_IC(
+            set_or_check_wei_format(), VERBOSE_UNSUPPORTED_TAG_S, "weights");
     format_tag_t dat_tag = utils::pick(
             ndims - 3, format_tag::nwc, format_tag::nhwc, format_tag::ndhwc);
 
@@ -1440,7 +1446,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
     } else {
         jcp.src_tag = src_d.matches_one_of_tag(dat_tag);
     }
-    VDISPATCH_CONV_IC(jcp.src_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_CONV_IC(jcp.src_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG_S, "src");
 
     if (dst_d.format_kind() == format_kind::any) {
         CHECK(memory_desc_init_by_tag(dst_md, dat_tag));
@@ -1448,7 +1454,7 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
     } else {
         jcp.dst_tag = dst_d.matches_one_of_tag(dat_tag);
     }
-    VDISPATCH_CONV_IC(jcp.dst_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG);
+    VDISPATCH_CONV_IC(jcp.dst_tag == dat_tag, VERBOSE_UNSUPPORTED_TAG_S, "dst");
 
     if (jcp.with_bias) {
         if (bias_d.format_kind() == format_kind::any)
@@ -1566,10 +1572,10 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
      * the threshold L1_cache_size is empirical */
     size_t wei_size
             = sizeof(float) * jcp.ic * jcp.oc * jcp.kh * jcp.kw * jcp.kd;
-    size_t out_size
-            = jcp.mb * jcp.typesize_out * jcp.oc * jcp.oh * jcp.ow * jcp.od;
-    size_t inp_size
-            = jcp.mb * jcp.typesize_in * jcp.ic * jcp.ih * jcp.iw * jcp.id;
+    size_t out_size = static_cast<size_t>(jcp.mb) * jcp.typesize_out * jcp.oc
+            * jcp.oh * jcp.ow * jcp.od;
+    size_t inp_size = static_cast<size_t>(jcp.mb) * jcp.typesize_in * jcp.ic
+            * jcp.ih * jcp.iw * jcp.id;
     size_t total_size = jcp.ngroups * (wei_size + out_size + inp_size);
     const unsigned int L1_cache_size = platform::get_per_core_cache_size(1);
 
@@ -1593,7 +1599,8 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
 
     bool args_ok = true && jcp.oc % jcp.oc_block == 0
             && IMPLICATION(!jcp.is_1stconv, jcp.ic % jcp.ic_block == 0);
-    VDISPATCH_CONV_IC(args_ok, VERBOSE_BLOCKING_FAIL);
+    VDISPATCH_CONV_IC(
+            args_ok, VERBOSE_BLOCKING_FAIL, "bad blocking dimensions");
 
     pick_loop_order(jcp);
 
@@ -1608,22 +1615,22 @@ status_t jit_uni_x8s8s32x_fwd_kernel<isa>::init_conf(jit_conv_conf_t &jcp,
 }
 
 template <cpu_isa_t isa>
-void jit_uni_x8s8s32x_fwd_kernel<isa>::init_scratchpad(
+void jit_uni_x8s8s32x_fwd_kernel_t<isa>::init_scratchpad(
         memory_tracking::registrar_t &scratchpad, const jit_conv_conf_t &jcp,
         const primitive_attr_t &attr) {
-
-    const int mask = attr.scales_.get(DNNL_ARG_WEIGHTS).mask_;
-    const dim_t scales_count
-            = mask == 0 ? 1 : static_cast<dim_t>(jcp.oc) * jcp.ngroups;
-    dim_t count = scales_count == 1 ? (dim_t)8 : scales_count;
+    dim_t count = 8;
+    if (!attr.scales_.has_default_values(DNNL_ARG_WEIGHTS)) {
+        const int wei_mask = attr.scales_.get_mask(DNNL_ARG_WEIGHTS);
+        if (wei_mask > 0) count = static_cast<dim_t>(jcp.oc) * jcp.ngroups;
+    }
     scratchpad.book<float>(key_conv_adjusted_scales, count);
 }
 
-template struct _jit_uni_x8s8s32x_fwd_kernel<avx2, Ymm>;
-template struct _jit_uni_x8s8s32x_fwd_kernel<avx2, Xmm>;
-template struct _jit_uni_x8s8s32x_fwd_kernel<sse41, Xmm>;
-template struct jit_uni_x8s8s32x_fwd_kernel<avx2>;
-template struct jit_uni_x8s8s32x_fwd_kernel<sse41>;
+template struct jit_uni_x8s8s32x_fwd_kernel_vmm_t<avx2, Ymm>;
+template struct jit_uni_x8s8s32x_fwd_kernel_vmm_t<avx2, Xmm>;
+template struct jit_uni_x8s8s32x_fwd_kernel_vmm_t<sse41, Xmm>;
+template struct jit_uni_x8s8s32x_fwd_kernel_t<avx2>;
+template struct jit_uni_x8s8s32x_fwd_kernel_t<sse41>;
 
 } // namespace x64
 } // namespace cpu

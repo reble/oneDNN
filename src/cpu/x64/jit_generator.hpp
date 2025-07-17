@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2024 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,12 +39,6 @@
 #define OFFSET_SHADOWSPACE 0x28
 #endif
 
-#if GCC_WA_NO_TREE_DOMINATOR_OPTS
-#define ATTRIBUTE_OPTIMIZE __attribute__((optimize("no-tree-dominator-opts")))
-#else
-#define ATTRIBUTE_OPTIMIZE
-#endif
-
 #define DECLARE_CPU_JIT_AUX_FUNCTIONS(gen_name) \
     const char *name() const override { return STRINGIFY(gen_name); } \
     const char *source_file() const override { return __FILE__; } \
@@ -66,21 +60,16 @@ namespace impl {
 namespace cpu {
 namespace x64 {
 
-// TODO: move this to jit_generator class?
+// TODO: move this to jit_generator_t class?
 namespace {
-
-typedef enum {
-    MAX_CODE_SIZE = 256 * 1024,
-} max_code_size_t;
 
 // TODO: move this somewhere else? Although this is only used by jit kernels
 // (Roma)
-static inline int float2int(float x) {
+inline int float2int(float x) {
     return utils::bit_cast<int>(x);
 }
 
-static inline void tc_configure_tile(
-        palette_config_t *tc, int t, int rows, int cols) {
+inline void tc_configure_tile(palette_config_t *tc, int t, int rows, int cols) {
     const bool rows_ok = (size_t)t < sizeof(tc->rows) / sizeof(tc->rows[0]);
     const bool cols_ok = (size_t)t < sizeof(tc->cols) / sizeof(tc->cols[0]);
     if (rows_ok && cols_ok) {
@@ -151,9 +140,9 @@ constexpr Xbyak::Operand::Code abi_not_param_reg =
 
 #endif
 
-class jit_generator : public Xbyak::MmapAllocator,
-                      public Xbyak::CodeGenerator,
-                      public c_compatible {
+class jit_generator_t : public Xbyak::MmapAllocator,
+                        public Xbyak::CodeGenerator,
+                        public c_compatible {
 public:
     using c_compatible::operator new;
     using c_compatible::operator new[];
@@ -194,7 +183,9 @@ public:
     const int EVEX_max_8b_offt = 0x200;
     const Xbyak::Reg64 reg_EVEX_max_8b_offt = rbp;
 
-    inline size_t get_size_of_abi_save_regs() { return size_of_abi_save_regs; }
+    inline size_t get_size_of_abi_save_regs() const {
+        return size_of_abi_save_regs;
+    }
 
     void preamble() {
         if (xmm_to_preserve) {
@@ -245,8 +236,7 @@ public:
     // By default it assumes to be called after the prologue
     // Note: that we cannot use RBP inside as we override it in preamble
     // for address computation in EVEX instructions
-    inline const Xbyak::RegExp get_stack_params_address(
-            bool after_prolog = true) {
+    inline Xbyak::RegExp get_stack_params_address(bool after_prolog = true) {
         int saved_regs_size = after_prolog ? get_size_of_abi_save_regs() : 0;
 #ifdef _WIN32
         // Using stack layout described in MS ABI
@@ -289,6 +279,8 @@ public:
     template <typename T>
     Xbyak::Address EVEX_compress_addr(
             Xbyak::Reg64 base, T raw_offt, bool bcast = false) {
+        assert(is_valid_isa(avx512_core));
+
         using Xbyak::Address;
         using Xbyak::Reg64;
         using Xbyak::RegExp;
@@ -371,6 +363,16 @@ public:
         }
     }
 
+    // The function returns type of encoding (Evex or Vex) depending on the
+    // system ISA. It's designed to be used with instructions that require
+    // specific encoding when both encodings are supported on the system.
+    // Evex would be preferred over Vex when possible.
+    // The assumption is that both encoding mnemonics are supported by the
+    // hardware for `avx512_core+` systems.
+    Xbyak::PreferredEncoding get_encoding() {
+        return mayiuse(avx512_core) ? Xbyak::EvexEncoding : Xbyak::VexEncoding;
+    }
+
     // Disallow char-based labels completely
     void L(const char *label) = delete;
     void L(Xbyak::Label &label) { Xbyak::CodeGenerator::L(label); }
@@ -387,8 +389,8 @@ public:
         else if (is_valid_isa(avx))
             vpxor(x1, x2, op);
         else {
-            assert(x1.isEqualIfNotInherited(x2));
-            pxor(x2, op);
+            if (!x1.isEqualIfNotInherited(x2)) movdqa(x1, x2);
+            pxor(x1, op);
         }
     }
     void uni_vpxor(const Xbyak::Ymm &x1, const Xbyak::Ymm &x2,
@@ -685,7 +687,7 @@ public:
         if (is_valid_isa(avx))
             vdivps(x, op1, op2);
         else {
-            assert(x.isEqualIfNotInherited(op1));
+            if (!x.isEqualIfNotInherited(op1)) movups(x, op1);
             divps(x, op2);
         }
     }
@@ -699,7 +701,7 @@ public:
         if (is_valid_isa(avx))
             vdivss(x, op1, op2);
         else {
-            assert(x.isEqualIfNotInherited(op1));
+            if (!x.isEqualIfNotInherited(op1)) movss(x, op1);
             divss(x, op2);
         }
     }
@@ -738,7 +740,7 @@ public:
         if (is_valid_isa(avx))
             vaddss(x, op1, op2);
         else {
-            assert(x.isEqualIfNotInherited(op1));
+            if (!x.isEqualIfNotInherited(op1)) movss(x, op1);
             addss(x, op2);
         }
     }
@@ -752,7 +754,7 @@ public:
         if (is_valid_isa(avx)) {
             vphaddd(x, x2, op);
         } else {
-            assert(x.isEqualIfNotInherited(op));
+            if (!x.isEqualIfNotInherited(op)) movdqa(x, x2);
             phaddd(x, op);
         }
     }
@@ -762,7 +764,7 @@ public:
         if (is_valid_isa(avx)) {
             vhaddps(x, x2, op);
         } else {
-            assert(x.isEqualIfNotInherited(op));
+            if (!x.isEqualIfNotInherited(op)) movups(x, x2);
             haddps(x, op);
         }
     }
@@ -772,7 +774,7 @@ public:
         if (is_valid_isa(avx))
             vpsignd(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (!x1.isEqualIfNotInherited(x2)) movdqa(x1, x2);
             psignd(x1, op);
         }
     }
@@ -786,7 +788,7 @@ public:
         if (is_valid_isa(avx))
             vpsubd(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (!x1.isEqualIfNotInherited(x2)) movdqa(x1, x2);
             psubd(x1, op);
         }
     }
@@ -800,7 +802,7 @@ public:
         if (is_valid_isa(avx))
             vpsubb(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (!x1.isEqualIfNotInherited(x2)) movdqa(x1, x2);
             psubb(x1, op);
         }
     }
@@ -814,7 +816,7 @@ public:
         if (is_valid_isa(avx))
             vsubss(x, op1, op2);
         else {
-            assert(x.isEqualIfNotInherited(op1));
+            if (!x.isEqualIfNotInherited(op1)) movss(x, op1);
             subss(x, op2);
         }
     }
@@ -842,7 +844,7 @@ public:
         if (is_valid_isa(avx))
             vsubps(x, op1, op2);
         else {
-            assert(x.isEqualIfNotInherited(op1));
+            if (!x.isEqualIfNotInherited(op1)) movups(x, op1);
             subps(x, op2);
         }
     }
@@ -916,7 +918,7 @@ public:
         if (is_valid_isa(avx))
             vmulss(x, op1, op2);
         else {
-            assert(x.isEqualIfNotInherited(op1));
+            if (!x.isEqualIfNotInherited(op1)) movss(x, op1);
             mulss(x, op2);
         }
     }
@@ -1353,7 +1355,7 @@ public:
         if (is_valid_isa(avx))
             vandps(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (!x1.isEqualIfNotInherited(x2)) movups(x1, x2);
             andps(x1, op);
         }
     }
@@ -1374,7 +1376,7 @@ public:
             assert(IMPLICATION(x1.getBit() == 256, is_valid_isa(avx2)));
             vpandn(x1, x2, op);
         } else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (!x1.isEqualIfNotInherited(x2)) movdqa(x1, x2);
             pandn(x1, op);
         }
     }
@@ -1384,7 +1386,7 @@ public:
         if (is_valid_isa(avx))
             vorps(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (!x1.isEqualIfNotInherited(x2)) movups(x1, x2);
             orps(x1, op);
         }
     }
@@ -1418,7 +1420,7 @@ public:
         if (is_valid_isa(avx))
             vpslld(x, op, imm);
         else {
-            assert(x.isEqualIfNotInherited(op));
+            if (!x.isEqualIfNotInherited(op)) movdqa(x, op);
             pslld(x, imm);
         }
     }
@@ -1537,29 +1539,38 @@ public:
         vtestps(x1, op);
     }
 
+    void uni_vptest(const Xbyak::Xmm &x1, const Xbyak::Operand &op) {
+        assert(!(x1.isZMM() || op.isZMM()));
+        if (is_valid_isa(avx))
+            vptest(x1, op);
+        else
+            ptest(x1, op);
+    }
+
     void uni_vblendvps(const Xbyak::Xmm &x1, const Xbyak::Xmm &x2,
             const Xbyak::Operand &op, const Xbyak::Xmm &msk) {
+        assert(!x1.isZMM() && !x2.isZMM());
         if (is_valid_isa(avx))
             vblendvps(x1, x2, op, msk);
         else {
-            assert(x1.getIdx() == x2.getIdx());
             assert(msk.getIdx() == 0);
+            if (!x1.isEqualIfNotInherited(x2)) movups(x1, x2);
             blendvps(x1, op);
         }
     }
     void uni_vblendvps(const Xbyak::Ymm &x1, const Xbyak::Ymm &x2,
             const Xbyak::Operand &op, const Xbyak::Ymm &msk) {
+        assert(!x1.isZMM() && !x2.isZMM());
         vblendvps(x1, x2, op, msk);
     }
 
     void uni_vblendps(const Xbyak::Xmm &x1, const Xbyak::Xmm &x2,
             const Xbyak::Operand &op, const int imm) {
         assert(!x1.isZMM() && !x2.isZMM());
-
         if (is_valid_isa(avx))
             vblendps(x1, x2, op, imm);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (!x1.isEqualIfNotInherited(x2)) movups(x1, x2);
             blendps(x1, op, imm);
         }
     }
@@ -1699,7 +1710,7 @@ public:
         if (is_valid_isa(avx))
             vpackssdw(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             packssdw(x1, op);
         }
     }
@@ -1713,7 +1724,7 @@ public:
         if (is_valid_isa(avx))
             vpackuswb(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             packuswb(x1, op);
         }
     }
@@ -1727,7 +1738,7 @@ public:
         if (is_valid_isa(avx))
             vpacksswb(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             packsswb(x1, op);
         }
     }
@@ -1741,7 +1752,7 @@ public:
         if (is_valid_isa(avx))
             vpinsrb(x1, x2, op, imm);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             pinsrb(x1, op, imm);
         }
     }
@@ -1756,7 +1767,7 @@ public:
         if (is_valid_isa(avx))
             vpinsrd(x1, x2, op, imm);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             pinsrd(x1, op, imm);
         }
     }
@@ -1770,7 +1781,7 @@ public:
         if (is_valid_isa(avx))
             vpinsrq(x1, x2, op, imm);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             pinsrq(x1, op, imm);
         }
     }
@@ -1784,7 +1795,7 @@ public:
         if (is_valid_isa(avx))
             vpinsrw(x1, x2, op, imm);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             pinsrw(x1, op, imm);
         }
     }
@@ -1891,7 +1902,7 @@ public:
         if (is_valid_isa(avx))
             vpshufb(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             pshufb(x1, op);
         }
     }
@@ -1907,7 +1918,7 @@ public:
         else if (is_valid_isa(avx))
             vpand(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             pand(x1, op);
         }
     }
@@ -1917,7 +1928,7 @@ public:
         if (is_valid_isa(avx))
             vpslldq(x, op, imm);
         else {
-            assert(x.isEqualIfNotInherited(op));
+            if (!x.isEqualIfNotInherited(op)) movdqa(x, op);
             pslldq(x, imm);
         }
     }
@@ -1975,7 +1986,7 @@ public:
         if (is_valid_isa(avx))
             vpackusdw(x1, x2, op);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             packusdw(x1, op);
         }
     }
@@ -2009,7 +2020,7 @@ public:
         if (is_valid_isa(avx))
             vmovhlps(x1, x2, x3);
         else {
-            assert(x1.getIdx() == x2.getIdx());
+            if (x1.getIdx() != x2.getIdx()) movups(x1, x2);
             movhlps(x1, x3);
         }
     }
@@ -2070,9 +2081,26 @@ public:
 
     template <typename Vmm>
     void init_saturate_f32(Vmm vmm_lbound, Vmm vmm_ubound, Xbyak::Reg64 reg_tmp,
-            data_type_t idt, data_type_t odt, bool force_lbound = false) {
+            data_type_t idt, data_type_t odt, bool force_lbound = false,
+            const bool use_sat_cvt = false) {
+        // Only brgemm-based primitives support sat_cvt for now
+        // when converting data to int8 is needed later
+        // TODO: extend sat_cvt support to jit-based primitives
+        // and remove flag use_sat_cvt
         using namespace data_type;
         if (!((idt == f32) && utils::one_of(odt, u8, s8, s32))) return;
+        if (!force_lbound && use_sat_cvt
+                && isa_has_sat_cvt(max_cpu_isa(), odt)) {
+            // Initialize xmm_permb for ISA that has saturating conversion
+            // using vpermb+vmovups is more efficient than vpmovusdb
+            static constexpr char perm_data[] = {0, 4, 8, 12, 16, 20, 24, 28,
+                    32, 36, 40, 44, 48, 52, 56, 60};
+            auto xmm_permb = Xbyak::Xmm(vmm_ubound.getIdx());
+            uni_vpxor(vmm_ubound, vmm_ubound, vmm_ubound);
+            mov(reg_tmp, reinterpret_cast<size_t>(perm_data));
+            vmovups(xmm_permb, ptr[reg_tmp]);
+            return;
+        }
 
         assert(IMPLICATION(idt == u8 || force_lbound,
                 vmm_lbound.getIdx() != vmm_ubound.getIdx()));
@@ -2102,27 +2130,48 @@ public:
         using namespace data_type;
         if (!utils::one_of(odt, u8, s8, s32)) return;
 
-        // no need to apply lower saturation bound when odt is
+        // Note: no need to apply lower saturation bound when odt is
         // signed, as cvtps2dq will return MIN_INT if the value
         // does not fit. The param force_lbound, will force saturate values
         // unconditionally to lbound.
+        //
+        // Note: `vmaxps` and `vminps` would propagate the value from the second
+        // source operand if any of values is NaN. As `lbound` or `ubound` are
+        // fixed values, to propagate NaN from the input further, the register
+        // with data must be a second source operand (last argument).
+        // TODO: this will disalign the behavior with SSE41 which will require
+        // either a scratch register or stack allocation to handle the case.
+        // Since there's no request for SSE41, keep it as is for now.
         if (odt == u8 || force_lbound) {
             if (is_valid_isa(avx))
-                vmaxps(vmm, vmm, vmm_lbound);
+                vmaxps(vmm, vmm_lbound, vmm);
             else
                 maxps(vmm, vmm_lbound);
         }
         if (is_valid_isa(avx))
-            vminps(vmm, vmm, vmm_ubound);
+            vminps(vmm, vmm_ubound, vmm);
         else
             minps(vmm, vmm_ubound);
     }
 
     template <typename Vmm>
     void saturate_cvt_f32(const Vmm &vmm, const Vmm &vmm_lbound,
-            const Vmm &vmm_ubound, data_type_t odt, bool force_lbound = false) {
-        saturate_f32(vmm, vmm_lbound, vmm_ubound, odt, force_lbound);
-        uni_vcvtps2dq(vmm, vmm);
+            const Vmm &vmm_ubound, data_type_t odt, bool force_lbound = false,
+            const bool use_sat_cvt = false) {
+        // Only brgemm-based primitives support sat_cvt for now
+        // when converting data to int8 is needed later
+        // TODO: extend sat_cvt support to jit-based primitives
+        // and remove flag use_sat_cvt
+        if (use_sat_cvt && isa_has_sat_cvt(max_cpu_isa(), odt)) {
+            switch (odt) {
+                case data_type::s8: vcvtps2ibs(vmm, vmm); break;
+                case data_type::u8: vcvtps2iubs(vmm, vmm); break;
+                default: assert(!"unsupported data type");
+            }
+        } else {
+            saturate_f32(vmm, vmm_lbound, vmm_ubound, odt);
+            uni_vcvtps2dq(vmm, vmm);
+        }
     }
 
     /**
@@ -2148,7 +2197,7 @@ public:
         constexpr bool is_vmm_supported = std::is_same<Vmm, Xbyak::Ymm>::value
                 || std::is_same<Vmm, Xbyak::Xmm>::value;
         if (!is_vmm_supported) {
-            assert("load_bytes() is only supported for xmm and ymm");
+            assert(!"load_bytes() is only supported for xmm and ymm");
             return;
         }
 
@@ -2167,7 +2216,7 @@ public:
         constexpr bool is_vmm_supported = std::is_same<Vmm, Xbyak::Ymm>::value
                 || std::is_same<Vmm, Xbyak::Xmm>::value;
         if (!is_vmm_supported) {
-            assert("load_bytes() is only supported for xmm and ymm");
+            assert(!"load_bytes() is only supported for xmm and ymm");
             return;
         }
 
@@ -2458,8 +2507,8 @@ public:
         constexpr bool is_vmm_supported = std::is_same<Vmm, Xbyak::Ymm>::value
                 || std::is_same<Vmm, Xbyak::Xmm>::value;
         if (!is_vmm_supported) {
-            assert("load_bytes_to_dword_extension() is only supported for xmm "
-                   "and ymm");
+            assert(!"load_bytes_to_dword_extension() is only supported for xmm "
+                    "and ymm");
             return;
         }
 
@@ -2519,7 +2568,7 @@ public:
                 Vmm, Xbyak::Ymm /*dummy*/>::type;
 
         if (!is_vmm_supported) {
-            assert("store_data() not supported");
+            assert(!"store_data() not supported");
             return;
         }
         helper_store_data(type_out, supported_vmm_t(vmm.getIdx()), reg, offset,
@@ -2569,9 +2618,7 @@ private:
                 store_bytes(vmm, reg, offset, store_size);
                 break;
             case data_type::bf16:
-                vcvtneps2bf16(xmm, vmm,
-                        is_valid_isa(avx512_core_bf16) ? Xbyak::EvexEncoding
-                                                       : Xbyak::VexEncoding);
+                vcvtneps2bf16(xmm, vmm, get_encoding());
                 store_bytes(vmm, reg, offset, sizeof(bfloat16_t) * store_size);
                 break;
             case data_type::f16:
@@ -2626,7 +2673,7 @@ public:
                 load_bytes(
                         vmm, src_addr, sizeof(float16_t) * load_size, zero_vmm);
                 vcvtph2ps(vmm,
-                        typename vreg_traits<Vmm>::Vmm_lower_t(vmm.getIdx()));
+                        typename vreg_traits_t<Vmm>::Vmm_lower_t(vmm.getIdx()));
                 break;
             default: assert(!"unsupported source data type");
         }
@@ -2645,7 +2692,7 @@ public:
             const std::function<void(int)> &tail_process,
             const data_type_t data_type = data_type::f32) {
         const auto simd_w
-                = vreg_traits<Vmm>::vlen / types::data_type_size(data_type);
+                = vreg_traits_t<Vmm>::vlen / types::data_type_size(data_type);
 
         Xbyak::Label label_tbl, label_tbl_end;
         std::vector<Xbyak::Label> l_case(simd_w);
@@ -2671,22 +2718,33 @@ public:
         L(label_tbl_end);
     }
 
-    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_generator);
+    void init_f32_avx2_mask_ymm(
+            Xbyak::Ymm &ymm_mask, const Xbyak::Reg64 &reg_tmp, int tail_size) {
+        static const uint32_t mask_in[16] = {0xffffffff, 0xffffffff, 0xffffffff,
+                0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0,
+                0, 0, 0, 0, 0, 0, 0};
+        constexpr int max_words_in_ymm = 8;
+        auto mask_in_offset = max_words_in_ymm - tail_size;
+        mov(reg_tmp, reinterpret_cast<size_t>(&mask_in[mask_in_offset]));
+        vmovups(ymm_mask, ptr[reg_tmp]);
+    }
 
-public:
+    void transpose(const Xbyak::Reg64 &reg_src, const Xbyak::Reg64 &reg_dst,
+            dim_t src_stride, dim_t dst_stride, int nrows, int ncolumns,
+            data_type_t dt,
+            /*rest of vmms used only if there are tails*/ Xbyak::Ymm &ymm_tmp,
+            Xbyak::Ymm &ymm_mask, Xbyak::Xmm &xmm_upper_mask);
+    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_generator_t);
+
     /* All uni_ instructions -- apart from uni_vzeroupper() -- will comply with
      * the max_cpu_isa argument */
-    jit_generator(const char *name, void *code_ptr = nullptr,
-            size_t code_size = MAX_CODE_SIZE, bool use_autogrow = true,
-            cpu_isa_t max_cpu_isa = get_max_cpu_isa())
+    jit_generator_t(const char *name, cpu_isa_t max_cpu_isa = get_max_cpu_isa())
         : Xbyak::MmapAllocator(name)
-        , Xbyak::CodeGenerator(code_size,
-                  (code_ptr == nullptr && use_autogrow) ? Xbyak::AutoGrow
-                                                        : code_ptr,
+        , Xbyak::CodeGenerator(max_code_size, Xbyak::AutoGrow,
                   /*allocator=*/this)
         , max_cpu_isa_(max_cpu_isa) {}
 
-    virtual ~jit_generator() {}
+    ~jit_generator_t() override = default;
 
     virtual const char *name() const = 0;
     virtual const char *source_file() const = 0;
@@ -2713,6 +2771,8 @@ public:
         return (jit_ker_) ? status::success : status::runtime_error;
     }
 
+    inline cpu_isa_t max_cpu_isa() const noexcept { return max_cpu_isa_; }
+
 private:
     const cpu_isa_t max_cpu_isa_;
     const Xbyak::uint8 *getCode() {
@@ -2730,6 +2790,8 @@ private:
     static inline bool is_initialized() {
         return Xbyak::GetError() == Xbyak::ERR_NONE;
     }
+
+    static constexpr unsigned max_code_size = 256 * 1024;
 
 protected:
     virtual void generate() = 0;

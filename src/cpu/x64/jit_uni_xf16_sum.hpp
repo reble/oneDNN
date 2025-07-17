@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #ifndef CPU_X64_JIT_UNI_XF16_SUM_HPP
 #define CPU_X64_JIT_UNI_XF16_SUM_HPP
 
+#include <memory>
 #include "common/c_types_map.hpp"
 #include "common/primitive.hpp"
 
@@ -51,14 +52,14 @@ struct jit_sum_call_t {
 };
 
 template <typename Vmm>
-struct jit_uni_xf16_sum_kernel_t : public jit_generator {
+struct jit_uni_xf16_sum_kernel_t : public jit_generator_t {
     jit_uni_xf16_sum_kernel_t(jit_sum_conf_t ajsp, unsigned int num_acc_iters)
-        : jit_generator(jit_name())
+        : jit_generator_t(jit_name())
         , jsp(ajsp)
         , reg_src {r8, r9, r10, r11, r12, r13, r14, r15}
         , num_acc_iters(num_acc_iters) {}
 
-    ~jit_uni_xf16_sum_kernel_t() {}
+    ~jit_uni_xf16_sum_kernel_t() override = default;
 
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_uni_xf16_sum_kernel_t)
 
@@ -102,16 +103,17 @@ struct jit_avx512_core_bf16_sum_kernel_t
     jit_avx512_core_bf16_sum_kernel_t(jit_sum_conf_t ajsp)
         : jit_uni_xf16_sum_kernel_t<Xbyak::Zmm>(
                 ajsp, utils::div_up(ajsp.num_srcs, 2))
-        , max_vregs_available(cpu_isa_traits<avx512_core>::n_vregs
+        , max_vregs_available(cpu_isa_traits_t<avx512_core>::n_vregs
                   - (isa_has_bf16(jsp.isa) ? 1 : 6))
         , bf16_emu_(nullptr) {
         if (!mayiuse(avx512_core_bf16))
-            bf16_emu_ = new bf16_emulation_t(this, bf16_emu_reserved_1,
-                    bf16_emu_reserved_2, bf16_emu_reserved_3, bf16_emu_scratch,
-                    bf16_emu_reserved_4, bf16_emu_reserved_5);
+            bf16_emu_ = utils::make_unique<bf16_emulation_t>(this,
+                    bf16_emu_reserved_1, bf16_emu_reserved_2,
+                    bf16_emu_reserved_3, bf16_emu_scratch, bf16_emu_reserved_4,
+                    bf16_emu_reserved_5);
     }
 
-    ~jit_avx512_core_bf16_sum_kernel_t() { delete bf16_emu_; }
+    ~jit_avx512_core_bf16_sum_kernel_t() override = default;
 
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx512_core_bf16_sum_kernel_t)
 
@@ -173,7 +175,7 @@ protected:
         return num_regs;
     }
 
-    bf16_emulation_t *bf16_emu_;
+    std::unique_ptr<bf16_emulation_t> bf16_emu_;
 
     Xbyak::Zmm bf16_emu_reserved_1 = Xbyak::Zmm(26);
     Xbyak::Zmm bf16_emu_reserved_2 = Xbyak::Zmm(27);
@@ -202,7 +204,7 @@ struct jit_avx2_vnni_2_xf16_sum_kernel_t
     jit_avx2_vnni_2_xf16_sum_kernel_t(jit_sum_conf_t ajsp)
         : jit_uni_xf16_sum_kernel_t<Xbyak::Ymm>(ajsp, ajsp.num_srcs) {}
 
-    ~jit_avx2_vnni_2_xf16_sum_kernel_t() {}
+    ~jit_avx2_vnni_2_xf16_sum_kernel_t() override = default;
 
     DECLARE_CPU_JIT_AUX_FUNCTIONS(jit_avx2_vnni_2_xf16_sum_kernel_t)
 
@@ -256,6 +258,8 @@ struct jit_xf16_sum_t : public primitive_t {
         status_t init(engine_t *engine) {
 
             unsigned int max_num_arrs;
+            // disabling verbose dispatch messages for unsupported isa for
+            // better readability
             if (!mayiuse(isa)) return status::unimplemented;
             if (is_superset(isa, avx512_core)) {
                 max_num_arrs = jit_avx512_core_bf16_sum_kernel_t::max_num_arrs;
@@ -318,13 +322,13 @@ struct jit_xf16_sum_t : public primitive_t {
 
     status_t execute(const exec_ctx_t &ctx) const override;
 
-    typedef typename prec_traits<src_data_type>::type src_data_t;
-    typedef typename prec_traits<dst_data_type>::type dst_data_t;
-    typedef typename prec_traits<data_type::f32>::type acc_data_t;
+    using src_data_t = typename prec_traits_t<src_data_type>::type;
+    using dst_data_t = typename prec_traits_t<dst_data_type>::type;
+    using acc_data_t = typename prec_traits_t<data_type::f32>::type;
 
 private:
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
-    std::unique_ptr<jit_generator> kernel_;
+    std::unique_ptr<jit_generator_t> kernel_;
 };
 
 } // namespace x64

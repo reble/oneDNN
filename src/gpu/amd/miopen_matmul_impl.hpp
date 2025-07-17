@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -18,7 +18,7 @@
 #ifndef GPU_AMD_MIOPEN_MATMUL_IMPL_HPP
 #define GPU_AMD_MIOPEN_MATMUL_IMPL_HPP
 
-#include "gpu/amd/sycl_hip_engine.hpp"
+#include "gpu/amd/engine.hpp"
 #include "gpu/amd/sycl_hip_utils.hpp"
 #include "miopen/miopen.h"
 #include "rocblas/rocblas.h"
@@ -154,10 +154,10 @@ struct miopen_matmul_impl_t {
     void convert_dims_matmul(
             const dnnl_dim_t *dims, int *new_dims, int n_dims) {
         new_dims[0] = 1;
-        for (size_t i = 0; i < n_dims; i++) {
+        for (int i = 0; i < n_dims; i++) {
             new_dims[i + 1] = static_cast<int>(dims[i]);
         }
-        for (size_t i = n_dims; i < 4; i++) {
+        for (int i = n_dims; i < 4; i++) {
             new_dims[i + 1] = 1;
         }
     }

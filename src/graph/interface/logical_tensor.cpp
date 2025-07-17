@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -38,7 +38,9 @@ size_t logical_tensor_wrapper_t::size() const {
                     static_cast<size_t>(strided_pdim * effective_stride));
         }
 
-        return max_size * data_type_size();
+        size_t data_size = utils::div_up(
+                max_size * data_type_size(), sub_byte_data_type_multiplier());
+        return data_size;
     } else if (is_opaque()) {
         size_t layout_id = lt->layout.layout_id;
         auto backend
@@ -175,6 +177,8 @@ size_t logical_tensor_wrapper_t::hash() const noexcept {
             break;
         default: assertm(false, "unknown layout_type");
     }
+    // property type
+    seed = hash_combine(seed, static_cast<size_t>(this->property_type()));
     return seed;
 }
 
@@ -185,6 +189,11 @@ status_t DNNL_API dnnl_graph_logical_tensor_init(
         return status::invalid_arguments;
     }
 
+    // currently only supports s32 host scalar.
+    if (ptype == property_type::host_scalar && dtype != data_type::s32) {
+        return status::invalid_arguments;
+    }
+
     auto val = logical_tensor_t();
     val.id = tid;
     val.ndims = ndims;
@@ -192,10 +201,15 @@ status_t DNNL_API dnnl_graph_logical_tensor_init(
     val.layout_type = ltype;
     val.property = ptype;
 
-    // initialize the dims and strides
-    std::fill(val.dims, val.dims + DNNL_MAX_NDIMS, DNNL_GRAPH_UNKNOWN_DIM);
-    std::fill(val.layout.strides, val.layout.strides + DNNL_MAX_NDIMS,
-            DNNL_GRAPH_UNKNOWN_DIM);
+    if (ndims == 0) {
+        val.dims[0] = 0;
+        if (ltype == layout_type::strided) { val.layout.strides[0] = 0; }
+    } else {
+        // initialize the dims and strides
+        std::fill(val.dims, val.dims + DNNL_MAX_NDIMS, DNNL_GRAPH_UNKNOWN_DIM);
+        std::fill(val.layout.strides, val.layout.strides + DNNL_MAX_NDIMS,
+                DNNL_GRAPH_UNKNOWN_DIM);
+    }
 
     *logical_tensor = val;
 
@@ -207,6 +221,11 @@ status_t DNNL_API dnnl_graph_logical_tensor_init_with_dims(
         int32_t ndims, const dims_t dims, layout_type_t ltype,
         property_type_t ptype) {
     if (!logical_tensor || ndims < 0) return status::invalid_arguments;
+
+    // currently only supports s32 host scalar.
+    if (ptype == property_type::host_scalar && dtype != data_type::s32) {
+        return status::invalid_arguments;
+    }
 
     auto val = logical_tensor_t();
     val.id = tid;
@@ -249,6 +268,11 @@ status_t DNNL_API dnnl_graph_logical_tensor_init_with_strides(
         int32_t ndims, const dims_t dims, const dims_t strides,
         property_type_t ptype) {
     if (!logical_tensor || ndims < 0) return status::invalid_arguments;
+
+    // currently only supports s32 host scalar.
+    if (ptype == property_type::host_scalar && dtype != data_type::s32) {
+        return status::invalid_arguments;
+    }
 
     auto val = logical_tensor_t();
     val.id = tid;

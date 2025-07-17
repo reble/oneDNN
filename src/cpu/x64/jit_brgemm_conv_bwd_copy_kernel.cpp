@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -28,13 +28,13 @@ using namespace data_type;
 
 namespace jit_avx512_core_brgemm_conv_bwd_copy_kernel {
 
-#define GET_OFF(field) offsetof(jit_brgemm_conv_bwd_copy_kernel_call_s, field)
+#define GET_OFF(field) offsetof(jit_brgemm_conv_bwd_copy_kernel_args_t, field)
 
 template <typename Vmm>
 jit_avx512_core_brgemm_conv_bwd_copy_kernel_t<Vmm>::
         jit_avx512_core_brgemm_conv_bwd_copy_kernel_t(
                 const jit_brgemm_conv_conf_t &ajcp)
-    : jit_generator(jit_name()), jcp(ajcp) {}
+    : jit_generator_t(jit_name()), jcp(ajcp) {}
 
 // use different vmovdqu32/16/8 due to case when tail mask used
 template <typename Vmm>
@@ -47,7 +47,9 @@ void jit_avx512_core_brgemm_conv_bwd_copy_kernel_t<Vmm>::load(
         case bf16:
         case f16: vmovdqu16(x, addr); break;
         case s8:
-        case u8: vmovdqu8(x, addr); break;
+        case u8:
+        case f8_e5m2:
+        case f8_e4m3: vmovdqu8(x, addr); break;
         default: assert(!"Unknown type!");
     }
 }
@@ -62,7 +64,9 @@ void jit_avx512_core_brgemm_conv_bwd_copy_kernel_t<Vmm>::store(
         case bf16:
         case f16: vmovdqu16(addr, x); break;
         case s8:
-        case u8: vmovdqu8(addr, x); break;
+        case u8:
+        case f8_e5m2:
+        case f8_e4m3: vmovdqu8(addr, x); break;
         default: assert(!"Unknown type!");
     }
 }
@@ -83,7 +87,7 @@ template <typename Vmm>
 void jit_avx512_core_brgemm_conv_bwd_copy_kernel_t<Vmm>::generate() {
     preamble();
 
-    const auto VL = vreg_traits<Vmm>::vlen;
+    const auto VL = vreg_traits_t<Vmm>::vlen;
     const auto simd_w = VL / jcp.dst_dsz;
     const auto n_vec = jcp.ic_block / simd_w;
     const auto n_tail_vec = (jcp.ic % jcp.ic_block) / simd_w;

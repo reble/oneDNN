@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Arm Ltd. and affiliates
+* Copyright 2022-2024 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,7 +37,7 @@ struct acl_deconv_conf_t {
     bool with_bias;
     // If this is true, the result of the convolution goes into a temporarily
     // allocated ACL tensor to be accumulated into the oneDNN dst during postops
-    bool use_dst_acc;
+    bool use_dst_acc_for_sum;
     bool fast_math;
     arm_compute::TensorInfo src_info;
     arm_compute::TensorInfo wei_info;
@@ -82,13 +82,9 @@ private:
 struct acl_deconvolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_deconvolution_fwd_pd_t {
         using cpu_deconvolution_fwd_pd_t::cpu_deconvolution_fwd_pd_t;
-        pd_t(const deconvolution_desc_t *adesc, const primitive_attr_t *attr,
-                const deconvolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_deconvolution_fwd_pd_t(adesc, attr, hint_fwd_pd)
-            , acl_pd_conf()
-            , post_ops() {}
 
-        DECLARE_COMMON_PD_T("acl", acl_deconvolution_fwd_t);
+        DECLARE_COMMON_PD_T(
+                "acl", acl_deconvolution_fwd_t, USE_GLOBAL_SCRATCHPAD);
 
         status_t init(engine_t *engine) {
             using namespace data_type;
@@ -193,18 +189,23 @@ struct acl_deconvolution_fwd_t : public primitive_t {
             }
 
             // Data layout
-            const auto acl_layout = is_nspc ? arm_compute::DataLayout::NHWC
-                                            : arm_compute::DataLayout::NCHW;
+            const arm_compute::DataLayout acl_layout = is_nspc
+                    ? arm_compute::DataLayout::NHWC
+                    : arm_compute::DataLayout::NCHW;
 
             acl_pd_conf.src_info = arm_compute::TensorInfo(is_nspc
                             ? arm_compute::TensorShape(ic, iw, ih, mb)
                             : arm_compute::TensorShape(iw, ih, ic, mb),
                     1, acl_src_data_t, acl_layout);
 
-            acl_pd_conf.wei_info = arm_compute::TensorInfo(is_nspc
-                            ? arm_compute::TensorShape(ic, kw, kh, oc)
-                            : arm_compute::TensorShape(kw, kh, ic, oc),
-                    1, acl_wei_data_t, acl_layout);
+            auto wei_info_tensor_shape = is_nspc
+                    ? arm_compute::TensorShape(ic, kw, kh, oc)
+                    : arm_compute::TensorShape(kw, kh, ic, oc);
+            // ACL removes last dimension if dim is 1.
+            // Below fix ensures the tensor shape is correct when queried.
+            wei_info_tensor_shape.set_num_dimensions(4);
+            acl_pd_conf.wei_info = arm_compute::TensorInfo(
+                    wei_info_tensor_shape, 1, acl_wei_data_t, acl_layout);
 
             acl_pd_conf.dst_info = arm_compute::TensorInfo(is_nspc
                             ? arm_compute::TensorShape(oc, ow, oh, mb)
@@ -239,18 +240,15 @@ struct acl_deconvolution_fwd_t : public primitive_t {
             // padding is set for convolution. Otherwise, describe deconvolution as convolution of
             // upsampling input with stride = 1 and pad = 0.
             arm_compute::ConvolutionMethod conv_method;
-            arm_compute::TensorInfo *conv_src_info;
+            arm_compute::TensorInfo conv_src_info(
+                    acl_pd_conf.src_info.clone()->set_is_resizable(true));
             unsigned int pad_left = 0;
             unsigned int pad_right = 0;
             unsigned int pad_top = 0;
             unsigned int pad_bottom = 0;
             if (sh != 1 || sw != 1) {
-                arm_compute::TensorInfo scale_out_info(
-                        acl_pd_conf.src_info.clone()
-                                ->set_is_resizable(true)
-                                .reset_padding()
-                                .set_tensor_shape(scale_out_shape));
-                conv_src_info = &scale_out_info;
+                conv_src_info.reset_padding();
+                conv_src_info.set_tensor_shape(scale_out_shape);
             } else {
                 // compute correct padding here
                 pad_left = pr > pl ? pr - pl : 0;
@@ -265,15 +263,13 @@ struct acl_deconvolution_fwd_t : public primitive_t {
                 pad_right += deconv_pad_x / 2;
                 pad_top += deconv_pad_y / 2;
                 pad_bottom += deconv_pad_y / 2;
-
-                conv_src_info = &acl_pd_conf.src_info;
             }
             const arm_compute::PadStrideInfo conv_info(1, 1, pad_left,
                     pad_right, pad_top, pad_bottom,
                     arm_compute::DimensionRoundingType::CEIL);
             conv_method
                     = arm_compute::NEConvolutionLayer::get_convolution_method(
-                            conv_src_info, &acl_pd_conf.wei_info,
+                            &conv_src_info, &acl_pd_conf.wei_info,
                             &acl_pd_conf.dst_info, conv_info,
                             arm_compute::WeightsInfo(),
                             arm_compute::Size2D(1U, 1U),
@@ -287,12 +283,18 @@ struct acl_deconvolution_fwd_t : public primitive_t {
             }
 
             CHECK(post_ops.init(engine, attr_.post_ops_, dst_md_));
-            acl_pd_conf.use_dst_acc = post_ops.has_sum();
+            acl_pd_conf.use_dst_acc_for_sum = post_ops.has_sum();
+
+            if (acl_pd_conf.use_dst_acc_for_sum) {
+                auto scratchpad = scratchpad_registry().registrar();
+                scratchpad.book(memory_tracking::names::key_generic_acc,
+                        dst_d.nelems(), dst_d.data_type_size());
+            }
 
             return status::success;
         }
 
-        acl_deconv_conf_t acl_pd_conf;
+        acl_deconv_conf_t acl_pd_conf = utils::zero<decltype(acl_pd_conf)>();
         acl_post_ops_t post_ops;
 
     private:
@@ -317,8 +319,6 @@ struct acl_deconvolution_fwd_t : public primitive_t {
         // Configure the resource based on information from primitive descriptor
         auto st = r->configure(pd()->acl_pd_conf);
         if (st == status::success) { mapper.add(this, std::move(r)); }
-
-        CHECK(pd()->post_ops.create_resource(engine, mapper));
 
         return st;
     }

@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2024 Intel Corporation
+ * Copyright 2022-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,16 +25,27 @@
 
 #include <graph/utils/utils.hpp>
 
+#include "common/dnnl_thread.hpp"
+#include "common/stream.hpp"
+
 #include "graph/backend/dnnl/common.hpp"
 #include "graph/backend/dnnl/dnnl_constant_tensor_cache.hpp"
 #include "graph/backend/dnnl/fusion_info.hpp"
 #include "graph/backend/dnnl/internal_attrs.hpp"
 #include "graph/backend/dnnl/op_executable.hpp"
+#include "graph/backend/dnnl/utils.hpp"
 
 namespace dnnl {
 namespace impl {
 namespace graph {
 namespace dnnl_impl {
+
+#define VCHECK_OP_EXECUTABLE(cond, msg, ...) \
+    if (!(cond)) { VERROR(graph, op_executable, msg, ##__VA_ARGS__); }
+
+#define VCHECK_PATTERN_UTILS(cond, status, msg, ...) \
+    VCONDCHECK(graph, create, check, pattern, (cond), status, msg, \
+            ##__VA_ARGS__);
 
 const indices_t::type_t input = indices_t::type_t::input;
 const indices_t::type_t output = indices_t::type_t::output;
@@ -66,8 +77,9 @@ conv_fwd_executable_t::desc_t conv_fwd_executable_t::create_desc(
         prm_attr = make_dnnl_primitive_attr(op, fusion_info);
     }
     prm_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    auto fpmath = mgr.get_fpmath_mode();
     prm_attr.set_fpmath_mode(
-            static_cast<dnnl::fpmath_mode>(mgr.get_fpmath_mode()));
+            static_cast<dnnl::fpmath_mode>(fpmath.mode_), fpmath.apply_to_int_);
     const bool can_use_blocked_layout = mgr.get_use_blocked_layout();
 
     auto src = make_dnnl_memory_desc(
@@ -181,8 +193,9 @@ deconv_fwd_executable_t::desc_t deconv_fwd_executable_t::create_desc(
         prm_attr = make_dnnl_primitive_attr(op, mgr.get_info(key));
     }
     prm_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    auto fpmath = mgr.get_fpmath_mode();
     prm_attr.set_fpmath_mode(
-            static_cast<dnnl::fpmath_mode>(mgr.get_fpmath_mode()));
+            static_cast<dnnl::fpmath_mode>(fpmath.mode_), fpmath.apply_to_int_);
 
     auto src = make_dnnl_memory_desc(
             op->get_input_value(0)->get_logical_tensor());
@@ -241,8 +254,9 @@ deconv_bwd_data_executable_t::desc_t deconv_bwd_data_executable_t::create_desc(
         prm_attr = make_dnnl_primitive_attr(op, mgr.get_info(key));
     }
     prm_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    auto fpmath = mgr.get_fpmath_mode();
     prm_attr.set_fpmath_mode(
-            static_cast<dnnl::fpmath_mode>(mgr.get_fpmath_mode()));
+            static_cast<dnnl::fpmath_mode>(fpmath.mode_), fpmath.apply_to_int_);
 
     auto diff_dst = make_dnnl_memory_desc(
             op->get_input_value(0)->get_logical_tensor());
@@ -292,8 +306,9 @@ deconv_bwd_weights_executable_t::create_desc(std::shared_ptr<op_t> &op,
         int64_t key = op->get_attr<int64_t>(op_attr::fusion_info_key);
         prm_attr = make_dnnl_primitive_attr(op, mgr.get_info(key));
     }
+    auto fpmath = mgr.get_fpmath_mode();
     prm_attr.set_fpmath_mode(
-            static_cast<dnnl::fpmath_mode>(mgr.get_fpmath_mode()));
+            static_cast<dnnl::fpmath_mode>(fpmath.mode_), fpmath.apply_to_int_);
 
     auto src = make_dnnl_memory_desc(
             op->get_input_value(0)->get_logical_tensor());
@@ -328,7 +343,7 @@ matmul_executable_t::desc_t matmul_executable_t::create_desc(
                 pd_cache.at(op.get()));
         return {pd, true};
     }
-
+    const bool can_use_blocked_layout = mgr.get_use_blocked_layout();
     dnnl::primitive_attr prm_attr;
     if (op->has_attr(op_attr::fusion_info_key)
             && op->get_attr<int64_t>(op_attr::fusion_info_key) != -1) {
@@ -336,70 +351,41 @@ matmul_executable_t::desc_t matmul_executable_t::create_desc(
         prm_attr = make_dnnl_primitive_attr(op, mgr.get_info(key));
     }
     prm_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    auto fpmath = mgr.get_fpmath_mode();
     prm_attr.set_fpmath_mode(
-            static_cast<dnnl::fpmath_mode>(mgr.get_fpmath_mode()));
+            static_cast<dnnl::fpmath_mode>(fpmath.mode_), fpmath.apply_to_int_);
 
     auto src = make_dnnl_memory_desc(
             op->get_input_value(0)->get_logical_tensor());
-    // For non-constant activation, create primitive desc with strided layout
-    // when:
-    // 1) activation has 4 dimensions and layout is acbd since oneDNN has
-    //    optimized kernel
-    // 2) activation has 2/3 dimensions and device kind is gpu for avoiding
-    //    blocked activation. This can reduce the cost for the reorder between
-    //    plain and block layout, especially for users who compile partition
-    //    with plain layout. The performance of strided primitive on GPU will be
-    //    optimized by oneDNN.
+    // For non-constant activation and weight, create primitive desc with
+    // strided layout
     bool const_activation
             = logical_tensor_wrapper_t(
                       op->get_input_value(0)->get_logical_tensor())
                       .is_constant()
             && is_constant_cache_enabled(p_engine);
-    const bool use_strided_src = !const_activation
-            && ((src.get_ndims() == 4
-                        && is_format(src, dnnl::memory::format_tag::acbd))
-                    || ((src.get_ndims() == 2 || src.get_ndims() == 3)
-                            && p_engine.get_kind() == dnnl::engine::kind::gpu));
-    // convert src memory desc to any when:
-    // 1) not the situation mentioned above
-    // 2) the given md is blocked and convert to queried layout is necessary
-    if (!use_strided_src || !is_plain(src)) { src = to_format_any(src); }
+    if (can_use_blocked_layout && const_activation) {
+        src = to_format_any(src);
+    }
     auto wei = make_dnnl_memory_desc(
             op->get_input_value(1)->get_logical_tensor());
-    // For non-constant weight, create primitive desc with strided layout when:
-    // 1) weight has 4 dimensions and layout is adbc/abdc/acbd since oneDNN has
-    //    optimized kernel
     bool const_weight = logical_tensor_wrapper_t(
                                 op->get_input_value(1)->get_logical_tensor())
                                 .is_constant()
             && is_constant_cache_enabled(p_engine);
-    const bool use_strided_wei = !const_weight
-            && (wei.get_ndims() == 4
-                    && (is_format(wei, dnnl::memory::format_tag::adbc)
-                            || is_format(wei, dnnl::memory::format_tag::abdc)
-                            || is_format(wei, dnnl::memory::format_tag::acbd)));
-    if (!use_strided_wei) { wei = to_format_any(wei); }
+    if (can_use_blocked_layout && const_weight) { wei = to_format_any(wei); }
     auto dst = make_dnnl_memory_desc(
             op->get_output_value(0)->get_logical_tensor());
     const bool keep_dst_layout = op->has_attr(op_attr::keep_dst_layout)
             && op->get_attr<bool>(op_attr::keep_dst_layout);
-    const bool use_strided_dst
-            = ((src.get_ndims() == 2 || src.get_ndims() == 3)
-                      && p_engine.get_kind() == dnnl::engine::kind::gpu)
-            || keep_dst_layout;
-    if (!use_strided_dst) {
-        dst = to_format_any(dst);
-    } else if (dst.get_format_kind() == dnnl::memory::format_kind::any
+    if (dst.get_format_kind() == dnnl::memory::format_kind::any
             && !keep_dst_layout) {
         // convert to strided for avoiding blocked activation. The format kind
         // of dst is possible to be any when:
         // 1) It is created with internal logical tensor
         // 2) It is the partition output and defined by user
         dst = to_ncx_format(dst);
-    } else {
-        // do nothing
     }
-
     dnnl::matmul::primitive_desc pd;
     if (op->has_attr(op_attr::with_bias)
             && op->get_attr<bool>(op_attr::with_bias)) {
@@ -494,8 +480,7 @@ pool_executable_t::desc_t pool_executable_t::create_desc(
                 ? algorithm::pooling_avg_exclude_padding
                 : algorithm::pooling_avg_include_padding;
     } else {
-        BACKEND_DNNL_ENFORCE(
-                0, "Currently only int8 MaxPool/AvgPool is supported.");
+        assert(!"only int8 MaxPool/AvgPool is supported.");
     }
 
     dnnl::pooling_forward::primitive_desc pd(p_engine, prop, algo, src, dst,
@@ -576,9 +561,7 @@ pool_bwd_executable_t::desc_t pool_bwd_executable_t::create_desc(
                 ? algorithm::pooling_avg_exclude_padding
                 : algorithm::pooling_avg_include_padding;
     } else {
-        BACKEND_DNNL_ENFORCE(0,
-                "Currently only MaxPoolBackprop/AvgPoolBackprop is "
-                "supported.");
+        assert(!"only MaxPoolBackprop/AvgPoolBackprop is supported.");
     }
 
     if (op->get_attr<std::string>(op_attr::kind) == "maxpool") {
@@ -751,9 +734,12 @@ layernorm_executable_t::desc_t layernorm_executable_t::create_desc(
 
     auto src = make_dnnl_memory_desc(
             op->get_input_value(0)->get_logical_tensor());
+    // onednn 3.6 spec: Implementations optimized for memory formats ab, abc,
+    // bac, abcd
+    src = to_ncx_format(src);
     auto dst = make_dnnl_memory_desc(
             op->get_output_value(0)->get_logical_tensor());
-
+    dst = to_format_any(dst);
     dnnl::layer_normalization_forward::primitive_desc pd(
             p_engine, pkind, src, dst, epsilon, flags, prm_attr);
 
@@ -829,8 +815,9 @@ conv_bwd_data_executable_t::desc_t conv_bwd_data_executable_t::create_desc(
         prm_attr = make_dnnl_primitive_attr(op, mgr.get_info(key));
     }
     prm_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    auto fpmath = mgr.get_fpmath_mode();
     prm_attr.set_fpmath_mode(
-            static_cast<dnnl::fpmath_mode>(mgr.get_fpmath_mode()));
+            static_cast<dnnl::fpmath_mode>(fpmath.mode_), fpmath.apply_to_int_);
     const bool can_use_blocked_layout = mgr.get_use_blocked_layout();
 
     auto diff_dst = make_dnnl_memory_desc(
@@ -888,8 +875,9 @@ conv_bwd_weights_executable_t::create_desc(std::shared_ptr<op_t> &op,
         prm_attr = make_dnnl_primitive_attr(op, mgr.get_info(key));
     }
     prm_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    auto fpmath = mgr.get_fpmath_mode();
     prm_attr.set_fpmath_mode(
-            static_cast<dnnl::fpmath_mode>(mgr.get_fpmath_mode()));
+            static_cast<dnnl::fpmath_mode>(fpmath.mode_), fpmath.apply_to_int_);
     const bool can_use_blocked_layout = mgr.get_use_blocked_layout();
 
     auto src = make_dnnl_memory_desc(
@@ -956,9 +944,7 @@ eltwise_executable_t::desc_t eltwise_executable_t::create_desc(
 
     const algorithm algo = static_cast<dnnl::algorithm>(
             op->get_attr<int64_t>(op_attr::alg_kind));
-    if (algo == algorithm::undef) {
-        BACKEND_DNNL_ENFORCE(0, "Unsupported eltwise op.");
-    }
+    if (algo == algorithm::undef) { assert(!"unsupported eltwise op."); }
 
     dnnl::eltwise_forward::primitive_desc pd;
     pd = dnnl::eltwise_forward::primitive_desc(p_engine, prop_kind::forward,
@@ -1070,7 +1056,7 @@ concat_executable_t::desc_t concat_executable_t::create_desc(
     const auto rank = op->get_output_value(0)->get_logical_tensor().ndims;
     const auto res = utils::try_reverse_axis(
             op->get_attr<int64_t>(op_attr::axis), rank);
-    assertm(res.first, "Incorrect axis value.");
+    VCHECK_OP_EXECUTABLE(res.first, "invalid axis for concat");
     const auto axis = res.second;
 
     dnnl::primitive_attr prm_attr;
@@ -1086,9 +1072,8 @@ concat_executable_t::desc_t concat_executable_t::create_desc(
     for (const auto &in_val : op->get_input_values()) {
         const auto tmp_desc
                 = make_dnnl_memory_desc(in_val->get_logical_tensor());
-        src_mds.emplace_back(
-                memory::desc {tmp_desc.get_dims(), tmp_desc.get_data_type(),
-                        get_forced_format_tag(tmp_desc.get_dims())});
+        src_mds.emplace_back(tmp_desc.get_dims(), tmp_desc.get_data_type(),
+                get_forced_format_tag(tmp_desc.get_dims()));
     }
     const auto tmp_desc = make_dnnl_memory_desc(
             op->get_output_value(0)->get_logical_tensor());
@@ -1134,7 +1119,7 @@ resampling_executable_t::desc_t resampling_executable_t::create_desc(
     } else if (mode == "linear" || mode == "bilinear" || mode == "trilinear") {
         algo = algorithm::resampling_linear;
     } else {
-        BACKEND_DNNL_ENFORCE(0, "Unsupported resampling mode.");
+        assert(!"unsupported resampling mode.");
     }
 
     dnnl::resampling_forward::primitive_desc pd;
@@ -1171,7 +1156,7 @@ resampling_bwd_executable_t::desc_t resampling_bwd_executable_t::create_desc(
     } else if (mode == "linear" || mode == "bilinear" || mode == "trilinear") {
         algo = algorithm::resampling_linear;
     } else {
-        BACKEND_DNNL_ENFORCE(0, "Unsupported resampling mode.");
+        assert(!"unsupported resampling mode.");
     }
 
     auto src = make_dnnl_memory_desc(
@@ -1236,8 +1221,15 @@ binary_executable_t::desc_t binary_executable_t::create_desc(
             op->get_attr<int64_t>(op_attr::alg_kind));
 
     dnnl::binary::primitive_desc pd;
-    pd = dnnl::binary::primitive_desc(
-            p_engine, algo, src0, src1, dst, prm_attr);
+    if (algo == algorithm::binary_select) {
+        auto src2 = make_dnnl_memory_desc(
+                op->get_input_value(2)->get_logical_tensor());
+        pd = dnnl::binary::primitive_desc(
+                p_engine, algo, src0, src1, src2, dst, prm_attr);
+    } else {
+        pd = dnnl::binary::primitive_desc(
+                p_engine, algo, src0, src1, dst, prm_attr);
+    }
 
     pd_cache.insert({op.get(), pd});
 
@@ -1348,10 +1340,17 @@ softmax_executable_t::desc_t softmax_executable_t::create_desc(
     int64_t axis = op->get_attr<int64_t>(op_attr::axis);
     if (axis < 0) { axis += src.get_ndims(); }
 
-    const dnnl::algorithm algo
-            = op->get_kind() == dnnl_impl::op_kind::dnnl_logsoftmax
-            ? dnnl::algorithm::softmax_log
-            : dnnl::algorithm::softmax_accurate;
+    dnnl::algorithm algo = dnnl::algorithm::undef;
+    if (op->get_kind() == dnnl_impl::op_kind::dnnl_softmax) {
+        const auto mode = op->get_attr<std::string>(op_attr::mode);
+        algo = mode == "inf_as_zero" ? static_cast<dnnl::algorithm>(
+                       dnnl::impl::alg_kind::softmax_accurate_inf_as_zero)
+                                     : dnnl::algorithm::softmax_accurate;
+    } else if (op->get_kind() == dnnl_impl::op_kind::dnnl_logsoftmax) {
+        algo = dnnl::algorithm::softmax_log;
+    } else {
+        assert(!"unexpected op kind");
+    }
 
     dnnl::softmax_forward::primitive_desc pd;
     pd = dnnl::softmax_forward::primitive_desc(p_engine,
@@ -1389,12 +1388,14 @@ softmax_bwd_executable_t::desc_t softmax_bwd_executable_t::create_desc(
     assertm(res.first, "Incorrect axis value.");
     const auto axis = res.second;
 
+    auto dst_lt = op->get_input_value(1)->get_logical_tensor();
+    auto dst = make_dnnl_memory_desc(dst_lt);
+
     // construct src with layout information from dst and data type information
     // from diff_src.
-    auto dst_lt = op->get_input_value(1)->get_logical_tensor();
-    dst_lt.data_type = diff_src_lt.data_type;
-    auto dst = make_dnnl_memory_desc(dst_lt);
-    const dnnl::memory::desc &src = dst;
+    auto src_lt = dst_lt;
+    src_lt.data_type = diff_src_lt.data_type;
+    auto src = make_dnnl_memory_desc(src_lt);
 
     const dnnl::algorithm algo
             = op->get_kind() == dnnl_impl::op_kind::dnnl_logsoftmax_bwd
@@ -1467,9 +1468,7 @@ reduction_executable_t::desc_t reduction_executable_t::create_desc(
 
     const algorithm alg = static_cast<dnnl::algorithm>(
             op->get_attr<int64_t>(op_attr::alg_kind));
-    if (alg == algorithm::undef) {
-        BACKEND_DNNL_ENFORCE(0, "Unsupported reduction op.");
-    }
+    if (alg == algorithm::undef) { assert(!"unsupported reduction op."); }
     float p = op->has_attr(op_attr::p) ? op->get_attr<float>(op_attr::p) : 0.f;
 
     float eps = 0.0f;
@@ -1506,35 +1505,77 @@ reorder_executable_t::desc_t reorder_executable_t::create_desc(
 
     // generate mask
     int mask = 0;
-    if (op->has_attr(op_attr::axis) && op->has_attr(op_attr::qtype)) {
-        int64_t axis = op->get_attr<int64_t>(op_attr::axis);
+    const auto set_reorder_mask = [&op, &prm_attr](int mask) {
+        std::vector<int64_t> default_groups;
+
+        if (op->has_attr(op_attr::with_runtime_scales)
+                && op->get_attr<bool>(op_attr::with_runtime_scales)) {
+            auto scale_dt
+                    = op->get_input_value(1)->get_logical_tensor().data_type;
+            // For runtime arg scales, need to get data type information from
+            // the op
+            prm_attr.set_scales(DNNL_ARG_SRC, mask, default_groups,
+                    static_cast<dnnl::memory::data_type>(scale_dt));
+        } else if (op->has_attr(op_attr::scales)) {
+            assertm(false, "only support runtime arg scales.\n");
+        }
+
+        if (op->has_attr(op_attr::with_runtime_src_zps)
+                && op->get_attr<bool>(op_attr::with_runtime_src_zps)) {
+            // For runtime src zps, as graph compilation will add extra
+            // typecast to convert int8 zero points to s32, we may still use
+            // the set_zero_points_mask API which specifies s32 zero point by
+            // default.
+            prm_attr.set_zero_points_mask(DNNL_ARG_FROM, mask);
+        } else if (op->has_attr(op_attr::src_zps)) {
+            assertm(false, "only support runtime src zero points.\n");
+        }
+
+        if (op->has_attr(op_attr::with_runtime_dst_zps)
+                && op->get_attr<bool>(op_attr::with_runtime_dst_zps)) {
+            // runtime dst zps
+            prm_attr.set_zero_points_mask(DNNL_ARG_TO, mask);
+        } else if (op->has_attr(op_attr::dst_zps)) {
+            assertm(false, "only support runtime dst zero points.\n");
+        }
+    };
+
+    if (op->has_attr(op_attr::qtype)) {
         std::string qtype = op->get_attr<std::string>(op_attr::qtype);
-        mask = qtype == "per_tensor" ? 0 : 1 << axis;
+        int64_t axis = op->has_attr(op_attr::axis)
+                ? op->get_attr<int64_t>(op_attr::axis)
+                : 1;
+
+        // For per group quantization, extra handling is needed for setting
+        // group shape and size.
+        if (qtype == "per_group") {
+            const auto &scale_lt = op->get_input_value(1)->get_logical_tensor();
+            const auto scales_data_type = scale_lt.data_type;
+            const auto &group_shape
+                    = op->get_attr<std::vector<int64_t>>(op_attr::group_shape);
+            const auto ndims = group_shape.size();
+            const int mask = (1 << ndims) - 1;
+
+            const std::vector<int64_t> groups
+                    = {group_shape[ndims - 2], group_shape[ndims - 1]};
+
+            prm_attr.set_scales(DNNL_ARG_FROM, mask, groups,
+                    static_cast<dnnl::memory::data_type>(scales_data_type));
+            if (op->has_attr(op_attr::with_runtime_src_zps)
+                    && op->get_attr<bool>(op_attr::with_runtime_src_zps)) {
+                const auto &zps_lt
+                        = op->get_input_value(2)->get_logical_tensor();
+                const auto zps_data_type = zps_lt.data_type;
+                prm_attr.set_zero_points(DNNL_ARG_FROM, mask, groups,
+                        static_cast<dnnl::memory::data_type>(zps_data_type));
+            }
+
+        } else { // per channel and per tensor quantization
+            if (qtype == "per_channel") { mask = 1 << axis; }
+            set_reorder_mask(mask);
+        }
     }
 
-    if (op->has_attr(op_attr::with_runtime_src_zps)
-            && op->get_attr<bool>(op_attr::with_runtime_src_zps)) {
-        // runtime src zps
-        prm_attr.set_zero_points_mask(DNNL_ARG_FROM, mask);
-    } else if (op->has_attr(op_attr::src_zps)) {
-        assertm(false, "only support runtime src zero points.\n");
-    }
-
-    if (op->has_attr(op_attr::with_runtime_scales)
-            && op->get_attr<bool>(op_attr::with_runtime_scales)) {
-        // runtime arg scales
-        prm_attr.set_scales_mask(DNNL_ARG_SRC, mask);
-    } else if (op->has_attr(op_attr::scales)) {
-        assertm(false, "only support runtime arg scales.\n");
-    }
-
-    if (op->has_attr(op_attr::with_runtime_dst_zps)
-            && op->get_attr<bool>(op_attr::with_runtime_dst_zps)) {
-        // runtime dst zps
-        prm_attr.set_zero_points_mask(DNNL_ARG_TO, mask);
-    } else if (op->has_attr(op_attr::dst_zps)) {
-        assertm(false, "only support runtime dst zero points.\n");
-    }
     prm_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
     auto in_md = make_dnnl_memory_desc(
@@ -1584,15 +1625,42 @@ bn_folding_t::desc_t bn_folding_t::create_desc(std::shared_ptr<op_t> &op,
     desc.epsilon_desc_ = memory::desc(
             epsilon_dims, memory::data_type::f32, memory::format_tag::a);
 
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+    // binary + sqrt post-op fusion is unsupported on NVIDIA GPU
+    if (p_engine.get_kind() == dnnl::engine::kind::gpu) {
+        primitive_attr add_attr;
+        desc.add_pd_
+                = dnnl::binary::primitive_desc(p_engine, algorithm::binary_add,
+                        variance, desc.epsilon_desc_, variance, add_attr);
+
+        primitive_attr sqrt_attr;
+        desc.sqrt_pd_ = dnnl::eltwise_forward::primitive_desc(p_engine,
+                prop_kind::forward, algorithm::eltwise_sqrt, variance, variance,
+                0.0f, 0.0f, sqrt_attr);
+    } else {
+        post_ops add_post_ops;
+        // sqrt_variance = sqrt(temp)
+        add_post_ops.append_eltwise(algorithm::eltwise_sqrt, 0.0f, 0.0f);
+
+        primitive_attr add_attr;
+        add_attr.set_post_ops(add_post_ops);
+        desc.add_pd_
+                = dnnl::binary::primitive_desc(p_engine, algorithm::binary_add,
+                        variance, desc.epsilon_desc_, variance, add_attr);
+    }
+
+#else
     post_ops add_post_ops;
     // sqrt_variance = sqrt(temp)
     add_post_ops.append_eltwise(algorithm::eltwise_sqrt, 0.0f, 0.0f);
 
     primitive_attr add_attr;
-    add_attr.set_post_ops(std::move(add_post_ops));
+    add_attr.set_post_ops(add_post_ops);
     desc.add_pd_ = dnnl::binary::primitive_desc(p_engine, algorithm::binary_add,
             variance, desc.epsilon_desc_, variance, add_attr);
 
+#endif
     // 2. updated_weight = weights * scale / sqrt_variance
 
     // expand 1D scale and variance to same ndims with weights
@@ -1625,7 +1693,7 @@ bn_folding_t::desc_t bn_folding_t::create_desc(std::shared_ptr<op_t> &op,
     mul_post_ops.append_binary(algorithm::binary_div, desc.new_variance_desc_);
 
     primitive_attr mul_attr;
-    mul_attr.set_post_ops(std::move(mul_post_ops));
+    mul_attr.set_post_ops(mul_post_ops);
     desc.mul_pd_ = dnnl::binary::primitive_desc(p_engine, algorithm::binary_mul,
             weights, desc.new_scale_desc_, weights, mul_attr);
 
@@ -1643,19 +1711,109 @@ bn_folding_t::desc_t bn_folding_t::create_desc(std::shared_ptr<op_t> &op,
     sub_post_ops.append_binary(algorithm::binary_add, shift);
 
     primitive_attr sub_attr;
-    sub_attr.set_post_ops(std::move(sub_post_ops));
+    sub_attr.set_post_ops(sub_post_ops);
     desc.sub_pd_ = dnnl::binary::primitive_desc(p_engine, algorithm::binary_sub,
             valid_bias, mean, valid_bias, sub_attr);
 
     memory::dims scratchpad_dims = variance.get_dims();
     // sqrt_variance, zero_bias and others (like epsilon),
     // or no need to alloc bias
+    // binary + sqrt post-op fusion is unsupported on NVIDIA GPU, so we need
+    // one more scratchpad for sqrt
+#if DNNL_GPU_RUNTIME != DNNL_RUNTIME_NONE \
+        && DNNL_GPU_VENDOR == DNNL_VENDOR_NVIDIA
+    size_t factor = 0;
+    if (p_engine.get_kind() == dnnl::engine::kind::gpu) {
+        factor = bias.is_zero() ? 4 : 3;
+    } else {
+        factor = bias.is_zero() ? 3 : 2;
+    }
+#else
     size_t factor = bias.is_zero() ? 3 : 2;
+#endif
     scratchpad_dims[0] *= factor;
     desc.scratchpad_desc_ = memory::desc(
             scratchpad_dims, variance.get_data_type(), memory::format_tag::a);
 
     return desc;
+}
+
+groupnorm_executable_t::desc_t groupnorm_executable_t::create_desc(
+        std::shared_ptr<op_t> &op, const dnnl::engine &p_engine,
+        fusion_info_mgr_t &mgr, pd_cache_t &pd_cache) {
+
+    // first look up the cache
+    if (pd_cache.find(op.get()) != pd_cache.end()) {
+        auto pd = graph::utils::any_cast<
+                dnnl::group_normalization_forward::primitive_desc>(
+                pd_cache.at(op.get()));
+        return {pd, true};
+    }
+
+    dnnl::primitive_attr prm_attr;
+    if (op->has_attr(op_attr::fusion_info_key)
+            && op->get_attr<int64_t>(op_attr::fusion_info_key) != -1) {
+        int64_t key = op->get_attr<int64_t>(op_attr::fusion_info_key);
+        prm_attr = make_dnnl_primitive_attr(op, mgr.get_info(key));
+    }
+
+    prm_attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
+    float epsilon = 1e-5f;
+    if (op->has_attr(op_attr::epsilon))
+        epsilon = op->get_attr<float>(op_attr::epsilon);
+    bool keep_stats = true;
+    if (op->has_attr(op_attr::keep_stats))
+        keep_stats = op->get_attr<bool>(op_attr::keep_stats);
+    bool use_affine = true;
+    if (op->has_attr(op_attr::use_affine))
+        use_affine = op->get_attr<bool>(op_attr::use_affine);
+    int64_t group_num = 1;
+    if (op->has_attr(op_attr::groups)) {
+        group_num = op->get_attr<int64_t>(op_attr::groups);
+    } else {
+        VCHECK_OP_EXECUTABLE(
+                false, "groups attribute is required for groupnorm");
+    }
+    auto flags = dnnl::normalization_flags::none;
+    if (use_affine)
+        flags |= (dnnl::normalization_flags::use_scale
+                | dnnl::normalization_flags::use_shift);
+
+    prop_kind pkind = keep_stats ? prop_kind::forward_training
+                                 : prop_kind::forward_inference;
+
+    auto src = make_dnnl_memory_desc(
+            op->get_input_value(0)->get_logical_tensor());
+    auto dst = make_dnnl_memory_desc(
+            op->get_output_value(0)->get_logical_tensor());
+
+    dst = to_format_any(dst);
+
+    dnnl::group_normalization_forward::primitive_desc pd(
+            p_engine, pkind, src, dst, group_num, epsilon, flags, prm_attr);
+
+    pd_cache.insert({op.get(), pd});
+    return {pd, false};
+}
+
+void genindex_executable_t ::execute(const stream &stream,
+        const std::unordered_map<int, memory> &args) const {
+    const auto &it_dst = args.find(DNNL_ARG_DST);
+    if (it_dst == args.end()) return;
+
+    auto &output = it_dst->second;
+    auto output_ptr = static_cast<int32_t *>(output.get_data_handle());
+
+    stream.get()->before_exec_hook();
+    dnnl::impl::parallel_nd(nelems_, [&](dim_t i) {
+        dims_t input_dims; // decomposition for physical offsets
+        dnnl::impl::utils::l_dims_by_l_offset(
+                input_dims, i, output_dims_, ndims_);
+        auto offset
+                = utils::offset_compute(output_strides_, input_dims, ndims_);
+        output_ptr[offset] = input_dims[axis_];
+    });
+    stream.get()->after_exec_hook();
 }
 
 static void get_arg_indices_for_post_ops(const op_t *op, fusion_info_mgr_t &mgr,
@@ -1762,12 +1920,16 @@ arg_indices_t matmul_executable_t::get_arg_indices(
 arg_indices_t binary_executable_t::get_arg_indices(
         const op_t *op, fusion_info_mgr_t &mgr) {
     arg_indices_t arg_indices;
+    const algorithm algo = static_cast<dnnl::algorithm>(
+            op->get_attr<int64_t>(op_attr::alg_kind));
 
     // add input args
     size_t index = 0;
     arg_indices.insert({DNNL_ARG_SRC_0, indices_t {input, index++}});
     arg_indices.insert({DNNL_ARG_SRC_1, indices_t {input, index++}});
-
+    if (algo == algorithm::binary_select) {
+        arg_indices.insert({DNNL_ARG_SRC_2, indices_t {input, index++}});
+    }
     get_arg_indices_for_post_ops(op, mgr, arg_indices, index);
 
     // add output args
@@ -1836,12 +1998,11 @@ static arg_indices_t get_arg_indices_for_siso_op(
             ? mgr.get_info(op->get_attr<int64_t>(op_attr::fusion_info_key))
             : fusion_info_t();
 
+    get_arg_indices_for_post_ops(op, mgr, arg_indices, index);
     if (fusion_info.with_runtime_scales(false, 0)) {
         arg_indices.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST,
                 indices_t {input, index++}});
     }
-
-    get_arg_indices_for_post_ops(op, mgr, arg_indices, index);
 
     // add output args
     arg_indices.insert({DNNL_ARG_TO, indices_t {output, 0}});
@@ -2078,9 +2239,8 @@ arg_indices_t batchnorm_bwd_executable_t::get_arg_indices(
     return arg_indices;
 }
 
-arg_indices_t layernorm_executable_t::get_arg_indices(
+static arg_indices_t get_arg_indices_for_lnorm_and_gnorm(
         const op_t *op, fusion_info_mgr_t &mgr) {
-    UNUSED(mgr);
     arg_indices_t arg_indices;
 
     size_t in_index = 0;
@@ -2097,6 +2257,8 @@ arg_indices_t layernorm_executable_t::get_arg_indices(
             ? mgr.get_info(op->get_attr<int64_t>(op_attr::fusion_info_key))
             : fusion_info_t();
 
+    get_arg_indices_for_post_ops(op, mgr, arg_indices, in_index);
+
     if (fusion_info.with_runtime_scales(false, 0)) {
         arg_indices.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST,
                 indices_t {input, in_index++}});
@@ -2111,12 +2273,14 @@ arg_indices_t layernorm_executable_t::get_arg_indices(
                 {DNNL_ARG_VARIANCE, indices_t {output, out_index++}});
     }
 
-    if (op->num_outputs() > out_index) {
-        arg_indices.insert(
-                {DNNL_ARG_SCRATCHPAD, indices_t {output, out_index++}});
-    }
+    arg_indices.insert({DNNL_ARG_SCRATCHPAD, indices_t {output, out_index++}});
 
     return arg_indices;
+}
+
+arg_indices_t layernorm_executable_t::get_arg_indices(
+        const op_t *op, fusion_info_mgr_t &mgr) {
+    return get_arg_indices_for_lnorm_and_gnorm(op, mgr);
 }
 
 arg_indices_t layernorm_bwd_executable_t::get_arg_indices(
@@ -2171,11 +2335,6 @@ arg_indices_t reorder_executable_t::get_arg_indices(
                 indices_t {input, index++}});
     }
 
-    if (fusion_info.with_runtime_scales(false, 0)) {
-        arg_indices.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST,
-                indices_t {input, index++}});
-    }
-
     if ((op->has_attr(op_attr::with_runtime_src_zps)
                 && op->get_attr<bool>(op_attr::with_runtime_src_zps))
             || fusion_info.with_runtime_zero_points(true, 0)) {
@@ -2184,6 +2343,11 @@ arg_indices_t reorder_executable_t::get_arg_indices(
     }
 
     get_arg_indices_for_post_ops(op, mgr, arg_indices, index);
+
+    if (fusion_info.with_runtime_scales(false, 0)) {
+        arg_indices.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_DST,
+                indices_t {input, index++}});
+    }
 
     if ((op->has_attr(op_attr::with_runtime_dst_zps)
                 && op->get_attr<bool>(op_attr::with_runtime_dst_zps))
@@ -2196,6 +2360,17 @@ arg_indices_t reorder_executable_t::get_arg_indices(
     if (op->num_outputs() > 1) {
         arg_indices.insert({DNNL_ARG_SCRATCHPAD, indices_t {output, 1}});
     }
+    return arg_indices;
+}
+
+arg_indices_t host_scalar_executable_t::get_arg_indices(
+        const op_t *op, fusion_info_mgr_t &mgr) {
+    UNUSED(op);
+    UNUSED(mgr);
+    arg_indices_t arg_indices;
+
+    arg_indices.insert({DNNL_ARG_FROM, indices_t {input, 0}});
+    arg_indices.insert({DNNL_ARG_TO, indices_t {output, 0}});
     return arg_indices;
 }
 
@@ -2241,6 +2416,47 @@ arg_indices_t eltwise_bwd_executable_t::get_arg_indices(
     arg_indices.insert({DNNL_ARG_DIFF_SRC, indices_t {output, 0}});
     arg_indices.insert({DNNL_ARG_SCRATCHPAD, indices_t {output, 1}});
 
+    return arg_indices;
+}
+
+arg_indices_t groupnorm_executable_t::get_arg_indices(
+        const op_t *op, fusion_info_mgr_t &mgr) {
+    return get_arg_indices_for_lnorm_and_gnorm(op, mgr);
+}
+
+arg_indices_t genindex_executable_t::get_arg_indices(
+        const op_t *op, fusion_info_mgr_t &mgr) {
+    UNUSED(op);
+    UNUSED(mgr);
+
+    arg_indices_t arg_indices;
+    arg_indices.insert({DNNL_ARG_SRC, indices_t {input, 0}});
+    arg_indices.insert({DNNL_ARG_DST, indices_t {output, 0}});
+
+    return arg_indices;
+}
+
+arg_indices_t sdpa_executable_t::get_arg_indices(
+        const op_t *op, fusion_info_mgr_t &mgr) {
+    UNUSED(mgr);
+
+    arg_indices_t arg_indices;
+    // add input args
+    size_t index = 0;
+    arg_indices.insert({DNNL_ARG_QUERIES, indices_t {input, index++}});
+    arg_indices.insert({DNNL_ARG_KEYS, indices_t {input, index++}});
+    arg_indices.insert({DNNL_ARG_VALUES, indices_t {input, index++}});
+    if (op->get_attr<bool>(op_attr::with_scale)) {
+        arg_indices.insert({DNNL_ARG_SCALE, indices_t {input, index++}});
+    }
+    if (op->get_attr<int64_t>(op_attr::mask_type)
+            == static_cast<int64_t>(attn_mask_type::buffer)) {
+        arg_indices.insert({DNNL_ARG_ATTN_MASK, indices_t {input, index++}});
+    }
+
+    // add output args
+    arg_indices.insert({DNNL_ARG_DST, indices_t {output, 0}});
+    arg_indices.insert({DNNL_ARG_SCRATCHPAD, indices_t {output, 1}});
     return arg_indices;
 }
 

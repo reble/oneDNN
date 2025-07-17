@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2024 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -49,95 +49,110 @@ struct ref_matmul_t : public primitive_t {
             const auto bia_type = weights_md(1)->data_type;
             const auto dst_type = dst_md(0)->data_type;
 
-            bool ok = is_dense_format_kind()
-                    && utils::one_of(src_type, f32, bf16, f16, f8_e5m2, f8_e4m3)
-                    && utils::one_of(wei_type, f32, bf16, f16, f8_e5m2, f8_e4m3,
-                            u8, s8, u4, s4)
-                    && utils::one_of(dst_type, f32, bf16, f16, f8_e5m2, f8_e4m3)
-                    && (src_type == wei_type
-                            || utils::one_of(wei_type, u8, s8, u4, s4))
-                    /* int8 weights decompression support */
-                    && IMPLICATION(utils::one_of(wei_type, u8, s8),
-                            attr_.mayiconvert(wei_type, src_type))
-                    && IMPLICATION(src_type == f32, dst_type == f32)
-                    && IMPLICATION(src_type == bf16,
-                            utils::one_of(dst_type, f32, bf16))
-                    && IMPLICATION(
-                            src_type == f16, utils::one_of(dst_type, f32, f16))
-                    // TODO: any implication on allowed dst data type for fp8?
-                    && IMPLICATION(with_bias(),
+            VDISPATCH_MATMUL(
+                    is_dense_format_kind(), VERBOSE_UNSUPPORTED_SPARSE_CFG);
+            VDISPATCH_MATMUL(utils::one_of(src_type, f32, bf16, f16, f8_e5m2,
+                                     f8_e4m3, f4_e2m1, f4_e3m0),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_MATMUL(utils::one_of(wei_type, f32, bf16, f16, f8_e5m2,
+                                     f8_e4m3, f4_e2m1, f4_e3m0, u8, s8, u4, s4),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_MATMUL(utils::one_of(dst_type, f32, bf16, f16, f8_e5m2,
+                                     f8_e4m3, f4_e2m1, f4_e3m0),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_MATMUL((src_type == wei_type
+                                     || utils::one_of(wei_type, bf16, f16, u8,
+                                             s8, u4, s4, f4_e3m0)),
+                    VERBOSE_UNSUPPORTED_DT);
+            /* int8 weights decompression support */
+            VDISPATCH_MATMUL(IMPLICATION(utils::one_of(wei_type, u8, s8),
+                                     attr_.mayiconvert(wei_type, src_type)),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_MATMUL(IMPLICATION(src_type == f32, dst_type == f32),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_MATMUL(IMPLICATION(src_type == bf16,
+                                     utils::one_of(dst_type, f32, bf16)),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_MATMUL(IMPLICATION(src_type == f16,
+                                     utils::one_of(dst_type, f32, f16)),
+                    VERBOSE_UNSUPPORTED_DT);
+            // TODO: any implication on allowed dst data type for fp8?
+            VDISPATCH_MATMUL(
+                    IMPLICATION(with_bias(),
                             utils::one_of(
                                     bia_type, f32, bf16, f16, f8_e5m2, f8_e4m3)
                                     && IMPLICATION(
-                                            src_type == f32, bia_type == f32)
-                                    && IMPLICATION(src_type == f16,
+                                            wei_type == f32, bia_type == f32)
+                                    && IMPLICATION(wei_type == f16,
                                             utils::one_of(bia_type, f32, f16))
-                                    && IMPLICATION(src_type == bf16,
+                                    && IMPLICATION(wei_type == bf16,
                                             utils::one_of(bia_type, f32, bf16))
                             // TODO: any implication on allowed bias
                             // data type for fp8?
-                            )
-                    && platform::has_data_type_support(src_type)
-                    && attr()->has_default_values(
-                            smask_t::scales_runtime_data_type
-                                    | smask_t::scales_runtime_groups
-                                    | smask_t::zero_points_runtime_data_type
-                                    | smask_t::zero_points_runtime_groups
+                            ),
+                    VERBOSE_UNSUPPORTED_BIAS_CFG);
+            VDISPATCH_MATMUL(platform::has_data_type_support(src_type),
+                    VERBOSE_UNSUPPORTED_DT);
+            VDISPATCH_MATMUL(
+                    attr()->has_default_values(smask_t::scales_data_type
+                                    | smask_t::scales_groups
+                                    | smask_t::zero_points_data_type
+                                    | smask_t::zero_points_groups
                                     | smask_t::post_ops | smask_t::sum_dt
-                                    | smask_t::fpmath_mode,
-                            dst_type)
-                    && attr_.post_ops_.check_sum_consistency(dst_type,
-                            /* is_int8 */ false)
-                    && ref_post_ops_t::primitive_kind_ok(attr()->post_ops_)
-                    && attr_scales_ok() && set_default_formats()
-                    && zero_points_ok()
-                    && attr_.set_default_formats(dst_md(0)) == status::success;
-            return ok ? status::success : status::unimplemented;
+                                    | smask_t::fpmath_mode | smask_t::dropout
+                                    | smask_t::rounding_mode,
+                            dst_type),
+                    VERBOSE_UNSUPPORTED_ATTR);
+            VDISPATCH_MATMUL(attr_.post_ops_.check_sum_consistency(dst_type,
+                                     /* is_int8 */ false),
+                    VERBOSE_UNSUPPORTED_POSTOP);
+            VDISPATCH_MATMUL(
+                    ref_post_ops_t::primitive_kind_ok(attr()->post_ops_),
+                    VERBOSE_UNSUPPORTED_POSTOP);
+            VDISPATCH_MATMUL(attr_scales_ok(), VERBOSE_UNSUPPORTED_SCALES_CFG);
+            VDISPATCH_MATMUL(set_default_formats(), VERBOSE_UNSUPPORTED_TAG);
+            VDISPATCH_MATMUL(zero_points_ok(), VERBOSE_UNSUPPORTED_ZP_CFG);
+            VDISPATCH_MATMUL(
+                    attr_.set_default_formats(dst_md(0)) == status::success,
+                    VERBOSE_UNSUPPORTED_POSTOP);
+            VDISPATCH_MATMUL(
+                    IMPLICATION(!attr_.dropout_.has_default_values(),
+                            utils::one_of(
+                                    attr_.dropout_.dropout_desc_.data_type, u8,
+                                    s8)),
+                    VERBOSE_UNSUPPORTED_ATTR);
+            VDISPATCH_MATMUL(
+                    IMPLICATION(!attr_.dropout_.has_default_values(),
+                            memory_desc_wrapper(dst_md(0)).similar_to(
+                                    attr_.dropout_.dropout_desc_, true, false)),
+                    VERBOSE_UNSUPPORTED_ATTR);
+
+            return status::success;
         }
 
-        virtual bool attr_scales_ok(
-                const std::vector<int> &supported_args = {DNNL_ARG_SRC,
-                        DNNL_ARG_WEIGHTS, DNNL_ARG_DST}) const override {
-            if (attr()->scales_.has_default_values()) return true;
+    private:
+        bool zero_points_ok() const {
+            const auto &zp = attr()->zero_points_;
+            if (!zp.has_default_values(DNNL_ARG_SRC)) { return false; }
+            /* weights decompression requires zero points support */
+            if (!zp.has_default_values(DNNL_ARG_WEIGHTS)) {
+                if (!zp.get(DNNL_ARG_WEIGHTS).has_default_groups()) {
+                    const auto gK = zp.get_group(DNNL_ARG_WEIGHTS, 0);
+                    bool ok = IMPLICATION(gK > 1, K() % gK == 0);
+                    if (!ok) return false;
 
-            bool ok = attr()->scales_.has_default_values(supported_args);
-            for (int arg : supported_args) {
-                const auto &sc = attr()->scales_.get(arg);
-                const auto &mask = sc.mask_;
-                if (!sc.has_default_values()) {
-                    if (arg == DNNL_ARG_WEIGHTS) {
-                        ok = ok
-                                && utils::one_of(mask, 0, wei_qmask_N(),
-                                        wei_qmask_N() + wei_qmask_K());
-                        ok = ok && utils::one_of(sc.ndims_, 0, 2)
-                                && IMPLICATION(sc.ndims_ == 2,
-                                        sc.group_dims_[1] == 1
-                                                && K() % sc.group_dims_[0]
-                                                        == 0);
-                    } else
-                        ok = ok && (mask == 0);
+                    const auto gN = zp.get_group(DNNL_ARG_WEIGHTS, 1);
+                    ok = IMPLICATION(gN > 1, N() % gN == 0);
+                    if (!ok) return false;
+
+                    // Only one non-unit group is supported.
+                    ok = utils::one_of(1, gK, gN);
+                    if (!ok) return false;
                 }
             }
-            return ok;
-        }
+            if (!zp.has_default_values(DNNL_ARG_DST)) { return false; }
 
-        bool zero_points_ok() const {
-            /* weights decompression requires zero points support */
-            int mask_wei = 0;
-            attr()->zero_points_.get(DNNL_ARG_WEIGHTS, &mask_wei);
-            const auto wei_group_ndims
-                    = attr()->zero_points_.get_groups_ndims(DNNL_ARG_WEIGHTS);
-            const auto wei_group_dims
-                    = attr()->zero_points_.get_groups(DNNL_ARG_WEIGHTS);
-
-            return attr()->zero_points_.has_default_values(DNNL_ARG_SRC)
-                    && attr()->zero_points_.has_default_values(DNNL_ARG_DST)
-                    && utils::one_of(mask_wei, 0, wei_qmask_N(),
-                            wei_qmask_N() + wei_qmask_K())
-                    && utils::one_of(wei_group_ndims, 0, 2)
-                    && IMPLICATION(wei_group_ndims == 2,
-                            wei_group_dims[1] == 1
-                                    && K() % wei_group_dims[0] == 0);
+            return true;
         }
     };
 

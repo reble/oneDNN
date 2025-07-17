@@ -15,8 +15,8 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef CPU_AARCH64_JIT_SVE_X8S8S32X_CONVOLUTION_HPP
-#define CPU_AARCH64_JIT_SVE_X8S8S32X_CONVOLUTION_HPP
+#ifndef CPU_AARCH64_JIT_SVE_512_X8S8S32X_CONVOLUTION_HPP
+#define CPU_AARCH64_JIT_SVE_512_X8S8S32X_CONVOLUTION_HPP
 
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
@@ -36,9 +36,7 @@ namespace aarch64 {
 template <impl::data_type_t src_type, impl::data_type_t dst_type>
 struct jit_sve_512_x8s8s32x_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit_int8:", sve_512, ""),
                 jit_sve_512_x8s8s32x_convolution_fwd_t);
@@ -53,9 +51,7 @@ struct jit_sve_512_x8s8s32x_convolution_fwd_t : public primitive_t {
                             utils::one_of(bias_md_.data_type, data_type::f32,
                                     data_type::s32, data_type::s8,
                                     data_type::u8))
-                    && attr()->has_default_values(
-                            smask_t::oscale_runtime | smask_t::post_ops,
-                            dst_type)
+                    && attr()->has_default_values(smask_t::post_ops, dst_type)
                     && !has_zero_dim_memory();
             if (!ok) return status::unimplemented;
 
@@ -71,15 +67,15 @@ struct jit_sve_512_x8s8s32x_convolution_fwd_t : public primitive_t {
             return status;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     jit_sve_512_x8s8s32x_convolution_fwd_t(const pd_t *apd)
         : primitive_t(apd) {}
 
-    typedef typename prec_traits<src_type>::type src_data_t;
-    typedef typename prec_traits<data_type::s8>::type wei_data_t;
-    typedef typename prec_traits<dst_type>::type dst_data_t;
+    typedef typename prec_traits_t<src_type>::type src_data_t;
+    typedef typename prec_traits_t<data_type::s8>::type wei_data_t;
+    typedef typename prec_traits_t<dst_type>::type dst_data_t;
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,

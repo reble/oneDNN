@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2018-2024 Intel Corporation
+# Copyright 2018-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -21,6 +21,10 @@ if(options_cmake_included)
     return()
 endif()
 set(options_cmake_included true)
+
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(DNNL_IS_MAIN_PROJECT TRUE)
+endif()
 
 # ========
 # Features
@@ -60,8 +64,9 @@ option(ONEDNN_ENABLE_GRAPH_DUMP "enables control of dumping graph artifacts via
 
 set(DNNL_LIBRARY_TYPE "SHARED" CACHE STRING
     "specifies whether oneDNN library should be SHARED or STATIC")
-option(DNNL_BUILD_EXAMPLES "builds examples"  ON)
-option(DNNL_BUILD_TESTS "builds tests" ON)
+option(DNNL_BUILD_DOC "builds documentation" ${DNNL_IS_MAIN_PROJECT})
+option(DNNL_BUILD_EXAMPLES "builds examples" ${DNNL_IS_MAIN_PROJECT})
+option(DNNL_BUILD_TESTS "builds tests" ${DNNL_IS_MAIN_PROJECT})
 option(DNNL_BUILD_FOR_CI
     "specifies whether oneDNN library will use special testing environment for
     internal testing processes"
@@ -76,12 +81,11 @@ set(DNNL_TEST_SET "CI" CACHE STRING
     semicolon separated string, e.g., DNNL_TEST_SET=CI;NO_CORR.")
 
 set(DNNL_INSTALL_MODE "DEFAULT" CACHE STRING
-    "specifies installation mode; supports DEFAULT, BUNDLE and BUNDLE_V2.
+    "specifies installation mode; supports DEFAULT and BUNDLE.
 
-    When BUNDLE or BUNDLE_V2 option is set oneDNN will be installed as a bundle
-    which contains examples and benchdnn. The difference between BUNDLE and
-    BUNDLE_V2 is in the directory layout.")
-if (NOT "${DNNL_INSTALL_MODE}" MATCHES "^(DEFAULT|BUNDLE|BUNDLE_V2)$")
+    When BUNDLE option is set oneDNN will be installed as a bundle
+    which contains examples and benchdnn.")
+if (NOT "${DNNL_INSTALL_MODE}" MATCHES "^(DEFAULT|BUNDLE)$")
     message(FATAL_ERROR "Unsupported install mode: ${DNNL_INSTALL_MODE}")
 endif()
 
@@ -118,9 +122,9 @@ set(DNNL_ENABLE_PRIMITIVE "ALL" CACHE STRING
     - ALL (the default). Includes all primitives to be enabled.
     - <PRIMITIVE_NAME>. Includes only the selected primitive to be enabled.
       Possible values are: BATCH_NORMALIZATION, BINARY, CONCAT, CONVOLUTION,
-      DECONVOLUTION, ELTWISE, INNER_PRODUCT, LAYER_NORMALIZATION, LRN, MATMUL,
-      POOLING, PRELU, REDUCTION, REORDER, RESAMPLING, RNN, SHUFFLE, SOFTMAX,
-      SUM.
+      DECONVOLUTION, ELTWISE, GROUP_NORMALIZATION, INNER_PRODUCT,
+      LAYER_NORMALIZATION, LRN, MATMUL, POOLING, PRELU, REDUCTION, REORDER,
+      RESAMPLING, RNN, SDPA, SHUFFLE, SOFTMAX, SUM.
     - <PRIMITIVE_NAME>;<PRIMITIVE_NAME>;... Includes only selected primitives to
       be enabled at build time. This is treated as CMake string, thus, semicolon
       is a mandatory delimiter between names. This is the way to specify several
@@ -142,7 +146,7 @@ set(DNNL_ENABLE_PRIMITIVE_GPU_ISA "ALL" CACHE STRING
     implementations will always be available. Valid values:
     - ALL (the default). Includes all ISA to be enabled.
     - <ISA_NAME>;<ISA_NAME>;... Includes only selected ISA to be enabled.
-      Possible values are: GEN9, GEN11, XELP, XEHP, XEHPG, XEHPC, XE2.")
+      Possible values are: XELP, XEHP, XEHPG, XEHPC, XE2, XE3.")
 
 set(ONEDNN_ENABLE_GEMM_KERNELS_ISA "ALL" CACHE STRING
     "Specifies an ISA set of GeMM kernels residing in x64/gemm folder to be
@@ -153,6 +157,17 @@ set(ONEDNN_ENABLE_GEMM_KERNELS_ISA "ALL" CACHE STRING
       Possible value are: SSE41, AVX2, AVX512. The linear order is
       SSE41 < AVX2 < AVX512 < AMX (or ALL). It means that if user selects, e.g.
       AVX2 ISA, SSE41 kernels will also present at build time.")
+
+set(DNNL_AMD_SYCL_KERNELS_TARGET_ARCH "" CACHE STRING
+    "Specifies the target architecture (e.g. gfx90a when compiling on AMD MI210)
+    to be used for compiling generic SYCL kernels for AMD vendor.
+    When this option is set to a valid architecture (see LLVM target column in
+    https://rocm.docs.amd.com/projects/install-on-linux/en/latest/reference/system-requirements.html#supported-gpus
+    for supported architectures), the generic SYCL kernels will be enabled for AMD
+    vendor. If not set, the SYCL kernels will not be compiled.
+    Warning: This option is temporary and will be removed as soon as the compiler
+    stops to require specifying the target architecture. After removing the option
+    the generic SYCL kernels will always be enabled for AMD vendor.")
 
 # =============
 # Optimizations
@@ -188,9 +203,9 @@ option(DNNL_EXPERIMENTAL
     using environment variables."
     OFF) # disabled by default
 
-option(DNNL_EXPERIMENTAL_SPARSE
-    "Enable experimental functionality for sparse domain. This option works
-    independetly from DNNL_EXPERIMENTAL."
+option(DNNL_EXPERIMENTAL_UKERNEL
+    "Enable experimental functionality for ukernels. This option works
+    independently from DNNL_EXPERIMENTAL."
     OFF) # disabled by default
 
 option(DNNL_EXPERIMENTAL_PROFILING
@@ -198,18 +213,21 @@ option(DNNL_EXPERIMENTAL_PROFILING
     from DNNL_EXPERIMENTAL."
     OFF) # disabled by default
 
-option(ONEDNN_EXPERIMENTAL_GRAPH_COMPILER_BACKEND
-    "builds oneDNN Graph API graph-compiler backend" OFF)
-set(ONEDNN_EXPERIMENTAL_GRAPH_COMPILER_CPU_LLVM_CONFIG "AUTO" CACHE STRING
-    "graph-compiler's llvm-config path")
-set(ONEDNN_EXPERIMENTAL_GRAPH_COMPILER_CPU_JIT "builtin" CACHE STRING
-    "the optional JIT backends for graph-compiler: llvm;c;builtin")
+option(DNNL_EXPERIMENTAL_LOGGING
+    "Enable experimental functionality for logging. This option works
+    independently from DNNL_EXPERIMENTAL."
+    OFF) # disabled by default
+
+option(DNNL_EXPERIMENTAL_SYCL_KERNEL_COMPILER
+    "Enable experimental SYCL OpenCL kernel compiler extension. This option
+    works independently from DNNL_EXPERIMENTAL."
+    OFF) # disabled by default
 
 # ======================
 # Profiling capabilities
 # ======================
 
-# TODO: restore default to ON after the issue with linking C files by 
+# TODO: restore default to ON after the issue with linking C files by
 # Intel oneAPI DPC++ Compiler is fixed. Currently this compiler issues a warning
 # when linking object files built from C and C++ sources.
 option(DNNL_ENABLE_JIT_PROFILING
@@ -220,8 +238,8 @@ option(DNNL_ENABLE_JIT_PROFILING
     ON)
 
 option(DNNL_ENABLE_ITT_TASKS
-    "Enable ITT Tasks tagging feature and tag all primitive execution 
-    (on by default). VTune Profiler can group profiling results based 
+    "Enable ITT Tasks tagging feature and tag all primitive execution
+    (on by default). VTune Profiler can group profiling results based
     on those ITT tasks and show corresponding timeline information."
     ON)
 
@@ -264,10 +282,15 @@ if(NOT "${DNNL_GPU_RUNTIME}" MATCHES "^(OCL|NONE|DPCPP|SYCL)$")
     message(FATAL_ERROR "Unsupported GPU runtime: ${DNNL_GPU_RUNTIME}")
 endif()
 
-set(DNNL_GPU_VENDOR "INTEL" CACHE STRING
-    "specifies target GPU vendor for GPU engines.
-    Can be INTEL (default) or NVIDIA.")
-if(NOT "${DNNL_GPU_VENDOR}" MATCHES "^(INTEL|NVIDIA|AMD)$")
+set(DNNL_GPU_VENDOR "NONE" CACHE STRING
+    "When DNNL_GPU_RUNTIME is not NONE DNNL_GPU_VENDOR specifies target GPU
+    vendor for GPU engines. Can be INTEL (default), NVIDIA or AMD.")
+
+if(NOT DNNL_GPU_RUNTIME STREQUAL "NONE" AND DNNL_GPU_VENDOR STREQUAL "NONE")
+    set(DNNL_GPU_VENDOR "INTEL")
+endif()
+
+if(NOT "${DNNL_GPU_VENDOR}" MATCHES "^(NONE|INTEL|NVIDIA|AMD|GENERIC)$")
     message(FATAL_ERROR "Unsupported GPU vendor: ${DNNL_GPU_VENDOR}")
 endif()
 
@@ -291,11 +314,15 @@ if(DNNL_GPU_RUNTIME STREQUAL "DPCPP" OR DNNL_GPU_RUNTIME STREQUAL "SYCL")
     set(DNNL_GPU_SYCL true)
     set(DNNL_SYCL_CUDA OFF)
     set(DNNL_SYCL_HIP OFF)
+    set(DNNL_SYCL_GENERIC OFF)
     if(DNNL_GPU_VENDOR STREQUAL "NVIDIA")
         set(DNNL_SYCL_CUDA ON)
     endif()
     if(DNNL_GPU_VENDOR STREQUAL "AMD")
         set(DNNL_SYCL_HIP ON)
+    endif()
+    if(DNNL_GPU_VENDOR STREQUAL "GENERIC")
+        set(DNNL_SYCL_GENERIC ON)
     endif()
 else()
     set(DNNL_GPU_SYCL false)
@@ -305,6 +332,11 @@ if(DNNL_CPU_SYCL OR DNNL_GPU_SYCL)
     set(DNNL_WITH_SYCL true)
 else()
     set(DNNL_WITH_SYCL false)
+endif()
+
+if(DNNL_SYCL_HIP AND NOT "${DNNL_AMD_SYCL_KERNELS_TARGET_ARCH}" STREQUAL "")
+    add_definitions(-DDNNL_AMD_ENABLE_SYCL_KERNELS)
+    set(DNNL_AMD_ENABLE_SYCL_KERNELS TRUE)
 endif()
 
 # =============
@@ -353,6 +385,10 @@ option(DNNL_ENABLE_STACK_CHECKER "enables stack checker that can be used to get
     Note: This option requires enabling concurrent scratchpad
     (DNNL_ENABLE_CONCURRENT_EXEC)." OFF)
 
+option(DNNL_DISABLE_GPU_REF_KERNELS
+        "builds oneDNN with only optimized kernels for GPU compute
+        primitives" OFF)
+
 # =============================
 # External BLAS library options
 # =============================
@@ -360,19 +396,16 @@ option(DNNL_ENABLE_STACK_CHECKER "enables stack checker that can be used to get
 set(DNNL_BLAS_VENDOR "NONE" CACHE STRING
     "Use an external BLAS library. Valid values:
       - NONE (default)
-        Use in-house implementation.
-      - MKL
-        Intel oneAPI Math Kernel Library (Intel oneMKL)
-        (https://www.intel.com/content/www/us/en/developer/tools/oneapi/onemkl.html)
-      - OPENBLAS
-        (https://www.openblas.net)
+        Use internal BLAS implementation. Recommended in most situations.
       - ACCELERATE
         (https://developer.apple.com/documentation/accelerate/blas)
       - ARMPL
         Arm Performance Libraries
         (https://developer.arm.com/tools-and-software/server-and-hpc/downloads/arm-performance-libraries)
       - ANY
-        FindBLAS will search default library paths for a known BLAS installation.")
+        FindBLAS will search default library paths for a known BLAS
+        installation. This vendor is supported for performance analysis
+        purposes only.")
 
 # ==============================================
 # AArch64 optimizations with Arm Compute Library

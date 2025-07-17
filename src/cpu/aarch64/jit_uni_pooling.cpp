@@ -1,6 +1,6 @@
 /*******************************************************************************
 * Copyright 2017-2023 Intel Corporation
-* Copyright 2020-2023 FUJITSU LIMITED
+* Copyright 2020-2024 FUJITSU LIMITED
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -560,7 +560,7 @@ void jit_uni_pooling_fwd_t<isa, d_type>::execute_forward(const data_t *src,
     const auto post_ops_binary_rhs_arg_vec
             = binary_injector::prepare_binary_args(jpp.post_ops, ctx);
 
-    using wsp_data_t = typename prec_traits<wsp_dt_>::type;
+    using wsp_data_t = typename prec_traits_t<wsp_dt_>::type;
     using namespace jit_uni_pooling_utils;
 
     const auto transpose_facade
@@ -573,7 +573,7 @@ void jit_uni_pooling_fwd_t<isa, d_type>::execute_forward(const data_t *src,
 
     const auto ker = [&](std::size_t ithr, int n, int b_c, int oh, int ur_bc) {
         assert(ur_bc == jpp.ur_bc || ur_bc == jpp.ur_bc_tail);
-        auto arg = jit_pool_call_s();
+        auto arg = jit_uni_pooling_args_t();
 
         const int ij = oh * jpp.stride_h;
         const int i_t_overflow = nstl::max(0, jpp.t_pad - ij);
@@ -688,7 +688,7 @@ void jit_uni_pooling_fwd_t<isa, d_type>::execute_forward_3d(const data_t *src,
     const auto post_ops_binary_rhs_arg_vec
             = binary_injector::prepare_binary_args(jpp.post_ops, ctx);
 
-    using wsp_data_t = typename prec_traits<wsp_dt_>::type;
+    using wsp_data_t = typename prec_traits_t<wsp_dt_>::type;
     using namespace jit_uni_pooling_utils;
     static constexpr int first_ithr = 0;
 
@@ -703,7 +703,7 @@ void jit_uni_pooling_fwd_t<isa, d_type>::execute_forward_3d(const data_t *src,
     auto ker = [&](int n, int b_c, int od, int oh, int id, int d_t_overflow,
                        int d_b_overflow, int ur_bc, int ithr) {
         assert(ur_bc == jpp.ur_bc || ur_bc == jpp.ur_bc_tail);
-        auto arg = jit_pool_call_s();
+        auto arg = jit_uni_pooling_args_t();
 
         const int ij = oh * jpp.stride_h;
         const int i_t_overflow = nstl::max(0, jpp.t_pad - ij);
@@ -893,7 +893,7 @@ void jit_uni_pooling_bwd_t<isa, d_type>::execute_backward(
         const exec_ctx_t &ctx) const {
 
     using namespace jit_uni_pooling_utils;
-    using wsp_data_t = typename prec_traits<wsp_dt_>::type;
+    using wsp_data_t = typename prec_traits_t<wsp_dt_>::type;
 
     const memory_desc_wrapper diff_src_d(pd()->diff_src_md());
     const memory_desc_wrapper diff_dst_d(pd()->diff_dst_md());
@@ -916,7 +916,7 @@ void jit_uni_pooling_bwd_t<isa, d_type>::execute_backward(
                 nstl::max(oh * jpp.stride_h - jpp.t_pad + jpp.kh, 0), jpp.ih);
     };
     const auto ker = [&](int ithr, int n, int b_c, int oh, int ur_bc) {
-        auto arg = jit_pool_call_s();
+        auto arg = jit_uni_pooling_args_t();
 
         const int ih = get_first_ih(oh);
         assert(IMPLICATION(pd()->ndims() == 3, utils::everyone_is(0, ih, oh)));
@@ -1018,7 +1018,7 @@ void jit_uni_pooling_bwd_t<isa, d_type>::execute_backward_3d(
 
     const auto &jpp = pd()->jpp_;
 
-    using wsp_data_t = typename prec_traits<wsp_dt_>::type;
+    using wsp_data_t = typename prec_traits_t<wsp_dt_>::type;
     using namespace jit_uni_pooling_utils;
     static constexpr int first_ithr = 0;
 
@@ -1043,7 +1043,7 @@ void jit_uni_pooling_bwd_t<isa, d_type>::execute_backward_3d(
     auto ker = [&](int n, int b_c, int od, int oh, int id, int d_t_overflow,
                        int d_b_overflow, bool zero_inp, int kd, int ur_bc,
                        int ithr) {
-        auto arg = jit_pool_call_s();
+        auto arg = jit_uni_pooling_args_t();
 
         const int ij = oh * jpp.stride_h;
         const int i_t_overflow = nstl::max(0, jpp.t_pad - ij);
@@ -1267,6 +1267,8 @@ void jit_uni_pooling_bwd_t<isa, d_type>::execute_backward_3d(
 
 template struct jit_uni_pooling_fwd_t<sve_512, data_type::f32>;
 template struct jit_uni_pooling_bwd_t<sve_512, data_type::f32>;
+template struct jit_uni_pooling_fwd_t<sve_256, data_type::f32>;
+template struct jit_uni_pooling_bwd_t<sve_256, data_type::f32>;
 
 } // namespace aarch64
 } // namespace cpu

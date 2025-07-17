@@ -17,12 +17,29 @@
 #include <array>
 
 #include "common/bit_cast.hpp"
+#include "common/dnnl_thread.hpp"
 #include "common/float16.hpp"
 #include "common/float8.hpp"
 #include "common/utils.hpp"
 
 namespace dnnl {
 namespace impl {
+
+float8_e8m0_t &float8_e8m0_t::operator=(float f) {
+    // we keep exponent bits and discard sign bit.
+    // - support only round to zero to simplify conversion.
+    // - no infinities in e8m0, so those become NaN essentially
+    uint32_t uf = utils::bit_cast<uint32_t>(f);
+    raw_bits_ = (uf >> 23) & 0xff;
+    return *this;
+}
+
+float8_e8m0_t::operator float() const {
+    // no inf, only NaN in e8m0
+    // we return Real Indefinite NaN
+    if (raw_bits_ == 0xff) return utils::bit_cast<float>(0xffc00000);
+    return utils::bit_cast<float>(raw_bits_ << 23);
+}
 
 float8_e5m2_t &float8_e5m2_t::operator=(float16_t f) {
     // we just need to apply rounding
@@ -167,6 +184,62 @@ float8_e4m3_t::operator float16_t() const {
 
     const uint16_t u16 = s16 | e16 | m16;
     return utils::bit_cast<float16_t>(u16);
+}
+
+void cvt_f8_e5m2_to_float(float *out, const float8_e5m2_t *inp, size_t nelems) {
+
+    // TODO: implement and use jit conversion kernel for DNNL_X64
+
+    PRAGMA_OMP_SIMD()
+    for (size_t i = 0; i < nelems; ++i)
+        out[i] = inp[i];
+}
+
+void cvt_f8_e4m3_to_float(float *out, const float8_e4m3_t *inp, size_t nelems) {
+
+    // TODO: implement and use jit conversion kernel for DNNL_X64
+
+    PRAGMA_OMP_SIMD()
+    for (size_t i = 0; i < nelems; ++i)
+        out[i] = inp[i];
+}
+
+void cvt_float_to_f8_e5m2(float8_e5m2_t *out, const float *inp, size_t nelems) {
+
+    // TODO: implement and use jit conversion kernel for DNNL_X64
+
+    PRAGMA_OMP_SIMD()
+    for (size_t i = 0; i < nelems; ++i)
+        out[i] = static_cast<float8_e5m2_t>(inp[i]);
+}
+
+void cvt_float_to_f8_e4m3(float8_e4m3_t *out, const float *inp, size_t nelems) {
+
+    // TODO: implement and use jit conversion kernel for DNNL_X64
+
+    PRAGMA_OMP_SIMD()
+    for (size_t i = 0; i < nelems; ++i)
+        out[i] = static_cast<float8_e4m3_t>(inp[i]);
+}
+
+void add_floats_and_cvt_to_f8_e5m2(float8_e5m2_t *out, const float *inp0,
+        const float *inp1, size_t nelems) {
+
+    // TODO: implement and use jit conversion kernel for DNNL_X64
+
+    PRAGMA_OMP_SIMD()
+    for (size_t i = 0; i < nelems; ++i)
+        out[i] = static_cast<float8_e5m2_t>(inp0[i] + inp1[i]);
+}
+
+void add_floats_and_cvt_to_f8_e4m3(float8_e4m3_t *out, const float *inp0,
+        const float *inp1, size_t nelems) {
+
+    // TODO: implement and use jit conversion kernel for DNNL_X64
+
+    PRAGMA_OMP_SIMD()
+    for (size_t i = 0; i < nelems; ++i)
+        out[i] = static_cast<float8_e4m3_t>(inp0[i] + inp1[i]);
 }
 
 } // namespace impl

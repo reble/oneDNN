@@ -1,6 +1,7 @@
 /*******************************************************************************
 * Copyright 2021-2022 Intel Corporation
-* Copyright 2021-2022 FUJITSU LIMITED
+* Copyright 2021-2024 FUJITSU LIMITED
+* Copyright 2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -18,6 +19,7 @@
 #ifndef CPU_AARCH64_JIT_UNI_DW_CONV_KERNEL_UTILS_HPP
 #define CPU_AARCH64_JIT_UNI_DW_CONV_KERNEL_UTILS_HPP
 
+#include <memory>
 #include "common/nstl.hpp"
 #include "common/type_helpers.hpp"
 #include "common/utils.hpp"
@@ -37,13 +39,14 @@ namespace cpu {
 namespace aarch64 {
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-struct jit_uni_dw_conv_fwd_kernel {
+struct jit_uni_dw_conv_fwd_kernel_t {
 
-    jit_uni_dw_conv_fwd_kernel(jit_conv_conf_t ajcp) : ker_(nullptr) {
-        ker_ = new jit_uni_dw_conv_fwd_kernel_f32<isa>(ajcp);
-    }
+    jit_uni_dw_conv_fwd_kernel_t(jit_conv_conf_t ajcp)
+        : ker_(utils::make_unique<jit_uni_dw_conv_fwd_kernel_f32_t<isa>>(
+                ajcp)) {}
+
     status_t create_kernel() { return ker_->create_kernel(); }
-    ~jit_uni_dw_conv_fwd_kernel() { delete ker_; }
+    ~jit_uni_dw_conv_fwd_kernel_t() = default;
 
     static bool post_ops_ok(jit_conv_conf_t &jcp, const primitive_attr_t &attr);
 
@@ -55,22 +58,23 @@ struct jit_uni_dw_conv_fwd_kernel {
     static void init_scratchpad(memory_tracking::registrar_t &scratchpad,
             const jit_conv_conf_t &jcp);
 
-    jit_generator *ker() const { return ker_; }
-    void operator()(const jit_conv_call_s *p) const { (*ker_)(p); }
+    jit_generator *ker() const { return ker_.get(); }
+    void operator()(const jit_conv_args_t *p) const { (*ker_)(p); }
 
 private:
-    jit_uni_dw_conv_fwd_kernel_f32<isa> *ker_;
+    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_uni_dw_conv_fwd_kernel_t)
+    std::unique_ptr<jit_uni_dw_conv_fwd_kernel_f32_t<isa>> ker_;
 };
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-bool jit_uni_dw_conv_fwd_kernel<isa, kernel_dt>::post_ops_ok(
+bool jit_uni_dw_conv_fwd_kernel_t<isa, kernel_dt>::post_ops_ok(
         jit_conv_conf_t &jcp, const primitive_attr_t &attr) {
     const auto &p = attr.post_ops_;
 
     auto is_eltwise = [&](int idx) {
         return p.entry_[idx].is_eltwise()
                 && eltwise_injector::is_supported(
-                        isa, p.entry_[idx].eltwise.alg);
+                        to_vla_sve(isa), p.entry_[idx].eltwise.alg);
     };
     auto is_sum = [&](int idx) { return p.entry_[idx].is_sum(); };
 
@@ -85,7 +89,7 @@ bool jit_uni_dw_conv_fwd_kernel<isa, kernel_dt>::post_ops_ok(
 }
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-status_t jit_uni_dw_conv_fwd_kernel<isa, kernel_dt>::init_conf(
+status_t jit_uni_dw_conv_fwd_kernel_t<isa, kernel_dt>::init_conf(
         jit_conv_conf_t &jcp, const convolution_desc_t &cd,
         memory_desc_t &src_md, memory_desc_t &weights_md,
         memory_desc_t &bias_md, memory_desc_t &dst_md,
@@ -107,8 +111,6 @@ status_t jit_uni_dw_conv_fwd_kernel<isa, kernel_dt>::init_conf(
     const auto wei_tag = isa == sve_512 ? Goihw16g : Goihw8g;
     const auto nxc_tag = nhwc;
     jcp.with_bias = cd.bias_desc.format_kind != format_kind::undef;
-    if ((blocked_tag != nChw16c) || (wei_tag != Goihw16g))
-        return status::unimplemented;
 
     if (src_d.format_kind() == format_kind::any) {
         CHECK(memory_desc_init_by_tag(src_md, blocked_tag));
@@ -146,8 +148,6 @@ status_t jit_uni_dw_conv_fwd_kernel<isa, kernel_dt>::init_conf(
     if (!mayiuse(isa)) return status::unimplemented;
 
     const int simd_w = isa == sve_512 ? 16 : 8;
-    if (simd_w != 16) return status::unimplemented;
-
     jcp.prop_kind = cd.prop_kind;
 
     const bool with_groups = weights_d.ndims() == src_d.ndims() + 1;
@@ -258,7 +258,7 @@ status_t jit_uni_dw_conv_fwd_kernel<isa, kernel_dt>::init_conf(
         if (dst_d.data_type() == data_type::s32) return status::unimplemented;
     }
     bool ok_to_pad_channels = true && jcp.oc == jcp.ngroups
-            && jcp.ic == jcp.ngroups && isa == sve_512;
+            && jcp.ic == jcp.ngroups && (isa == sve_256 || isa == sve_512);
     if (ok_to_pad_channels) {
         jcp.oc = rnd_up(jcp.oc, simd_w);
         jcp.ic = rnd_up(jcp.oc, simd_w);
@@ -278,24 +278,26 @@ status_t jit_uni_dw_conv_fwd_kernel<isa, kernel_dt>::init_conf(
 }
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-void jit_uni_dw_conv_fwd_kernel<isa, kernel_dt>::init_scratchpad(
+void jit_uni_dw_conv_fwd_kernel_t<isa, kernel_dt>::init_scratchpad(
         memory_tracking::registrar_t &scratchpad, const jit_conv_conf_t &jcp) {
     using namespace dnnl::impl::memory_tracking::names;
     if (jcp.with_bias && jcp.oc_without_padding != jcp.oc)
         scratchpad.book<float>(key_conv_padded_bias, jcp.oc);
 }
 
-template struct jit_uni_dw_conv_fwd_kernel<sve_512, data_type::f32>;
+template struct jit_uni_dw_conv_fwd_kernel_t<sve_512, data_type::f32>;
+template struct jit_uni_dw_conv_fwd_kernel_t<sve_256, data_type::f32>;
+template struct jit_uni_dw_conv_fwd_kernel_t<sve_256, data_type::bf16>;
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-struct jit_uni_dw_conv_bwd_data_kernel {
+struct jit_uni_dw_conv_bwd_data_kernel_t {
 
-    jit_uni_dw_conv_bwd_data_kernel(jit_conv_conf_t ajcp) : ker_(nullptr) {
-        ker_ = new jit_uni_dw_conv_bwd_data_kernel_f32<isa>(ajcp);
-    }
+    jit_uni_dw_conv_bwd_data_kernel_t(jit_conv_conf_t ajcp)
+        : ker_(utils::make_unique<jit_uni_dw_conv_bwd_data_kernel_f32_t<isa>>(
+                ajcp)) {}
 
     status_t create_kernel() { return ker_->create_kernel(); }
-    ~jit_uni_dw_conv_bwd_data_kernel() { delete ker_; }
+    ~jit_uni_dw_conv_bwd_data_kernel_t() = default;
 
     static status_t init_conf(jit_conv_conf_t &jcp,
             const convolution_desc_t &cd, const memory_desc_wrapper &diff_src_d,
@@ -305,16 +307,15 @@ struct jit_uni_dw_conv_bwd_data_kernel {
     static void init_scratchpad(memory_tracking::registrar_t &scratchpad,
             const jit_conv_conf_t &jcp);
 
-    void operator()(const jit_conv_call_s *p) const { (*ker_)(p); }
+    void operator()(const jit_conv_args_t *p) const { (*ker_)(p); }
 
 private:
-    jit_uni_dw_conv_bwd_data_kernel_f32<isa> *ker_;
-
-    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_uni_dw_conv_bwd_data_kernel);
+    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_uni_dw_conv_bwd_data_kernel_t)
+    std::unique_ptr<jit_uni_dw_conv_bwd_data_kernel_f32_t<isa>> ker_;
 };
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-status_t jit_uni_dw_conv_bwd_data_kernel<isa, kernel_dt>::init_conf(
+status_t jit_uni_dw_conv_bwd_data_kernel_t<isa, kernel_dt>::init_conf(
         jit_conv_conf_t &jcp, const convolution_desc_t &cd,
         const memory_desc_wrapper &diff_src_d,
         const memory_desc_wrapper &weights_d,
@@ -372,7 +373,7 @@ status_t jit_uni_dw_conv_bwd_data_kernel<isa, kernel_dt>::init_conf(
     jcp.iwp = jcp.iw + jcp.l_pad + jcp.r_pad;
 
     bool ok_to_pad_channels = true && jcp.oc == jcp.ngroups
-            && jcp.ic == jcp.ngroups && isa == sve_512;
+            && jcp.ic == jcp.ngroups && (isa == sve_256 || isa == sve_512);
     if (ok_to_pad_channels) {
         jcp.oc = rnd_up(jcp.oc, simd_w);
         jcp.ic = rnd_up(jcp.oc, simd_w);
@@ -411,23 +412,24 @@ status_t jit_uni_dw_conv_bwd_data_kernel<isa, kernel_dt>::init_conf(
 }
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-void jit_uni_dw_conv_bwd_data_kernel<isa, kernel_dt>::init_scratchpad(
+void jit_uni_dw_conv_bwd_data_kernel_t<isa, kernel_dt>::init_scratchpad(
         memory_tracking::registrar_t &scratchpad, const jit_conv_conf_t &jcp) {
     UNUSED(scratchpad);
     UNUSED(jcp);
 }
 
-template struct jit_uni_dw_conv_bwd_data_kernel<sve_512, data_type::f32>;
+template struct jit_uni_dw_conv_bwd_data_kernel_t<sve_512, data_type::f32>;
+template struct jit_uni_dw_conv_bwd_data_kernel_t<sve_256, data_type::f32>;
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-struct jit_uni_dw_conv_bwd_weights_kernel {
+struct jit_uni_dw_conv_bwd_weights_kernel_t {
 
-    jit_uni_dw_conv_bwd_weights_kernel(jit_conv_conf_t ajcp) : ker_(nullptr) {
-        ker_ = new jit_uni_dw_conv_bwd_weights_kernel_f32<isa>(ajcp);
-    }
+    jit_uni_dw_conv_bwd_weights_kernel_t(jit_conv_conf_t ajcp)
+        : ker_(utils::make_unique<
+                jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>>(ajcp)) {}
 
     status_t create_kernel() { return ker_->create_kernel(); }
-    ~jit_uni_dw_conv_bwd_weights_kernel() { delete ker_; }
+    ~jit_uni_dw_conv_bwd_weights_kernel_t() = default;
 
     static status_t init_conf(jit_conv_conf_t &jcp,
             const convolution_desc_t &cd, const memory_desc_wrapper &src_d,
@@ -439,14 +441,15 @@ struct jit_uni_dw_conv_bwd_weights_kernel {
 
     static void balance(jit_conv_conf_t &jcp, int nthreads);
 
-    void operator()(const jit_dw_conv_call_s *p) const { (*ker_)(p); }
+    void operator()(const jit_dw_conv_args_t *p) const { (*ker_)(p); }
 
 private:
-    jit_uni_dw_conv_bwd_weights_kernel_f32<isa> *ker_;
+    DNNL_DISALLOW_COPY_AND_ASSIGN(jit_uni_dw_conv_bwd_weights_kernel_t)
+    std::unique_ptr<jit_uni_dw_conv_bwd_weights_kernel_f32_t<isa>> ker_;
 };
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-status_t jit_uni_dw_conv_bwd_weights_kernel<isa, kernel_dt>::init_conf(
+status_t jit_uni_dw_conv_bwd_weights_kernel_t<isa, kernel_dt>::init_conf(
         jit_conv_conf_t &jcp, const convolution_desc_t &cd,
         const memory_desc_wrapper &src_d,
         const memory_desc_wrapper &diff_weights_d,
@@ -544,7 +547,7 @@ status_t jit_uni_dw_conv_bwd_weights_kernel<isa, kernel_dt>::init_conf(
 }
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-void jit_uni_dw_conv_bwd_weights_kernel<isa, kernel_dt>::init_scratchpad(
+void jit_uni_dw_conv_bwd_weights_kernel_t<isa, kernel_dt>::init_scratchpad(
         memory_tracking::registrar_t &scratchpad, const jit_conv_conf_t &jcp) {
     using namespace dnnl::impl::memory_tracking::names;
     /* Notes: if splitting thread work on 'mb', then a reduction has to take
@@ -568,7 +571,7 @@ void jit_uni_dw_conv_bwd_weights_kernel<isa, kernel_dt>::init_scratchpad(
 }
 
 template <cpu_isa_t isa, data_type_t kernel_dt>
-void jit_uni_dw_conv_bwd_weights_kernel<isa, kernel_dt>::balance(
+void jit_uni_dw_conv_bwd_weights_kernel_t<isa, kernel_dt>::balance(
         jit_conv_conf_t &jcp, int nthreads) {
     jcp.nthr = nthreads;
     jcp.nthr_g = jcp.nthr_mb = 1;
@@ -588,9 +591,10 @@ void jit_uni_dw_conv_bwd_weights_kernel<isa, kernel_dt>::balance(
     jcp.nthr = jcp.nthr_g * jcp.nthr_mb;
 }
 
-template struct jit_uni_dw_conv_bwd_weights_kernel<sve_512, data_type::f32>;
+template struct jit_uni_dw_conv_bwd_weights_kernel_t<sve_512, data_type::f32>;
+template struct jit_uni_dw_conv_bwd_weights_kernel_t<sve_256, data_type::f32>;
 } // namespace aarch64
 } // namespace cpu
 } // namespace impl
 } // namespace dnnl
-#endif /* CPU_X64_JIT_UNI_DW_CONV_KERNEL_UTILS_HPP */
+#endif // CPU_AARCH64_JIT_UNI_DW_CONV_KERNEL_UTILS_HPP

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2022 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -45,6 +45,7 @@ TEST(primitive_cache_mt_test, TestGeneralCase) {
 }
 
 TEST(primitive_cache_mt_test, TestNestedCase) {
+    SKIP_IF_HIP(true, "Sum operator is not supported by HIP");
     using tag = memory::format_tag;
     using dt = memory::data_type;
 

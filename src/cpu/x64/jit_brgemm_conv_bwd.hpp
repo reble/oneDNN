@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,11 +37,7 @@ template <cpu_isa_t isa>
 struct brgemm_convolution_bwd_t : public primitive_t {
 
     struct pd_t : public cpu_convolution_bwd_data_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::hint_class *hint_fwd_pd)
-            : cpu_convolution_bwd_data_pd_t(adesc, attr, hint_fwd_pd) {}
-
-        ~pd_t() = default;
+        using cpu_convolution_bwd_data_pd_t::cpu_convolution_bwd_data_pd_t;
 
         DECLARE_COMMON_PD_T(name_.c_str(), brgemm_convolution_bwd_t);
 
@@ -50,14 +46,18 @@ struct brgemm_convolution_bwd_t : public primitive_t {
         std::shared_ptr<primitive_desc_t> fwd_pd_;
 
     private:
-        std::string name_
-                = JIT_IMPL_NAME_HELPER("brg_fwd:", isa, "") + std::string("+");
-        void init_name() { name_.append(fwd_pd_->name()); }
+        std::string name_;
+
+        void init_name() {
+            name_ = JIT_IMPL_NAME_HELPER("brg_conv_bwd:", isa, "");
+            name_.append("+");
+            name_.append(fwd_pd_->name());
+        }
     };
 
     brgemm_convolution_bwd_t(const pd_t *apd) : primitive_t(apd) {};
 
-    ~brgemm_convolution_bwd_t() = default;
+    ~brgemm_convolution_bwd_t() override = default;
 
     status_t init(engine_t *engine) override;
 

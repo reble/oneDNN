@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Arm Ltd. and affiliates
+* Copyright 2020-2025 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -67,11 +67,7 @@ private:
 
 struct acl_wino_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd)
-            , acp_()
-            , post_ops() {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(
                 "wino:acl", acl_wino_convolution_fwd_t, USE_GLOBAL_SCRATCHPAD);
@@ -101,12 +97,19 @@ struct acl_wino_convolution_fwd_t : public primitive_t {
 
             CHECK(post_ops.init(
                     engine, attr_.post_ops_, dst_md_, acp_.act_info));
-            acp_.use_dst_acc = post_ops.has_sum();
+            acp_.use_dst_acc_for_sum = post_ops.has_sum();
+
+            if (acp_.use_dst_acc_for_sum) {
+                const memory_desc_wrapper dst_d(&dst_md_);
+                auto scratchpad = scratchpad_registry().registrar();
+                scratchpad.book(memory_tracking::names::key_generic_acc,
+                        dst_d.nelems(), dst_d.data_type_size());
+            }
 
             return status::success;
         }
 
-        acl_conv_conf_t acp_;
+        acl_conv_conf_t acp_ = utils::zero<decltype(acp_)>();
         acl_post_ops_t post_ops;
     };
 
@@ -123,14 +126,12 @@ struct acl_wino_convolution_fwd_t : public primitive_t {
         CHECK(r->configure(pd()->acp_));
         mapper.add(this, std::move(r));
 
-        CHECK(pd()->post_ops.create_resource(engine, mapper));
-
         return status::success;
     }
 
-    ~acl_wino_convolution_fwd_t() {}
+    ~acl_wino_convolution_fwd_t() override = default;
 
-    typedef typename prec_traits<data_type::f32>::type data_t;
+    using data_t = typename prec_traits_t<data_type::f32>::type;
 
     status_t execute(const exec_ctx_t &ctx) const override {
         return execute_forward(ctx);

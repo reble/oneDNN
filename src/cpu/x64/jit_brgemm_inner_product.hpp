@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 * limitations under the License.
 *******************************************************************************/
 
-#ifndef CPU_X64_BRGEMM_INNER_PRODUCT_HPP
-#define CPU_X64_BRGEMM_INNER_PRODUCT_HPP
+#ifndef CPU_X64_JIT_BRGEMM_INNER_PRODUCT_HPP
+#define CPU_X64_JIT_BRGEMM_INNER_PRODUCT_HPP
 
 #include "common/c_types_map.hpp"
 #include "common/dnnl_thread.hpp"
@@ -45,9 +45,7 @@ namespace x64 {
 template <cpu_isa_t isa>
 struct brgemm_inner_product_fwd_t : public primitive_t {
     struct pd_t : public cpu_inner_product_fwd_pd_t {
-        pd_t(const inner_product_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_inner_product_fwd_pd_t(adesc, attr, hint_fwd_pd) {}
+        using cpu_inner_product_fwd_pd_t::cpu_inner_product_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("brgemm:", isa, ""),
                 brgemm_inner_product_fwd_t);
@@ -64,11 +62,14 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
             using skip_mask_t = primitive_attr_t::skip_mask_t;
             auto skip_mask = skip_mask_t::post_ops | skip_mask_t::sum_dt
                     | skip_mask_t::fpmath_mode;
-            if (is_int8) skip_mask |= skip_mask_t::scales_runtime;
-
+            if (is_int8) skip_mask |= skip_mask_t::scales;
+            // disabling verbose dispatch messages for unsupported isa for
+            // better readability
             if (!mayiuse(isa)) return status::unimplemented;
 
-            VDISPATCH_INNER_PRODUCT(is_fwd(), VERBOSE_BAD_PROPKIND);
+            VDISPATCH_INNER_PRODUCT(
+                    get_prop_kind() == prop_kind::forward_training,
+                    VERBOSE_BAD_PROPKIND);
             VDISPATCH_INNER_PRODUCT(
                     expect_data_types(src_dt, wei_dt, data_type::undef, dst_dt,
                             data_type::undef),
@@ -116,7 +117,7 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
                 int bs = get_brg_batchsize(i_bs, i_K);
                 int idx = get_brg_kernel_idx(i_bs, i_init, i_M, i_N, i_K, bs);
                 if (idx < 0) continue;
-                brgemm_t &brg = brg_descs_[idx];
+                brgemm_desc_t &brg = brg_descs_[idx];
                 CHECK(brgemm_desc_init(&brg, isa, jbgp_.brg_type, jbgp_.src_dt,
                         jbgp_.wei_dt, false, false, brgemm_row_major, alpha,
                         vbeta, jbgp_.LDA, jbgp_.LDB, jbgp_.LDC, vM, vN, vK));
@@ -127,7 +128,7 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
                 brgemm_attr_t brgattr;
                 if (jbgp_.is_amx) {
                     brgattr.max_bs = bs;
-                    brgattr.wary_tail_read = false;
+                    brgattr.wary_A_k_tail_read = false;
                     brgattr.hint_expected_A_size = jbgp_.mb * jbgp_.ic;
                     brgattr.hint_expected_B_size = jbgp_.oc * jbgp_.ic;
                     brgattr.hint_expected_C_size = jbgp_.mb * jbgp_.oc;
@@ -142,6 +143,7 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
                 }
 
                 CHECK(brgemm_desc_set_attr(&brg, brgattr));
+                CHECK(brgemm_desc_finalize(&brg));
 
                 if (jbgp_.is_amx)
                     jbgp_.amx_buf_size_per_thread
@@ -187,7 +189,8 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
             return bs;
         }
 
-        brgemm_t brg_descs_[brgemm_inner_product_utils::max_num_brg_kernels_ip];
+        brgemm_desc_t
+                brg_descs_[brgemm_inner_product_utils::max_num_brg_kernels_ip];
         brgemm_inner_product_utils::jit_brgemm_ip_fwd_conf_t jbgp_;
     };
 
@@ -220,12 +223,13 @@ struct brgemm_inner_product_fwd_t : public primitive_t {
         // JIT to precompute scales
         const bool is_jit_supported = mayiuse(avx512_core);
         const auto attr = pd()->attr();
-        if (is_jit_supported && req_copy_scales(attr)) {
-            const auto &attr_scales = attr->scales_;
-            int wei_scale_mask = attr_scales.get(DNNL_ARG_WEIGHTS).mask_;
-            if (wei_scale_mask != 0) {
+        const auto &attr_scales = attr->scales_;
+        if (is_jit_supported && pd()->OC() > 1
+                && req_copy_scales(attr_scales)) {
+            int wei_scale_mask = attr_scales.get_mask(DNNL_ARG_WEIGHTS);
+            if (wei_scale_mask > 0) {
                 CHECK(safe_ptr_assign(jit_scale_precompute_,
-                        new jit_avx512_core_scale_precompute_t()));
+                        new jit_avx512_core_scale_precompute_t(attr)));
                 CHECK(jit_scale_precompute_->create_kernel());
             }
         }
@@ -253,9 +257,7 @@ private:
 template <cpu_isa_t isa>
 struct brgemm_inner_product_bwd_data_t : public primitive_t {
     struct pd_t : public cpu_inner_product_bwd_data_pd_t {
-        pd_t(const inner_product_desc_t *adesc, const primitive_attr_t *attr,
-                const inner_product_fwd_pd_t *hint_fwd_pd)
-            : cpu_inner_product_bwd_data_pd_t(adesc, attr, hint_fwd_pd) {}
+        using cpu_inner_product_bwd_data_pd_t::cpu_inner_product_bwd_data_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("brgemm_bwd_d:", isa, ""),
                 brgemm_inner_product_bwd_data_t);
@@ -266,15 +268,18 @@ struct brgemm_inner_product_bwd_data_t : public primitive_t {
             auto diff_src_dt = invariant_src_md()->data_type;
             auto diff_dst_dt = invariant_dst_md()->data_type;
             auto wei_dt = invariant_wei_md()->data_type;
-
+            // disabling verbose dispatch messages for unsupported isa for
+            // better readability
             if (!mayiuse(isa)) return status::unimplemented;
             VDISPATCH_INNER_PRODUCT(
                     desc()->prop_kind == prop_kind::backward_data,
                     VERBOSE_BAD_PROPKIND);
             VDISPATCH_INNER_PRODUCT(
                     !has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
-            VDISPATCH_INNER_PRODUCT(utils::one_of(diff_dst_dt, data_type::f32,
-                                            data_type::bf16, data_type::f16),
+            VDISPATCH_INNER_PRODUCT(
+                    utils::one_of(diff_dst_dt, data_type::f32, data_type::bf16,
+                            data_type::f16, data_type::f8_e5m2,
+                            data_type::f8_e4m3),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_INNER_PRODUCT(wei_dt == diff_dst_dt,
                     VERBOSE_INCONSISTENT_DT, "weights", "diff_dst");
@@ -310,7 +315,7 @@ struct brgemm_inner_product_bwd_data_t : public primitive_t {
                 int idx = get_brg_kernel_idx(i_bs, i_init, i_M, i_N, i_K, bs);
                 if (idx < 0) continue;
 
-                brgemm_t &brg = brg_descs_[idx];
+                brgemm_desc_t &brg = brg_descs_[idx];
                 CHECK(brgemm_desc_init(&brg, isa, jbgp_.brg_type, diff_dst_dt,
                         dt_b, false, false, brgemm_row_major, alpha, vbeta,
                         jbgp_.LDA, jbgp_.LDB, jbgp_.LDC, vM, vN, vK));
@@ -320,7 +325,7 @@ struct brgemm_inner_product_bwd_data_t : public primitive_t {
                 if (jbgp_.is_amx) {
                     brgemm_attr_t brgattr;
                     brgattr.max_bs = bs;
-                    brgattr.wary_tail_read = false;
+                    brgattr.wary_A_k_tail_read = false;
                     brgattr.hint_expected_A_size = jbgp_.mb * jbgp_.oc;
                     brgattr.hint_expected_B_size = jbgp_.oc * jbgp_.ic;
                     brgattr.hint_expected_C_size = jbgp_.mb * jbgp_.ic;
@@ -331,6 +336,9 @@ struct brgemm_inner_product_bwd_data_t : public primitive_t {
                     brgattr.fpmath_mode = attr()->fpmath_.mode_;
 
                     CHECK(brgemm_desc_set_attr(&brg, brgattr));
+                }
+                CHECK(brgemm_desc_finalize(&brg));
+                if (jbgp_.is_amx) {
                     jbgp_.amx_buf_size_per_thread
                             = nstl::max(brg.get_wsp_buffer_size(),
                                     jbgp_.amx_buf_size_per_thread);
@@ -368,7 +376,8 @@ struct brgemm_inner_product_bwd_data_t : public primitive_t {
             return bs;
         }
 
-        brgemm_t brg_descs_[brgemm_inner_product_utils::max_num_brg_kernels_ip];
+        brgemm_desc_t
+                brg_descs_[brgemm_inner_product_utils::max_num_brg_kernels_ip];
         brgemm_inner_product_utils::jit_brgemm_ip_bwd_d_conf_t jbgp_;
     };
 
@@ -428,9 +437,8 @@ private:
 template <cpu_isa_t isa>
 struct brgemm_inner_product_bwd_weights_t : public primitive_t {
     struct pd_t : public cpu_inner_product_bwd_weights_pd_t {
-        pd_t(const inner_product_desc_t *adesc, const primitive_attr_t *attr,
-                const inner_product_fwd_pd_t *hint_fwd_pd)
-            : cpu_inner_product_bwd_weights_pd_t(adesc, attr, hint_fwd_pd) {}
+        using cpu_inner_product_bwd_weights_pd_t::
+                cpu_inner_product_bwd_weights_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("brgemm_bwd_w:", isa, ""),
                 brgemm_inner_product_bwd_weights_t);
@@ -441,15 +449,28 @@ struct brgemm_inner_product_bwd_weights_t : public primitive_t {
             auto src_dt = invariant_src_md()->data_type;
             auto diff_wei_type = invariant_wei_md()->data_type;
             auto diff_dst_type = invariant_dst_md()->data_type;
-
+            auto diff_bia_type = invariant_bia_md()->data_type;
+            // disabling verbose dispatch messages for unsupported isa for
+            // better readability
             if (!mayiuse(isa)) return status::unimplemented;
+
+            const bool is_f32 = utils::everyone_is(data_type::f32, src_dt,
+                                        diff_wei_type, diff_dst_type)
+                    && IMPLICATION(
+                            with_bias(), diff_bia_type == data_type::f32);
+
+            VDISPATCH_INNER_PRODUCT(IMPLICATION(!is_f32, mayiuse(avx512_core)),
+                    VERBOSE_UNSUPPORTED_DT_CFG);
+
             VDISPATCH_INNER_PRODUCT(
                     desc()->prop_kind == prop_kind::backward_weights,
                     VERBOSE_BAD_PROPKIND);
             VDISPATCH_INNER_PRODUCT(
                     !has_zero_dim_memory(), VERBOSE_EMPTY_TENSOR, "");
-            VDISPATCH_INNER_PRODUCT(utils::one_of(src_dt, data_type::f32,
-                                            data_type::bf16, data_type::f16),
+            VDISPATCH_INNER_PRODUCT(
+                    utils::one_of(src_dt, data_type::f32, data_type::bf16,
+                            data_type::f16, data_type::f8_e5m2,
+                            data_type::f8_e4m3),
                     VERBOSE_UNSUPPORTED_DT);
             VDISPATCH_INNER_PRODUCT(diff_dst_type == src_dt,
                     VERBOSE_INCONSISTENT_DT, "diff_dst", "src");
@@ -486,14 +507,14 @@ struct brgemm_inner_product_bwd_weights_t : public primitive_t {
                 int bs = get_brg_batchsize(i_bs, i_K);
                 int idx = get_brg_kernel_idx(i_bs, i_init, i_M, i_N, i_K, bs);
                 if (idx < 0) continue;
-                brgemm_t &brg = brg_descs_[idx];
+                brgemm_desc_t &brg = brg_descs_[idx];
                 CHECK(brgemm_desc_init(&brg, isa, jbgp_.brg_type, dt_a, dt_b,
                         false, false, brgemm_row_major, alpha, vbeta, jbgp_.LDA,
                         jbgp_.LDB, jbgp_.LDC, vM, vN, vK));
                 if (jbgp_.is_amx) {
                     brgemm_attr_t brgattr;
                     brgattr.max_bs = bs;
-                    brgattr.wary_tail_read = false;
+                    brgattr.wary_A_k_tail_read = false;
                     brgattr.hint_expected_A_size = jbgp_.mb * jbgp_.ic;
                     brgattr.hint_expected_B_size = jbgp_.mb * jbgp_.oc;
                     brgattr.hint_expected_C_size = jbgp_.ic * jbgp_.oc;
@@ -504,6 +525,9 @@ struct brgemm_inner_product_bwd_weights_t : public primitive_t {
                     brgattr.fpmath_mode = attr()->fpmath_.mode_;
 
                     CHECK(brgemm_desc_set_attr(&brg, brgattr));
+                }
+                CHECK(brgemm_desc_finalize(&brg));
+                if (jbgp_.is_amx) {
                     jbgp_.amx_buf_size_per_thread
                             = nstl::max(brg.get_wsp_buffer_size(),
                                     jbgp_.amx_buf_size_per_thread);
@@ -537,7 +561,8 @@ struct brgemm_inner_product_bwd_weights_t : public primitive_t {
             return bs;
         }
 
-        brgemm_t brg_descs_[brgemm_inner_product_utils::max_num_brg_kernels_ip];
+        brgemm_desc_t
+                brg_descs_[brgemm_inner_product_utils::max_num_brg_kernels_ip];
         brgemm_inner_product_utils::jit_brgemm_ip_bwd_w_conf_t jbgp_;
     };
 
@@ -579,15 +604,16 @@ struct brgemm_inner_product_bwd_weights_t : public primitive_t {
 
         if (jbgp.use_buffer_b)
             CHECK(create_brgemm_trans_to_vnni(trans_B_kernel_, &pd()->jbgp_,
-                    jit_brgemm_trans_to_vnni_t::matrix_to_transform::matrix_B));
+                    jit_brgemm_trans_to_vnni_t::matrix_to_transform_t::
+                            matrix_B));
 
         if (!jbgp.is_amx) {
             if (jbgp.wei_dt != jbgp.acc_dt)
                 CHECK(create_brgemm_trans_to_vnni(trans_C_kernel_, &pd()->jbgp_,
-                        jit_brgemm_trans_to_vnni_t::matrix_to_transform::
+                        jit_brgemm_trans_to_vnni_t::matrix_to_transform_t::
                                 matrix_C));
-        } else if (utils::one_of(
-                           jbgp.wei_dt, data_type::bf16, data_type::f16)) {
+        } else if (utils::one_of(jbgp.wei_dt, data_type::bf16, data_type::f16,
+                           data_type::f8_e5m2, data_type::f8_e4m3)) {
             CHECK(create_brgemm_amx_ip_trans_wei(diff_wei_trans_kernel_,
                     &pd()->jbgp_, ext_ic_block_, ext_oc_block_));
         }
@@ -607,8 +633,8 @@ struct brgemm_inner_product_bwd_weights_t : public primitive_t {
 
 private:
     struct thread_info_t;
-    using ker_diff_bias_t
-            = jit_brgemm_kernel_diff_bias_t<typename cpu_isa_traits<isa>::Vmm>;
+    using ker_diff_bias_t = jit_brgemm_kernel_diff_bias_t<
+            typename cpu_isa_traits_t<isa>::Vmm>;
     std::unique_ptr<ker_diff_bias_t> kernels_db_[2][2];
     std::unique_ptr<brgemm_kernel_t>
             brg_kernels_[brgemm_inner_product_utils::max_num_brg_kernels_ip];
@@ -616,7 +642,7 @@ private:
     std::unique_ptr<jit_brgemm_trans_to_vnni_t> trans_B_kernel_;
     std::unique_ptr<jit_brgemm_trans_to_vnni_t> trans_C_kernel_;
     std::unique_ptr<cpu_accumulator_1d_t<data_type::f32>> acc_ker_;
-    std::unique_ptr<jit_amx_ip_trans_diff_wei> diff_wei_trans_kernel_;
+    std::unique_ptr<jit_amx_ip_trans_diff_wei_t> diff_wei_trans_kernel_;
 
     void execute_backward_weights(const exec_ctx_t &ctx) const;
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }

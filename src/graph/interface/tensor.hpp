@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -27,26 +27,17 @@ public:
     dnnl_graph_tensor(const dnnl::impl::graph::logical_tensor_t &lt,
             const dnnl::impl::graph::engine_t *eng, void *handle);
 
-    bool is(dnnl::impl::graph::data_type_t dtype) const {
-        return dtype == lt_.data_type;
-    }
-
-    template <typename Value>
-    typename std::add_pointer<Value>::type get_data_handle() const {
-        return is(get_data_type<Value>())
-                ? reinterpret_cast<typename std::add_pointer<Value>::type>(
-                        handle_.get())
-                : nullptr;
-    }
-
     void *get_data_handle() const { return handle_.get(); }
 
-    void *get_data_handle_if_is(dnnl::impl::graph::data_type_t type) const {
-        return is(type) ? handle_.get() : nullptr;
-    }
+    dnnl::impl::graph::status_t set_data_handle(void *handle) {
+        auto ltw = dnnl::impl::graph::logical_tensor_wrapper_t(lt_);
 
-    void set_data_handle(void *handle) {
-        handle_.reset(handle, dummy_destructor);
+        if (ltw.is_host_scalar()) {
+            return dnnl::impl::graph::status::invalid_arguments;
+        } else {
+            handle_.reset(handle, dummy_destructor);
+            return dnnl::impl::graph::status::success;
+        }
     }
 
     const dnnl::impl::graph::logical_tensor_t &get_logical_tensor() const {
@@ -62,23 +53,18 @@ private:
         return dnnl::impl::graph::status::success;
     }
 
-    template <typename T>
-    dnnl::impl::graph::data_type_t get_data_type() const {
-        if (std::is_same<T, float>::value)
-            return dnnl::impl::graph::data_type::f32;
-        else if (std::is_same<T, int8_t>::value)
-            return dnnl::impl::graph::data_type::s8;
-        else if (std::is_same<T, uint8_t>::value)
-            return dnnl::impl::graph::data_type::u8;
-        else
-            return dnnl::impl::graph::data_type::undef;
-    }
-
     dnnl::impl::graph::logical_tensor_t lt_
             = dnnl::impl::graph::zero_logical_tensor();
     const dnnl::impl::graph::engine_t *eng_ {nullptr};
 
     std::shared_ptr<void> handle_ {nullptr};
+
+    union {
+        // this field is valid when logical tensor's
+        // property is host_scalar
+        int32_t s32_value = 0;
+        // TODO: add more dtype support
+    } scalar_;
 };
 
 #endif

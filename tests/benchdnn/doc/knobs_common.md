@@ -65,6 +65,11 @@ checked up with ONEDNN_VERBOSE output. By default, `INDEX` is `0`. If the
 index is greater or equal to the number of devices of requested kind
 discovered on a system, a runtime error occurs.
 
+### --impl
+`--impl=STRING_NAME[,STRING_NAME...]` option is used to search for an
+implementation containing one of the names provided.
+Refer to [implementation filtering](knob_impl_filter.md) for details.
+
 ### --mem-check
 `--mem-check=BOOL` instructs the driver to perform a device RAM capability
 check if the problem fits the device including all service memory allocations.
@@ -84,7 +89,7 @@ runtimes. `KIND` values can be `usm` (default), `buffer`, `usm_device`
                `--mode=P --mode-modifier=PM --max-ms-per-prb=10`
   - `CP` or `cp` for both correctness and performance testing
   - `B` or `b` for bitwise (numerical determinism) testing
-  - `R` or `r` for run mode
+  - `R` or `r` for run mode, enables `--mode-modifier=M`
   - `I` or `i` for initialization mode
   - `L` or `l` for listing mode
 
@@ -95,7 +100,7 @@ Refer to [modes](benchdnn_general_info.md) for details.
 `MODIFIER` values can be:
   - empty for no modifiers (the default)
   - `P` or `p` for parallel backend object creation
-  - `M` or `m` for disabling usage of host memory (GPU only)
+  - `M` or `m` for disabling usage of reference memory (GPU only)
 
 Refer to [mode modifiers](benchdnn_general_info.md) for details.
 
@@ -127,25 +132,30 @@ not be reset. COMMON-OPTIONS describe a global state and, thus, are not affected
 by this option.
 
 ### --skip-impl
-`--skip-impl=STR` instructs the driver to jump to the next implementation
-in the list if the name of the returned one matches `STR` symbol-by-symbol.
-`STR` is a string literal with no spaces. When `STR` is empty (the default), the
-driver uses the first fetched implementation. `STR` supports several patterns to
-be matched against through the comma `,` delimiter between patterns. The name of
-a fetched implementation is searched against all specified patterns; and if any
-of the patterns match any part of the implementation name string, it counts as a
-hit. For example, `--skip-impl=ref,gemm` causes `ref:any` or `x64:gemm:jit`
-implementations to be skipped.
+`--skip-impl=STRING_NAME[,STRING_NAME...]` option is used to search for an
+implementation that doesn't contain any of the names provided.
+Refer to [implementation filtering](knob_impl_filter.md) for details.
 
 ### --start
 `--start=N` specifies the test index `N` to start testing from. All tests
 before the index `N` will be skipped.
+
+### --summary
+`--summary=VALUE` provides additional specific statistics output. Refer to
+[summary documentation](knob_summary.md) for details.
 
 ### --verbose
 `--verbose=N`, or a short form `-vN`, specifies the driver verbosity level.
 Additional information is printed to the stdout depending on a level `N`. `N` is
 a non-negative integer value. The default value is `0`. Refer to
 [verbose](knobs_verbose.md) for details.
+
+### --execution-mode
+`--execution-mode=MODE` specifies the execution mode to be used. When `MODE`
+is set to `direct` (the default), the driver will execute normally. When `MODE`
+is set to `graph` it instructs the driver to execute on a graph backend.
+Currently this feature is limited to the experimental SYCL Graph feature on
+DPC++ runtime with Level Zero backend.
 
 ## Correctness mode settings
 
@@ -156,6 +166,14 @@ attributes. When `BOOL` is `true`, the check returns an error if implementation
 names mismatch for two descriptors. It indicates that appending an attribute
 changes the implementation dispatching which is an undesired behavior. When
 `BOOL` is `false` (the default), the check is disabled.
+
+### --check-ref-impl
+`--check-ref-impl=BOOL` instructs the driver to compare the implementation name
+string against the `ref` string pattern. When `BOOL` is set to `true`, the check
+returns an error if the name matches the reference pattern. By default, the
+check is disabled. It's useful to catch unexpected fallbacks to slow reference
+implementations from a big batch of problems. This option is always disabled on
+NVIDIA, AMD, and Generic vendors.
 
 ### --fast-ref
 `--fast-ref=BOOL` instructs the driver to use an optimized implementation
@@ -174,7 +192,7 @@ only. This mode targets forward and backward by data propagation kinds. When
 This targets any propagation kind but mostly bandwidth-limited functionality
 to emulate first access to data or branching cases. When `MODE` is set to
 `custom`, cold cache is enabled for specified arguments, but it requires source
-code adjustments. Refer to [cold cache](cold_cache.md) for more information.
+code adjustments. Refer to [cold cache](knob_cold_cache.md) for more information.
 
 ### --fix-times-per-prb
 `--fix-times-per-prb=N` specifies the `N` number of rounds per problem to run,

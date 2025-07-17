@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2023 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -49,7 +49,7 @@ int str2desc(desc_t *desc, const char *str) {
             ok = 1; \
             s += strlen(prb); \
             char *end_s; \
-            d.c = strtol(s, &end_s, 10); \
+            d.c = strtoll(s, &end_s, 10); \
             if (end_s == s) { \
                 BENCHDNN_PRINT(0, \
                         "ERROR: No value found for `%s` setting. Full " \
@@ -146,7 +146,7 @@ std::ostream &operator<<(std::ostream &s, const desc_t &d) {
 }
 
 std::string prb_t::set_repro_line() {
-    std::stringstream s;
+    dnnl::impl::stringstream_t s;
     dump_global_params(s);
     settings_t def;
 
@@ -156,6 +156,8 @@ std::string prb_t::set_repro_line() {
 
     if (canonical || dir != def.dir[0]) s << "--dir=" << dir << " ";
     if (canonical || !has_default_dts) s << "--dt=" << dt << " ";
+    if ((canonical || bia_dt_ != def.bia_dt[0]) && !(dir & FLAG_BIA))
+        s << "--bia-dt=" << bia_dt_ << " ";
     if (canonical || stag != def.stag[0]) s << "--stag=" << stag << " ";
     if (canonical || wtag != def.wtag[0]) s << "--wtag=" << wtag << " ";
     if (canonical || dtag != def.dtag[0]) s << "--dtag=" << dtag << " ";
@@ -165,6 +167,8 @@ std::string prb_t::set_repro_line() {
         s << "--ctx-init=" << ctx_init << " ";
     if (canonical || ctx_exe != def.ctx_exe[0])
         s << "--ctx-exe=" << ctx_exe << " ";
+    if (canonical || !impl_filter.is_def() || !global_impl_filter.is_def())
+        s << impl_filter;
 
     s << static_cast<const desc_t &>(*this);
 

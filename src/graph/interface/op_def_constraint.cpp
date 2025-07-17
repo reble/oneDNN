@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2023-2024 Intel Corporation
+* Copyright 2023-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,7 +19,8 @@
 #include "graph/interface/op_def_constraint.hpp"
 
 #define VCHECK_SHAPE_INFER(cond, msg, ...) \
-    VCONDCHECK(graph, create, check, add_op, (cond), false, msg, ##__VA_ARGS__);
+    VCONDCHECK(graph, create, check, shape_infer, (cond), false, msg, \
+            ##__VA_ARGS__);
 
 namespace dnnl {
 namespace impl {
@@ -85,12 +86,71 @@ bool check_bn_data_type(const op_t *n) {
     return true;
 }
 
-// check function for data_type of LayerNorm.
+// For MatMul, it's required that src and wei have the same data type. When
+// src/wei is xf16, dst can be f32 or xf16 (the same type as src/wei). We can
+// disable this check to allow f32f32xf16 when there is a request.
+bool check_matmul_dtype(const op_t *mm) {
+    const auto &inputs = mm->get_input_values();
+    const auto &outputs = mm->get_output_values();
+
+    const logical_tensor_t &src = inputs[0]->get_logical_tensor();
+    const logical_tensor_t &dst = outputs[0]->get_logical_tensor();
+    if (src.data_type != dst.data_type) {
+        if (dst.data_type != data_type::f32) {
+            VCHECK_SHAPE_INFER(false, "%s, %s src + %s dst is not supported",
+                    op_t::kind2str(mm->get_kind()).c_str(),
+                    dnnl_dt2str(src.data_type), dnnl_dt2str(dst.data_type));
+        }
+    }
+
+    return true;
+}
+
+// For SoftMax, if the src is f32, dst can be xf16. Otherwise, src and dst
+// should have the same data type.
+bool check_softmax_dtype(const op_t *n) {
+    const auto &inputs = n->get_input_values();
+    const auto &outputs = n->get_output_values();
+
+    const logical_tensor_t &src = inputs[0]->get_logical_tensor();
+    const logical_tensor_t &dst = outputs[0]->get_logical_tensor();
+    if (src.data_type != dst.data_type) {
+        if (src.data_type != data_type::f32) {
+            VCHECK_SHAPE_INFER(false, "%s, %s src + %s dst is not supported",
+                    op_t::kind2str(n->get_kind()).c_str(),
+                    dnnl_dt2str(src.data_type), dnnl_dt2str(dst.data_type));
+        }
+    }
+
+    return true;
+}
+
+// For SoftMaxBackward, diff_src should be f32,  or the same data type as dst
+// and diff_dst.
+bool check_softmax_bwd_output_dtype(const op_t *n) {
+    const auto &inputs = n->get_input_values();
+    const auto &outputs = n->get_output_values();
+
+    const logical_tensor_t &diff_dst = inputs[0]->get_logical_tensor();
+    const logical_tensor_t &diff_src = outputs[0]->get_logical_tensor();
+    if (diff_src.data_type != diff_dst.data_type
+            && diff_src.data_type != data_type::f32) {
+        VCHECK_SHAPE_INFER(false,
+                "%s, %s diff_dst + %s diff_src is not supported",
+                op_t::kind2str(n->get_kind()).c_str(),
+                dnnl_dt2str(diff_dst.data_type),
+                dnnl_dt2str(diff_src.data_type));
+    }
+
+    return true;
+}
+
+// check function for data_type of LayerNorm and GroupNorm.
 // only when data is bf16, gamma/beta/mean/var can be bf16.
 // If data is bf16, gamma/beta/mean/var can be f32 or bf16.
-bool check_ln_data_type(const op_t *n) {
-    auto input_values = n->get_input_values();
-    auto output_values = n->get_output_values();
+bool check_ln_gn_data_type(const op_t *n) {
+    const auto &input_values = n->get_input_values();
+    const auto &output_values = n->get_output_values();
 
     const logical_tensor_t &src_lt = input_values[0]->get_logical_tensor();
     logical_tensor_t aux_lt;
@@ -197,9 +257,9 @@ bool check_interpolate_sizes_scales(const op_t *n) {
     return true;
 }
 
-// check function for output number of LayerNorm forward.
+// check function for output number of LayerNorm and GroupNorm forward.
 // if keep_stats == true, outputs should include mean and variance.
-bool check_ln_fwd_outputs_num(const op_t *n) {
+bool check_ln_gn_fwd_outputs_num(const op_t *n) {
     const size_t actual_num = n->num_outputs();
     const bool keep_stats = n->has_attr(op_attr::keep_stats)
             ? n->get_attr<bool>(op_attr::keep_stats)
@@ -328,11 +388,38 @@ bool check_dyn_quant_dequant_scales_zps(const op_t *n) {
         // in case of not setting value for zps
         if (sz_zps == DNNL_GRAPH_UNKNOWN_DIM) { return true; }
 
-        VCHECK_SHAPE_INFER((sz_scales == sz_zps),
-                "%s, scales and zps should keep same. given scale "
-                "size: %d, given zp size: %d.",
-                op_t::kind2str(n->get_kind()).c_str(),
-                static_cast<int>(sz_scales), static_cast<int>(sz_zps));
+        if (qtype == "per_group") {
+            const auto &ndims
+                    = n->get_input_value(1)->get_logical_tensor().ndims;
+            const auto &scale_ndims
+                    = n->get_input_value(1)->get_logical_tensor().ndims;
+            const auto &scale_dims
+                    = n->get_input_value(1)->get_logical_tensor().dims;
+            const auto &zp_ndims
+                    = n->get_input_value(2)->get_logical_tensor().ndims;
+            const auto &zp_dims
+                    = n->get_input_value(2)->get_logical_tensor().dims;
+            VCHECK_SHAPE_INFER((ndims >= 2),
+                    "group quantization requires at least two dimensions");
+            VCHECK_SHAPE_INFER(((ndims == scale_ndims) && (ndims == zp_ndims)),
+                    "%s, input, scales and zps should keep the number of "
+                    "dimensions for group quantization",
+                    op_t::kind2str(n->get_kind()).c_str());
+            VCHECK_SHAPE_INFER(
+                    (std::equal(scale_dims, scale_dims + ndims, zp_dims)),
+                    "%s, scales and zps should keep the same shape for group "
+                    "quantization",
+                    op_t::kind2str(n->get_kind()).c_str());
+        }
+
+        if (qtype == "per_channel") {
+            VCHECK_SHAPE_INFER((sz_zps == 1 || sz_scales == sz_zps),
+                    "%s, zps should be 1 or equals to scales size for "
+                    "per_channel policy, given zps size: %d and scales size: "
+                    "%d",
+                    op_t::kind2str(n->get_kind()).c_str(),
+                    static_cast<int>(sz_zps), static_cast<int>(sz_scales));
+        }
 
         if (qtype == "per_tensor") {
             VCHECK_SHAPE_INFER((sz_zps == 1),

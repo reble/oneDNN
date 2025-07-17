@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2023 Intel Corporation
+ * Copyright 2022-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *******************************************************************************/
-#ifndef BACKEND_DNNL_SUBGRAPH_HPP
-#define BACKEND_DNNL_SUBGRAPH_HPP
+#ifndef GRAPH_BACKEND_DNNL_SUBGRAPH_HPP
+#define GRAPH_BACKEND_DNNL_SUBGRAPH_HPP
 
 #include <algorithm>
 #include <functional>
@@ -30,6 +30,7 @@
 
 #include "graph/interface/c_types_map.hpp"
 #include "graph/interface/graph.hpp"
+#include "graph/interface/graph_attr.hpp"
 #include "graph/interface/op.hpp"
 #include "graph/interface/value.hpp"
 #include "graph/utils/utils.hpp"
@@ -65,7 +66,7 @@ private:
 
 public:
     subgraph_t(const std::vector<op_ptr> &ops, const dnnl::engine &eng,
-            impl::fpmath_mode_t fpm_mode, bool can_use_blocked_layout,
+            const graph::fpmath_t &fpm_mode, bool can_use_blocked_layout,
             bool reset_layout);
 
     subgraph_t(const std::vector<op_ptr> &ops, bool reset_layout = true);
@@ -108,6 +109,7 @@ public:
     {
         MAYBE_UNUSED(partition_id);
         // Set _DNNL_BACKEND_SUBGRAPH_DUMP=1 to enable dump subgraph
+        // NOLINTNEXTLINE(cppcoreguidelines-prefer-member-initializer)
         enabled_ = graph::utils::getenv_int_internal("BACKEND_SUBGRAPH_DUMP", 0)
                 > 0;
     }
@@ -139,8 +141,6 @@ public:
 class subgraph_rewriter_t {
 public:
     subgraph_rewriter_t(std::shared_ptr<subgraph_t> &sg) : subgraph_(sg) {}
-
-    ~subgraph_rewriter_t();
 
     // Finalize the rewriting, which actually insert/remove the op to/from
     // subgraph op list

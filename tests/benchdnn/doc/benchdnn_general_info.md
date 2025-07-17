@@ -16,18 +16,18 @@ Returns `1` if any submitted tests returned status `FAILED` or `UNIMPLEMENTED`,
 
 ## Running Tests
 
-oneDNN comes with its own testing infrastructure enabled through CMake. Tests
-can be executed via the command:
+oneDNN comes with its own testing infrastructure enabled through CMake.
+If the project is built with `DNNL_BUILD_TESTS` set to `TRUE`, then Cmake will
+add test targets automatically.
+Targets can be triggered by the following command:
 ``` sh
-    make test_<test-name>
+    ctest [-R ".*benchdnn.*"]
 ```
-This instructs CMake to build a deployable project and run the specific test.
-
-These tests target specific oneDNN features and are based on benchdnn
-configurable executions.
+, where the content in brackets is optional and limits testing to benchdnn only.
+The pattern can be extended further for finer granularity.
 
 The available tests can be found in the oneDNN directory:
-tests/benchdnn/inputs/<driver>/<test-name>.
+tests/benchdnn/inputs/
 
 ## Glossary
 
@@ -100,10 +100,10 @@ otherwise. The following modes (`--mode`) are supported:
 
 ## Mode modifiers
 
-Modes may have extensions to their default behavior. Those extensions may be
-enabled by special mode modifiers (`--mode-modifier`). They have limited scope
-and applicability. See details next to each modifier to know their limits.
-The following modifiers are supported:
+Modes may have extensions to their default behavior. These extensions are
+enabled by default for certain modes and further modifiers may be enabled by
+(`--mode-modifier`). See details next to each modifier to know their limits. The
+following modifiers are supported:
 * Parallel test object creation (`P`). This is an extension of step 4, when
   several backend objects, up to the number of threads identified on the system,
   are created in parallel and then executed in order. This allows to overlap
@@ -114,11 +114,10 @@ The following modifiers are supported:
   used  unless "-DDNNL_ENABLE_CONCURRENT_EXEC=ON" is enabled at the build time.
   Otherwise scratchpad pointers are invalidated due to threads used for creation
   are no longer alive at the point when execution time comes.
-* Disabling usage of host memory (`M`). This is an extension of performance mode
-  when all work with host memory is disabled. It includes mapping/unmapping
-  memory objects and also skipping filling functions with their reorders. Every
+* Disable reference memory (`M`). This is an extension for modes which do not
+  need reference memory, like run mode. It includes skipping
+  mapping/unmapping memory objects and also skipping filling functions. Every
   value of a device memory object is assigned with a special value directly.
-  This is applicable for GPU only.
 
 ## Problem Statuses
 
@@ -129,15 +128,15 @@ problem):
   reproducer line might be reported. The execution was stopped before creating
   any library objects.
 * `SKIPPED`. Same as `LISTED` but the execution was stopped intentionally for
-  the reason given in the short description, e.g. `CASE_NOT_SUPPORTED` or
-  `SKIP_IMPL_HIT`.
+  the reason given in the short description, e.g. "Case not supported" or
+  "Skip-impl option hit".
   Note: Nvidia backend is treated specially. See a note below.
 * `INVALID_ARGUMENTS`. It means that the library API returned an error due to
   incorrect argument values. It is treated as a failure.
 * `UNIMPLEMENTED`. It means that the library does not have an implementation for
   a requested problem. It is treated as a failure.
   Note: All Nvidia backend `unimplemented` status errors are always treated as
-  `SKIPPED (CASE_NOT_SUPPORTED)` to simplify validation.
+  `SKIPPED "(Case not supported)"` to simplify validation.
 * `INITIALIZED`. It means that a problem was initialized, and the primitive
   creation was successful, but there was no execution call or validation.
 * `EXECUTED`. It means that a problem was run, and the library execution call

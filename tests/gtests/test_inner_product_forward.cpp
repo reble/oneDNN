@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -88,15 +88,18 @@ class inner_product_test_t
 protected:
     void SetUp() override {
         auto p = ::testing::TestWithParam<inprod_test_params_t>::GetParam();
-        SKIP_IF_CUDA(!cuda_check_format_tags(p.src_format, p.weights_format,
-                             p.bias_format, p.dst_format),
+        SKIP_IF_CUDA(!cuda_generic_check_format_tags(p.src_format,
+                             p.weights_format, p.bias_format, p.dst_format),
+                "Unsupported format tag");
+        SKIP_IF_GENERIC(!cuda_generic_check_format_tags(p.src_format,
+                                p.weights_format, p.bias_format, p.dst_format),
                 "Unsupported format tag");
         SKIP_IF_CUDA(p.ndims > 5, "Unsupported number of dimensions");
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status);
     }
 
-    bool cuda_check_format_tags(memory::format_tag src_format,
+    bool cuda_generic_check_format_tags(memory::format_tag src_format,
             memory::format_tag wei_format, memory::format_tag bia_format,
             memory::format_tag dst_format) {
         bool src_ok = src_format == memory::format_tag::ncdhw
@@ -143,7 +146,7 @@ protected:
         ASSERT_EQ(p.aprop_kind, prop_kind::forward);
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
-        memory::data_type data_type = data_traits<data_t>::data_type;
+        memory::data_type data_type = data_traits_t<data_t>::data_type;
         ASSERT_EQ(data_type, dnnl::memory::data_type::f32);
 
         memory::dims src_dims = {ipd.mb, ipd.ic}, wei_dims = {ipd.oc, ipd.ic};
@@ -174,12 +177,16 @@ protected:
                 : pd_t(eng, p.aprop_kind, ip_src_desc, ip_weights_desc,
                         ip_dst_desc);
 
-        auto aa = allows_attr_t {false};
-        aa.po_binary = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
+        allows_attr_t aa {};
         aa.po_eltwise = true;
-        aa.po_prelu = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
         aa.po_sum = true;
-
+#ifdef DNNL_SYCL_GENERIC
+        aa.po_binary = true;
+        aa.po_prelu = true;
+#else
+        aa.po_binary = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
+        aa.po_prelu = !is_nvidia_gpu(eng) && !is_amd_gpu(eng);
+#endif
         test_fwd_pd_constructors<pd_t>(ip_primitive_desc, aa, p.aprop_kind,
                 ip_src_desc, ip_weights_desc, ip_bias_desc, ip_dst_desc);
 

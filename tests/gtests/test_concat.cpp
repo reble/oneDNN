@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -99,8 +99,17 @@ protected:
                 dnnl_aBcde4b);
     }
 
+    bool generic_supported_format_tag(memory::format_tag tag) {
+        return impl::utils::one_of(tag, dnnl_a, dnnl_ab, dnnl_abc, dnnl_abcd,
+                dnnl_abcde, dnnl_abcdef, dnnl_abdec, dnnl_acb, dnnl_acbde,
+                dnnl_acbdef, dnnl_acdb, dnnl_acdeb, dnnl_ba, dnnl_bac,
+                dnnl_bacd, dnnl_bca, dnnl_bcda, dnnl_bcdea, dnnl_cba, dnnl_cdba,
+                dnnl_cdeba, dnnl_decab, dnnl_defcab);
+    }
+
     void SetUp() override {
-        auto data_type = data_traits<data_t>::data_type;
+        auto data_type = data_traits_t<data_t>::data_type;
+        SKIP_IF_HIP(true, "Concat operator is not supported");
         SKIP_IF(unsupported_data_type(data_type),
                 "Engine does not support this data type.");
         concat_test_params_t p
@@ -108,9 +117,13 @@ protected:
         for (size_t i = 0; i < p.srcs_cds.size(); i++) {
             SKIP_IF_CUDA(!cuda_supported_format_tag(p.srcs_format[i]),
                     "Unsupported format tag");
+            SKIP_IF_GENERIC(!generic_supported_format_tag(p.srcs_format[i]),
+                    "Unsupported format tag");
         }
 
         SKIP_IF_CUDA(!cuda_supported_format_tag(p.dst_format),
+                "Unsupported format tag");
+        SKIP_IF_GENERIC(!generic_supported_format_tag(p.dst_format),
                 "Unsupported format tag");
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status, false);
@@ -140,14 +153,13 @@ protected:
 
         auto eng = get_test_engine();
         auto strm = make_stream(eng);
-        memory::data_type data_type = data_traits<data_t>::data_type;
+        memory::data_type data_type = data_traits_t<data_t>::data_type;
 
         std::vector<memory::desc> srcs_md;
+        srcs_md.reserve(p.srcs_cds.size());
         std::vector<memory> srcs;
-        for (size_t i = 0; i < p.srcs_cds.size(); i++) {
-            auto md = memory::desc(p.srcs_cds[i], data_type, p.srcs_format[i]);
-            srcs_md.push_back(md);
-        }
+        for (size_t i = 0; i < p.srcs_cds.size(); i++)
+            srcs_md.emplace_back(p.srcs_cds[i], data_type, p.srcs_format[i]);
 
         auto dst_desc = memory::desc(p.dst_cds, data_type, p.dst_format);
         auto concat_pd = pd_t(
@@ -155,8 +167,9 @@ protected:
         // test construction from a C pd
         concat_pd = pd_t(concat_pd.get());
 
-        auto aa = allows_attr_t {false};
+        allows_attr_t aa {};
         aa.scales = true;
+        aa.scales_arg = DNNL_ARG_MULTIPLE_SRC;
 
         test_fwd_pd_constructors<pd_t>(concat_pd, aa, dst_desc,
                 static_cast<int>(p.concat_dimension), srcs_md);
@@ -182,7 +195,7 @@ protected:
             const size_t sz = src_memory.get_desc().get_size() / sizeof(data_t);
             fill_data<data_t>(sz, src_memory);
             check_zero_tail<data_t>(1, src_memory);
-            srcs.push_back(src_memory);
+            srcs.push_back(std::move(src_memory));
         }
 
         for (int i = 0; i < (int)srcs.size(); i++)

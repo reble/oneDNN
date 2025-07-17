@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2024 Intel Corporation
+ * Copyright 2022-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@
 #include <unordered_map>
 
 #include "graph/interface/c_types_map.hpp"
+#include "graph/interface/graph_attr.hpp"
 #include "graph/interface/op.hpp"
 #include "graph/interface/value.hpp"
 #include "graph/utils/utils.hpp"
@@ -40,6 +41,9 @@ namespace dnnl {
 namespace impl {
 namespace graph {
 namespace dnnl_impl {
+#define VCHECK_FUSION_INFO(cond, status, msg, ...) \
+    VCONDCHECK(graph, create, check, fusion_info, (cond), status, msg, \
+            ##__VA_ARGS__);
 
 // This class is used to represent an op's fusion information, such as the post
 // ops, the zero points or scales.
@@ -112,7 +116,8 @@ public:
                 return nullptr;
             return const_cast<op_t *>(input_scales_.at(index)->get_op());
         } else {
-            assertm(index == 0, "index for output scales must be 0");
+            VCHECK_FUSION_INFO(
+                    index == 0, nullptr, "index for output scales must be 0");
             if (!dst_scales_) return nullptr;
             return const_cast<op_t *>(dst_scales_->get_op());
         }
@@ -143,7 +148,8 @@ public:
             if (input_zps_.find(index) == input_zps_.end()) return nullptr;
             return const_cast<op_t *>(input_zps_.at(index)->get_op());
         } else {
-            assertm(index == 0, "index for output zps must be 0");
+            VCHECK_FUSION_INFO(
+                    index == 0, nullptr, "index for output zps must be 0");
             if (!output_zps_) return nullptr;
             return const_cast<op_t *>(output_zps_->get_op());
         }
@@ -198,15 +204,24 @@ public:
                             == op_kind::dnnl_convolution;
                 });
 
-        assertm(pos != post_ops_.end(), "cannot find post dw_conv");
+        VCHECK_FUSION_INFO(
+                pos != post_ops_.end(), *pos, "cannot find post dw_conv");
         return *pos;
     }
 
-    bool with_runtime_zero_points(bool is_input, size_t indice) const {
+    bool has_post_binary() const {
+        auto pos = std::find_if(post_ops_.begin(), post_ops_.end(),
+                [](const std::shared_ptr<meta_op_t> &mop) {
+                    return mop->is_post_binary();
+                });
+        return pos != post_ops_.end();
+    }
+
+    bool with_runtime_zero_points(bool is_input, size_t index) const {
         if (is_input) {
-            if (input_zps_.find(indice) == input_zps_.end()) return false;
+            if (input_zps_.find(index) == input_zps_.end()) return false;
             const op_t *zp_op
-                    = const_cast<op_t *>(input_zps_.at(indice)->get_op());
+                    = const_cast<op_t *>(input_zps_.at(index)->get_op());
             if (zp_op->has_attr(op_attr::with_runtime_zps)) {
                 return zp_op->get_attr<bool>(op_attr::with_runtime_zps);
             } else {
@@ -223,11 +238,11 @@ public:
         }
     }
 
-    bool with_runtime_scales(bool is_input, size_t indice) const {
+    bool with_runtime_scales(bool is_input, size_t index) const {
         if (is_input) {
-            if (input_scales_.find(indice) == input_scales_.end()) return false;
+            if (input_scales_.find(index) == input_scales_.end()) return false;
             const op_t *zp_op
-                    = const_cast<op_t *>(input_scales_.at(indice)->get_op());
+                    = const_cast<op_t *>(input_scales_.at(index)->get_op());
             if (zp_op->has_attr(op_attr::with_runtime_scales)) {
                 return zp_op->get_attr<bool>(op_attr::with_runtime_scales);
             } else {
@@ -259,8 +274,8 @@ private:
 // info key to query it out from the manager.
 class fusion_info_mgr_t {
 public:
-    fusion_info_mgr_t(fpmath_mode_t fpm_mode = fpmath_mode::strict,
-            bool can_use_blocked_layout = false)
+    fusion_info_mgr_t(
+            graph::fpmath_t fpm_mode = {}, bool can_use_blocked_layout = false)
         : fpmath_mode_(fpm_mode)
         , can_use_blocked_layout_(can_use_blocked_layout) {}
 
@@ -272,31 +287,31 @@ public:
 
     // Initialize an empty fusion info object and return its key
     int64_t init_info() {
-        data_.emplace_back(fusion_info_t());
+        data_.emplace_back();
         return static_cast<int64_t>(data_.size() - 1);
     }
 
     // Get out a mutable fusion info reference according to the key
     fusion_info_t &get_mutable_info(int64_t key) {
         size_t k = static_cast<size_t>(key);
-        assertm(k < data_.size(), "invalid key");
+        VCHECK_FUSION_INFO(k < data_.size(), data_[k], "invalid key");
         return data_[k];
     }
 
     // Get out a constant fusion info reference according to the key
     const fusion_info_t &get_info(int64_t key) const {
         size_t k = static_cast<size_t>(key);
-        assertm(k < data_.size(), "invalid key");
+        VCHECK_FUSION_INFO(k < data_.size(), data_[k], "invalid key");
         return data_[k];
     }
 
-    fpmath_mode_t get_fpmath_mode() const { return fpmath_mode_; }
+    const fpmath_t &get_fpmath_mode() const { return fpmath_mode_; }
     bool get_use_blocked_layout() const { return can_use_blocked_layout_; }
 
 private:
     std::vector<fusion_info_t> data_;
     // specified floating-point math mode for all fusions
-    fpmath_mode_t fpmath_mode_ {};
+    fpmath_t fpmath_mode_;
     bool can_use_blocked_layout_;
 };
 

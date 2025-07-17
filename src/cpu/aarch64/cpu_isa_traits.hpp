@@ -1,7 +1,7 @@
 /*******************************************************************************
 * Copyright 2018-2023 Intel Corporation
-* Copyright 2020-2023 FUJITSU LIMITED
-* Copyright 2023 Arm Ltd. and affiliates
+* Copyright 2020-2024 FUJITSU LIMITED
+* Copyright 2023, 2025 Arm Ltd. and affiliates 
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -21,10 +21,9 @@
 
 #include <type_traits>
 
-#include "dnnl_types.h"
-
-#include "common/dnnl_thread.hpp"
+#include "common/type_helpers.hpp"
 #include "common/utils.hpp"
+#include "dnnl_types.h"
 
 /* in order to make selinux happy memory that would be marked with X-bit should
  * be obtained with mmap */
@@ -32,8 +31,8 @@
 #define XBYAK_USE_MMAP_ALLOCATOR
 #endif
 
-#include "cpu/aarch64/xbyak_aarch64/xbyak_aarch64/xbyak_aarch64.h"
-#include "cpu/aarch64/xbyak_aarch64/xbyak_aarch64/xbyak_aarch64_util.h"
+#include "xbyak_aarch64/xbyak_aarch64/xbyak_aarch64.h"
+#include "xbyak_aarch64/xbyak_aarch64/xbyak_aarch64_util.h"
 
 namespace dnnl {
 namespace impl {
@@ -103,6 +102,11 @@ cpu_isa_t DNNL_API get_max_cpu_isa_mask(bool soft = false);
 status_t set_max_cpu_isa(dnnl_cpu_isa_t isa);
 dnnl_cpu_isa_t get_effective_cpu_isa();
 
+// If isa is a superset of sve_128, return sve_128, else return isa
+constexpr cpu_isa_t to_vla_sve(const cpu_isa_t isa) {
+    return (cpu_isa_t)(isa & sve_128);
+}
+
 static inline bool compare_isa(
         cpu_isa_t isa_1, cpu_isa_cmp_t cmp, cpu_isa_t isa_2) {
     // By default, comparison between ISA ignores ISA specific hints
@@ -126,7 +130,7 @@ static inline bool is_superset(cpu_isa_t isa_1, cpu_isa_t isa_2) {
 }
 
 template <cpu_isa_t>
-struct cpu_isa_traits {}; /* ::vlen -> 32 (for avx2) */
+struct cpu_isa_traits {}; /* ::vlen -> 32 (for sve2) */
 
 template <>
 struct cpu_isa_traits<isa_all> {
@@ -203,6 +207,17 @@ static inline bool mayiuse(const cpu_isa_t cpu_isa, bool soft = false) {
     return false;
 }
 
+static inline int isa_max_vlen(cpu_isa_t isa) {
+    if (isa == sve_512)
+        return cpu_isa_traits<sve_512>::vlen;
+    else if (isa == sve_256)
+        return cpu_isa_traits<sve_256>::vlen;
+    else if (isa == sve_128)
+        return cpu_isa_traits<sve_128>::vlen;
+    else
+        return 0;
+};
+
 static inline uint64_t get_sve_length() {
     return cpu().getSveLen();
 }
@@ -212,10 +227,25 @@ static inline bool mayiuse_atomic() {
     return cpu().isAtomicSupported();
 }
 
+static inline bool isa_has_s8s8(cpu_isa_t isa) {
+    return is_superset(isa, sve_256);
+}
+
 static inline bool mayiuse_bf16() {
     using namespace Xbyak_aarch64::util;
     return cpu().isBf16Supported();
 }
+
+static inline int isa_num_vregs(cpu_isa_t isa) {
+    if (isa == sve_512)
+        return cpu_isa_traits<sve_512>::n_vregs;
+    else if (isa == sve_256)
+        return cpu_isa_traits<sve_256>::n_vregs;
+    else if (isa == sve_128)
+        return cpu_isa_traits<sve_128>::n_vregs;
+    else
+        return 0;
+};
 
 } // namespace
 
@@ -230,6 +260,28 @@ static inline bool mayiuse_bf16() {
     ((isa) == sve_512 ? prefix STRINGIFY(sve_512) : \
     prefix suffix_if_any)))))
 /* clang-format on */
+
+inline size_t data_type_vnni_granularity(data_type_t data_type) {
+    using namespace data_type;
+    switch (data_type) {
+        case f32:
+        case s32: return size_t(1);
+        case f16:
+        case bf16: return size_t(2);
+        case s8:
+        case u8: return size_t(4);
+        case data_type::undef:
+        default: assert(!"unknown data_type");
+    }
+    return size_t(0); /* should not be reachable */
+}
+
+template <cpu_isa_t isa>
+inline size_t data_type_vnni_simd_elems(data_type_t data_type) {
+    const size_t dt_size = types::data_type_size(data_type);
+    assert(dt_size > 0);
+    return cpu_isa_traits<isa>::vlen / dt_size;
+}
 
 } // namespace aarch64
 } // namespace cpu

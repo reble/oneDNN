@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 #include <cctype>
 
-#include "oneapi/dnnl/dnnl.hpp"
+#include "oneapi/dnnl/dnnl.h"
 
 #include "common/c_types_map.hpp"
 #include "common/memory_desc.hpp"
@@ -43,7 +43,7 @@ status_t memory_desc_init_by_tag(memory_desc_t &memory_desc, int ndims,
     /* memory_desc != 0 */
     bool args_ok
             = memory_desc_sanity_check(ndims, dims, data_type, format_kind);
-    if (!args_ok) return invalid_arguments;
+    VCHECK_MEMORY(args_ok, invalid_arguments, VERBOSE_MEM_DESC_CHECK_FAIL);
 
     auto md = memory_desc_t();
     md.ndims = ndims;
@@ -77,7 +77,7 @@ status_t memory_desc_init_by_strides(memory_desc_t &memory_desc, int ndims,
     /* memory_desc != 0 */
     bool args_ok = memory_desc_sanity_check(
             ndims, dims, data_type, format_kind::undef);
-    if (!args_ok) return invalid_arguments;
+    VCHECK_MEMORY(args_ok, invalid_arguments, VERBOSE_MEM_DESC_CHECK_FAIL);
 
     auto md = memory_desc_t();
     md.ndims = ndims;
@@ -99,7 +99,8 @@ status_t memory_desc_init_by_strides(memory_desc_t &memory_desc, int ndims,
         }
         strides = default_strides;
     }
-    if (!memory_desc_strides_check(md, strides)) return invalid_arguments;
+    VCHECK_MEMORY(memory_desc_strides_check(md, strides), invalid_arguments,
+            VERBOSE_UNSUPPORTED_MEM_STRIDE);
 
     array_copy(md.format_desc.blocking.strides, strides, md.ndims);
 
@@ -117,11 +118,11 @@ status_t memory_desc_init_by_csr_encoding(memory_desc_t &memory_desc, int ndims,
     }
 
     // This is the only number of dims that is supported at this point.
-    if (ndims > 2) return unimplemented;
+    VCHECK_MEMORY(ndims <= 2, unimplemented, VERBOSE_BAD_NDIMS, "", ndims);
 
     bool args_ok = memory_desc_sanity_check(
             ndims, dims, data_type, format_kind::undef);
-    if (!args_ok) return invalid_arguments;
+    VCHECK_MEMORY(args_ok, invalid_arguments, VERBOSE_MEM_DESC_CHECK_FAIL);
 
     auto md = memory_desc_t();
     md.ndims = ndims;
@@ -139,6 +140,36 @@ status_t memory_desc_init_by_csr_encoding(memory_desc_t &memory_desc, int ndims,
     return success;
 }
 
+status_t memory_desc_init_by_coo_encoding(memory_desc_t &memory_desc, int ndims,
+        const dims_t dims, data_type_t data_type, dim_t nnz,
+        data_type_t indices_dt) {
+    if (ndims == 0) {
+        memory_desc = types::zero_md();
+        return success;
+    }
+
+    // This is the only number of dims that is supported at this point.
+    VCHECK_MEMORY(ndims <= 2, unimplemented, VERBOSE_BAD_NDIMS, "", ndims);
+
+    bool args_ok = memory_desc_sanity_check(
+            ndims, dims, data_type, format_kind::undef);
+    VCHECK_MEMORY(args_ok, invalid_arguments, VERBOSE_MEM_DESC_CHECK_FAIL);
+
+    auto md = memory_desc_t();
+    md.ndims = ndims;
+    array_copy(md.dims, dims, ndims);
+    md.data_type = data_type;
+    array_copy(md.padded_dims, dims, ndims);
+    md.format_kind = format_kind::sparse;
+    md.format_desc.sparse_desc.encoding = sparse_encoding::coo;
+    md.format_desc.sparse_desc.nnz = nnz;
+    md.format_desc.sparse_desc.metadata_types[0] = indices_dt;
+
+    memory_desc = md;
+
+    return success;
+}
+
 status_t memory_desc_init_by_packed_encoding(memory_desc_t &memory_desc,
         int ndims, const dims_t dims, data_type_t data_type, dim_t nnz) {
     if (ndims == 0) {
@@ -148,7 +179,7 @@ status_t memory_desc_init_by_packed_encoding(memory_desc_t &memory_desc,
 
     bool args_ok = memory_desc_sanity_check(
             ndims, dims, data_type, format_kind::undef);
-    if (!args_ok) return invalid_arguments;
+    VCHECK_MEMORY(args_ok, invalid_arguments, VERBOSE_MEM_DESC_CHECK_FAIL);
 
     auto md = memory_desc_t();
     md.ndims = ndims;
@@ -167,21 +198,26 @@ status_t memory_desc_init_by_packed_encoding(memory_desc_t &memory_desc,
 status_t memory_desc_init_submemory(memory_desc_t &memory_desc,
         const memory_desc_t &parent_memory_desc, const dims_t dims,
         const dims_t offsets) {
-    if (!memory_desc_sanity_check(parent_memory_desc)) return invalid_arguments;
+    VCHECK_MEMORY(memory_desc_sanity_check(parent_memory_desc),
+            invalid_arguments, VERBOSE_MEM_DESC_CHECK_FAIL);
 
     const memory_desc_wrapper src_d(parent_memory_desc);
-    if (src_d.has_runtime_dims_or_strides()) return unimplemented;
+    VCHECK_MEMORY((!src_d.has_runtime_dims_or_strides()), unimplemented,
+            VERBOSE_UNSUPPORTED_MEM_STRIDE);
 
     for (int d = 0; d < src_d.ndims(); ++d) {
-        if (utils::one_of(DNNL_RUNTIME_DIM_VAL, dims[d], offsets[d]))
-            return unimplemented;
+        VCHECK_MEMORY(
+                !(utils::one_of(DNNL_RUNTIME_DIM_VAL, dims[d], offsets[d])),
+                unimplemented, VERBOSE_RUNTIMEDIM_UNSUPPORTED);
 
-        if (dims[d] < 0 || offsets[d] < 0
-                || (offsets[d] + dims[d] > src_d.dims()[d]))
-            return invalid_arguments;
+        const bool dim_offsets_oob = (dims[d] < 0 || offsets[d] < 0
+                || (offsets[d] + dims[d] > src_d.dims()[d]));
+        VCHECK_MEMORY(
+                !dim_offsets_oob, invalid_arguments, VERBOSE_BAD_DIM, "src", d);
     }
 
-    if (src_d.format_kind() != format_kind::blocked) return unimplemented;
+    VCHECK_MEMORY(src_d.format_kind() == format_kind::blocked, unimplemented,
+            VERBOSE_UNSUPPORTED_TAG);
 
     dims_t blocks;
     src_d.compute_blocks(blocks);
@@ -225,17 +261,24 @@ status_t memory_desc_reshape(memory_desc_t &out_memory_desc,
         return prod;
     };
 
-    if (!memory_desc_sanity_check(in_memory_desc)
-            || !memory_desc_sanity_check(ndims, dims, in_memory_desc.data_type,
-                    in_memory_desc.format_kind)
-            || !one_of(in_memory_desc.format_kind, format_kind::any,
-                    format_kind::blocked)
-            || types::is_zero_md(&in_memory_desc)
-            || volume(in_memory_desc.dims, in_memory_desc.ndims)
-                    != volume(dims, ndims)
-            || memory_desc_wrapper(in_memory_desc).has_runtime_dims_or_strides()
-            || in_memory_desc.extra.flags != 0)
-        return invalid_arguments;
+    VCHECK_MEMORY(memory_desc_sanity_check(in_memory_desc), invalid_arguments,
+            VERBOSE_MEM_DESC_CHECK_FAIL);
+    VCHECK_MEMORY(memory_desc_sanity_check(ndims, dims,
+                          in_memory_desc.data_type, in_memory_desc.format_kind),
+            invalid_arguments, VERBOSE_MEM_DESC_CHECK_FAIL);
+    VCHECK_MEMORY(one_of(in_memory_desc.format_kind, format_kind::any,
+                          format_kind::blocked),
+            invalid_arguments, VERBOSE_UNSUPPORTED_TAG);
+    VCHECK_MEMORY(!types::is_zero_md(&in_memory_desc), invalid_arguments,
+            VERBOSE_NULL_ARG);
+    VCHECK_MEMORY(volume(in_memory_desc.dims, in_memory_desc.ndims)
+                    == volume(dims, ndims),
+            invalid_arguments, VERBOSE_SHAPE_RESTRICTION);
+    VCHECK_MEMORY(
+            !memory_desc_wrapper(in_memory_desc).has_runtime_dims_or_strides(),
+            invalid_arguments, VERBOSE_UNSUPPORTED_MEM_STRIDE);
+    VCHECK_MEMORY(in_memory_desc.extra.flags == 0, invalid_arguments,
+            VERBOSE_UNSUPPORTED_MD_FLAG, "extra");
 
     if (in_memory_desc.format_kind == format_kind::any)
         return memory_desc_init_by_tag(out_memory_desc, ndims, dims,
@@ -418,21 +461,28 @@ status_t memory_desc_reshape(memory_desc_t &out_memory_desc,
 
 status_t memory_desc_permute_axes(memory_desc_t &out_memory_desc,
         const memory_desc_t &in_memory_desc, const int *perm) {
-    if (!memory_desc_sanity_check(in_memory_desc)
-            || !one_of(in_memory_desc.format_kind, format_kind::any,
-                    format_kind::blocked)
-            || types::is_zero_md(&in_memory_desc)
-            || memory_desc_wrapper(in_memory_desc).has_runtime_dims_or_strides()
-            || in_memory_desc.extra.flags != 0)
-        return invalid_arguments;
+    VCHECK_MEMORY(memory_desc_sanity_check(in_memory_desc), invalid_arguments,
+            VERBOSE_MEM_DESC_CHECK_FAIL);
+    VCHECK_MEMORY(one_of(in_memory_desc.format_kind, format_kind::any,
+                          format_kind::blocked),
+            invalid_arguments, VERBOSE_UNSUPPORTED_TAG);
+    VCHECK_MEMORY(!types::is_zero_md(&in_memory_desc), invalid_arguments,
+            VERBOSE_NULL_ARG);
+    VCHECK_MEMORY(
+            !memory_desc_wrapper(in_memory_desc).has_runtime_dims_or_strides(),
+            invalid_arguments, VERBOSE_UNSUPPORTED_MEM_STRIDE);
+    VCHECK_MEMORY(
+            check_md_extra_flags_compensation_gpu(in_memory_desc.extra.flags),
+            invalid_arguments, VERBOSE_UNSUPPORTED_MD_FLAG, "extra");
 
     // verify that perm is indeed a permutation of [0 .. ndims)
     unsigned occurrence_mask = 0;
     for (int d = 0; d < in_memory_desc.ndims; ++d)
         if (0 <= perm[d] && perm[d] < in_memory_desc.ndims)
             occurrence_mask |= (1u << perm[d]);
-    if (occurrence_mask + 1 != (1u << in_memory_desc.ndims))
-        return invalid_arguments;
+    VCHECK_MEMORY((occurrence_mask + 1 == (1u << in_memory_desc.ndims)),
+            invalid_arguments, VERBOSE_BAD_NDIMS, "in_memory_desc",
+            in_memory_desc.ndims);
 
     out_memory_desc = in_memory_desc;
     for (int d = 0; d < in_memory_desc.ndims; ++d) {
@@ -462,7 +512,8 @@ status_t memory_desc_init_by_string_tag(memory_desc_t &md, int ndims,
     std::copy(dims, dims + ndims, tmp_dims);
 
     md.ndims = ndims;
-    if (ndims < 0 || ndims > DNNL_MAX_NDIMS) return invalid_arguments;
+    VCHECK_MEMORY(!(ndims < 0 || ndims > DNNL_MAX_NDIMS), invalid_arguments,
+            VERBOSE_BAD_NDIMS, "", ndims);
 
     std::copy(tmp_dims, tmp_dims + ndims, md.dims);
     md.data_type = data_type;
@@ -480,7 +531,10 @@ status_t memory_desc_init_by_string_tag(memory_desc_t &md, int ndims,
             pos--;
 
         int dim_idx = std::tolower(tag[pos0]) - 'a';
-        if (dim_idx >= ndims) return invalid_arguments;
+        VCHECK_MEMORY(dim_idx < ndims, invalid_arguments,
+                "ndims deduced (%d) from the tag \'%s\' is inconsistent with "
+                "provided ndims (%d)",
+                dim_idx + 1, tag.c_str(), ndims);
         ndims_from_tag = std::max(dim_idx + 1, ndims_from_tag);
         int block_str_len = pos0 - pos - 1;
         bool is_blocked = block_str_len > 0;
@@ -489,7 +543,10 @@ status_t memory_desc_init_by_string_tag(memory_desc_t &md, int ndims,
         if (is_blocked && block == 1) continue; // skip trivial blocks
         dim_blocks.emplace_back(dim_idx, block);
     }
-    if (ndims_from_tag != ndims) return invalid_arguments;
+    VCHECK_MEMORY((ndims_from_tag == ndims), invalid_arguments,
+            "ndims deduced (%d) from the tag \'%s\' is inconsistent with "
+            "provided ndims (%d)",
+            ndims_from_tag, tag.c_str(), ndims);
 
     auto &blk = md.format_desc.blocking;
 
@@ -566,6 +623,19 @@ status_t dnnl_memory_desc_create_with_csr_encoding(memory_desc_t **memory_desc,
     if (!md) return out_of_memory;
     CHECK(memory_desc_init_by_csr_encoding(
             *md, ndims, dims, data_type, nnz, indices_dt, pointers_dt));
+    (*memory_desc) = md.release();
+    return success;
+}
+
+status_t dnnl_memory_desc_create_with_coo_encoding(memory_desc_t **memory_desc,
+        int ndims, const dims_t dims, data_type_t data_type, dim_t nnz,
+        data_type_t indices_dt) {
+    if (any_null(memory_desc)) return invalid_arguments;
+
+    auto md = utils::make_unique<memory_desc_t>();
+    if (!md) return out_of_memory;
+    CHECK(memory_desc_init_by_coo_encoding(
+            *md, ndims, dims, data_type, nnz, indices_dt));
     (*memory_desc) = md.release();
     return success;
 }
@@ -657,6 +727,7 @@ status_t dnnl_memory_desc_query(
         case query::format_kind:
             switch ((int)md->format_kind) {
                 case format_kind::rnn_packed:
+                case format_kind::cublaslt_blocked:
                 case format_kind::wino:
                     *(format_kind_t *)result = format_kind::opaque;
                     break;
@@ -684,14 +755,14 @@ status_t dnnl_memory_desc_query(
     return status::success;
 }
 
-#ifdef DNNL_EXPERIMENTAL_SPARSE
 status_t dnnl_memory_desc_query_v2(
         const memory_desc_t *md, query_t what, int index, void *result) {
     if (any_null(md, result)) return invalid_arguments;
     const bool is_sparse = md->format_kind == format_kind::sparse;
-    if ((!is_sparse && index > 0)
-            || (is_sparse && index > 0 && what != query::data_type))
-        return status::invalid_arguments;
+    VCHECK_MEMORY(
+            !((!is_sparse && index > 0)
+                    || (is_sparse && index > 0 && what != query::data_type)),
+            invalid_arguments, VERBOSE_UNSUPPORTED_SPARSE_CFG);
 
     switch (what) {
         case query::sparse_encoding:
@@ -705,12 +776,20 @@ status_t dnnl_memory_desc_query_v2(
         case query::data_type:
             *(data_type_t *)result = (index == 0)
                     ? md->data_type
-                    : md->format_desc.sparse_desc.metadata_types[index - 1];
+                    : md->format_desc.sparse_desc.metadata_types
+                              [md->format_desc.sparse_desc.encoding
+                                                      == sparse_encoding_t::
+                                                              dnnl_coo
+                                              ? 0
+                                              : index - 1];
             break;
         case query::num_handles_s32:
             if (is_sparse) {
                 switch (md->format_desc.sparse_desc.encoding) {
                     case sparse_encoding::csr:
+                    case sparse_encoding::coo:
+                        *(int *)result = md->ndims + 1;
+                        break;
                     case sparse_encoding::packed: *(int *)result = 3; break;
                     default: assert(!"unknown encoding"); *(int *)result = 0;
                 }
@@ -721,7 +800,6 @@ status_t dnnl_memory_desc_query_v2(
     }
     return status::success;
 }
-#endif
 
 status_t dnnl_memory_desc_destroy(memory_desc_t *memory_desc) {
     delete memory_desc;
@@ -731,6 +809,27 @@ status_t dnnl_memory_desc_destroy(memory_desc_t *memory_desc) {
 status_t dnnl_memory_desc_clone(memory_desc_t **memory_desc,
         const memory_desc_t *existing_memory_desc) {
     (*memory_desc) = new memory_desc_t(*existing_memory_desc);
+    return success;
+}
+
+status_t dnnl_memory_desc_get_blob(
+        uint8_t *blob, size_t *size, const memory_desc_t *md) {
+    if (md == nullptr || (blob == nullptr && size == nullptr))
+        return invalid_arguments;
+    if (blob != nullptr)
+        memcpy(blob, md, *size);
+    else if (size != nullptr)
+        *size = sizeof(memory_desc_t);
+
+    return success;
+}
+
+status_t dnnl_memory_desc_create_with_blob(
+        memory_desc_t **md, const uint8_t *blob) {
+    if (one_of(nullptr, md, blob)) return invalid_arguments;
+
+    *md = new memory_desc_t();
+    memcpy(*md, blob, sizeof(memory_desc_t));
     return success;
 }
 

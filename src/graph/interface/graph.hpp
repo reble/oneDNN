@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -31,6 +31,7 @@
 #include "oneapi/dnnl/dnnl_graph.h"
 
 #include "graph/interface/c_types_map.hpp"
+#include "graph/interface/graph_attr.hpp"
 #include "graph/interface/logical_tensor.hpp"
 #include "graph/interface/op.hpp"
 #include "graph/interface/op_schema.hpp"
@@ -40,7 +41,6 @@
 
 #include "graph/utils/debug.hpp"
 #include "graph/utils/id.hpp"
-#include "graph/utils/json.hpp"
 #include "graph/utils/utils.hpp"
 
 namespace graph = dnnl::impl::graph;
@@ -68,13 +68,13 @@ struct dnnl_graph_graph : public graph::utils::id_t {
 
 private:
     /*! \brief added ops*/
-    std::vector<op_ptr> ops_ {};
+    std::vector<op_ptr> ops_;
 
     /*! \brief The engine kind on which the operator will be evaluated */
     graph::engine_kind_t engine_kind_ {};
 
     /*! \brief The floating-point math mode */
-    graph::fpmath_mode_t fpmath_mode_ {};
+    graph::fpmath_t fpmath_;
 
     std::vector<std::shared_ptr<graph::partition_impl_t>> partition_impls_;
 
@@ -85,24 +85,28 @@ private:
 
 public:
     dnnl_graph_graph(graph::engine_kind_t kind = graph::engine_kind::cpu)
-        : engine_kind_(kind), fpmath_mode_(dnnl::impl::get_fpmath_mode()) {}
+        : engine_kind_(kind) {
+        fpmath_.mode_ = dnnl::impl::get_fpmath_mode();
+    }
 
     dnnl_graph_graph(
             graph::engine_kind_t kind, graph::fpmath_mode_t fpmath_mode)
-        : engine_kind_(kind), fpmath_mode_(fpmath_mode) {}
+        : engine_kind_(kind) {
+        fpmath_.mode_ = fpmath_mode;
+    }
 
     // deep copy (except that the partition_impls_ is shallow copy)
     dnnl_graph_graph(const dnnl_graph_graph &other)
         : id_t(other)
         , ops_(deep_copy(other.ops_))
         , engine_kind_(other.engine_kind_)
-        , fpmath_mode_(other.fpmath_mode_)
+        , fpmath_(other.fpmath_)
         , partition_impls_(other.partition_impls_) {};
 
     dnnl_graph_graph(const std::vector<op_ptr> &ops,
             graph::engine_kind_t kind = graph::engine_kind::cpu,
             graph::fpmath_mode_t fpmath_mode = graph::fpmath_mode::strict)
-        : ops_(ops), engine_kind_(kind), fpmath_mode_(fpmath_mode) {}
+        : ops_(ops), engine_kind_(kind), fpmath_ {fpmath_mode, false} {};
 
     dnnl_graph_graph &operator=(const dnnl_graph_graph &other) = delete;
 
@@ -110,7 +114,7 @@ public:
 
     graph::engine_kind_t get_engine_kind() const { return engine_kind_; }
 
-    graph::fpmath_mode_t get_fpmath_mode() const { return fpmath_mode_; }
+    const graph::fpmath_t &get_fpmath_mode() const { return fpmath_; }
 
     /*!
      * \brief Check whether an operator can be added
@@ -139,6 +143,13 @@ public:
             for (size_t i = 0; i < back_op->num_outputs(); i++)
                 back_op->get_output_value(i)->set_producer(*back_op);
         }
+        return graph::status::success;
+    }
+
+    graph::status_t set_fpmath_mode(
+            graph::fpmath_mode_t mode, bool apply_to_int) {
+        fpmath_.mode_ = mode;
+        fpmath_.apply_to_int_ = apply_to_int;
         return graph::status::success;
     }
 
@@ -268,7 +279,7 @@ public:
      * \param list of partitions
      */
     graph::status_t get_ordered_partitions(
-            std::vector<graph::partition_t *> &partitions);
+            std::vector<graph::partition_t *> &partitions) const;
 
     // Finalize the graph after finishing adding ops.
     graph::status_t finalize();
@@ -283,7 +294,7 @@ public:
     // This function is used to infer shape for all the ops in a graph.
     // Before calling this function, the inputs value of the graph should
     // have valid shape
-    graph::status_t infer_shape() {
+    graph::status_t infer_shape() const {
         using value_ptr = std::shared_ptr<value_t>;
 
         // Check inputs shape
@@ -334,6 +345,7 @@ public:
 
     // This function is used to set user given logical tensors for inputs and
     // outputs of a graph.
+    // NOLINTNEXTLINE(readability-make-member-function-const)
     graph::status_t set_user_inputs_outputs(
             const std::vector<graph::logical_tensor_t> &inputs,
             const std::vector<graph::logical_tensor_t> &outputs) {
@@ -396,41 +408,7 @@ public:
     }
 
     // This function is used to serialize graph to a JSON file
-    graph::status_t serialize(const std::string &filename) const {
-        printf("onednn_graph_verbose,info,serialize graph to a json file %s\n",
-                filename.c_str());
-        std::ofstream of(filename);
-        graph::utils::json::json_writer_t writer(&of);
-        writer.begin_object();
-        std::string version = std::to_string(dnnl_version()->major) + "."
-                + std::to_string(dnnl_version()->minor) + "."
-                + std::to_string(dnnl_version()->patch);
-        writer.write_keyvalue("version", version);
-        writer.write_keyvalue("engine_kind",
-                std::string(graph::utils::engine_kind2str(get_engine_kind())));
-        writer.write_keyvalue("fpmath_mode",
-                std::string(graph::utils::fpmath_mode2str(get_fpmath_mode())));
-        std::vector<size_t> inputs_id;
-        inputs_id.reserve(get_input_values().size());
-        for (const auto &val : get_input_values()) {
-            auto lt = val->get_logical_tensor();
-            auto ltw = logical_tensor_wrapper_t(lt);
-            inputs_id.push_back(ltw.id());
-        }
-        writer.write_keyvalue("input_ports", inputs_id);
-        std::vector<size_t> outputs_id;
-        outputs_id.reserve(get_output_values().size());
-        for (const auto &val : get_output_values()) {
-            auto lt = val->get_logical_tensor();
-            auto ltw = logical_tensor_wrapper_t(lt);
-            outputs_id.push_back(ltw.id());
-        }
-        writer.write_keyvalue("output_ports", outputs_id);
-        writer.write_keyvalue("graph", get_ops());
-        writer.end_object();
-
-        return graph::status::success;
-    }
+    graph::status_t serialize(const std::string &filename) const;
 
     static std::vector<op_ptr> deep_copy(const std::vector<op_ptr> &ops);
 };

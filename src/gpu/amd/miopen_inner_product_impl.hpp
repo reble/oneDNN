@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2024 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,7 @@
 #include <miopen/miopen.h>
 
 #include "common/type_helpers.hpp"
-#include "gpu/amd/sycl_hip_engine.hpp"
+#include "gpu/amd/engine.hpp"
 #include "gpu/amd/sycl_hip_utils.hpp"
 
 namespace dnnl {
@@ -134,7 +134,7 @@ struct miopen_inner_product_impl_base_t {
     bool conv_using_scale_scratchpad() const { return scale_bias_; }
 
     void set_bias_dims(miopenTensorLayout_t format, int ndims, int bias_dim) {
-        for (size_t i = 0; i < ndims; ++i) {
+        for (int i = 0; i < ndims; ++i) {
             dims_[io::bia][i] = 1;
             strides_[io::bia][i] = (format != miopenTensorNHWC ? 1 : bias_dim);
         }
@@ -142,8 +142,9 @@ struct miopen_inner_product_impl_base_t {
         strides_[io::bia][1] = 1;
         strides_[io::bia][0] = bias_dim;
     }
-    virtual status_t init(engine_t * /*engine*/, inner_product_pd_t * /*pd*/,
-            bool /*with_relu*/, bool /*with_eltwise*/, bool /*with_sum */,
+    virtual status_t init(impl::engine_t * /*engine*/,
+            inner_product_pd_t * /*pd*/, bool /*with_relu*/,
+            bool /*with_eltwise*/, bool /*with_sum */,
             bool /*using_fused_path_for_blocking*/)
             = 0;
 
@@ -154,7 +155,7 @@ struct miopen_inner_product_impl_base_t {
 
 struct miopen_inner_product_fwd_base_t
     : public miopen_inner_product_impl_base_t {
-    float output_scales_; // alpha in gemm
+    float alpha_; // alpha in gemm
     bool do_scaling_ {false}, runtime_scaling_ {false};
     float sum_scale_; // beta in gemm
     float eltwise_alpha(const inner_product_pd_t *pd) const {

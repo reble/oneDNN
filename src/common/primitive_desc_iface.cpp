@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2023 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,10 +37,10 @@ status_t primitive_desc_create(primitive_desc_iface_t **primitive_desc_iface,
 
     if (!primitive_desc_iface) return invalid_arguments;
 
-    const bool known_primitive_kind = utils::one_of(op_desc->kind,
+    const bool known_primitive_kind = utils::one_of(op_desc->primitive_kind,
             batch_normalization, binary, convolution, deconvolution, eltwise,
             gemm, group_normalization, inner_product, layer_normalization, lrn,
-            matmul, pooling, prelu, reduction, resampling, rnn, shuffle,
+            matmul, pooling, prelu, reduction, resampling, rnn, sdpa, shuffle,
             softmax);
     if (!known_primitive_kind) return invalid_arguments;
 
@@ -91,11 +91,15 @@ status_t dnnl_primitive_desc::next_impl() {
 }
 
 status_t dnnl_primitive_desc::create_primitive_iface(
-        std::pair<primitive_iface_t *, bool> &primitive_iface,
+        std::pair<primitive_iface_t *, cache_state_t> &primitive_iface,
         const cache_blob_t &cache_blob) const {
     // Step 1: create impl::primitive_t or get it from primitive cache
-    std::pair<std::shared_ptr<primitive_t>, bool> p;
-    auto status = impl()->create_primitive(p, engine(), cache_blob);
+    std::pair<std::shared_ptr<primitive_t>, cache_state_t> p;
+    // Top level primitive can be fetched from the primitive cache since it's
+    // fetching it faster.
+    constexpr bool force_create_from_blob = false;
+    auto status = impl()->create_primitive(
+            p, engine(), cache_blob, force_create_from_blob);
     if (status != status::success) return status;
     // Step 2: create primitive_iface_t, init and return it to user
     primitive_iface_t *p_iface = nullptr;

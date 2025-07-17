@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2022-2024 Intel Corporation
+* Copyright 2022-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ namespace graph {
 using namespace dnnl::graph;
 using namespace dnnl::impl::graph;
 
-void deserialized_attr::load(utils::json::json_reader_t *reader) {
+void deserialized_attr_t::load(utils::json::json_reader_t *reader) {
     reader->begin_object();
     std::string key_entry;
     std::string value_entry;
@@ -64,7 +64,7 @@ void deserialized_attr::load(utils::json::json_reader_t *reader) {
     reader->next_object_item(&value_entry);
 }
 
-logical_tensor::data_type deserialized_lt::get_data_type() const {
+logical_tensor::data_type deserialized_lt_t::get_data_type() const {
     if (data_type_ == "f32") {
         return logical_tensor::data_type::f32;
     } else if (data_type_ == "f16") {
@@ -83,22 +83,28 @@ logical_tensor::data_type deserialized_lt::get_data_type() const {
         return logical_tensor::data_type::f8_e5m2;
     } else if (data_type_ == "f8_e4m3") {
         return logical_tensor::data_type::f8_e4m3;
+    } else if (data_type_ == "s4") {
+        return logical_tensor::data_type::s4;
+    } else if (data_type_ == "u4") {
+        return logical_tensor::data_type::u4;
     } else {
         return logical_tensor::data_type::undef;
     }
 }
 
-logical_tensor::property_type deserialized_lt::get_property_type() const {
+logical_tensor::property_type deserialized_lt_t::get_property_type() const {
     if (property_type_ == "constant") {
         return logical_tensor::property_type::constant;
     } else if (property_type_ == "variable") {
         return logical_tensor::property_type::variable;
+    } else if (property_type_ == "host_scalar") {
+        return logical_tensor::property_type::host_scalar;
     } else {
         return logical_tensor::property_type::undef;
     }
 }
 
-logical_tensor deserialized_lt::create() const {
+logical_tensor deserialized_lt_t::create() const {
     if (layout_type_ == "any") {
         return logical_tensor(id_, get_data_type(), shape_,
                 logical_tensor::layout_type::any, get_property_type());
@@ -108,7 +114,7 @@ logical_tensor deserialized_lt::create() const {
     }
 }
 
-void deserialized_lt::load(utils::json::json_reader_t *reader) {
+void deserialized_lt_t::load(utils::json::json_reader_t *reader) {
     utils::json::read_helper_t helper;
 
     helper.declare_field("id", &id_);
@@ -120,7 +126,11 @@ void deserialized_lt::load(utils::json::json_reader_t *reader) {
     helper.read_fields(reader);
 }
 
-void deserialized_op::load(utils::json::json_reader_t *reader) {
+bool deserialized_lt_t::is_host_scalar() const {
+    return property_type_ == "host_scalar";
+}
+
+void deserialized_op_t::load(utils::json::json_reader_t *reader) {
     utils::json::read_helper_t helper;
 
     helper.declare_field("id", &id_);
@@ -132,14 +142,14 @@ void deserialized_op::load(utils::json::json_reader_t *reader) {
     helper.read_fields(reader);
 }
 
-op deserialized_op::create() const {
+op deserialized_op_t::create() const {
     op aop(id_, opstr2kind(kind_), name_);
     for (auto it = attrs_.begin(); it != attrs_.end(); ++it) {
         const auto &attr = attrstr2kind(it->first);
         const auto &attr_value = it->second;
         const auto &type = attr_value.type_;
         if (type == "string") {
-            const auto value = attr_value.str_value_;
+            const auto &value = attr_value.str_value_;
             aop.set_attr(attr, value);
         } else if (type == "bool") {
             const auto value = attr_value.bool_value_;
@@ -148,13 +158,13 @@ op deserialized_op::create() const {
             const auto value = attr_value.s64_value_;
             aop.set_attr(attr, value);
         } else if (type == "s64[]") {
-            const auto value = attr_value.s64_vector_;
+            const auto &value = attr_value.s64_vector_;
             aop.set_attr(attr, value);
         } else if (type == "f32") {
             const auto value = attr_value.f32_value_;
             aop.set_attr(attr, value);
         } else if (type == "f32[]") {
-            const auto value = attr_value.f32_vector_;
+            const auto &value = attr_value.f32_vector_;
             aop.set_attr(attr, value);
         }
     }
@@ -169,49 +179,202 @@ op deserialized_op::create() const {
     return aop;
 }
 
-bool deserialized_op::get_attr_string(
+class op_kind_hash_t {
+public:
+    std::size_t operator()(const dnnl::graph::op::kind &op_kind) const {
+        return std::hash<int>()(static_cast<int>(op_kind));
+    }
+};
+
+dnnl_driver_t deserialized_op_t::opkind2driver() const {
+    const static std::unordered_map<dnnl::graph::op::kind, dnnl_driver_t,
+            op_kind_hash_t>
+            op_map = {
+                    {dnnl::graph::op::kind::Abs, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::AbsBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Add, dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::AvgPool, dnnl_driver_t::pool},
+                    {dnnl::graph::op::kind::AvgPoolBackward,
+                            dnnl_driver_t::pool},
+                    {dnnl::graph::op::kind::BatchNormForwardTraining,
+                            dnnl_driver_t::bnorm},
+                    {dnnl::graph::op::kind::BatchNormInference,
+                            dnnl_driver_t::bnorm},
+                    {dnnl::graph::op::kind::BatchNormTrainingBackward,
+                            dnnl_driver_t::bnorm},
+                    {dnnl::graph::op::kind::BiasAdd, dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::BiasAddBackward,
+                            dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::Clamp, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::ClampBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Concat, dnnl_driver_t::concat},
+                    {dnnl::graph::op::kind::Convolution, dnnl_driver_t::conv},
+                    {dnnl::graph::op::kind::ConvolutionBackwardData,
+                            dnnl_driver_t::conv},
+                    {dnnl::graph::op::kind::ConvolutionBackwardWeights,
+                            dnnl_driver_t::conv},
+                    {dnnl::graph::op::kind::ConvTranspose,
+                            dnnl_driver_t::deconv},
+                    {dnnl::graph::op::kind::ConvTransposeBackwardData,
+                            dnnl_driver_t::deconv},
+                    {dnnl::graph::op::kind::ConvTransposeBackwardWeights,
+                            dnnl_driver_t::deconv},
+                    {dnnl::graph::op::kind::Dequantize, dnnl_driver_t::reorder},
+                    {dnnl::graph::op::kind::Divide, dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::DynamicDequantize,
+                            dnnl_driver_t::reorder},
+                    {dnnl::graph::op::kind::DynamicQuantize,
+                            dnnl_driver_t::reorder},
+                    {dnnl::graph::op::kind::Elu, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::EluBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::End, dnnl_driver_t::others},
+                    //{dnnl::graph::op::kind::Erf, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Exp, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::GELU, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::GELUBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::GenIndex, dnnl_driver_t::custom},
+                    {dnnl::graph::op::kind::GreaterEqual,
+                            dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::GroupNorm, dnnl_driver_t::gnorm},
+                    {dnnl::graph::op::kind::HardSigmoid,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::HardSigmoidBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::HardSwish, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::HardSwishBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Interpolate,
+                            dnnl_driver_t::resampling},
+                    {dnnl::graph::op::kind::InterpolateBackward,
+                            dnnl_driver_t::resampling},
+                    {dnnl::graph::op::kind::LayerNorm, dnnl_driver_t::lnorm},
+                    {dnnl::graph::op::kind::LayerNormBackward,
+                            dnnl_driver_t::lnorm},
+                    {dnnl::graph::op::kind::LeakyReLU, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Log, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::LogSoftmax, dnnl_driver_t::softmax},
+                    {dnnl::graph::op::kind::LogSoftmaxBackward,
+                            dnnl_driver_t::softmax},
+                    {dnnl::graph::op::kind::MatMul, dnnl_driver_t::matmul},
+                    {dnnl::graph::op::kind::Maximum, dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::MaxPool, dnnl_driver_t::pool},
+                    {dnnl::graph::op::kind::MaxPoolBackward,
+                            dnnl_driver_t::pool},
+                    {dnnl::graph::op::kind::Minimum, dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::Mish, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::MishBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Multiply, dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::PReLU, dnnl_driver_t::prelu},
+                    {dnnl::graph::op::kind::PReLUBackward,
+                            dnnl_driver_t::prelu},
+                    {dnnl::graph::op::kind::Pow, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Quantize, dnnl_driver_t::reorder},
+                    {dnnl::graph::op::kind::Reciprocal, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::ReduceL1, dnnl_driver_t::reduction},
+                    {dnnl::graph::op::kind::ReduceL2, dnnl_driver_t::reduction},
+                    {dnnl::graph::op::kind::ReduceMax,
+                            dnnl_driver_t::reduction},
+                    {dnnl::graph::op::kind::ReduceMean,
+                            dnnl_driver_t::reduction},
+                    {dnnl::graph::op::kind::ReduceMin,
+                            dnnl_driver_t::reduction},
+                    {dnnl::graph::op::kind::ReduceProd,
+                            dnnl_driver_t::reduction},
+                    {dnnl::graph::op::kind::ReduceSum,
+                            dnnl_driver_t::reduction},
+                    {dnnl::graph::op::kind::ReLU, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::ReLUBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Reorder, dnnl_driver_t::reorder},
+                    {dnnl::graph::op::kind::Round, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Select, dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::Sigmoid, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::SigmoidBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::SoftMax, dnnl_driver_t::softmax},
+                    {dnnl::graph::op::kind::SoftMaxBackward,
+                            dnnl_driver_t::softmax},
+                    {dnnl::graph::op::kind::SoftPlus, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::SoftPlusBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Sqrt, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::SqrtBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::Square, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::SquaredDifference,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::StaticReshape,
+                            dnnl_driver_t::custom},
+                    {dnnl::graph::op::kind::StaticTranspose,
+                            dnnl_driver_t::custom},
+                    {dnnl::graph::op::kind::Subtract, dnnl_driver_t::binary},
+                    {dnnl::graph::op::kind::Tanh, dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::TanhBackward,
+                            dnnl_driver_t::eltwise},
+                    {dnnl::graph::op::kind::TypeCast, dnnl_driver_t::reorder},
+                    {dnnl::graph::op::kind::Wildcard, dnnl_driver_t::others},
+            };
+
+    dnnl::graph::op::kind op_kind = opstr2kind(kind_);
+    const auto it = op_map.find(op_kind);
+    if (it != op_map.end()) {
+        return it->second;
+    } else {
+        fprintf(stderr, "graph: ERROR: Unsupported opkind: `%d`, exiting...\n",
+                static_cast<int>(op_kind));
+        SAFE_V(FAIL);
+    }
+    return dnnl_driver_t::others;
+}
+
+bool deserialized_op_t::get_attr_string(
         std::string &attr, const std::string &attr_name) const {
     auto it = attrs_.find(attr_name);
     if (it == attrs_.end()) return false;
     return attr = it->second.str_value_, true;
 }
 
-bool deserialized_op::get_attr_bool(
+bool deserialized_op_t::get_attr_bool(
         bool &attr, const std::string &attr_name) const {
     auto it = attrs_.find(attr_name);
     if (it == attrs_.end()) return false;
     return attr = it->second.bool_value_, true;
 }
 
-bool deserialized_op::get_attr_f32(
+bool deserialized_op_t::get_attr_f32(
         float &attr, const std::string &attr_name) const {
     auto it = attrs_.find(attr_name);
     if (it == attrs_.end()) return false;
     return attr = it->second.f32_value_, true;
 }
 
-bool deserialized_op::get_attr_s64(
+bool deserialized_op_t::get_attr_s64(
         int64_t &attr, const std::string &attr_name) const {
     auto it = attrs_.find(attr_name);
     if (it == attrs_.end()) return false;
     return attr = it->second.s64_value_, true;
 }
 
-bool deserialized_op::get_attr_f32_vector(
+bool deserialized_op_t::get_attr_f32_vector(
         std::vector<float> &attr, const std::string &attr_name) const {
     auto it = attrs_.find(attr_name);
     if (it == attrs_.end()) return false;
     return attr = it->second.f32_vector_, true;
 }
 
-bool deserialized_op::get_attr_s64_vector(
+bool deserialized_op_t::get_attr_s64_vector(
         std::vector<int64_t> &attr, const std::string &attr_name) const {
     auto it = attrs_.find(attr_name);
     if (it == attrs_.end()) return false;
     return attr = it->second.s64_vector_, true;
 }
 
-bool deserialized_op::has_NXC_format() const {
+bool deserialized_op_t::has_NXC_format() const {
     std::string data_format;
     if (get_attr_string(data_format, "data_format")) {
         return data_format == "NXC";
@@ -230,14 +393,14 @@ bool deserialized_op::has_NXC_format() const {
     }
 }
 
-logical_tensor::dims deserialized_op::get_NCX_shape(
+logical_tensor::dims deserialized_op_t::get_NCX_shape(
         size_t idx, bool input) const {
     auto src_dims = input ? in_lts_.at(idx).shape_ : out_lts_.at(idx).shape_;
     if (has_NXC_format()) { change_format_to_ncx(src_dims); }
     return src_dims;
 }
 
-void deserialized_graph::load(const std::string &pass_config_json) {
+void deserialized_graph_t::load(const std::string &pass_config_json) {
     std::ifstream fs(pass_config_json.c_str());
     utils::json::json_reader_t read(&fs);
     utils::json::read_helper_t helper;
@@ -245,6 +408,8 @@ void deserialized_graph::load(const std::string &pass_config_json) {
     helper.declare_field("version", &version_);
     helper.declare_field("engine_kind", &engine_kind_);
     helper.declare_field("fpmath_mode", &fpmath_mode_);
+    helper.declare_field(
+            "fpmath_mode_apply_to_int", &fpmath_mode_apply_to_int_);
     helper.declare_field("input_ports", &input_ports_);
     helper.declare_field("output_ports", &output_ports_);
     helper.read_fields(&read);
@@ -255,8 +420,30 @@ void deserialized_graph::load(const std::string &pass_config_json) {
         SAFE_V(FAIL);
     }
 
+    // Original graph int8 cases come with close-to-real-world values of scales.
+    // They are typically f32 random real numbers which doesn't help to validate
+    // correctness due to rounding issues in lower precision data types.
+    // To work around potential rounding, the code below rounds scales from the
+    // case to the nearest pow2 value. E.g. 0.2438485 -> 0.25.
+    // Note: it must be done before `ops` are put into `ops_map`.
+    for (auto &aop : ops_) {
+        if (aop.kind_ != "Dequantize" && aop.kind_ != "Quantize") continue;
+
+        const auto it_attr_scales = aop.attrs_.find("scales");
+        const bool has_scales = it_attr_scales != aop.attrs_.end();
+        if (!has_scales) continue;
+
+        auto &f32_vector = it_attr_scales->second.f32_vector_;
+        for (size_t i = 0; i < f32_vector.size(); i++) {
+            const int64_t p
+                    = static_cast<int64_t>(std::ceil(std::log2(f32_vector[i])));
+            const float new_scale = p >= 0 ? (1LL << p) : (1.f / (1LL << -p));
+            f32_vector[i] = new_scale;
+        }
+    }
+
     std::map<size_t, size_t> deg; // record indegree for each op
-    std::map<size_t, deserialized_op> ops_map; // op_id -> op
+    std::map<size_t, deserialized_op_t> ops_map; // op_id -> op
     for (const auto &aop : ops_) {
         ops_map[aop.id_] = aop;
         deg[aop.id_] = 0;
@@ -268,6 +455,10 @@ void deserialized_graph::load(const std::string &pass_config_json) {
             // collect graph internal and output tensors memory layout
             std::string mtag
                     = strides2memory_tag(lt.shape_.size(), lt.stride_, false);
+            if (!is_contiguous_memory(lt.stride_, lt.shape_, mtag)) {
+                // "not_available" string is handled later inside flex_rewrite.
+                mtag = "not_available";
+            }
             lt_2_mtag_[lt.id_] = mtag;
         }
     }
@@ -316,12 +507,18 @@ void deserialized_graph::load(const std::string &pass_config_json) {
             // collect graph input tensors memory layout
             std::string mtag
                     = strides2memory_tag(lt.shape_.size(), lt.stride_, false);
+            if (!is_contiguous_memory(lt.stride_, lt.shape_, mtag)) {
+                mtag = "not_available";
+            }
             lt_2_mtag_[lt.id_] = mtag;
         }
     }
 
+    // Keep the object out of the call due to recursion inside the call.
+    // Accumulates the state of mb rewrite of nested ops.
+    std::unordered_map<size_t, bool> mb_rewrite_ret;
     for (const auto &graph_in : graph_tensors_) {
-        if (check_tensor_with_mb(graph_in.first)) {
+        if (check_tensor_with_mb(graph_in.first, mb_rewrite_ret)) {
             graph_inputs_with_mb_.push_back(graph_in.first);
         }
     }
@@ -334,14 +531,14 @@ void deserialized_graph::load(const std::string &pass_config_json) {
 }
 
 // Prints the lt in the plain string format: `(id):dt:shape`.
-std::ostream &operator<<(std::ostream &s, const deserialized_lt &dlt) {
+std::ostream &operator<<(std::ostream &s, const deserialized_lt_t &dlt) {
     s << "(" << dlt.id_ << "):" << dlt.data_type_ << ":"
       << lt_dims2str(dlt.shape_);
     return s;
 }
 
-std::string deserialized_lt::get_string() const {
-    std::stringstream ss;
+std::string deserialized_lt_t::get_string() const {
+    dnnl::impl::stringstream_t ss;
     ss << *this;
     return ss.str();
 }
@@ -351,7 +548,7 @@ std::string deserialized_lt::get_string() const {
 //     In: { lt0, lt1, ... }
 //     Out: { lt0, lt1, ... }
 //     Attrs: { Scales: { val0, ... } }  // <-- if any available.
-std::ostream &operator<<(std::ostream &s, const deserialized_op &dop) {
+std::ostream &operator<<(std::ostream &s, const deserialized_op_t &dop) {
     s << "{(" << dop.id_ << ") " << dop.kind_ << "}\n";
 
     s << "    In: { ";
@@ -371,45 +568,72 @@ std::ostream &operator<<(std::ostream &s, const deserialized_op &dop) {
     s << "}\n";
 
     const auto it_attr_scales = dop.attrs_.find("scales");
+    const auto it_attr_group_shape = dop.attrs_.find("group_shape");
     const bool has_scales = it_attr_scales != dop.attrs_.end();
-    if (has_scales) {
+    const bool has_group_shape = it_attr_group_shape != dop.attrs_.end();
+
+    if (has_scales || has_group_shape) {
         s << "    Attrs: { ";
-        s << "Scales: { ";
-        const auto &scales_v = it_attr_scales->second.f32_vector_;
-        for (size_t i = 0; i < scales_v.size(); i++) {
-            s << scales_v[i];
-            if (i != scales_v.size() - 1) s << ",";
-            s << " ";
+
+        if (has_scales) {
+            const auto &scales_v = it_attr_scales->second.f32_vector_;
+            const auto size = scales_v.size();
+            std::string size_str = " (" + std::to_string(size) + ")";
+            s << "Scales" << (size > 1 ? size_str : "") << ": { ";
+            for (size_t i = 0; i < size; i++) {
+                s << scales_v[i];
+                if (i != size - 1) s << ",";
+                s << " ";
+            }
+            s << "} "; // Scales
         }
-        s << "} "; // Scales
+
+        if (has_group_shape) {
+            const auto &group_shape_v = it_attr_group_shape->second.s64_vector_;
+            const auto size = group_shape_v.size();
+            std::string size_str = " (" + std::to_string(size) + ")";
+            s << "Group shape:" << (size > 1 ? size_str : "") << ": { ";
+            for (size_t i = 0; i < size; i++) {
+                s << group_shape_v[i];
+                if (i != size - 1) s << ",";
+                s << " ";
+            }
+            s << "} "; // Group Shape
+        }
+
         s << "}\n"; // Attrs
     }
+
     return s;
 }
 
-std::string deserialized_op::get_string() const {
-    std::stringstream ss;
+std::string deserialized_op_t::get_string() const {
+    dnnl::impl::stringstream_t ss;
     ss << *this;
     return ss.str();
 }
 
-std::ostream &operator<<(std::ostream &s, const deserialized_graph &dg) {
+std::ostream &operator<<(std::ostream &s, const deserialized_graph_t &dg) {
     for (const auto &op : dg.ops_) {
         s << op;
     }
     return s;
 }
 
-std::string deserialized_graph::get_string() const {
-    std::stringstream ss;
+std::string deserialized_graph_t::get_string() const {
+    dnnl::impl::stringstream_t ss;
     ss << *this;
     return ss.str();
 }
 
-dnnl::graph::graph deserialized_graph::to_graph(
-        dnnl::fpmath_mode fpmath_mode) const {
+dnnl::graph::graph deserialized_graph_t::to_graph(
+        const graph_fpmath_mode_t &fpmath_mode) const {
     const auto &engine = get_graph_engine();
-    dnnl::graph::graph g(engine.get_kind(), fpmath_mode);
+    dnnl::graph::graph g(engine.get_kind());
+    g.set_fpmath_mode(static_cast<dnnl::fpmath_mode>(
+                              str2fpmath_mode(fpmath_mode.mode_.c_str())),
+            fpmath_mode.apply_to_int_);
+
     for (const auto &aop : ops_) {
         try {
             g.add_op(aop.create());
@@ -422,30 +646,71 @@ dnnl::graph::graph deserialized_graph::to_graph(
     return g;
 }
 
-const deserialized_op &deserialized_graph::get_op(size_t id) const {
+const deserialized_op_t &deserialized_graph_t::get_op(size_t id) const {
     for (const auto &op : ops_) {
         if (op.id_ == id) return op;
     }
     assert(!"Given id was not found in the deserialized graph.");
-    static deserialized_op dummy;
+    static deserialized_op_t dummy;
     return dummy;
 }
 
-bool deserialized_graph::check_tensor_with_mb(size_t tensor_id) const {
-    if (in_lt_2_ops_.find(tensor_id) == in_lt_2_ops_.end()) return true;
+const deserialized_op_t &deserialized_graph_t::get_op_by_out_lt(
+        size_t out_lt_id) const {
+    for_(const auto &op : ops_)
+    for (const auto &out_lt : op.out_lts_) {
+        if (out_lt.id_ == out_lt_id) return op;
+    }
 
+    static deserialized_op_t dummy;
+    return dummy;
+}
+
+const deserialized_op_t &deserialized_graph_t::get_op_by_in_lt(
+        size_t in_lt_id) const {
+    for_(const auto &op : ops_)
+    for (const auto &in_lt : op.in_lts_) {
+        if (in_lt.id_ == in_lt_id) return op;
+    }
+
+    static deserialized_op_t dummy;
+    return dummy;
+}
+
+bool deserialized_graph_t::check_tensor_with_mb(size_t tensor_id,
+        std::unordered_map<size_t, bool> &mb_rewrite_ret) const {
+    if (in_lt_2_ops_.find(tensor_id) == in_lt_2_ops_.end()) return true;
+    if (mb_rewrite_ret.find(tensor_id) != mb_rewrite_ret.end())
+        return mb_rewrite_ret.at(tensor_id);
+
+    bool ret = true;
+    // TODO: initialize with false to avoid multiple re-initialization
     for (const auto &aop : in_lt_2_ops_.at(tensor_id)) {
-        // those unsupport op need rewrite dst_shape / weight_shape also
+        const bool matmul_mb_rewrite = (aop.kind_ == "MatMul")
+                && aop.in_lts_[0].shape_.size() > 2
+                && (tensor_id == aop.in_lts_[0].id_
+                        || tensor_id == aop.in_lts_[1].id_);
+        // The second and third inputs of dynamic dequantize are allowed to
+        // rewrite md only when the sebsequent op supports mb rewriting.
+        const bool dynamicdq_mb_rewrite = (aop.kind_ == "DynamicDequantize")
+                && aop.in_lts_[0].shape_.size() > 2
+                && check_tensor_with_mb(aop.out_lts_[0].id_, mb_rewrite_ret)
+                && (tensor_id == aop.in_lts_[0].id_
+                        || tensor_id == aop.in_lts_[1].id_
+                        || tensor_id == aop.in_lts_[2].id_);
+
         if (std::find(unsupport_mb_rewrite_ops_.begin(),
                     unsupport_mb_rewrite_ops_.end(), aop.kind_)
                 != unsupport_mb_rewrite_ops_.end()) {
-            return false;
-            // bwd ops have multiple inputs with mb
+            // those unsupport op need rewrite dst_shape / weight_shape also
+            ret = false;
         } else if (std::find(bwd_ops_.begin(), bwd_ops_.end(), aop.kind_)
                 != bwd_ops_.end()) {
+            // bwd ops have multiple inputs with mb
+            ret = false;
             if (tensor_id == aop.in_lts_[0].id_
                     || tensor_id == aop.in_lts_[1].id_) {
-                check_tensor_with_mb(aop.out_lts_[0].id_);
+                ret = check_tensor_with_mb(aop.out_lts_[0].id_, mb_rewrite_ret);
                 // deal with LayerNormBackward
             } else if (aop.kind_ == "LayerNormBackward"
                     && ((tensor_id == aop.in_lts_[2].id_
@@ -454,13 +719,12 @@ bool deserialized_graph::check_tensor_with_mb(size_t tensor_id) const {
                             || (tensor_id == aop.in_lts_[3].id_
                                     && aop.in_lts_[3].shape_[0]
                                             == aop.in_lts_[0].shape_[0]))) {
-                check_tensor_with_mb(aop.out_lts_[0].id_);
-            } else {
-                return false;
+                ret = check_tensor_with_mb(aop.out_lts_[0].id_, mb_rewrite_ret);
             }
-            // binary ops need consider rank of 2 inputs
         } else if (std::find(binary_ops_.begin(), binary_ops_.end(), aop.kind_)
                 != binary_ops_.end()) {
+            // binary ops need consider rank of 2 inputs
+            ret = false;
             size_t max_rank_id = aop.in_lts_[0].shape_.size()
                             >= aop.in_lts_[1].shape_.size()
                     ? aop.in_lts_[0].id_
@@ -468,28 +732,29 @@ bool deserialized_graph::check_tensor_with_mb(size_t tensor_id) const {
             if ((aop.in_lts_[0].shape_.size() == aop.in_lts_[1].shape_.size()
                         && aop.in_lts_[1].shape_[0] != 1)
                     || tensor_id == max_rank_id) {
-                check_tensor_with_mb(aop.out_lts_[0].id_);
-            } else {
-                return false;
+                ret = check_tensor_with_mb(aop.out_lts_[0].id_, mb_rewrite_ret);
             }
-            // prelu input1 may has same shape with input0
         } else if (aop.kind_ == "PReLU" && tensor_id == aop.in_lts_[1].id_) {
+            // prelu input1 may has same shape with input0
+            ret = false;
             if (aop.in_lts_[0].shape_.size() == aop.in_lts_[1].shape_.size()) {
-                check_tensor_with_mb(aop.out_lts_[0].id_);
-            } else {
-                return false;
+                ret = check_tensor_with_mb(aop.out_lts_[0].id_, mb_rewrite_ret);
             }
-            // apply mb for all inputs of concat
-        } else if (aop.kind_ != "Concat" && tensor_id != aop.in_lts_[0].id_) {
-            return false;
-            // check consumer ops recursively
+        } else if (!(matmul_mb_rewrite || dynamicdq_mb_rewrite
+                           || aop.kind_ == "Concat")
+                && tensor_id != aop.in_lts_[0].id_) {
+            // Do not rewrite if the given tensor is not the first input of the
+            // op, except matmul, dynamic dequantize and concat.
+            ret = false;
         } else if (aop.kind_ == "End") {
-            return true;
+            ret = true;
         } else {
-            return check_tensor_with_mb(aop.out_lts_[0].id_);
+            ret = check_tensor_with_mb(aop.out_lts_[0].id_, mb_rewrite_ret);
         }
     }
-    return true;
+
+    mb_rewrite_ret.emplace(tensor_id, ret);
+    return ret;
 }
 
 } // namespace graph

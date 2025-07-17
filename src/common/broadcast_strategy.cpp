@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2024 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -34,11 +34,13 @@ broadcasting_strategy_t get_rhs_arg_broadcasting_strategy(
     static const bcast_set_t all_bcast_strategies {
             broadcasting_strategy_t::scalar, broadcasting_strategy_t::per_oc,
             broadcasting_strategy_t::per_oc_spatial,
+            broadcasting_strategy_t::per_oc_d,
             broadcasting_strategy_t::shared_axes,
             broadcasting_strategy_t::per_mb,
             broadcasting_strategy_t::per_mb_spatial,
             broadcasting_strategy_t::per_mb_w, broadcasting_strategy_t::per_w,
-            broadcasting_strategy_t::batch,
+            broadcasting_strategy_t::per_hw, broadcasting_strategy_t::batch,
+            broadcasting_strategy_t::spatial,
             broadcasting_strategy_t::no_broadcast};
 
     return get_rhs_arg_broadcasting_strategy(
@@ -128,6 +130,21 @@ bool is_per_mb_bcast(const std::bitset<DNNL_MAX_NDIMS> mask,
     return per_mb_bcast;
 }
 
+// Checks if mask corresponds to broadcast per batch and height dimensions
+// Returns true if mask (4D) is equal to [1, 1, 0, 0]
+bool is_per_hw_bcast(const std::bitset<DNNL_MAX_NDIMS> mask,
+        const memory_desc_wrapper &dst_d) {
+    if (!dst_d.is_plain()) return false; // blocked format not supported
+
+    if (dst_d.ndims() != 4) return false;
+
+    bool per_hw_bcast = mask.test(0) && mask.test(1);
+    if (!per_hw_bcast) return false;
+    per_hw_bcast = per_hw_bcast && !mask.test(2) && !mask.test(3);
+
+    return per_hw_bcast;
+}
+
 // Checks if mask corresponds to broadcast per oc and spatial dimensions
 // Returns true if mask (5D) is equal to [1, 0, 0, 0, 0]
 bool is_batch_bcast(const std::bitset<DNNL_MAX_NDIMS> mask,
@@ -145,6 +162,35 @@ bool is_batch_bcast(const std::bitset<DNNL_MAX_NDIMS> mask,
                                           : batch_bcast;
 
     return batch_bcast;
+}
+
+// Checks if mask corresponds to broadcast per mb and oc dimensions
+// Returns true if mask (5D) is equal to [0, 0, 1, 1, 1]
+bool is_spatial_bcast(const std::bitset<DNNL_MAX_NDIMS> mask,
+        const memory_desc_wrapper &dst_d) {
+    if (!dst_d.is_plain()) return false; // blocked format not supported
+
+    bool spatial_bcast = !mask.test(0) && !mask.test(1);
+    if (!spatial_bcast) return false;
+
+    const size_t ndims = dst_d.ndims();
+    assert(ndims > 0);
+
+    for (size_t d = 2; d < ndims; ++d)
+        spatial_bcast = spatial_bcast && mask.test(d);
+
+    return spatial_bcast;
+}
+// Check if mask corresponds to per oc_d
+// true if dim == 4 and mask = [1, 0, 0, 1]
+bool is_per_oc_d_bcast(const std::bitset<DNNL_MAX_NDIMS> mask,
+        const memory_desc_t &rhs_arg_md, const memory_desc_wrapper &dst_d) {
+    const dims_t &rdims = rhs_arg_md.dims;
+    const dims_t &ddims = dst_d.dims();
+    if (rhs_arg_md.ndims != 4) return false;
+    if (!mask.test(0) || !mask.test(3)) return false;
+    if (rdims[1] != ddims[1] || rdims[2] != ddims[2]) return false;
+    return true;
 }
 
 bool bcast_strategy_enabled(const bcast_set_t &supported_strategy_set,
@@ -233,6 +279,15 @@ broadcasting_strategy_t get_rhs_arg_broadcasting_strategy(
     else if (is_batch_bcast(mask, dst_d, output_dims)
             && is_enabled(broadcasting_strategy_t::batch))
         bcast = broadcasting_strategy_t::batch;
+    else if (is_spatial_bcast(mask, dst_d)
+            && is_enabled(broadcasting_strategy_t::spatial))
+        bcast = broadcasting_strategy_t::spatial;
+    else if (is_per_oc_d_bcast(mask, rhs_arg_md, dst_d)
+            && is_enabled(broadcasting_strategy_t::per_oc_d)) {
+        bcast = broadcasting_strategy_t::per_oc_d;
+    } else if (is_per_hw_bcast(mask, dst_d)
+            && is_enabled(broadcasting_strategy_t::per_hw))
+        bcast = broadcasting_strategy_t::per_hw;
     else if (is_enabled(broadcasting_strategy_t::shared_axes))
         bcast = broadcasting_strategy_t::shared_axes;
 

@@ -7,7 +7,7 @@
 --dir=FWD_B,FWD_D
 ### Direct
 --alg=direct
---dt=f32,bf16,f8_e5m2,f8_e4m3,f16
+--dt=f32,bf16,f8_e5m2,f8_e4m3,f16,f32:f16:f32,f32:bf16:f32
 --stag=any,axb
 --dtag=any,axb
 --attr-post-ops=, \
@@ -16,6 +16,11 @@
                 add:f32, \
                 prelu:per_oc, \
                 mul:s8:per_oc+sum:0.25+relu:0.5+add:f32:per_tensor
+--batch=shapes_basic
+#### f32 abx format
+--stag=abx
+--dtag=abx
+--dt=f32
 --batch=shapes_basic
 ### Wino
 --alg=wino
@@ -28,9 +33,14 @@
 --attr-post-ops=
 ### Direct
 --alg=direct
---dt=f32,bf16,f8_e5m2,f8_e4m3
+--dt=f32,bf16,f16,f8_e5m2,f8_e4m3
 --stag=any,axb
 --dtag=any,axb
+--batch=shapes_basic
+#### f32 abx format
+--stag=abx
+--dtag=abx
+--dt=f32
 --batch=shapes_basic
 ### Wino
 --alg=wino
@@ -45,7 +55,6 @@
 
 ## Direct
 --alg=direct
-
 ### All inference configs
 --dt=s8:s8:f32,s8:s8:bf16,s8:s8:f16,s8:s8:s32,s8:s8:s8,s8:s8:u8, \
       u8:s8:f32,u8:s8:bf16,u8:s8:f16,u8:s8:s32,u8:s8:s8,u8:s8:u8
@@ -63,7 +72,7 @@
 --attr-zero-points=
 --batch=shapes_basic
 --attr-post-ops=
---attr-zero-points=,src:common:2+dst:common:1,src:per_dim_1+dst:per_dim_1
+--attr-zero-points=,src:common:2+dst:common:1,src:per_dim_1+dst:per_dim_1,src:per_dim_1+dst:common:1
 --batch=shapes_basic
 ### Signed input
 --dt=s8:s8:s8
@@ -77,13 +86,13 @@
 --attr-zero-points=
 --batch=shapes_basic
 --attr-post-ops=
---attr-zero-points=,src:common:2+dst:common:1,src:per_dim_1+dst:per_dim_1
+--attr-zero-points=,src:common:2+dst:common:1,src:per_dim_1+dst:per_dim_1,src:per_dim_1+dst:common:1
 --batch=shapes_basic
-# BF32
+# BF32 and TF32
 --reset
 --dir=FWD_D,BWD_D
 --dt=f32
---stag=any
---dtag=any
---attr-fpmath=bf16
+--stag=any,axb
+--dtag=any,axb
+--attr-fpmath=bf16,tf32
 --batch=shapes_basic

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2019-2023 Intel Corporation
+* Copyright 2019-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -37,9 +37,7 @@ namespace x64 {
 template <data_type_t dst_data_type>
 struct gemm_bf16_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(GEMM_IMPL_STR, gemm_bf16_convolution_fwd_t,
                 USE_GLOBAL_SCRATCHPAD);
@@ -70,25 +68,13 @@ struct gemm_bf16_convolution_fwd_t : public primitive_t {
                                    dst_data_type),
                     VERBOSE_UNSUPPORTED_ATTR);
 
-            {
-                using namespace x64::injector;
-                static constexpr bool sum_at_pos_0_only = true;
-                static constexpr bool sum_requires_scale_one = true;
-                static constexpr bool sum_requires_zp_zero = true;
-                const auto dst_md = memory_desc_wrapper(dst_md_);
-
-                VDISPATCH_CONV(
-                        post_ops_ok(post_ops_ok_args_t(avx512_core,
-                                {binary, eltwise, sum}, attr()->post_ops_,
-                                &dst_md, sum_at_pos_0_only,
-                                sum_requires_scale_one, sum_requires_zp_zero)),
-                        VERBOSE_UNSUPPORTED_POSTOP);
-            }
-
             auto scratchpad = scratchpad_registry().registrar();
+
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            jcp_ = conv_gemm_conf_t();
             return jit_gemm_convolution_utils::init_conf(jcp_, scratchpad,
                     *desc(), src_md_, weights_md_, dst_md_, bias_md_, attr_,
-                    dnnl_get_max_threads());
+                    dnnl_get_max_threads(), true /* check_postops */);
         }
 
         bool is_postprocess_required() const {
@@ -103,16 +89,16 @@ struct gemm_bf16_convolution_fwd_t : public primitive_t {
                     || is_pp_for_post_ops_required;
         }
 
-        conv_gemm_conf_t jcp_;
+        conv_gemm_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     gemm_bf16_convolution_fwd_t(const pd_t *apd)
         : primitive_t(apd), pp_ker_(nullptr) {}
 
-    typedef typename prec_traits<dst_data_type>::type dst_data_t;
-    typedef typename prec_traits<data_type::f32>::type acc_data_t;
-    typedef typename prec_traits<data_type::bf16>::type src_data_t;
-    typedef typename prec_traits<data_type::bf16>::type wei_data_t;
+    using dst_data_t = typename prec_traits_t<dst_data_type>::type;
+    using acc_data_t = typename prec_traits_t<data_type::f32>::type;
+    using src_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using wei_data_t = typename prec_traits_t<data_type::bf16>::type;
 
     status_t init(engine_t *engine) override {
         const auto &post_ops = pd()->attr()->post_ops_;
@@ -145,7 +131,7 @@ private:
 
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
 
-    class pp_ker_t : public jit_generator {
+    class pp_ker_t : public jit_generator_t {
     public:
         DECLARE_CPU_JIT_AUX_FUNCTIONS(gemm_bf16_convolution_fwd_t::pp_kernel);
         pp_ker_t(const pd_t *pd);
@@ -161,19 +147,19 @@ private:
                 const size_t g_oc_offset);
 
     private:
-        struct ker_args {
-            dst_data_t *dst;
-            const acc_data_t *acc;
-            const acc_data_t *bias;
-            float sum_scale;
-            size_t dst_stride_in_bytes;
-            size_t acc_stride_in_bytes;
-            size_t spatial_length;
-            size_t oc_work;
+        struct ker_args_t {
+            dst_data_t *dst = nullptr;
+            const acc_data_t *acc = nullptr;
+            const acc_data_t *bias = nullptr;
+            float sum_scale = 0.f;
+            size_t dst_stride_in_bytes = 0;
+            size_t acc_stride_in_bytes = 0;
+            size_t spatial_length = 0;
+            size_t oc_work = 0;
 
-            size_t g_oc_offset;
-            const void *post_ops_binary_rhs_arg_vec;
-            const void *dst_orig;
+            size_t g_oc_offset = 0;
+            const void *post_ops_binary_rhs_arg_vec = nullptr;
+            const void *dst_orig = nullptr;
         };
 
         enum { default_unroll_2_pow_ = 2 };
@@ -254,9 +240,7 @@ private:
 template <data_type_t diff_src_data_type>
 struct gemm_bf16_convolution_bwd_data_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_data_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_data_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_bwd_data_pd_t::cpu_convolution_bwd_data_pd_t;
 
         DECLARE_COMMON_PD_T(GEMM_IMPL_STR, gemm_bf16_convolution_bwd_data_t,
                 USE_GLOBAL_SCRATCHPAD);
@@ -277,20 +261,23 @@ struct gemm_bf16_convolution_bwd_data_t : public primitive_t {
                     attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
 
             auto scratchpad = scratchpad_registry().registrar();
+
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            jcp_ = conv_gemm_conf_t();
             return jit_gemm_convolution_utils::init_conf(jcp_, scratchpad,
                     *desc(), diff_src_md_, weights_md_, diff_dst_md_, bias_md_,
                     attr_, dnnl_get_max_threads());
         }
 
-        conv_gemm_conf_t jcp_;
+        conv_gemm_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     gemm_bf16_convolution_bwd_data_t(const pd_t *apd) : primitive_t(apd) {}
 
-    typedef typename prec_traits<data_type::bf16>::type diff_dst_data_t;
-    typedef typename prec_traits<data_type::f32>::type acc_data_t;
-    typedef typename prec_traits<diff_src_data_type>::type diff_src_data_t;
-    typedef typename prec_traits<data_type::bf16>::type wei_data_t;
+    using diff_dst_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using acc_data_t = typename prec_traits_t<data_type::f32>::type;
+    using diff_src_data_t = typename prec_traits_t<diff_src_data_type>::type;
+    using wei_data_t = typename prec_traits_t<data_type::bf16>::type;
 
     status_t execute(const exec_ctx_t &ctx) const override {
         const bool is_nspc = pd()->jcp_.is_nspc;
@@ -312,10 +299,8 @@ private:
 template <data_type_t diff_wei_data_type>
 struct gemm_bf16_convolution_bwd_weights_t : public primitive_t {
     struct pd_t : public cpu_convolution_bwd_weights_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const convolution_fwd_pd_t *hint_fwd_pd)
-            : cpu_convolution_bwd_weights_pd_t(adesc, attr, hint_fwd_pd)
-            , jcp_() {}
+        using cpu_convolution_bwd_weights_pd_t::
+                cpu_convolution_bwd_weights_pd_t;
 
         DECLARE_COMMON_PD_T(GEMM_IMPL_STR, gemm_bf16_convolution_bwd_weights_t,
                 USE_GLOBAL_SCRATCHPAD);
@@ -341,21 +326,24 @@ struct gemm_bf16_convolution_bwd_weights_t : public primitive_t {
                     attr()->has_default_values(), VERBOSE_UNSUPPORTED_ATTR);
 
             auto scratchpad = scratchpad_registry().registrar();
+
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            jcp_ = conv_gemm_conf_t();
             return jit_gemm_convolution_utils::init_conf(jcp_, scratchpad,
                     *desc(), src_md_, diff_weights_md_, diff_dst_md_,
                     diff_bias_md_, attr_, dnnl_get_max_threads());
         }
 
-        conv_gemm_conf_t jcp_;
+        conv_gemm_conf_t jcp_ = utils::zero<decltype(jcp_)>();
     };
 
     gemm_bf16_convolution_bwd_weights_t(const pd_t *apd)
         : primitive_t(apd), acc_ker_(nullptr) {}
 
-    typedef typename prec_traits<data_type::bf16>::type diff_dst_data_t;
-    typedef typename prec_traits<data_type::f32>::type acc_data_t;
-    typedef typename prec_traits<data_type::bf16>::type src_data_t;
-    typedef typename prec_traits<diff_wei_data_type>::type diff_wei_data_t;
+    using diff_dst_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using acc_data_t = typename prec_traits_t<data_type::f32>::type;
+    using src_data_t = typename prec_traits_t<data_type::bf16>::type;
+    using diff_wei_data_t = typename prec_traits_t<diff_wei_data_type>::type;
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(

@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2024 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -19,11 +19,9 @@
 
 #include "oneapi/dnnl/dnnl.h"
 
-#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_THREADPOOL
-#include "oneapi/dnnl/dnnl_threadpool_iface.hpp"
-#endif
-
 #include "c_types_map.hpp"
+#include "common/engine_impl.hpp"
+#include "common/stream_impl.hpp"
 #include "engine_id.hpp"
 #include "memory.hpp"
 #include "memory_storage.hpp"
@@ -34,6 +32,14 @@
 #include "graph/interface/allocator.hpp"
 #endif
 
+#define VERROR_ENGINE(cond, stat, msg, ...) \
+    do { \
+        if (!(cond)) { \
+            VERROR(common, runtime, msg, ##__VA_ARGS__); \
+            return stat; \
+        } \
+    } while (0)
+
 /** \brief An abstraction of an execution unit with shared resources
  *
  * Responsibilities:
@@ -41,31 +47,33 @@
  *   - Provide engine specific primitive_desc_t creators
  */
 struct dnnl_engine : public dnnl::impl::c_compatible {
-    dnnl_engine(dnnl::impl::engine_kind_t kind,
-            dnnl::impl::runtime_kind_t runtime_kind, size_t index)
-        : kind_(kind)
-        , runtime_kind_(runtime_kind)
-        , index_(index)
-        , counter_(1) {}
+    dnnl_engine(dnnl::impl::engine_impl_t *impl) : impl_(impl), counter_(1) {}
 
     /** get kind of the current engine */
-    dnnl::impl::engine_kind_t kind() const { return kind_; }
+    dnnl::impl::engine_kind_t kind() const { return impl()->kind(); }
 
     /** get the runtime kind of the current engine */
-    dnnl::impl::runtime_kind_t runtime_kind() const { return runtime_kind_; }
+    dnnl::impl::runtime_kind_t runtime_kind() const {
+        return impl()->runtime_kind();
+    }
 
     /** get index of the current engine */
-    size_t index() const { return index_; }
+    size_t index() const { return impl()->index(); }
 
-    virtual dnnl::impl::device_id_t device_id() const = 0;
-
-    virtual dnnl::impl::engine_id_t engine_id() const = 0;
+    virtual dnnl::impl::engine_id_t engine_id() const {
+        return impl()->engine_id();
+    }
 
     /** create memory storage */
     virtual dnnl::impl::status_t create_memory_storage(
             dnnl::impl::memory_storage_t **storage, unsigned flags, size_t size,
-            void *handle)
-            = 0;
+            void *handle) {
+        assert(impl());
+        if (!impl()) return dnnl::impl::status::runtime_error;
+        return impl()->create_memory_storage(
+                storage, this, flags, size, handle);
+    }
+
     dnnl::impl::status_t create_memory_storage(
             dnnl::impl::memory_storage_t **storage, size_t size) {
         return create_memory_storage(
@@ -73,16 +81,25 @@ struct dnnl_engine : public dnnl::impl::c_compatible {
     }
 
     /** create stream */
-    virtual dnnl::impl::status_t create_stream(
-            dnnl::impl::stream_t **stream, unsigned flags)
+    virtual dnnl::impl::status_t create_stream(dnnl::impl::stream_t **stream,
+            dnnl::impl::stream_impl_t *stream_impl)
             = 0;
 
-#if DNNL_CPU_RUNTIME == DNNL_RUNTIME_THREADPOOL
-    virtual dnnl::impl::status_t create_stream(dnnl::impl::stream_t **stream,
-            dnnl::threadpool_interop::threadpool_iface *threadpool) {
-        return dnnl::impl::status::invalid_arguments;
+    dnnl::impl::status_t create_stream(
+            dnnl::impl::stream_t **stream, unsigned flags) {
+        std::unique_ptr<dnnl::impl::stream_impl_t> stream_impl;
+        dnnl::impl::stream_impl_t *stream_impl_ptr = nullptr;
+        CHECK(impl()->create_stream_impl(&stream_impl_ptr, flags));
+        stream_impl.reset(stream_impl_ptr);
+
+        dnnl::impl::stream_t *s;
+        CHECK(create_stream(&s, stream_impl.get()));
+        // stream (`s`) takes ownership of `stream_impl` if `create_stream` call
+        // is successful.
+        stream_impl.release();
+        *stream = s;
+        return dnnl::impl::status::success;
     }
-#endif
 
     virtual dnnl::impl::status_t get_service_stream(
             dnnl::impl::stream_t *&stream) {
@@ -120,13 +137,28 @@ struct dnnl_engine : public dnnl::impl::c_compatible {
         return dnnl::impl::status::runtime_error;
     }
 
+    virtual dnnl::impl::status_t get_cache_blob_size(size_t *size) const {
+        assert(!"unexpected");
+        return dnnl::impl::status::runtime_error;
+    }
+
+    virtual dnnl::impl::status_t get_cache_blob(
+            size_t size, uint8_t *cache_blob) const {
+        assert(!"unexpected");
+        return dnnl::impl::status::runtime_error;
+    }
+
+    virtual bool mayiuse_system_memory_allocators() const { return false; }
     virtual bool mayiuse_f16_accumulator_with_f16() const { return false; }
 
+    const dnnl::impl::engine_impl_t *impl() const { return impl_.get(); }
+
 #ifdef ONEDNN_BUILD_GRAPH
-    /** only used in graph implementation **/
-    void *get_allocator() const { return (void *)(&allocator_); };
+    // only used in graph implementation
+    void *get_allocator() const { return impl()->get_allocator(); }
+    // TODO: consider moving it to constructor.
     void set_allocator(dnnl::impl::graph::allocator_t *alloc) {
-        allocator_ = *alloc;
+        impl_->set_allocator(alloc);
     }
 #endif
 
@@ -137,18 +169,11 @@ struct dnnl_engine : public dnnl::impl::c_compatible {
     }
 
 protected:
-    dnnl::impl::engine_kind_t kind_;
-    dnnl::impl::runtime_kind_t runtime_kind_;
-    size_t index_;
-
-#ifdef ONEDNN_BUILD_GRAPH
-    /** only used in graph implementation **/
-    dnnl::impl::graph::allocator_t allocator_;
-#endif
-
+    dnnl::impl::status_t init_impl() { return impl_->init(); }
     virtual ~dnnl_engine() = default;
 
 private:
+    std::unique_ptr<dnnl::impl::engine_impl_t> impl_;
     std::atomic<int> counter_;
 };
 

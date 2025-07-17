@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2020-2023 Intel Corporation
+* Copyright 2020-2025 Intel Corporation
 * Copyright 2020 Codeplay Software Limited
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,7 +25,7 @@
 #include "common/primitive.hpp"
 #include "gpu/nvidia/cudnn_conv_inner_product_impl.hpp"
 #include "gpu/nvidia/cudnn_inner_product.hpp"
-#include "gpu/nvidia/sycl_cuda_engine.hpp"
+#include "gpu/nvidia/engine.hpp"
 #include "gpu/nvidia/sycl_cuda_utils.hpp"
 
 namespace dnnl {
@@ -60,12 +60,12 @@ struct cudnn_conv_inner_product_fwd_t : public cudnn_inner_product_fwd_t {
 
         DECLARE_COMMON_PD_T("cuda:cudnn:conv", cudnn_conv_inner_product_fwd_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
             using namespace prop_kind;
             using sm_t = primitive_attr_t::skip_mask_t;
 
-            const auto attr_skip_mask = sm_t::scales_runtime | sm_t::post_ops;
+            const auto attr_skip_mask = sm_t::scales | sm_t::post_ops;
             // Flag for checking if the fused routine can be used for the
             // blocked format case. If set to true, that implies ReLU and
             // blocking are used.
@@ -91,7 +91,8 @@ struct cudnn_conv_inner_product_fwd_t : public cudnn_inner_product_fwd_t {
                     new cudnn_conv_inner_product_fwd_impl_t());
 
             auto st = inner_product_impl_->init(engine, this, with_relu(),
-                    with_eltwise(), with_sum(), use_fused_path_for_blocking);
+                    with_eltwise(), with_sum(), use_fused_path_for_blocking,
+                    false);
             return st;
         }
         bool with_eltwise() const {
@@ -169,7 +170,7 @@ struct cudnn_conv_inner_product_fwd_t : public cudnn_inner_product_fwd_t {
                     && memory_desc_matches_nchw_vect_c(weights_md(0));
         }
 
-        bool data_types_ok(engine_t *engine) const {
+        bool data_types_ok(impl::engine_t *engine) const {
             using namespace data_type;
             dnnl_data_type_t src_type = src_md()->data_type;
             dnnl_data_type_t weights_type = weights_md(0)->data_type;
@@ -177,8 +178,7 @@ struct cudnn_conv_inner_product_fwd_t : public cudnn_inner_product_fwd_t {
             dnnl_data_type_t dst_type = dst_md()->data_type;
             dnnl_data_type_t acc_type = desc()->accum_data_type;
 
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+            auto *sycl_engine = utils::downcast<nvidia::engine_t *>(engine);
 
             if (!IMPLICATION(utils::one_of(bf16, src_type, weights_type,
                                      bias_type, dst_type, acc_type),
@@ -232,7 +232,7 @@ struct cudnn_conv_inner_product_bwd_data_t
         DECLARE_COMMON_PD_T(
                 "cuda:cudnn:conv", cudnn_conv_inner_product_bwd_data_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
             using namespace prop_kind;
 
@@ -251,7 +251,7 @@ struct cudnn_conv_inner_product_bwd_data_t
                     new cudnn_conv_inner_product_bwd_data_impl_t());
 
             return inner_product_impl_->init(
-                    engine, this, false, false, false, false);
+                    engine, this, false, false, false, false, false);
         }
 
         status_t set_default_params() {
@@ -289,9 +289,8 @@ struct cudnn_conv_inner_product_bwd_data_t
                     == 0;
         }
 
-        bool data_types_ok(engine_t *engine) const {
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+        bool data_types_ok(impl::engine_t *engine) const {
+            auto *sycl_engine = utils::downcast<nvidia::engine_t *>(engine);
 
             auto diff_src_dt = diff_src_md()->data_type;
             auto weights_dt = weights_md(0)->data_type;
@@ -323,7 +322,7 @@ struct cudnn_conv_inner_product_bwd_weights_t
         DECLARE_COMMON_PD_T(
                 "cuda:cudnn:conv", cudnn_conv_inner_product_bwd_weights_t);
 
-        status_t init(engine_t *engine) {
+        status_t init(impl::engine_t *engine) {
             using namespace data_type;
             using namespace prop_kind;
             bool ok = true && (set_default_params() == status::success);
@@ -343,7 +342,7 @@ struct cudnn_conv_inner_product_bwd_weights_t
                     new cudnn_conv_inner_product_bwd_weights_impl_t());
 
             return inner_product_impl_->init(
-                    engine, this, false, false, false, false);
+                    engine, this, false, false, false, false, false);
         }
 
         status_t set_default_params() {
@@ -384,9 +383,8 @@ struct cudnn_conv_inner_product_bwd_weights_t
                     == 0;
         }
 
-        bool data_types_ok(engine_t *engine) const {
-            auto *sycl_engine
-                    = utils::downcast<impl::sycl::sycl_engine_base_t *>(engine);
+        bool data_types_ok(impl::engine_t *engine) const {
+            auto *sycl_engine = utils::downcast<nvidia::engine_t *>(engine);
 
             if (!IMPLICATION(utils::one_of(data_type::bf16,
                                      diff_weights_md(1)->data_type,

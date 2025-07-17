@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2020-2024 Intel Corporation
+ * Copyright 2020-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -68,6 +68,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, eltwise_fwd_pass)
             return std::make_shared<float_eltwise_fwd>();
         });
 
+#if BUILD_TRAINING
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, eltwise_bwd_pass)
         .set_priority(DEFAULT_P)
         .set_kind(partition_kind_t::misc_post_ops)
@@ -78,6 +79,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, eltwise_bwd_pass)
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
             return std::make_shared<eltwise_bwd_t>();
         });
+#endif
 
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, binary_pass)
         .set_priority(DEFAULT_P)
@@ -88,7 +90,8 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, binary_pass)
                             graph::op_kind::Add, graph::op_kind::Multiply,
                             graph::op_kind::Maximum, graph::op_kind::Minimum,
                             graph::op_kind::Divide, graph::op_kind::Subtract,
-                            graph::op_kind::SquaredDifference});
+                            graph::op_kind::SquaredDifference,
+                            graph::op_kind::Select});
                 })
         .set_attr<FCreateKernel>("FCreateKernel",
                 []() -> kernel_ptr { return std::make_shared<binary_t>(); });
@@ -107,6 +110,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, quant_dequant_pass)
             return std::make_shared<quantize_dequantize_t>();
         });
 
+#if BUILD_TRAINING
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, avg_pool_bw_pass)
         .set_priority(8.f)
         .set_kind(partition_kind_t::misc_post_ops)
@@ -121,6 +125,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, avg_pool_bw_pass)
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
             return std::make_shared<pooling_bwd_t>();
         });
+#endif
 
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_pass)
         .set_priority(8.f)
@@ -134,7 +139,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_pass)
                                     1>);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<batchnorm_fwd_t>();
+            return std::make_shared<batch_norm_fwd_t>();
         });
 
 #define BATCHNORM_INPUT_NUM_CHECK(n1, n2) \
@@ -148,6 +153,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_pass)
                 || check_output_num<n2>(graph_op); \
     })
 
+#if BUILD_TRAINING
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_fw_train_pass)
         .set_priority(DEFAULT_P)
         .set_kind(partition_kind_t::misc_post_ops)
@@ -162,7 +168,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_fw_train_pass)
                     p_batchnorm_fwd_training->BATCHNORM_INPUT_NUM_CHECK(3, 5);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<batchnorm_fwd_t>();
+            return std::make_shared<batch_norm_fwd_t>();
         });
 
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_bw_pass)
@@ -179,8 +185,9 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, bn_bw_pass)
                     p_batchnorm_backprop->BATCHNORM_OUTPUT_NUM_CHECK(1, 3);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<batchnorm_bwd_t>();
+            return std::make_shared<batch_norm_bwd_t>();
         });
+#endif
 
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, ln_pass)
         .set_priority(DEFAULT_P)
@@ -194,11 +201,15 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, ln_pass)
                                     1>);
                     p_layernorm->append_decision_function(
                             check_begin_norm_axis_attr);
+                    // primitive only support 2-5D data tensor for layernorm
+                    p_layernorm->append_decision_function(
+                            check_input_ndim_from_offset<0, 2, 5>);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<layernorm_fwd_t>();
+            return std::make_shared<layer_norm_fwd_t>();
         });
 
+#if BUILD_TRAINING
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, ln_bw_pass)
         .set_priority(DEFAULT_P)
         .set_kind(partition_kind_t::misc_post_ops)
@@ -212,14 +223,19 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, ln_bw_pass)
                                     2>);
                     p_layernorm_bwd->append_decision_function(
                             check_begin_norm_axis_attr);
+                    // primitive only support 2-5D data tensor for layernorm
+                    p_layernorm_bwd->append_decision_function(
+                            check_input_ndim_from_offset<0, 2, 5>);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<layernorm_bwd_t>();
+            return std::make_shared<layer_norm_bwd_t>();
         });
+#endif
 
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(concat_pass, Concat, float_concat)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(conv_pass, Convolution, float_conv_fwd)
 
+#if BUILD_TRAINING
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, conv_data_bw_pass)
         .set_priority(DEFAULT_P)
         .set_kind(partition_kind_t::misc_post_ops)
@@ -251,11 +267,13 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, conv_weights_bwd_pass)
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
             return std::make_shared<conv_bwd_weights_t>();
         });
+#endif
 
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(
         convtranspose_pass, ConvTranspose, float_convtranspose_fwd)
+#if BUILD_TRAINING
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(convtranspose_data_bwd_pass,
-        ConvTransposeBackwardData, convtranspose_bwd_data_t)
+        ConvTransposeBackwardData, conv_transpose_bwd_data_t)
 
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, convtranspose_weights_bwd_pass)
         .set_priority(DEFAULT_P)
@@ -270,22 +288,44 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, convtranspose_weights_bwd_pass)
                             check_input_num<2>);
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<convtranspose_bwd_weights_t>();
+            return std::make_shared<conv_transpose_bwd_weights_t>();
         });
+#endif
 
+DNNL_BACKEND_SINGLE_OP_TRANSFORM(gen_index_pass, GenIndex, genindex_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(matmul_pass, MatMul, float_matmul)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(max_pool_pass, MaxPool, float_pooling_fwd)
+DNNL_BACKEND_SINGLE_OP_TRANSFORM(prelu_pass, PReLU, float_prelu_fwd)
+DNNL_BACKEND_SINGLE_OP_TRANSFORM(logsoftmax_pass, LogSoftmax, logsoftmax_fwd_t)
+DNNL_BACKEND_SINGLE_OP_TRANSFORM(softmax_pass, SoftMax, softmax_fwd_t)
+
+#if BUILD_TRAINING
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(
         max_pool_bw_pass, MaxPoolBackward, pooling_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(prelu_pass, PReLU, float_prelu_fwd)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(prelu_bwd_pass, PReLUBackward, prelu_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(logsoftmax_pass, LogSoftmax, logsoftmax_fwd_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(
         logsoftmax_bwd_pass, LogSoftmaxBackward, logsoftmax_bwd_t)
-DNNL_BACKEND_SINGLE_OP_TRANSFORM(softmax_pass, SoftMax, softmax_fwd_t)
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(
         softmax_bwd_pass, SoftMaxBackward, softmax_bwd_t)
+#endif
+
 DNNL_BACKEND_SINGLE_OP_TRANSFORM(reorder_pass, Reorder, float_reorder)
+DNNL_BACKEND_SINGLE_OP_TRANSFORM(reorder_pass, StaticTranspose, float_reorder)
+DNNL_BACKEND_SINGLE_OP_TRANSFORM(reorder_pass, StaticReshape, float_reorder)
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, gn_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    graph::utils::pm::pb_op_t *p_groupnorm
+                            = pgraph->append_op(graph::op_kind::GroupNorm);
+                    p_groupnorm->append_decision_function(
+                            check_input_dtype_from_offset<graph::data_type::f32,
+                                    1>);
+                })
+        .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
+            return std::make_shared<group_norm_fwd_t>();
+        });
 
 // if op is interpolate, need to filter out attrs not supported by dnnl
 #define INTERPOLATE_ATTR_CHECK() \
@@ -307,9 +347,10 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, interpolate_pass)
                     p_interpolate->INTERPOLATE_ATTR_CHECK();
                 })
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
-            return std::make_shared<float_resampling_fwd>();
+            return std::make_shared<resampling_fwd_t>();
         });
 
+#if BUILD_TRAINING
 DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, interpolate_bwd_pass)
         .set_priority(DEFAULT_P)
         .set_kind(partition_kind_t::misc_post_ops)
@@ -323,6 +364,7 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, interpolate_bwd_pass)
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
             return std::make_shared<resampling_bwd_t>();
         });
+#endif
 
 // if op is typecast, need to filter out bf16-in-f16-out and
 // f16-in-bf16-out and same dtype in/out.
@@ -382,6 +424,16 @@ DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, reduce_pass)
         .set_attr<FCreateKernel>("FCreateKernel", []() -> kernel_ptr {
             return std::make_shared<float_reduction>();
         });
+
+DNNL_BACKEND_REGISTER_PATTERN_MATCHER_PASS(dnnl, greater_equal_pass)
+        .set_priority(DEFAULT_P)
+        .set_kind(partition_kind_t::misc_post_ops)
+        .set_attr<FCreatePattern>("FCreatePattern",
+                [](const std::shared_ptr<pb_graph_t> &pgraph) -> void {
+                    pgraph->append_op(graph::op_kind::GreaterEqual);
+                })
+        .set_attr<FCreateKernel>("FCreateKernel",
+                []() -> kernel_ptr { return std::make_shared<binary_t>(); });
 
 #undef DNNL_BACKEND_SINGLE_OP_TRANSFORM
 #undef DEFAULT_P

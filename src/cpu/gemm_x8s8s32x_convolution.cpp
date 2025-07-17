@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2022 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -135,8 +135,9 @@ status_t gemm_x8s8s32x_convolution_fwd_t::execute_forward(
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
-    const float *scales = precompute_scales(
-            scratchpad, src_scales, wei_scales, pd()->OC(), pd()->attr());
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
+    const float *scales = precompute_scales(scratchpad, src_scales, wei_scales,
+            pd()->IC(), pd()->OC(), false, wei_scale_mask > 0, pd()->attr());
 
     parallel(jcp.nthr, [&](const int ithr, const int nthr) {
         status_t st_thr = execute_forward_thr(ithr, nthr, src_base, wei_base,
@@ -273,7 +274,7 @@ status_t gemm_x8s8s32x_convolution_fwd_t::execute_forward_thr(const int ithr,
             const float onef = 1.f, zerof = 0.f;
             const char *__restrict src_od
                     = src + od * jcp.oh * jcp.ow * jcp.ngroups * jcp.ic;
-            st = gemm_s8x8s32("N", BT, jcp.signed_input ? "C" : "F", &M, &N, &K,
+            st = gemm_s8u8s32("N", BT, jcp.signed_input ? "C" : "F", &M, &N, &K,
                     &onef, wei, &LDA, &off_a,
                     jcp.im2col_sz ? col : (uint8_t *)src_od, &LDB, &off_b,
                     &zerof, acc, &M, jcp.signed_input ? wei_comp : &off_c);
@@ -356,14 +357,15 @@ status_t gemm_x8s8s32x_convolution_bwd_data_t::execute_backward_data_thr(
     const auto diff_src_dt_size
             = types::data_type_size(diff_src_md.data_type());
 
-    const int scale_idx_mult = pd()->attr()->scales_.get(DNNL_ARG_WEIGHTS).mask_
+    const int scale_idx_mult = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS)
             == (1 << static_cast<int>(pd()->with_groups()));
     DEFINE_ARG_SCALES_BUFFER(src_scales, DNNL_ARG_SRC);
     DEFINE_ARG_SCALES_BUFFER(wei_scales, DNNL_ARG_WEIGHTS);
     DEFINE_ARG_SCALES_BUFFER(dst_scales, DNNL_ARG_DST);
 
-    const float *scales = precompute_scales(
-            scratchpad, src_scales, wei_scales, pd()->OC(), pd()->attr());
+    const int wei_scale_mask = pd()->attr()->scales_.get_mask(DNNL_ARG_WEIGHTS);
+    const float *scales = precompute_scales(scratchpad, src_scales, wei_scales,
+            pd()->IC(), pd()->OC(), false, wei_scale_mask > 0, pd()->attr());
 
     const dim_t work_amount = jcp.ngroups * jcp.mb;
 
@@ -399,7 +401,7 @@ status_t gemm_x8s8s32x_convolution_bwd_data_t::execute_backward_data_thr(
                         = reinterpret_cast<const int8_t *>(diff_dst_base)
                         + n * diff_dst_mb_stride + g * diff_dst_g_stride;
                 const int8_t off_b = 0;
-                st = gemm_s8x8s32("T", "N", "F", &M, &N, &K, &onef, wei, &LD,
+                st = gemm_s8s8s32("T", "N", "F", &M, &N, &K, &onef, wei, &LD,
                         &off_a, diff_dst, &LD, &off_b, &zerof,
                         jcp.im2col_sz ? col : acc, &M, &off_c);
             } break;
@@ -408,7 +410,7 @@ status_t gemm_x8s8s32x_convolution_bwd_data_t::execute_backward_data_thr(
                         = reinterpret_cast<const uint8_t *>(diff_dst_base)
                         + n * diff_dst_mb_stride + g * diff_dst_g_stride;
                 const uint8_t off_b = 0;
-                st = gemm_s8x8s32("T", "N", "F", &M, &N, &K, &onef, wei, &LD,
+                st = gemm_s8u8s32("T", "N", "F", &M, &N, &K, &onef, wei, &LD,
                         &off_a, diff_dst, &LD, &off_b, &zerof,
                         jcp.im2col_sz ? col : acc, &M, &off_c);
             } break;

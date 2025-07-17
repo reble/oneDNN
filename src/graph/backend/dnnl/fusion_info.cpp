@@ -1,5 +1,5 @@
 /*******************************************************************************
- * Copyright 2022-2024 Intel Corporation
+ * Copyright 2022-2025 Intel Corporation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -35,29 +35,39 @@
 #include "graph/backend/dnnl/utils.hpp"
 
 #include "oneapi/dnnl/dnnl.hpp"
-
 namespace dnnl {
 namespace impl {
 namespace graph {
 namespace dnnl_impl {
 
+using value_ptr = std::shared_ptr<value_t>;
+
 dnnl::primitive_attr make_dnnl_primitive_attr(
         const std::shared_ptr<op_t> &op, const fusion_info_t &fusion_info) {
     dnnl::primitive_attr attr;
+    std::vector<int64_t> default_groups;
 
     if (fusion_info.dst_scales_) {
         const op_t *dst_scales_op = fusion_info.dst_scales_->get_op();
-        assertm(fusion_info.with_runtime_scales(false, 0),
-                "only support runtime dst scales.\n");
+        VCHECK_FUSION_INFO(fusion_info.with_runtime_scales(false, 0), attr,
+                "failed to set scales for %s since primitive only supports "
+                "runtime dst scales",
+                op->get_name().c_str());
         int mask = 0;
+        int64_t dt = 0;
+
         if (dst_scales_op->has_attr(op_attr::axis)
                 && dst_scales_op->has_attr(op_attr::qtype)) {
             int64_t axis = dst_scales_op->get_attr<int64_t>(op_attr::axis);
             std::string qtype
                     = dst_scales_op->get_attr<std::string>(op_attr::qtype);
             mask = qtype == "per_tensor" ? 0 : 1 << axis;
+            dt = dst_scales_op->has_attr(op_attr::data_type)
+                    ? dst_scales_op->get_attr<int64_t>(op_attr::data_type)
+                    : dnnl_f32;
         }
-        attr.set_scales_mask(DNNL_ARG_DST, mask);
+        attr.set_scales(DNNL_ARG_DST, mask, default_groups,
+                static_cast<dnnl::memory::data_type>(dt));
     }
 
     // convert input scales
@@ -65,17 +75,31 @@ dnnl::primitive_attr make_dnnl_primitive_attr(
         for (const auto &in_scales : fusion_info.input_scales_) {
             size_t in_scales_indices = in_scales.first;
             const op_t *in_scales_op = in_scales.second->get_op();
-            assertm(fusion_info.with_runtime_scales(true, in_scales_indices),
-                    "only support runtime src scales.\n");
+            VCHECK_FUSION_INFO(
+                    fusion_info.with_runtime_scales(true, in_scales_indices),
+                    attr,
+                    "failed to set scales for %s since primitive only supports "
+                    "runtime src scales",
+                    op->get_name().c_str());
             int mask = 0;
-            if (in_scales_op->has_attr(op_attr::axis)
-                    && in_scales_op->has_attr(op_attr::qtype)) {
-                int64_t axis = in_scales_op->get_attr<int64_t>(op_attr::axis);
+            if (in_scales_op->has_attr(op_attr::qtype)) {
                 std::string qtype
                         = in_scales_op->get_attr<std::string>(op_attr::qtype);
+                const auto scales_data_type
+                        = in_scales_op->has_attr(op_attr::data_type)
+                        ? in_scales_op->get_attr<int64_t>(op_attr::data_type)
+                        : dnnl_f32;
                 if (qtype == "per_tensor") {
                     mask = 0;
-                } else {
+                    attr.set_scales(in_scales_indices == 0 ? DNNL_ARG_SRC
+                                                           : DNNL_ARG_WEIGHTS,
+                            mask, default_groups,
+                            static_cast<dnnl::memory::data_type>(
+                                    scales_data_type));
+                } else if (qtype == "per_channel") { // per-channel quantization
+                    int64_t axis = in_scales_op->has_attr(op_attr::axis)
+                            ? in_scales_op->get_attr<int64_t>(op_attr::axis)
+                            : 1;
                     if (impl::utils::one_of(op->get_kind(),
                                 op_kind::dnnl_convolution,
                                 op_kind::dnnl_convtranspose)
@@ -94,11 +118,31 @@ dnnl::primitive_attr make_dnnl_primitive_attr(
                     } else {
                         mask = 1 << axis;
                     }
+                    attr.set_scales(in_scales_indices == 0 ? DNNL_ARG_SRC
+                                                           : DNNL_ARG_WEIGHTS,
+                            mask, default_groups,
+                            static_cast<dnnl::memory::data_type>(
+                                    scales_data_type));
+                } else { // per-group quantization
+                    // oneDNN only supports weights-decompressed matmul
+                    if (in_scales_indices != 1
+                            || op->get_kind() != op_kind::dnnl_matmul)
+                        continue;
+                    const auto &group_shape
+                            = in_scales_op->get_attr<std::vector<int64_t>>(
+                                    op_attr::group_shape);
+
+                    // Currently oneDNN only supports grouped scales and zps on
+                    // last two dimensions.
+                    std::vector<int64_t> groups(
+                            group_shape.end() - 2, group_shape.end());
+                    int mask = (1 << group_shape.size()) - 1;
+
+                    attr.set_scales(DNNL_ARG_WEIGHTS, mask, groups,
+                            static_cast<dnnl::memory::data_type>(
+                                    scales_data_type));
                 }
             }
-            attr.set_scales_mask(
-                    in_scales_indices == 0 ? DNNL_ARG_SRC : DNNL_ARG_WEIGHTS,
-                    mask);
         }
     }
 
@@ -106,21 +150,66 @@ dnnl::primitive_attr make_dnnl_primitive_attr(
     if (!fusion_info.input_zps_.empty()) {
         for (const auto &in_zps : fusion_info.input_zps_) {
             size_t in_zps_indices = in_zps.first;
-            assertm(fusion_info.with_runtime_zero_points(true, in_zps_indices),
-                    "only support runtime src zero points.\n");
-            int mask = 0;
-            attr.set_zero_points_mask(
-                    in_zps_indices == 0 ? DNNL_ARG_SRC : DNNL_ARG_WEIGHTS,
-                    mask);
+            const op_t *in_zps_op = in_zps.second->get_op();
+            VCHECK_FUSION_INFO(
+                    fusion_info.with_runtime_zero_points(true, in_zps_indices),
+                    attr,
+                    "failed to set zero points for %s since primitive only "
+                    "supports runtime src zero points",
+                    op->get_name().c_str());
+
+            if (in_zps_op->has_attr(op_attr::qtype)) {
+                std::string qtype
+                        = in_zps_op->get_attr<std::string>(op_attr::qtype);
+                const auto zps_data_type
+                        = in_zps_op->has_attr(op_attr::data_type)
+                        ? in_zps_op->get_attr<int64_t>(op_attr::data_type)
+                        : dnnl_s32;
+                if (qtype == "per_group") {
+                    // oneDNN only supports weights-decompressed matmul
+                    if (in_zps_indices != 1
+                            || op->get_kind() != op_kind::dnnl_matmul)
+                        break;
+                    const auto &group_shape
+                            = in_zps_op->get_attr<std::vector<int64_t>>(
+                                    op_attr::group_shape);
+
+                    // Currently oneDNN only supports grouped scales and zps on
+                    // last two dimensions.
+                    std::vector<int64_t> groups(
+                            group_shape.end() - 2, group_shape.end());
+                    int mask = (1 << group_shape.size()) - 1;
+
+                    // Currently oneDNN only supports grouped zps on last two dimensions.
+                    attr.set_zero_points(DNNL_ARG_WEIGHTS, mask, groups,
+                            static_cast<dnnl::memory::data_type>(
+                                    zps_data_type));
+
+                } else {
+                    int mask = 0;
+                    attr.set_zero_points(in_zps_indices == 0 ? DNNL_ARG_SRC
+                                                             : DNNL_ARG_WEIGHTS,
+                            mask, default_groups,
+                            static_cast<dnnl::memory::data_type>(
+                                    zps_data_type));
+                }
+            }
         }
     }
 
     // convert output zps
     if (fusion_info.output_zps_) {
-        assertm(fusion_info.with_runtime_zero_points(false, 0),
-                "only support runtime src zero points.\n");
+        const op_t *output_zps_op = fusion_info.output_zps_->get_op();
+        const auto zps_data_type = output_zps_op->has_attr(op_attr::data_type)
+                ? output_zps_op->get_attr<int64_t>(op_attr::data_type)
+                : dnnl_s32;
+        VCHECK_FUSION_INFO(fusion_info.with_runtime_zero_points(false, 0), attr,
+                "failed to set zero points for %s since primitive only "
+                "supports runtime dst zero points",
+                op->get_name().c_str());
         int mask = 0;
-        attr.set_zero_points_mask(DNNL_ARG_DST, mask);
+        attr.set_zero_points(DNNL_ARG_DST, mask, default_groups,
+                static_cast<dnnl::memory::data_type>(zps_data_type));
     }
 
     // convert post ops
@@ -211,11 +300,16 @@ dnnl::primitive_attr make_dnnl_primitive_attr(
                 dnnl_pops.append_sum(scale, zp, sum_dt);
             } else {
                 // post-binary
-                assertm(extra_inputs.size() == 1,
-                        "post-binary only has 1 extra input");
-                assertm(scale == 1.f && zp == 0,
-                        "post-binary doesn't support input scale and zp");
+                VCHECK_FUSION_INFO(
+                        extra_inputs.size() == 1 && scale == 1.f && zp == 0,
+                        attr,
+                        "%s post-binary only has 1 extra input and doesn't "
+                        "support "
+                        "input scale and zp",
+                        op->get_name().c_str());
                 auto md = make_dnnl_memory_desc(psrc);
+                if (op->get_kind() == op_kind::dnnl_convolution)
+                    md = to_format_any(md);
                 dnnl_pops.append_binary(alg, md);
             }
         } else if (fused_op_kind == op_kind::dnnl_convolution) {
@@ -249,7 +343,7 @@ dnnl::primitive_attr make_dnnl_primitive_attr(
             // not reachable
         }
     }
-    attr.set_post_ops(std::move(dnnl_pops));
+    attr.set_post_ops(dnnl_pops);
 
     return attr;
 }

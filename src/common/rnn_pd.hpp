@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2024 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -39,6 +39,7 @@ namespace impl {
 
 struct rnn_fwd_pd_t;
 
+// NOLINTBEGIN(google-default-arguments)
 struct rnn_pd_t : public primitive_desc_t {
     static constexpr auto base_pkind = primitive_kind::rnn;
 
@@ -230,10 +231,10 @@ protected:
 
     memory_desc_t ws_md_;
 
-    rnn_pd_t(const rnn_desc_t *adesc, const primitive_attr_t *attr,
+    rnn_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const rnn_fwd_pd_t *hint_fwd_pd)
         : primitive_desc_t(attr, base_pkind)
-        , desc_(*adesc)
+        , desc_(*op_desc_t::to_desc<rnn_desc_t>(adesc))
         , hint_fwd_pd_(hint_fwd_pd)
         , src_layer_md_(desc_.src_layer_desc)
         , src_iter_md_(desc_.src_iter_desc)
@@ -245,47 +246,53 @@ protected:
         , bias_md_(desc_.bias_desc)
         , dst_layer_md_(desc_.dst_layer_desc)
         , dst_iter_md_(desc_.dst_iter_desc)
-        , dst_iter_c_md_(desc_.dst_iter_c_desc)
-        , ws_md_() {}
+        , dst_iter_c_md_(desc_.dst_iter_c_desc) {}
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct rnn_fwd_pd_t : public rnn_pd_t {
-    typedef rnn_fwd_pd_t base_class;
-    typedef rnn_fwd_pd_t hint_class;
+    using base_class = rnn_fwd_pd_t;
+    using hint_class = rnn_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (arg == DNNL_ARG_SRC_LAYER) return arg_usage_t::input;
 
-        if (arg == DNNL_ARG_AUGRU_ATTENTION && with_augru_attention())
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_AUGRU_ATTENTION)
+            return with_augru_attention() ? arg_usage_t::input
+                                          : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_SRC_ITER && with_src_iter())
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_SRC_ITER)
+            return with_src_iter() ? arg_usage_t::input : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_SRC_ITER_C && with_src_iter_c())
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_SRC_ITER_C)
+            return with_src_iter_c() ? arg_usage_t::input : arg_usage_t::unused;
 
         if (utils::one_of(arg, DNNL_ARG_WEIGHTS_LAYER, DNNL_ARG_WEIGHTS_ITER))
             return arg_usage_t::input;
 
-        if (arg == DNNL_ARG_WEIGHTS_PEEPHOLE && is_lstm_peephole())
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_WEIGHTS_PEEPHOLE)
+            return is_lstm_peephole() ? arg_usage_t::input
+                                      : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_WEIGHTS_PROJECTION && is_lstm_projection())
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_WEIGHTS_PROJECTION)
+            return is_lstm_projection() ? arg_usage_t::input
+                                        : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_BIAS && with_bias()) return arg_usage_t::input;
+        if (arg == DNNL_ARG_BIAS)
+            return with_bias() ? arg_usage_t::input : arg_usage_t::unused;
 
         if (arg == DNNL_ARG_DST_LAYER) return arg_usage_t::output;
 
-        if (arg == DNNL_ARG_DST_ITER && with_dst_iter())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_DST_ITER)
+            return with_dst_iter() ? arg_usage_t::output : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_DST_ITER_C && with_dst_iter() && is_lstm())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_DST_ITER_C)
+            return with_dst_iter_c() ? arg_usage_t::output
+                                     : arg_usage_t::unused;
 
-        if (arg == DNNL_ARG_WORKSPACE && is_training())
-            return arg_usage_t::output;
+        if (arg == DNNL_ARG_WORKSPACE)
+            return is_training() ? arg_usage_t::output : arg_usage_t::unused;
 
         return primitive_desc_t::arg_usage(arg);
     }
@@ -323,14 +330,16 @@ struct rnn_fwd_pd_t : public rnn_pd_t {
     }
 
 protected:
-    rnn_fwd_pd_t(const rnn_desc_t *adesc, const primitive_attr_t *attr,
+    rnn_fwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const rnn_fwd_pd_t *hint_fwd_pd)
         : rnn_pd_t(adesc, attr, hint_fwd_pd) {}
 };
+// NOLINTEND(google-default-arguments)
 
+// NOLINTBEGIN(google-default-arguments)
 struct rnn_bwd_pd_t : public rnn_pd_t {
-    typedef rnn_bwd_pd_t base_class;
-    typedef rnn_fwd_pd_t hint_class;
+    using base_class = rnn_bwd_pd_t;
+    using hint_class = rnn_fwd_pd_t;
 
     arg_usage_t arg_usage(int arg) const override {
         if (utils::one_of(arg, DNNL_ARG_SRC_LAYER, DNNL_ARG_DST_LAYER,
@@ -342,53 +351,52 @@ struct rnn_bwd_pd_t : public rnn_pd_t {
                     DNNL_ARG_DIFF_WEIGHTS_LAYER, DNNL_ARG_DIFF_WEIGHTS_ITER))
             return arg_usage_t::output;
 
-        if (with_augru_attention()) {
-            if (arg == DNNL_ARG_AUGRU_ATTENTION) return arg_usage_t::input;
-            if (arg == DNNL_ARG_DIFF_AUGRU_ATTENTION)
-                return arg_usage_t::output;
-        }
+        if (arg == DNNL_ARG_AUGRU_ATTENTION)
+            return with_augru_attention() ? arg_usage_t::input
+                                          : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_AUGRU_ATTENTION)
+            return with_augru_attention() ? arg_usage_t::output
+                                          : arg_usage_t::unused;
 
-        if (is_lstm_peephole()) {
-            if (arg == DNNL_ARG_WEIGHTS_PEEPHOLE) return arg_usage_t::input;
+        if (arg == DNNL_ARG_WEIGHTS_PEEPHOLE)
+            return is_lstm_peephole() ? arg_usage_t::input
+                                      : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_WEIGHTS_PEEPHOLE)
+            return is_lstm_peephole() ? arg_usage_t::output
+                                      : arg_usage_t::unused;
 
-            if (arg == DNNL_ARG_DIFF_WEIGHTS_PEEPHOLE)
-                return arg_usage_t::output;
-        }
+        if (arg == DNNL_ARG_WEIGHTS_PROJECTION)
+            return is_lstm_projection() ? arg_usage_t::input
+                                        : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_WEIGHTS_PROJECTION)
+            return is_lstm_projection() ? arg_usage_t::output
+                                        : arg_usage_t::unused;
 
-        if (is_lstm_projection()) {
-            if (arg == DNNL_ARG_WEIGHTS_PROJECTION) return arg_usage_t::input;
+        if (arg == DNNL_ARG_BIAS)
+            return with_bias() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_BIAS)
+            return with_bias() ? arg_usage_t::output : arg_usage_t::unused;
 
-            if (arg == DNNL_ARG_DIFF_WEIGHTS_PROJECTION)
-                return arg_usage_t::output;
-        }
+        if (arg == DNNL_ARG_SRC_ITER)
+            return with_src_iter() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_SRC_ITER)
+            return with_src_iter() ? arg_usage_t::output : arg_usage_t::unused;
 
-        if (with_bias()) {
-            if (arg == DNNL_ARG_BIAS) return arg_usage_t::input;
+        if (arg == DNNL_ARG_SRC_ITER_C)
+            return with_src_iter_c() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_SRC_ITER_C)
+            return with_src_iter_c() ? arg_usage_t::output
+                                     : arg_usage_t::unused;
 
-            if (arg == DNNL_ARG_DIFF_BIAS) return arg_usage_t::output;
-        }
+        if (arg == DNNL_ARG_DST_ITER)
+            return with_dst_iter() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_DST_ITER)
+            return with_dst_iter() ? arg_usage_t::input : arg_usage_t::unused;
 
-        if (with_src_iter()) {
-            if (arg == DNNL_ARG_SRC_ITER) return arg_usage_t::input;
-
-            if (arg == DNNL_ARG_DIFF_SRC_ITER) return arg_usage_t::output;
-        }
-
-        if (with_src_iter_c()) {
-            if (arg == DNNL_ARG_SRC_ITER_C) return arg_usage_t::input;
-
-            if (arg == DNNL_ARG_DIFF_SRC_ITER_C) return arg_usage_t::output;
-        }
-
-        if (with_dst_iter()
-                && utils::one_of(
-                        arg, DNNL_ARG_DST_ITER, DNNL_ARG_DIFF_DST_ITER))
-            return arg_usage_t::input;
-
-        if (with_dst_iter_c()
-                && utils::one_of(
-                        arg, DNNL_ARG_DST_ITER_C, DNNL_ARG_DIFF_DST_ITER_C))
-            return arg_usage_t::input;
+        if (arg == DNNL_ARG_DST_ITER_C)
+            return with_dst_iter_c() ? arg_usage_t::input : arg_usage_t::unused;
+        if (arg == DNNL_ARG_DIFF_DST_ITER_C)
+            return with_dst_iter_c() ? arg_usage_t::input : arg_usage_t::unused;
 
         if (arg == DNNL_ARG_WORKSPACE) return arg_usage_t::input;
 
@@ -521,7 +529,7 @@ protected:
     memory_desc_t diff_dst_iter_md_;
     memory_desc_t diff_dst_iter_c_md_;
 
-    rnn_bwd_pd_t(const rnn_desc_t *adesc, const primitive_attr_t *attr,
+    rnn_bwd_pd_t(const op_desc_t *adesc, const primitive_attr_t *attr,
             const rnn_fwd_pd_t *hint_fwd_pd)
         : rnn_pd_t(adesc, attr, hint_fwd_pd)
         , diff_src_layer_md_(desc_.diff_src_layer_desc)
@@ -536,6 +544,7 @@ protected:
         , diff_dst_iter_md_(desc_.diff_dst_iter_desc)
         , diff_dst_iter_c_md_(desc_.diff_dst_iter_c_desc) {}
 };
+// NOLINTEND(google-default-arguments)
 
 } // namespace impl
 } // namespace dnnl

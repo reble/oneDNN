@@ -1,5 +1,5 @@
 #===============================================================================
-# Copyright 2016-2023 Intel Corporation
+# Copyright 2016-2025 Intel Corporation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ file(GLOB HEADERS_SUBDIR
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/oneapi/dnnl/*.h
     ${CMAKE_CURRENT_SOURCE_DIR}/../include/oneapi/dnnl/*.hpp
     )
+include_directories_with_host_compiler(${PROJECT_SOURCE_DIR}/third_party)
 include_directories_with_host_compiler(${CMAKE_CURRENT_SOURCE_DIR})
 
 if (DNNL_LIBRARY_TYPE STREQUAL "SHARED")
@@ -75,12 +76,24 @@ if(DNNL_EXPERIMENTAL)
     message(STATUS "Experimental features are enabled")
 endif()
 
-if(DNNL_EXPERIMENTAL_SPARSE)
-    message(STATUS "Experimental functionality for sparse domain is enabled")
+if(DNNL_EXPERIMENTAL_UKERNEL)
+    if(DNNL_TARGET_ARCH STREQUAL "X64" OR DNNL_TARGET_ARCH STREQUAL "AARCH64")
+        message(STATUS "Experimental functionality for ukernels is enabled")
+    else()
+        message(FATAL_ERROR "ukernel API isn't supported for ${DNNL_TARGET_ARCH}.")
+    endif()
 endif()
 
 if(DNNL_EXPERIMENTAL_PROFILING)
     message(STATUS "Experimental profiling capabilities are enabled")
+endif()
+
+if(DNNL_EXPERIMENTAL_LOGGING)
+    message(STATUS "Experimental logging capabilities are enabled")
+endif()
+
+if(DNNL_EXPERIMENTAL_SYCL_KERNEL_COMPILER)
+    message(STATUS "Experimental SYCL OpenCL kernel compiler is enabled")
 endif()
 
 if(DNNL_ENABLE_ITT_TASKS AND NOT DNNL_CPU_RUNTIME STREQUAL "NONE")
@@ -122,27 +135,29 @@ if(NOT DNNL_GPU_RUNTIME STREQUAL "NONE")
     add_subdirectory(gpu)
 endif()
 
+if(DNNL_WITH_SYCL OR DNNL_GPU_RUNTIME STREQUAL "OCL")
+    add_subdirectory(xpu)
+endif()
+
 if(DNNL_WITH_SYCL)
     # Enable linking SYCL kernels.
-    if(DNNL_SYCL_CUDA)
+    if(DNNL_SYCL_CUDA OR (DNNL_SYCL_GENERIC AND NVIDIA_TARGET_SUPPORTED))
         append(CMAKE_SHARED_LINKER_FLAGS "-fsycl-targets=nvptx64-nvidia-cuda")
         append(CMAKE_STATIC_LINKER_FLAGS "-fsycl-targets=nvptx64-nvidia-cuda")
     endif()
-    add_subdirectory(sycl)
+    if(DNNL_AMD_ENABLE_SYCL_KERNELS)
+        append(CMAKE_SHARED_LINKER_FLAGS "-fsycl-targets=amdgcn-amd-amdhsa -Xsycl-target-backend --offload-arch=${DNNL_AMD_SYCL_KERNELS_TARGET_ARCH}")
+        append(CMAKE_STATIC_LINKER_FLAGS "-fsycl-targets=amdgcn-amd-amdhsa -Xsycl-target-backend --offload-arch=${DNNL_AMD_SYCL_KERNELS_TARGET_ARCH}")
+    endif()
 endif()
 
 if(ONEDNN_BUILD_GRAPH)
     message(STATUS "Graph component is enabled")
-    if (DNNL_GPU_RUNTIME STREQUAL "OCL")
-        message(FATAL_ERROR "Graph API does not support OCL GPU runtime. "
-            "Either disable Graph API with ONEDNN_BUILD_GRAPH=OFF or change GPU "
-            "runtime to SYCL with ONEDNN_GPU_RUNTIME=SYCL.")
-    endif()
 
-    if (NOT DNNL_GPU_VENDOR STREQUAL "INTEL")
+    if (NOT DNNL_GPU_RUNTIME STREQUAL "NONE" AND NOT DNNL_GPU_VENDOR STREQUAL "INTEL" AND NOT DNNL_GPU_VENDOR STREQUAL "NVIDIA")
         message(FATAL_ERROR "Graph API does not support ${DNNL_GPU_VENDOR} GPU. "
             "Either disable Graph API with ONEDNN_BUILD_GRAPH=OFF or change GPU "
-            "vendor to INTEL with ONEDNN_GPU_VENDOR=INTEL.")
+            "vendor to INTEL or NVIDIA.")
     endif()
 
     if (NOT DNNL_ENABLE_PRIMITIVE STREQUAL "ALL")
@@ -151,28 +166,12 @@ if(ONEDNN_BUILD_GRAPH)
             "primitive selection with ONEDNN_ENABLE_PRIMITIVE=ALL.")
     endif()
 
-    if (NOT DNNL_ENABLE_WORKLOAD STREQUAL "TRAINING")
-        message(FATAL_ERROR "Graph API does not support selecting workloads. "
-            "Either disable Graph API with ONEDNN_BUILD_GRAPH=OFF or change "
-            "workload selection with ONEDNN_ENABLE_WORKLOAD=TRAINING.")
-    endif()
-
-    if(ONEDNN_EXPERIMENTAL_GRAPH_COMPILER_BACKEND)
-        add_definitions_with_host_compiler(-DDNNL_ENABLE_COMPILER_BACKEND)
-    endif()
     if(ONEDNN_ENABLE_GRAPH_DUMP)
         message(STATUS "Graph artifacts dump is enabled")
         add_definitions_with_host_compiler(-DDNNL_ENABLE_GRAPH_DUMP)
     endif()
 
     add_subdirectory(graph)
-    if(ONEDNN_EXPERIMENTAL_GRAPH_COMPILER_BACKEND AND TARGET dnnl_graphcompiler_llvm_lib_exclude_string)
-        get_property(GC_EXCLUDE_LIBS TARGET dnnl_graphcompiler_llvm_lib_exclude_string PROPERTY INTERFACE_LINK_LIBRARIES)
-        if(DEFINED GC_EXCLUDE_LIBS AND NOT MSVC AND NOT APPLE)
-            # set the LLVM symbols as hidden, or all LLVM symbols will be exported
-            append(CMAKE_SHARED_LINKER_FLAGS "-Wl,--exclude-libs=${GC_EXCLUDE_LIBS}")
-        endif()
-    endif()
 else()
     # If graph component is not built, remove the headers from build and installation.
     list(REMOVE_ITEM HEADERS_SUBDIR
@@ -189,8 +188,7 @@ get_property(SHARED_LIB_DEPS GLOBAL PROPERTY DNNL_SUBDIR_EXTRA_SHARED_LIBS)
 add_library(${LIB_PACKAGE_NAME} ${DNNL_LIBRARY_TYPE}
     ${VERSION_RESOURCE_FILE} ${HEADERS_ROOT} ${HEADERS_SUBDIR} ${LIB_DEPS})
 
-# LINK_PRIVATE for cmake 2.8.11 compatibility
-target_link_libraries(${LIB_PACKAGE_NAME} LINK_PRIVATE ${${LIB_PACKAGE_NAME}_INTERFACE} ${STATIC_LIB_DEPS} ${SHARED_LIB_DEPS})
+target_link_libraries(${LIB_PACKAGE_NAME} PRIVATE ${STATIC_LIB_DEPS} ${SHARED_LIB_DEPS})
 
 set_property(TARGET ${LIB_PACKAGE_NAME} PROPERTY OUTPUT_NAME ${DNNL_LIBRARY_NAME})
 set_property(TARGET ${LIB_PACKAGE_NAME} PROPERTY VERSION "${DNNL_VERSION_MAJOR}.${DNNL_VERSION_MINOR}")
@@ -202,12 +200,19 @@ target_include_directories(${LIB_PACKAGE_NAME} PUBLIC
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
     )
 
-target_link_libraries_build(${LIB_PACKAGE_NAME}
-    "${EXTRA_SHARED_LIBS};${EXTRA_STATIC_LIBS}")
+target_link_libraries(${LIB_PACKAGE_NAME} PUBLIC "$<BUILD_INTERFACE:${EXTRA_SHARED_LIBS};${EXTRA_STATIC_LIBS}>")
 target_link_libraries_install(${LIB_PACKAGE_NAME} "${EXTRA_SHARED_LIBS}")
 if(DNNL_LIBRARY_TYPE STREQUAL "STATIC")
     target_link_libraries_install(${LIB_PACKAGE_NAME} "${EXTRA_STATIC_LIBS}")
 endif()
+
+foreach(object_library IN LISTS LIB_DEPS)
+    string(REPLACE "$<TARGET_OBJECTS:" "" object_library "${object_library}")
+    string(REPLACE ">" "" object_library "${object_library}")
+
+    # explicitly set compile PDB name as with Ninja, all targets have the same pdb name like vc<vc_ver>.pdb
+    set_target_properties(${object_library} PROPERTIES COMPILE_PDB_NAME ${object_library})
+endforeach()
 
 set(LIB_EXPORT_NAME "${LIB_PACKAGE_NAME}-targets")
 install(TARGETS ${LIB_PACKAGE_NAME}
@@ -225,7 +230,7 @@ foreach(header ${HEADERS_SUBDIR})
 endforeach()
 
 string(TOUPPER "${LIB_PACKAGE_NAME}::" LIB_NAMESPACE)
-if(DNNL_INSTALL_MODE STREQUAL "BUNDLE_V2" AND WIN32)
+if(DNNL_INSTALL_MODE STREQUAL "BUNDLE" AND WIN32)
     # Config file for binary distribution needs to define a mapping
     # DEBUG -> RELWITHMDD so that proper library (dnnld) is picked up for the
     # DEBUG configuration.
@@ -256,7 +261,7 @@ install(EXPORT ${LIB_EXPORT_NAME}
 
 # Apply a workaround to CMake config file to make it work with symlinks.
 # The patched config file is only used in oneAPI binary distribution.
-if(UNIX AND DNNL_INSTALL_MODE STREQUAL "BUNDLE_V2")
+if(UNIX AND DNNL_INSTALL_MODE STREQUAL "BUNDLE")
     install(CODE "file(READ \"${CMAKE_INSTALL_PREFIX}/${LIB_CONFIG_INSTALL_DIR}/${LIB_PACKAGE_NAME}-targets.cmake\" TARGETS_CONTENT)")
     install(CODE "string(REPLACE
                          \"get_filename_component(_IMPORT_PREFIX \\\"\\\${CMAKE_CURRENT_LIST_FILE}\\\" PATH)\"
@@ -279,7 +284,7 @@ if(DNNL_CPU_THREADING_RUNTIME STREQUAL "TBB")
     endif()
 endif()
 
-if(DNNL_GPU_RUNTIME STREQUAL "OCL")
+if(DNNL_GPU_RUNTIME STREQUAL "OCL" OR (DNNL_GPU_SYCL AND DNNL_GPU_VENDOR STREQUAL "INTEL"))
     install(FILES
         "../cmake/FindOpenCL.cmake"
         DESTINATION ${LIB_CONFIG_INSTALL_DIR})
@@ -289,6 +294,14 @@ if(DNNL_BLAS_VENDOR STREQUAL "ACCELERATE")
     install(FILES
     "../cmake/FindBLAS.cmake"
     DESTINATION ${LIB_CONFIG_INSTALL_DIR})
+endif()
+
+if(DNNL_SYCL_CUDA)
+    install(FILES
+        "../cmake/FindcuBLAS.cmake"
+        "../cmake/FindcublasLt.cmake"
+        "../cmake/FindcuDNN.cmake"
+        DESTINATION ${LIB_CONFIG_INSTALL_DIR})
 endif()
 
 # On Windows we need to add dnnl.dll path to CTESTCONFIG_PATH which is later

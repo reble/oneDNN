@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2017-2023 Intel Corporation
+* Copyright 2017-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -34,9 +34,7 @@ namespace x64 {
 
 struct jit_sse41_convolution_fwd_t : public primitive_t {
     struct pd_t : public cpu_convolution_fwd_pd_t {
-        pd_t(const convolution_desc_t *adesc, const primitive_attr_t *attr,
-                const typename pd_t::base_class *hint_fwd_pd)
-            : cpu_convolution_fwd_pd_t(adesc, attr, hint_fwd_pd), jcp_() {}
+        using cpu_convolution_fwd_pd_t::cpu_convolution_fwd_pd_t;
 
         DECLARE_COMMON_PD_T(JIT_IMPL_NAME_HELPER("jit:", sse41, ""),
                 jit_sse41_convolution_fwd_t);
@@ -58,14 +56,15 @@ struct jit_sse41_convolution_fwd_t : public primitive_t {
                     attr_.set_default_formats(dst_md(0)) == status::success,
                     VERBOSE_UNSUPPORTED_POSTOP);
 
-            CHECK(jit_sse41_conv_fwd_kernel_f32::init_conf(jcp_, *desc(),
+            // TODO: make `init_conf` assign initialized object to `jcp_`
+            CHECK(jit_sse41_conv_fwd_kernel_f32_t::init_conf(jcp_, *desc(),
                     *src_md(), *weights_md(), *dst_md(), *attr(),
                     dnnl_get_max_threads()));
 
             return status::success;
         }
 
-        jit_conv_conf_t jcp_;
+        jit_conv_conf_t jcp_ = utils::zero<decltype(jcp_)>();
 
     protected:
         bool set_default_formats() {
@@ -105,11 +104,11 @@ struct jit_sse41_convolution_fwd_t : public primitive_t {
 
     jit_sse41_convolution_fwd_t(const pd_t *apd) : primitive_t(apd) {}
 
-    typedef typename prec_traits<data_type::f32>::type data_t;
+    using data_t = typename prec_traits_t<data_type::f32>::type;
 
     status_t init(engine_t *engine) override {
         CHECK(safe_ptr_assign(kernel_,
-                new jit_sse41_conv_fwd_kernel_f32(
+                new jit_sse41_conv_fwd_kernel_f32_t(
                         pd()->jcp_, *pd()->attr(), *pd()->dst_md(0))));
         return kernel_->create_kernel();
     }
@@ -122,7 +121,7 @@ struct jit_sse41_convolution_fwd_t : public primitive_t {
 private:
     void execute_forward(const exec_ctx_t &ctx) const;
     const pd_t *pd() const { return (const pd_t *)primitive_t::pd().get(); }
-    std::unique_ptr<jit_sse41_conv_fwd_kernel_f32> kernel_;
+    std::unique_ptr<jit_sse41_conv_fwd_kernel_f32_t> kernel_;
 };
 
 } // namespace x64

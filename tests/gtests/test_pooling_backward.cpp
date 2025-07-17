@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2016-2023 Intel Corporation
+* Copyright 2016-2025 Intel Corporation
 * Copyright 2022-2023 Arm Ltd. and affiliates
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
@@ -60,6 +60,13 @@ bool hip_check_format_tags(memory::format_tag format) {
     return format_ok;
 }
 
+bool generic_check_format_tags(memory::format_tag format) {
+    return impl::utils::one_of(format, memory::format_tag::a,
+            memory::format_tag::nchw, memory::format_tag::ncdhw,
+            memory::format_tag::nhwc, memory::format_tag::ndhwc,
+            memory::format_tag::any);
+}
+
 template <typename data_t>
 class pooling_bwd_test_t
     : public ::testing::TestWithParam<pool_bwd_test_params_t> {
@@ -97,6 +104,11 @@ protected:
                 "Test is not designed to test non-intel implementations of max "
                 "algorithm");
 
+        SKIP_IF_GENERIC(!generic_check_format_tags(p.diff_src_format),
+                "Unsupported format tag");
+        SKIP_IF_GENERIC(!generic_check_format_tags(p.diff_dst_format),
+                "Unsupported format tag");
+
         catch_expected_failures(
                 [&]() { Test(); }, p.expect_to_fail, p.expected_status);
     }
@@ -106,7 +118,7 @@ protected:
 
         eng = get_test_engine();
         strm = make_stream(eng);
-        data_type = data_traits<data_t>::data_type;
+        data_type = data_traits_t<data_t>::data_type;
         ASSERT_EQ(data_type, dnnl::memory::data_type::f32);
 
         if (p.ndims == 5) {
@@ -221,7 +233,7 @@ protected:
         auto pool_bwd_prim_desc = pd_t(eng, p.aalgorithm, *src_desc, *dst_desc,
                 strides, ker, dilation, pad_l, pad_r, pool_prim_desc);
         // test all pd ctors
-        allows_attr_t aa {false}; // doesn't support anything
+        allows_attr_t aa {}; // doesn't support anything
         test_bwd_pd_constructors<pd_t, hint_pd_t>(pool_bwd_prim_desc,
                 pool_prim_desc, aa, p.aalgorithm, *src_desc, *dst_desc, strides,
                 ker, dilation, pad_l, pad_r);

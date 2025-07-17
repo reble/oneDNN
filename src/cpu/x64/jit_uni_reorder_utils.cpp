@@ -1,5 +1,5 @@
 /*******************************************************************************
-* Copyright 2018-2024 Intel Corporation
+* Copyright 2018-2025 Intel Corporation
 *
 * Licensed under the Apache License, Version 2.0 (the "License");
 * you may not use this file except in compliance with the License.
@@ -199,15 +199,22 @@ status_t prb_init(prb_t &p, const memory_desc_t &imd, const memory_desc_t &omd,
         return po.len() == 0 || (po.len() == 1 && po.entry_[0].is_sum(false));
     };
 
-    bool ok = im_d.is_blocking_desc() && om_d.is_blocking_desc()
-            && !im_d.has_runtime_dims_or_strides() && !im_d.has_zero_dim()
-            && !om_d.has_runtime_dims_or_strides() && !om_d.has_zero_dim()
-            && attr->has_default_values(
-                    primitive_attr_t::skip_mask_t::scales_runtime
-                    | primitive_attr_t::skip_mask_t::zero_points_runtime
-                    | primitive_attr_t::skip_mask_t::post_ops)
-            && check_post_ops(attr);
-    if (!ok) return unimplemented;
+    VDISPATCH_REORDER_IC(
+            im_d.is_blocking_desc(), VERBOSE_UNSUPPORTED_FORMAT_KIND);
+    VDISPATCH_REORDER_IC(
+            om_d.is_blocking_desc(), VERBOSE_UNSUPPORTED_FORMAT_KIND);
+    VDISPATCH_REORDER_IC(!im_d.has_zero_dim(), VERBOSE_EMPTY_TENSOR, "src");
+    VDISPATCH_REORDER_IC(!om_d.has_zero_dim(), VERBOSE_EMPTY_TENSOR, "dst");
+    VDISPATCH_REORDER_IC(!im_d.has_runtime_dims_or_strides(),
+            VERBOSE_RUNTIMEDIM_UNSUPPORTED);
+    VDISPATCH_REORDER_IC(!om_d.has_runtime_dims_or_strides(),
+            VERBOSE_RUNTIMEDIM_UNSUPPORTED);
+
+    using smask_t = primitive_attr_t::skip_mask_t;
+    VDISPATCH_REORDER_IC(attr->has_default_values(smask_t::scales
+                                 | smask_t::zero_points | smask_t::post_ops),
+            VERBOSE_UNSUPPORTED_ATTR);
+    VDISPATCH_REORDER_IC(check_post_ops(attr), VERBOSE_UNSUPPORTED_POSTOP);
 
     bool is_tail_present = false;
     dims_t iblocks, oblocks, i_tails, o_tails, i_paddings, o_paddings;
@@ -219,7 +226,8 @@ status_t prb_init(prb_t &p, const memory_desc_t &imd, const memory_desc_t &omd,
         const auto pdim = om_d.padded_dims()[d];
         const auto cblock = oblocks[d];
         // do not allow excess pdim other than required for rounding-up of dim.
-        if (utils::rnd_up(dim, cblock) != pdim) return unimplemented;
+        VDISPATCH_REORDER_IC(utils::rnd_up(dim, cblock) == pdim,
+                VERBOSE_UNSUPPORTED_PAD_FEATURE, "dst");
     }
 
     utils::array_set(i_tails, 0, im_d.ndims());
@@ -273,24 +281,25 @@ status_t prb_init(prb_t &p, const memory_desc_t &imd, const memory_desc_t &omd,
 
     p.src_scale_type = scale_type_t::NONE;
     int src_mask = 0;
-    bool is_src_set = false;
-    CHECK(attr->scales_.get(DNNL_ARG_SRC, &src_mask, &is_src_set));
-    if (is_src_set) {
+    if (!attr->scales_.has_default_values(DNNL_ARG_SRC)) {
+        src_mask = attr->scales_.get_mask(DNNL_ARG_SRC);
         p.src_scale_type
                 = src_mask == 0 ? scale_type_t::COMMON : scale_type_t::MANY;
     }
 
     p.dst_scale_type = scale_type_t::NONE;
     int dst_mask = 0;
-    bool is_dst_set = false;
-    CHECK(attr->scales_.get(DNNL_ARG_DST, &dst_mask, &is_dst_set));
-    if (is_dst_set) {
+    if (!attr->scales_.has_default_values(DNNL_ARG_DST)) {
+        dst_mask = attr->scales_.get_mask(DNNL_ARG_DST);
         p.dst_scale_type
                 = dst_mask == 0 ? scale_type_t::COMMON : scale_type_t::MANY;
     }
 
-    if (is_src_set && is_dst_set && src_mask != dst_mask)
-        return status::unimplemented;
+    VDISPATCH_REORDER_IC(
+            IMPLICATION(p.src_scale_type != scale_type_t::NONE
+                            && p.dst_scale_type != scale_type_t::NONE,
+                    src_mask == dst_mask),
+            VERBOSE_UNSUPPORTED_SCALES_CFG);
 
     p.scale_adjust = (om_d.extra().flags & memory_extra_flags::scale_adjust)
             ? om_d.extra().scale_adjust
@@ -306,10 +315,12 @@ status_t prb_init(prb_t &p, const memory_desc_t &imd, const memory_desc_t &omd,
         return IMPLICATION(check, mask == (with_groups ? 0x3 : 0x1));
     };
 
-    if (!mask_ok(p.req_s8s8_comp, om_d.extra().compensation_mask)
-            || !mask_ok(p.req_asymmetric_comp,
-                    om_d.extra().asymm_compensation_mask))
-        return status::unimplemented;
+    VDISPATCH_REORDER_IC(
+            mask_ok(p.req_s8s8_comp, om_d.extra().compensation_mask),
+            VERBOSE_UNSUPPORTED_MD_FLAG, "dst");
+    VDISPATCH_REORDER_IC(mask_ok(p.req_asymmetric_comp,
+                                 om_d.extra().asymm_compensation_mask),
+            VERBOSE_UNSUPPORTED_MD_FLAG, "dst");
 
     ptrdiff_t ss[max_ndims] = {0}; // scales strides
     if (p.src_scale_type == scale_type_t::MANY
@@ -428,14 +439,14 @@ status_t prb_init(prb_t &p, const memory_desc_t &imd, const memory_desc_t &omd,
     p.beta = sum_idx == -1 ? 0.f : attr->post_ops_.entry_[sum_idx].sum.scale;
 
     DEBUG({
-        printf("init : ");
-        prb_dump(p);
+        verbose_printf(
+                verbose_t::debuginfo, "init : %s\n", prb_dump(p).c_str());
     });
 
     prb_normalize(p);
     DEBUG({
-        printf("norm : ");
-        prb_dump(p);
+        verbose_printf(
+                verbose_t::debuginfo, "norm : %s\n", prb_dump(p).c_str());
     });
 
     // compensation strides require prb_normalized
@@ -443,8 +454,8 @@ status_t prb_init(prb_t &p, const memory_desc_t &imd, const memory_desc_t &omd,
 
     prb_simplify(p);
     DEBUG({
-        printf("smpl : ");
-        prb_dump(p);
+        verbose_printf(
+                verbose_t::debuginfo, "smpl : %s\n", prb_dump(p).c_str());
     });
 
     return success;
@@ -596,18 +607,20 @@ void prb_node_move(prb_t &p, int d0, int d1) {
     p.nodes[d1] = node;
 }
 
-void prb_dump(const prb_t &p) {
-    printf("@@@ type:%s:%s ndims:%d ", dnnl_dt2str(p.itype),
-            dnnl_dt2str(p.otype), p.ndims);
+std::string prb_dump(const prb_t &p) {
+    stringstream_t ss;
+    ss << "@@@ type:" << dnnl_dt2str(p.itype) << ':' << dnnl_dt2str(p.otype)
+       << " ndims:" << p.ndims;
     for (int d = 0; d < p.ndims; ++d) {
-        if (d != 0) printf("x");
-        printf("[%zu:%zu:%d:%d:%s:%td:%td:%td:%td]", p.nodes[d].n,
-                p.nodes[d].tail_size, p.nodes[d].dim_id,
-                p.nodes[d].parent_node_id,
-                p.nodes[d].is_zero_pad_needed ? "true" : "false", p.nodes[d].is,
-                p.nodes[d].os, p.nodes[d].ss, p.nodes[d].cs);
+        if (d != 0) ss << 'x';
+        const auto &node = p.nodes[d];
+        ss << '[' << node.n << ':' << node.tail_size << ':' << node.dim_id
+           << ':' << node.parent_node_id << ':'
+           << (node.is_zero_pad_needed ? "true" : "false") << ':' << node.is
+           << ':' << node.os << ':' << node.ss << ':' << node.cs << ']';
     }
-    printf(" off:%zu:%zu\n", p.ioff, p.ooff);
+    ss << " off:" << p.ioff << ':' << p.ooff;
+    return ss.str();
 }
 
 } // namespace tr
